@@ -6,10 +6,11 @@ __pycache__/
 venv/
 env/
 
-# Flask instance (SQLiteデータベース・設定ファイル config.py・週報の設定などを格納)
+# Flask instance (SQLiteデータベース・設定ファイル config.py・画面で編集する設定 *.json・自動送信のロック scheduler.lock などを格納)
 instance/
 
-# 旧バージョンのローカル設定ファイル(現在は使わない。残っていても誤ってコミットしないよう除外)
+# 旧バージョンのローカル設定ファイル(アプリは使わない。flask コマンドは python-dotenv があると自動で読み込むため、
+# 残っている場合は移動・削除する。誤ってコミットしないよう除外)
 .env
 
 # OS / エディタ
