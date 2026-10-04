@@ -107,6 +107,7 @@ import codecs
 import copy
 import hashlib
 import hmac
+import ipaddress
 import json
 import math
 import os
@@ -176,6 +177,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font
 from sqlalchemy import case, func, inspect, text
 from sqlalchemy.orm import selectinload
+from werkzeug.routing import IntegerConverter
 
 
 # #############################################################################
@@ -219,7 +221,8 @@ class Config(FixedConfig):
     # 空のままなら起動のたびにランダムな鍵を生成する(再起動するとログアウトされる)。
     SECRET_KEY = ""
 
-    # 固定ローカル管理者(admin)のパスワード。空なら admin でのログインは無効。
+    # 固定ローカル管理者(admin)のパスワード。空なら admin の確認は ldap_client.py の authenticate() に任せる
+    # (同梱の ldap_client.py には admin 用の既定の固定パスワードがあり、それでログインできるようになる)。
     ADMIN_PASSWORD = ""
 
     # LDAP-API のエンドポイント(本番のLDAP認証APIに差し替える際に使用)。
@@ -277,7 +280,8 @@ SECRET_KEY = ""
 
 # 固定ローカル管理者(ID: admin)のパスワード。
 # 自動作成時にランダムな値が入ります。必要に応じて変更してください。
-# 空にすると admin でのログインは無効になります。
+# 空にすると、admin のログイン可否は ldap_client.py の authenticate() に任されます
+# (同梱の ldap_client.py では、admin 用の既定の固定パスワードでログインできるようになります)。
 ADMIN_PASSWORD = ""
 
 # -----------------------------------------------------------------------------
@@ -640,6 +644,10 @@ def _read_for_change(instance_path, expected_version):
     文字コードの指定(coding)が UTF-8 でない場合は ConfigFileError(画面からは書き換えない)。
     """
     current = read_config(instance_path)
+    if not current["exists"]:
+        raise ConfigFileError(
+            "instance/{} がありません。サーバーを再起動すると自動作成されます。"
+            "ファイルは変更していません。".format(CONFIG_FILENAME))
     if expected_version is not None and current["version"] != expected_version:
         raise ConfigConflictError(
             "画面を開いた後に instance/{} が更新されています。".format(CONFIG_FILENAME))
@@ -1025,23 +1033,49 @@ def parse_hhmm(value):
         return None
 
 
+# SQLite の INTEGER に入る整数の範囲(これを超える整数で問い合わせると OverflowError になる)
+SQLITE_INT_MAX = 2 ** 63 - 1
+SQLITE_INT_MIN = -(2 ** 63)
+
+
+def to_int(value, signed=False):
+    """フォーム・URL の文字列を整数にする。整数にできなければ None。
+
+    前後の空白は無視する。数字(全角の数字も可)だけでなければ None(signed なら先頭の「-」も可)。
+    「²」のように isdigit() は真でも int() で読めない文字や、SQLite の整数の範囲
+    (SQLITE_INT_MIN〜SQLITE_INT_MAX)を超える値も None(問い合わせで 500 にしないため)。
+    """
+    raw = str(value if value is not None else "").strip()
+    body = raw[1:] if signed and raw.startswith("-") else raw
+    if not body or len(body) > 19 or not body.isdecimal():
+        return None
+    number = int(raw)
+    return number if SQLITE_INT_MIN <= number <= SQLITE_INT_MAX else None
+
+
+def to_ints(values):
+    """文字列の一覧(getlist の値)のうち、0 以上の整数にできるものだけを整数にして返す(順番どおり)。"""
+    return [n for n in (to_int(v) for v in values) if n is not None]
+
+
 def form_int(values, name):
     """フォーム・URL の値(values は request.form / request.args など)を 0 以上の整数にする。
 
-    前後の空白は無視する。数字だけでなければ None。
+    前後の空白は無視する。数字だけでなければ None(SQLite の整数の範囲を超える値も None。to_int)。
     """
-    raw = (values.get(name) or "").strip()
-    return int(raw) if raw.isdecimal() else None
+    return to_int(values.get(name))
 
 
 def form_sort_order(form, default=0):
     """フォームの並び順(sort_order。負の数も可)。無い・整数でなければ default。"""
-    raw = form.get("sort_order", str(default))
-    return int(raw) if raw.lstrip("-").isdigit() else default
+    number = to_int(form.get("sort_order", str(default)), signed=True)
+    return default if number is None else number
 
 
 def get_or_404(model, ident):
-    """主キーが ident の行を返す。無ければ 404 にする。"""
+    """主キーが ident の行を返す。無ければ 404 にする(SQLite の整数の範囲外の ID も 404)。"""
+    if isinstance(ident, int) and not SQLITE_INT_MIN <= ident <= SQLITE_INT_MAX:
+        abort(404)
     obj = db.session.get(model, ident)
     if obj is None:
         abort(404)
@@ -1221,13 +1255,16 @@ class JsonSettings:
 #   - 日付が決まっている祝日(元日・建国記念の日・天皇誕生日・昭和の日・憲法記念日・
 #     みどりの日・こどもの日・山の日・文化の日・勤労感謝の日)
 #   - ハッピーマンデー(成人の日・海の日・敬老の日・スポーツの日〔体育の日〕)
-#   - 春分の日・秋分の日(1980〜2099年の標準的な計算式。範囲外の年も同じ式で近似する)
+#   - 春分の日・秋分の日(1980〜2099年の標準的な計算式。範囲外の年も同じ式で近似する。
+#     式の結果が日付にならない年〔おおむね4500年以降〕は、春分の日・秋分の日なしとして扱う)
 #   - 振替休日(祝日が日曜日のとき、その後の最も近い祝日でない日。2006年までは翌月曜日)
 #   - 国民の休日(前日と翌日が祝日である、祝日でない日。日曜日を除く)
 #   - 一度きりの祝日・休日(2019年の天皇の即位の日・即位礼正殿の儀の行われる日、
 #     2020・2021年の海の日・スポーツの日・山の日の移動など)
 # 法律の改正の年(成人の日のハッピーマンデー化・天皇誕生日の日付など)も反映する。
 # 祝日法の施行(1948年7月20日)より前の日付は、祝日なしとして扱う。
+# business_days_ago は長い期間(期限が0026年・9999年と入力されたタスクなど)でも、年ごとの祝日を
+# 数えて計算する(1日ずつ数えない)。
 
 _ONE_DAY = timedelta(days=1)
 
@@ -1283,9 +1320,14 @@ def autumnal_equinox_day(year):
 def _national_holidays(year):
     """その年の「国民の祝日」(振替休日・国民の休日を除く) {date: 名前}。"""
     days = {}
+    if year < _LAW_START.year:
+        return days  # 祝日法の施行より前の年は祝日なし
 
     def add(month, day, name):
-        d = date(year, month, day)
+        try:
+            d = date(year, month, day)
+        except ValueError:
+            return  # 春分・秋分の計算式が日付にならない年(遠い未来)は、その祝日なしとする
         if d >= _LAW_START:
             days[d] = name
 
@@ -1405,12 +1447,13 @@ def business_days_ago(past_date, today):
     past_date, today = _to_date(past_date), _to_date(today)
     if past_date >= today:
         return 0
-    count = 0
-    d = past_date + _ONE_DAY
-    while d <= today:
-        if is_business_day(d):
-            count += 1
-        d += _ONE_DAY
+    # 月〜金の日数を数え、そのうちの祝日・休日を引く(長い期間でも速く数えられるように1日ずつは数えない)
+    first = past_date + _ONE_DAY
+    total = (today - first).days + 1
+    weeks, extra = divmod(total, 7)
+    count = weeks * 5 + sum(1 for i in range(extra) if (first.weekday() + i) % 7 < 5)
+    for year in range(first.year, today.year + 1):
+        count -= sum(1 for d in _holidays_of_year(year) if first <= d <= today and d.weekday() < 5)
     return count
 
 
@@ -1923,7 +1966,8 @@ class LeaveRequest(db.Model):
 #
 # 各メンバーが担当している繰り返し業務(定型業務・定期業務)を管理する。
 # タスク(単発の作業)とは別物で、頻度・所要時間・手順書の作成状況などを持つ。
-# マネージャー・メンバーの全員が登録・編集できる。
+# 全員が登録できる。メンバーは自分が担当のもの(担当者は自分に固定)だけを登録・編集でき、
+# マネージャーはすべてを登録・編集できる。削除はマネージャーのみ(5-4)。
 
 # 頻度の単位
 FREQ_DAY = "日"
@@ -2244,6 +2288,12 @@ class Operation(db.Model):
         """指定スキルの必要レベル・レコードを返す(未設定ならNone)。"""
         sid = skill.id if hasattr(skill, "id") else skill
         return next((r for r in self.skill_reqs if r.skill_id == sid), None)
+
+    @property
+    def active_skill_reqs(self):
+        """有効なスキルの必要スキルだけ(無効化したスキルの必要スキルは、対応可否・育成計画・件数に数えない。
+        行は残すので、スキルを有効に戻すと元どおりになる)。"""
+        return [r for r in self.skill_reqs if r.skill is not None and r.skill.is_active]
 
     def __repr__(self):
         return f"<Operation {self.id}: {self.name}>"
@@ -2850,10 +2900,37 @@ def _build_message(text, html, attachments):
         part = MIMEBase(maintype, subtype)
         part.set_payload(data)
         encoders.encode_base64(part)
-        # 日本語のファイル名は RFC 2231 の形式で付ける
-        part.add_header("Content-Disposition", "attachment", filename=("utf-8", "", filename))
+        # 日本語のファイル名は RFC 2231 の形式で付ける(長い名前は分けて付ける)
+        part["Content-Disposition"] = _attachment_disposition(filename)
         msg.attach(part)
     return msg
+
+
+# 添付ファイル名(RFC 2231 の形式。%XX の形にしたもの)を1つのパラメータで付ける長さの上限。
+# これより長い名前は filename*0*= / filename*1*= ... に _FILENAME_PIECE_MAX 文字ずつ分けて付ける
+# (折り返した1行が78文字を超えないように)
+_FILENAME_PARAM_MAX = 60
+_FILENAME_PIECE_MAX = 54
+
+
+def _attachment_disposition(filename):
+    """添付ファイルの Content-Disposition の値(RFC 2231。長い名前は継続パラメータに分ける)。"""
+    encoded = quote(filename, safe="")
+    if len(encoded) <= _FILENAME_PARAM_MAX:
+        return "attachment; filename*=utf-8''{}".format(encoded)
+    pieces, i = [], 0
+    while i < len(encoded):
+        j = min(i + _FILENAME_PIECE_MAX, len(encoded))
+        # %XX の途中で分けない
+        if j < len(encoded):
+            k = encoded.rfind("%", i, j)
+            if k > i and j - k < 3:
+                j = k
+        pieces.append(encoded[i:j])
+        i = j
+    params = ["filename*0*=utf-8''{}".format(pieces[0])]
+    params += ["filename*{}*={}".format(n, piece) for n, piece in enumerate(pieces[1:], 1)]
+    return "attachment; " + "; ".join(params)
 
 
 def send_mail(subject, text, html=None, attachments=(), to=None, cc=None, test=False):
@@ -2887,7 +2964,8 @@ def send_mail(subject, text, html=None, attachments=(), to=None, cc=None, test=F
     try:
         # 暗号化(STARTTLS)・認証(ログイン)はしない。接続して送るだけ(終わると QUIT で切断する)
         with smtplib.SMTP(values["server"], values["port"], timeout=SMTP_TIMEOUT) as smtp:
-            refused = smtp.sendmail(mail_from, envelope, msg.as_string())
+            # ヘッダは78文字で折り返す(宛先が多い・件名が長いときに1行が長くなりすぎないように)
+            refused = smtp.sendmail(mail_from, envelope, msg.as_string(maxheaderlen=78))
     except smtplib.SMTPRecipientsRefused as exc:
         return False, "すべての宛先が拒否されました: {}".format("、".join(exc.recipients))
     except smtplib.SMTPSenderRefused:
@@ -2981,6 +3059,27 @@ def _match_registered_user(info):
     return user
 
 
+def _safe_next(value):
+    """ログイン後に戻る先(next)が、このアプリの中のパスならそのまま返す。それ以外は None。
+
+    「//evil.example/」や、「/」の次に逆スラッシュが続くもののように「/」で始まっても
+    別のサイトを指すもの、スキーム・ホストの付いたもの、制御文字・空白・逆スラッシュを含むものは
+    使わない(ログイン直後に外部のサイトへ移動させない。オープンリダイレクトの防止)。
+    """
+    value = str(value or "")
+    if not value.startswith("/") or value.startswith(("//", "/\\")):
+        return None
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F or ch.isspace() or ch == "\\" for ch in value):
+        return None
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return None
+    if parts.scheme or parts.netloc:
+        return None
+    return value
+
+
 @auth_bp.route("/login", methods=["GET", "POST"])
 def login():
     # すでにログイン済みならトップへ
@@ -3018,9 +3117,9 @@ def login():
         login_user(user)
         flash(f"ようこそ、{user.display_name} さん。", "success")
 
-        # ログイン前にアクセスしようとしていたページがあればそこへ戻す
-        next_page = request.args.get("next")
-        if next_page and next_page.startswith("/"):
+        # ログイン前にアクセスしようとしていたページがあればそこへ戻す(このアプリの中のパスだけ)
+        next_page = _safe_next(request.args.get("next"))
+        if next_page:
             return redirect(next_page)
         return redirect(url_for("main.dashboard"))
 
@@ -3111,21 +3210,31 @@ tasks_bp = Blueprint("tasks", __name__, url_prefix="/tasks")
 
 # 完了にするには成果(実績)が必要、という案内文(各所で共用)
 _COMPLETE_NEEDS_OUTCOME = "「完了」にするには、成果(実績)の定量または定性のいずれかを入力してください。"
+# 状態・優先度に選択肢に無い値が送られたときの案内文
+_INVALID_CHOICE = "ステータス・優先度は選択肢から選んでください。"
+
+# 成果(定量)の値の上限(絶対値。これ以上は入力の誤りとして受け付けない)
+OUTCOME_NUMBER_MAX = 1e15
 
 
 def _read_outcomes():
     """フォームから成果(定量・定性)欄を読み取る。返り値 (data, error)。
 
     定量の値は数値(カンマ・￥は無視)。不正な数値のときは error にメッセージを入れて返す。
+    inf・nan(「1e400」のように大きすぎて inf になるものを含む)や、絶対値が OUTCOME_NUMBER_MAX 以上の
+    値も不正とする(詳細画面の表示・年換算の集計で扱えないため)。
     """
     def _num(field):
         raw = (request.form.get(field, "") or "").strip().replace(",", "").replace("￥", "")
         if raw == "":
             return None, False
         try:
-            return float(raw), False
+            value = float(raw)
         except ValueError:
             return None, True
+        if not math.isfinite(value) or abs(value) >= OUTCOME_NUMBER_MAX:
+            return None, True
+        return value, False
 
     est, est_bad = _num("outcome_quant_estimate")
     act, act_bad = _num("outcome_quant_actual")
@@ -3197,8 +3306,39 @@ def _can_edit(task):
 
 def _selected_assignees(users):
     """フォームの assignee_ids(複数)から担当ユーザーのリストを返す。"""
-    ids = {int(x) for x in request.form.getlist("assignee_ids") if x.isdigit()}
+    ids = set(to_ints(request.form.getlist("assignee_ids")))
     return [u for u in users if u.id in ids]
+
+
+def _assignee_choices(task):
+    """編集画面の担当者の選択肢: 有効なユーザーと、そのタスクの担当のまま無効化されたユーザー。
+
+    無効化されたユーザーは選択肢(get_active_users)に出ないため、そのままでは保存のたびに担当から
+    外れてしまう(担当の履歴・成果・Excel出力・期限超過通知の担当者が消える)。担当のまま残し、
+    画面では「［無効］」を付けて表示する(マネージャーがチェックを外したときだけ外す)。
+    """
+    users = get_active_users()
+    if task is None:
+        return users
+    inactive = [u for u in task.assignees if not u.is_active]
+    return users + sorted(inactive, key=lambda u: u.display_name or "")
+
+
+# キーワード検索の LIKE で、文字そのものとして探す記号の前に付ける文字(escape に渡す)
+_LIKE_ESCAPE = "\\"
+
+
+def _like_pattern(keyword):
+    """キーワード検索の LIKE のパターン(「%」「_」と逆スラッシュは文字そのものとして探す)。"""
+    escaped = (keyword.replace(_LIKE_ESCAPE, _LIKE_ESCAPE * 2)
+               .replace("%", _LIKE_ESCAPE + "%").replace("_", _LIKE_ESCAPE + "_"))
+    return "%{}%".format(escaped)
+
+
+def _read_choice(name, choices, default):
+    """フォームの選択肢の値(空なら default)。選択肢に無い値なら None。"""
+    value = request.form.get(name) or default
+    return value if value in choices else None
 
 
 @tasks_bp.route("/")
@@ -3206,9 +3346,7 @@ def _selected_assignees(users):
 def list_tasks():
     # フィルタ条件を取得(ステータス・担当者はチェックボックスで複数選択可=OR条件)
     statuses = [s for s in request.args.getlist("status") if s in STATUS_CHOICES]
-    assignee_ids = [
-        int(a) for a in request.args.getlist("assignee") if a.isdigit()
-    ]
+    assignee_ids = to_ints(request.args.getlist("assignee"))
     scope = request.args.get("scope", "")  # "mine" なら自分の担当のみ
     hide_done = request.args.get("hide_done") == "1"  # 「完了」を除く
     keyword = request.args.get("q", "").strip()
@@ -3224,10 +3362,9 @@ def list_tasks():
     if hide_done:
         query = query.filter(Task.status != STATUS_DONE)
     if keyword:
-        like = f"%{keyword}%"
-        query = query.filter(
-            db.or_(Task.title.ilike(like), Task.description.ilike(like))
-        )
+        like = _like_pattern(keyword)
+        query = query.filter(db.or_(Task.title.ilike(like, escape=_LIKE_ESCAPE),
+                                    Task.description.ilike(like, escape=_LIKE_ESCAPE)))
 
     # 未完了→期限が近い順、その後に完了タスク
     tasks = query.order_by(
@@ -3240,6 +3377,8 @@ def list_tasks():
     return render_template(
         "tasks/list.html",
         tasks=tasks,
+        # 一覧でその場で状態を変えられるタスク(作成者・担当者・マネージャー。ほかは状態の表示だけ)
+        editable_ids={t.id for t in tasks if _can_edit(t)},
         users=get_active_users(),
         status_choices=STATUS_CHOICES,
         task_colors=STATUS_COLORS,
@@ -3273,7 +3412,12 @@ def new_task():
             flash(err, "danger")
             return _render_task_form(None, users, request.form, sel)
 
-        status = request.form.get("status") or STATUS_CHOICES[0]
+        # 状態・優先度は選択肢の値だけ(画面の選択肢以外の値を送られても保存しない)
+        status = _read_choice("status", STATUS_CHOICES, STATUS_CHOICES[0])
+        priority = _read_choice("priority", PRIORITY_CHOICES, PRIORITY_MID)
+        if status is None or priority is None:
+            flash(_INVALID_CHOICE, "danger")
+            return _render_task_form(None, users, request.form, sel)
         if status == STATUS_DONE and not _outcomes_have_actual(data):
             flash(_COMPLETE_NEEDS_OUTCOME, "danger")
             return _render_task_form(None, users, request.form, sel)
@@ -3282,7 +3426,7 @@ def new_task():
             title=title,
             description=request.form.get("description", "").strip(),
             status=status,
-            priority=request.form.get("priority") or PRIORITY_MID,
+            priority=priority,
             start_date=parse_date(request.form.get("start_date")),
             due_date=parse_date(request.form.get("due_date")),
             scale=_read_scale(),
@@ -3314,11 +3458,16 @@ def edit_task(task_id):
         flash("このタスクを編集する権限がありません。", "danger")
         return redirect(url_for("tasks.detail", task_id=task.id))
 
-    users = get_active_users()
+    # 担当者の選択肢(担当のまま無効化されたユーザーも、外さずに残せるよう含める)
+    users = _assignee_choices(task)
 
     if request.method == "POST":
         title = request.form.get("title", "").strip()
-        sel = [u.id for u in _selected_assignees(users)]
+        # 担当者を変えられるのはマネージャーだけ。メンバーの画面の担当者は今の担当のまま表示する
+        if current_user.is_manager:
+            sel = [u.id for u in _selected_assignees(users)]
+        else:
+            sel = [u.id for u in task.assignees]
         if not title:
             flash("タイトルは必須です。", "danger")
             return _render_task_form(task, users, request.form, sel)
@@ -3328,9 +3477,19 @@ def edit_task(task_id):
             flash(err, "danger")
             return _render_task_form(task, users, request.form, sel)
 
+        # 状態・優先度は選択肢の値だけ(今の値が選択肢に無い古い値なら、そのままの保存は可)
         status = request.form.get("status") or task.status
-        # 「完了」への変更時のみ実績を必須に(既に完了のタスクの編集は妨げない)
-        if status == STATUS_DONE and task.status != STATUS_DONE and not _outcomes_have_actual(data):
+        priority = task.priority
+        if current_user.is_manager:
+            priority = request.form.get("priority") or task.priority
+        if (status not in STATUS_CHOICES and status != task.status) or \
+                (priority not in PRIORITY_CHOICES and priority != task.priority):
+            flash(_INVALID_CHOICE, "danger")
+            return _render_task_form(task, users, request.form, sel)
+        # 完了のタスクは成果(実績)が必要。既に完了のタスクでも、実績を消して保存はできない
+        # (以前の版で実績なしのまま完了になっているタスクは、そのままの編集を妨げない)
+        if status == STATUS_DONE and not _outcomes_have_actual(data) and \
+                (task.status != STATUS_DONE or task.has_outcome_actual):
             flash(_COMPLETE_NEEDS_OUTCOME, "danger")
             return _render_task_form(task, users, request.form, sel)
 
@@ -3341,7 +3500,7 @@ def edit_task(task_id):
         # 計画系の項目(優先度/開始日/期限/規模/担当者)はマネージャーのみ変更可。
         # メンバーは担当タスクの状況・内容・成果のみ更新でき、既存値を保持する。
         if current_user.is_manager:
-            task.priority = request.form.get("priority") or task.priority
+            task.priority = priority
             task.start_date = parse_date(request.form.get("start_date"))
             task.due_date = parse_date(request.form.get("due_date"))
             task.scale = _read_scale()
@@ -3442,7 +3601,10 @@ def delete_task(task_id):
 # =============================================================================
 # 定型・定期業務のルーティング。
 #
-# マネージャー・メンバーの全員が登録・編集・削除できる(権限による制限なし)。
+# 権限:
+#   ・登録   : 全員。メンバーは担当者が自分に固定され、マネージャーは担当者を選べる
+#   ・編集   : マネージャーはすべて、メンバーは自分が担当のものだけ(_can_edit_routine)
+#   ・削除   : マネージャーのみ
 
 routine_bp = Blueprint("routine", __name__, url_prefix="/routine")
 
@@ -3476,9 +3638,20 @@ def _person_summary():
     return rows, totals
 
 
-def _to_int(value):
-    value = (value or "").strip()
-    return int(value) if value.isdigit() else None
+# 回数・1回の所要時間(分)の上限(これより大きい値は入力の誤りとして受け付けない)
+ROUTINE_NUMBER_MAX = 999999
+
+
+def _routine_number(form, name, label, errors):
+    """回数・所要時間の値(空なら None)。0〜ROUTINE_NUMBER_MAX の整数でなければ errors に足す。"""
+    raw = (form.get(name) or "").strip()
+    if not raw:
+        return None
+    number = to_int(raw)
+    if number is None or number > ROUTINE_NUMBER_MAX:
+        errors.append("{}は0〜{}の整数で入力してください。".format(label, ROUTINE_NUMBER_MAX))
+        return None
+    return number
 
 
 def _can_edit_routine(rw):
@@ -3486,9 +3659,18 @@ def _can_edit_routine(rw):
     return current_user.is_manager or rw.assignee_id == current_user.id
 
 
-def _assignee_users():
-    """担当者の選択肢。メンバーは自分のみ、マネージャーは全員。"""
-    return get_active_users() if current_user.is_manager else [current_user]
+def _assignee_users(routine=None):
+    """担当者の選択肢。メンバーは自分のみ、マネージャーは全員。
+
+    編集する業務の担当者が無効化されている場合は、その人も選択肢に含める(マネージャーが担当を
+    付け替えずにほかの項目を直せるように。画面では「［無効］」を付ける)。
+    """
+    if not current_user.is_manager:
+        return [current_user]
+    users = get_active_users()
+    if routine is not None and routine.assignee is not None and not routine.assignee.is_active:
+        users.append(routine.assignee)
+    return users
 
 
 def _forced_assignee_id():
@@ -3515,11 +3697,14 @@ def _fill_from_form(rw, form, forced_assignee_id=None):
         errors.append("業務名は必須です。")
 
     if forced_assignee_id is not None:
-        assignee_id = str(forced_assignee_id)
+        assignee_id = forced_assignee_id
     else:
-        assignee_id = form.get("assignee_id", "")
-        if not assignee_id.isdigit():
+        assignee_id = to_int(form.get("assignee_id"))
+        if assignee_id is None:
             errors.append("担当者を選択してください。")
+
+    frequency_count = _routine_number(form, "frequency_count", "回数", errors)
+    minutes_per = _routine_number(form, "minutes_per", "1回の所要時間(分)", errors)
 
     if errors:
         return errors
@@ -3532,11 +3717,11 @@ def _fill_from_form(rw, form, forced_assignee_id=None):
         manual = MANUAL_UNDONE
 
     rw.name = name
-    rw.assignee_id = int(assignee_id)
+    rw.assignee_id = assignee_id
     rw.purpose = form.get("purpose", "").strip()
-    rw.frequency_count = _to_int(form.get("frequency_count"))
+    rw.frequency_count = frequency_count
     rw.frequency_unit = unit
-    rw.minutes_per = _to_int(form.get("minutes_per"))
+    rw.minutes_per = minutes_per
     rw.content = form.get("content", "").strip()
     rw.manual_status = manual
     return []
@@ -3554,17 +3739,16 @@ def list_routines():
     keyword = request.args.get("q", "").strip()
 
     query = RoutineWork.query
-    if assignee_id.isdigit():
-        query = query.filter(RoutineWork.assignee_id == int(assignee_id))
+    if to_int(assignee_id) is not None:
+        query = query.filter(RoutineWork.assignee_id == to_int(assignee_id))
     if scope == "mine":
         query = query.filter(RoutineWork.assignee_id == current_user.id)
     if manual in MANUAL_CHOICES:
         query = query.filter(RoutineWork.manual_status == manual)
     if keyword:
-        like = f"%{keyword}%"
-        query = query.filter(
-            db.or_(RoutineWork.name.ilike(like), RoutineWork.content.ilike(like))
-        )
+        like = _like_pattern(keyword)
+        query = query.filter(db.or_(RoutineWork.name.ilike(like, escape=_LIKE_ESCAPE),
+                                    RoutineWork.content.ilike(like, escape=_LIKE_ESCAPE)))
 
     routines = query.order_by(RoutineWork.assignee_id, RoutineWork.id.desc()).all()
 
@@ -3623,7 +3807,7 @@ def edit_routine(routine_id):
     if not _can_edit_routine(rw):
         flash("この定型・定期業務を編集できるのは担当者・マネージャーのみです。", "danger")
         return redirect(url_for("routine.detail", routine_id=rw.id))
-    users = _assignee_users()
+    users = _assignee_users(rw)
     if request.method == "POST":
         errors = _fill_from_form(rw, request.form, forced_assignee_id=_forced_assignee_id())
         if errors:
@@ -3638,7 +3822,7 @@ def edit_routine(routine_id):
 
 
 # --------------------------------------------------------------------------- #
-# 削除(マネージャーのみ。登録・編集は全員可)
+# 削除(マネージャーのみ。登録は全員・編集はマネージャーと担当者)
 # --------------------------------------------------------------------------- #
 @routine_bp.route("/<int:routine_id>/delete", methods=["POST"])
 @login_required
@@ -3667,6 +3851,14 @@ leaves_bp = Blueprint("leaves", __name__, url_prefix="/leaves")
 
 CALENDAR_WEEKDAY_LABELS = ["日", "月", "火", "水", "木", "金", "土"]
 
+# 登録できる取得日・表示できるカレンダーの年の範囲(範囲外の年はカレンダーを作れない・入力の誤り)
+LEAVE_YEAR_MIN = 2000
+LEAVE_YEAR_MAX = 2099
+
+# 同じ人・同じ取得日の重複を防ぐため、登録・更新の「重複の確認→保存」を1つずつ行うロック
+# (既存のテーブルに一意制約を足さないため。同時に送信されても2件にならないように)
+_leave_lock = threading.Lock()
+
 
 # --------------------------------------------------------------------------- #
 # 権限ヘルパー(取消・編集は本人のみ)
@@ -3680,6 +3872,7 @@ def _render_leave_form(leave, form=None):
     return render_template(
         "leaves/form.html", leave=leave,
         type_choices=LEAVE_TYPE_CHOICES, daily_limit=LEAVE_DAILY_LIMIT, form=form,
+        year_min=LEAVE_YEAR_MIN, year_max=LEAVE_YEAR_MAX,
     )
 
 
@@ -3689,6 +3882,15 @@ def _read_leave_form():
     if leave_type not in LEAVE_TYPE_CHOICES:
         leave_type = LEAVE_FULL
     return parse_date(request.form.get("leave_date")), leave_type
+
+
+def _leave_date_error(leave_date):
+    """取得日の誤り(未入力・範囲外)のメッセージ。問題なければ None。"""
+    if leave_date is None:
+        return "取得日を入力してください。"
+    if not LEAVE_YEAR_MIN <= leave_date.year <= LEAVE_YEAR_MAX:
+        return "取得日は{}年〜{}年の日付で入力してください。".format(LEAVE_YEAR_MIN, LEAVE_YEAR_MAX)
+    return None
 
 
 def _duplicate_on(user_id, leave_date, exclude_id=None):
@@ -3804,16 +4006,14 @@ def _build_weeks(year, month, dept_id=None):
 @login_required
 def calendar_view():
     today = date.today()
-    try:
-        year = int(request.args.get("year", today.year))
-        month = int(request.args.get("month", today.month))
-        if not (1 <= month <= 12):
-            raise ValueError
-    except (TypeError, ValueError):
+    year = to_int(request.args.get("year", today.year))
+    month = to_int(request.args.get("month", today.month))
+    # 範囲外の年・月(カレンダーを作れない年を含む)は今月を表示する
+    if year is None or month is None or not (1 <= month <= 12) \
+            or not LEAVE_YEAR_MIN <= year <= LEAVE_YEAR_MAX:
         year, month = today.year, today.month
 
-    dept_raw = request.args.get("dept", "")
-    dept_id = int(dept_raw) if dept_raw.isdigit() else None
+    dept_id = to_int(request.args.get("dept", ""))
     weeks = _build_weeks(year, month, dept_id)
 
     prev_year, prev_month = (year - 1, 12) if month == 1 else (year, month - 1)
@@ -3845,8 +4045,8 @@ def list_leaves():
     date_to = parse_date(request.args.get("to"))
 
     query = LeaveRequest.query
-    if user_id.isdigit():
-        query = query.filter(LeaveRequest.user_id == int(user_id))
+    if to_int(user_id) is not None:
+        query = query.filter(LeaveRequest.user_id == to_int(user_id))
     if scope == "mine":
         query = query.filter(LeaveRequest.user_id == current_user.id)
     if date_from:
@@ -3879,20 +4079,22 @@ def list_leaves():
 def new_leave():
     if request.method == "POST":
         leave_date, leave_type = _read_leave_form()
-        if leave_date is None:
-            flash("取得日を入力してください。", "danger")
+        error = _leave_date_error(leave_date)
+        if error:
+            flash(error, "danger")
             return _render_leave_form(None, request.form)
 
-        dup = _duplicate_on(current_user.id, leave_date)
-        if dup:
-            flash("その取得日の年休は既に登録されています。", "warning")
-            return redirect(url_for("leaves.detail", leave_id=dup.id))
+        with _leave_lock:
+            dup = _duplicate_on(current_user.id, leave_date)
+            if dup:
+                flash("その取得日の年休は既に登録されています。", "warning")
+                return redirect(url_for("leaves.detail", leave_id=dup.id))
 
-        leave = LeaveRequest(
-            user_id=current_user.id, leave_date=leave_date, leave_type=leave_type
-        )
-        db.session.add(leave)
-        db.session.commit()
+            leave = LeaveRequest(
+                user_id=current_user.id, leave_date=leave_date, leave_type=leave_type
+            )
+            db.session.add(leave)
+            db.session.commit()
         flash("年休を登録しました。", "success")
         _registration_messages(current_user, leave_date, exclude_id=leave.id)
         return redirect(url_for("leaves.calendar_view", year=leave_date.year, month=leave_date.month))
@@ -3925,16 +4127,18 @@ def edit_leave(leave_id):
 
     if request.method == "POST":
         leave_date, leave_type = _read_leave_form()
-        if leave_date is None:
-            flash("取得日を入力してください。", "danger")
+        error = _leave_date_error(leave_date)
+        if error:
+            flash(error, "danger")
             return _render_leave_form(leave, request.form)
-        dup = _duplicate_on(current_user.id, leave_date, exclude_id=leave.id)
-        if dup:
-            flash("その取得日の年休は既に登録されています。", "warning")
-            return redirect(url_for("leaves.detail", leave_id=dup.id))
-        leave.leave_date = leave_date
-        leave.leave_type = leave_type
-        db.session.commit()
+        with _leave_lock:
+            dup = _duplicate_on(current_user.id, leave_date, exclude_id=leave.id)
+            if dup:
+                flash("その取得日の年休は既に登録されています。", "warning")
+                return redirect(url_for("leaves.detail", leave_id=dup.id))
+            leave.leave_date = leave_date
+            leave.leave_type = leave_type
+            db.session.commit()
         flash("年休を更新しました。", "success")
         _registration_messages(current_user, leave_date, exclude_id=leave.id)
         return redirect(url_for("leaves.detail", leave_id=leave.id))
@@ -4001,6 +4205,13 @@ def _skill_users():
 def _is_skill_target(user):
     """その人がスキル管理の対象か(メンバーかつ有効)。"""
     return user is not None and user.is_active and user.role == ROLE_MEMBER
+
+
+def _not_target_message(user):
+    """スキル管理の対象外のユーザーを開いたときのメッセージ(無効化されたユーザー・マネージャー)。"""
+    if not user.is_active:
+        return "無効化されたユーザーはスキル管理の対象外です。"
+    return "マネージャーはスキル管理の対象外です。"
 
 
 def _active_skills(skill_type):
@@ -4114,8 +4325,7 @@ def edit_operation(op_id):
 
     if request.method == "POST":
         for s in all_skills:
-            raw = request.form.get(f"level_{s.id}", "")
-            level = int(raw) if raw.isdigit() else 0
+            level = to_int(request.form.get(f"level_{s.id}", "")) or 0
             level = max(0, min(level, s.max_level))
             req = op.req_for(s)
             if level == 0:
@@ -4151,7 +4361,7 @@ def coverage():
     users = _skill_users()
 
     # 必要スキルの到達度を lookup 化: (user_id, skill_id) -> level
-    req_skill_ids = {r.skill_id for op in operations for r in op.skill_reqs}
+    req_skill_ids = {r.skill_id for op in operations for r in op.active_skill_reqs}
     level_lookup = {}
     if req_skill_ids:
         for sr in SkillRating.query.filter(
@@ -4161,7 +4371,7 @@ def coverage():
 
     rows = []
     for op in operations:
-        reqs = op.skill_reqs  # level>=1 のみ
+        reqs = op.active_skill_reqs  # level>=1 のみ(無効化したスキルは数えない)
         cells = []
         doable = 0
         for u in users:
@@ -4204,8 +4414,8 @@ def coverage():
 def member(user_id):
     member = get_or_404(User, user_id)
     if not _is_skill_target(member):
-        # manager権限のユーザーはスキル管理の対象外
-        flash("マネージャーはスキル管理の対象外です。", "info")
+        # manager権限のユーザー・無効化されたユーザーはスキル管理の対象外
+        flash(_not_target_message(member), "info")
         return redirect(url_for("skills.list_skills"))
 
     # 区分ごとに (skill, rating) を整理
@@ -4225,7 +4435,7 @@ def member(user_id):
     need = {}  # skill_id -> 育成が必要なスキルの集約
     for op in _active_operations():
         reqs = sorted(
-            op.skill_reqs,
+            op.active_skill_reqs,
             key=lambda r: (r.skill.skill_type, r.skill.sort_order, r.skill.name),
         )
         if not reqs:
@@ -4280,8 +4490,8 @@ def member(user_id):
 def edit_member(user_id):
     member = get_or_404(User, user_id)
     if not _is_skill_target(member):
-        # manager権限のユーザーはスキル管理の対象外
-        flash("マネージャーはスキル管理の対象外です。", "info")
+        # manager権限のユーザー・無効化されたユーザーはスキル管理の対象外
+        flash(_not_target_message(member), "info")
         return redirect(url_for("skills.list_skills"))
 
     # 全区分の有効スキルをまとめて編集
@@ -4290,13 +4500,31 @@ def edit_member(user_id):
         all_skills.extend(_active_skills(stype))
 
     if request.method == "POST":
+        form = request.form
+        conflicts = []
         for s in all_skills:
-            raw = request.form.get(f"level_{s.id}", "")
-            note = (request.form.get(f"note_{s.id}", "") or "").strip()
-            level = int(raw) if raw.isdigit() else 0
+            level = to_int(form.get(f"level_{s.id}"))
+            if level is None:
+                # フォームに無い(画面を開いた後に追加・有効化されたスキル)・不正な値の行は変えない
+                continue
             level = max(0, min(level, s.max_level))
+            note = (form.get(f"note_{s.id}", "") or "").strip()
 
             rating = s.rating_for(member)
+            stored = ((rating.level if rating else 0), (rating.note or "").strip() if rating else "")
+            # 画面を開いたときの値(hidden。無い古いフォームは保存されている値とみなす)
+            if f"orig_level_{s.id}" in form:
+                shown = (to_int(form.get(f"orig_level_{s.id}")) or 0,
+                         (form.get(f"orig_note_{s.id}", "") or "").strip())
+            else:
+                shown = stored
+            if (level, note) == shown or (level, note) == stored:
+                # 変えていない行・変えても今の値と同じ行は触らない(評価者・評価日時を書き換えない)
+                continue
+            if stored != shown:
+                # 画面を開いた後に、ほかの操作(スキルテストの自動登録など)で変わっていた: 上書きしない
+                conflicts.append(s.name)
+                continue
             if level == 0 and not note:
                 # 未習得かつメモ無し → スパース維持(既存があれば削除)
                 if rating is not None:
@@ -4310,6 +4538,10 @@ def edit_member(user_id):
             rating.rated_by_id = current_user.id
         db.session.commit()
         flash(f"{member.display_name} さんのスキル到達度を更新しました。", "success")
+        if conflicts:
+            flash("次のスキルは、画面を開いた後にほかの操作（スキルテストの自動登録など）で到達度が変わっていたため、"
+                  "変更していません。今の値を確認して、必要ならもう一度変更してください: {}".format(
+                      "、".join(conflicts)), "warning")
         return redirect(url_for("skills.member", user_id=member.id))
 
     by_type = {}
@@ -4527,7 +4759,7 @@ def description_draft():
     skill = None
     raw_id = request.values.get("skill_id", "").strip()
     if raw_id:
-        skill = db.session.get(Skill, int(raw_id)) if raw_id.isdecimal() else None
+        skill = db.session.get(Skill, to_int(raw_id)) if to_int(raw_id) is not None else None
         if skill is None:
             abort(404)
     # 区分は、編集中のスキルならそのスキルの区分(変更できないため)、追加中なら選択中の区分
@@ -4655,6 +4887,7 @@ def _build_workload(today, users):
         for u in users
     }
 
+    open_ids, overdue_ids = set(), set()  # 合計の件数用(複数担当でも1件と数える)
     for t in Task.query.filter(Task.status != STATUS_DONE).all():
         assignees = [u for u in t.assignees if u.id in load]
         n = len(assignees)
@@ -4662,6 +4895,10 @@ def _build_workload(today, users):
             continue
         share = t.scale_monthly_hours / n  # 複数担当は均等割り
         overdue = bool(t.due_date and t.due_date < today)
+        if t.status in (STATUS_DOING, STATUS_TODO, STATUS_HOLD):
+            open_ids.add(t.id)
+            if overdue:
+                overdue_ids.add(t.id)
         for u in assignees:
             d = load[u.id]
             if t.status == STATUS_DOING:
@@ -4698,8 +4935,9 @@ def _build_workload(today, users):
     rows.sort(key=lambda r: r["total_h"], reverse=True)
 
     totals = {
-        "task_open": sum(r["task_open"] for r in rows),
-        "overdue": sum(r["overdue"] for r in rows),
+        # 件数はタスクの数(複数担当のタスクも1件。ヒト別の行は各担当に数える)
+        "task_open": len(open_ids),
+        "overdue": len(overdue_ids),
         "task_h": round(sum(r["task_h"] for r in rows), 1),
         "routine_cnt": sum(r["routine_cnt"] for r in rows),
         "routine_h": round(sum(r["routine_h"] for r in rows), 1),
@@ -4906,6 +5144,24 @@ def _build_outcomes(today, users, only_user_id=None):
     }
 
 
+# ガントチャートの期間の上限(日数。約2年)。長すぎる期間は週の目盛りが増えすぎて画面が重くなるため、
+# 開始日からこの日数までにする
+GANTT_MAX_DAYS = 731
+# 期間の終わりの上限(週の目盛り・棒の終わりの翌日の計算が date.max を超えないように)
+_GANTT_LAST_DAY = date.max - timedelta(days=8)
+
+
+def _limit_gantt_period(gfrom, gto):
+    """ガントチャートの期間を上限までにする。戻り値: (開始日, 終了日, 短くしたか)。"""
+    limited = False
+    if gto > _GANTT_LAST_DAY:
+        gto, limited = _GANTT_LAST_DAY, True
+        gfrom = min(gfrom, gto)
+    if (gto - gfrom).days + 1 > GANTT_MAX_DAYS:
+        gto, limited = gfrom + timedelta(days=GANTT_MAX_DAYS - 1), True
+    return gfrom, gto, limited
+
+
 def _build_gantt(today, only_user_id=None):
     """全タスクのガントチャート用データを組み立てる(ダッシュボード内蔵・全画面で共用)。
 
@@ -4920,6 +5176,10 @@ def _build_gantt(today, only_user_id=None):
     gto = parse_date(request.args.get("gto")) or (today + timedelta(days=28))
     if gto < gfrom:
         gfrom, gto = gto, gfrom
+    gfrom, gto, limited = _limit_gantt_period(gfrom, gto)
+    if limited:
+        flash("ガントチャートの期間は最長{}日（約2年）までです。{}〜{} を表示しています。".format(
+            GANTT_MAX_DAYS, gfrom.strftime("%Y/%m/%d"), gto.strftime("%Y/%m/%d")), "warning")
     gsort = request.args.get("gsort", "task")
     if gsort not in ("task", "assignee"):
         gsort = "task"
@@ -4943,8 +5203,8 @@ def _build_gantt(today, only_user_id=None):
         gquery = gquery.filter(Task.status != STATUS_DONE)
     if only_user_id is not None:
         gquery = gquery.filter(Task.assignees.any(User.id == only_user_id))
-    elif gassignee.isdigit():
-        gquery = gquery.filter(Task.assignees.any(User.id == int(gassignee)))
+    elif to_int(gassignee) is not None:
+        gquery = gquery.filter(Task.assignees.any(User.id == to_int(gassignee)))
 
     gantt = []
     for t in gquery.all():
@@ -5329,8 +5589,7 @@ def save_memberships():
     users = User.query.filter_by(is_active=True).all()
     user_by_id = {u.id: u for u in users}
     for dept in Department.query.all():
-        checked = request.form.getlist(f"dept_{dept.id}")
-        checked_ids = {int(x) for x in checked if x.isdigit()}
+        checked_ids = set(to_ints(request.form.getlist(f"dept_{dept.id}")))
         dept.users = [user_by_id[uid] for uid in checked_ids if uid in user_by_id]
     db.session.commit()
     flash("チームの紐づけを保存しました。", "success")
@@ -5358,6 +5617,10 @@ def _fmt(v):
         return v.strftime("%Y-%m-%d %H:%M")
     if isinstance(v, date):
         return v.strftime("%Y-%m-%d")
+    if isinstance(v, str):
+        # Excel(xlsx)に入れられない制御文字(貼り付けた文書の改行 U+000B など)は除く
+        # (1文字でも残っていると出力全体が作成できないため。改行・タブは残す)
+        return CONTROL_CHARS.sub("", v)
     return v
 
 
@@ -6053,7 +6316,8 @@ def weekly_form_context(settings):
 # - 数値の集計はすべてここ(コード)で行う。AIには計算させない
 # - チーム全体の件数・成果は、複数担当のタスクも1件として数える(重複なし)
 
-# 「期限が近い」とみなす日数(期間の終了日の翌日から数える)
+# 「期限が近い」とみなす日数(期間の終了日の DUE_SOON_DAYS 日後までが期限の未完了のタスク。
+# 期限超過ではないもの〔期限が期間の終了日の翌日以降。期間が今日を含むときは今日以降〕。_task_facts)
 DUE_SOON_DAYS = 7
 # 進捗記載1件を材料に載せる最大文字数(長文でAIへの送信量が膨らまないように)
 COMMENT_MAX = 400
@@ -6085,10 +6349,17 @@ def _completed_on(task):
     return task.updated_at.date() if task.updated_at else None
 
 
-def _task_facts(task, start, end):
-    """1件のタスクについて、期間に関係する事実をまとめる(表示用の素の値だけ)。"""
+def _task_facts(task, start, end, today=None):
+    """1件のタスクについて、期間に関係する事実をまとめる(表示用の素の値だけ)。
+
+    期限超過 = 未完了で、期限が「期間の終わりの翌日」と「今日(作成日)」の早いほうより前。
+    期間が今日を含む(送信日を含む7日間など)ときも、今日が期限のタスクは期限超過にせず「期限が近い」に
+    入れる(期限超過通知・ダッシュボードと同じく、期限が今日より前のものだけを期限超過とする)。
+    """
     start_dt = datetime.combine(start, time.min)
     end_dt = datetime.combine(end, time.max)
+    # この日より前が期限なら期限超過
+    overdue_before = min(end + _ONE_DAY, today or date.today())
 
     def in_period(dt):
         return dt is not None and start_dt <= dt <= end_dt
@@ -6130,9 +6401,9 @@ def _task_facts(task, start, end):
         "completed_on": completed_on,
         "completed_in": completed_on is not None and start <= completed_on <= end,
         "is_open": is_open,
-        "overdue": is_open and due is not None and due <= end,
+        "overdue": is_open and due is not None and due < overdue_before,
         "due_soon": (is_open and due is not None
-                     and end < due <= end + timedelta(days=DUE_SOON_DAYS)),
+                     and overdue_before <= due <= end + timedelta(days=DUE_SOON_DAYS)),
         "outcome_quant": task.outcome_quant_actual_label or "",
         "outcome_qual": _join_lines(task.outcome_qual_actual),
         "outcome_value": task.outcome_quant_actual,
@@ -6253,7 +6524,7 @@ def collect_weekly_material(start, end, users, today=None):
         # 期間より後に登録されたタスクは対象外(過去の期間を作成する場合)
         if task.created_at is not None and task.created_at > end_dt:
             continue
-        fact = _task_facts(task, start, end)
+        fact = _task_facts(task, start, end, today)
         if _is_relevant(fact):
             facts.append(fact)
 
@@ -6633,7 +6904,7 @@ def write_report(material, settings, created_on):
 #
 # 文章(AI または ルールベース)は1行ずつ次のように変換する:
 #   ■ または 【 で始まる行 → 見出し2
-#   ・ - * で始まる行      → 箇条書き(List Bullet)
+#   ・ で始まる行・「- 」「* 」「• 」(記号の後に空白)で始まる行 → 箇条書き(List Bullet)
 #   空行                   → 飛ばす
 #   Markdown の記号(行頭の #・**)は取り除く
 # Word(XML)に入れられない制御文字(貼り付けた端末出力の ESC など)は、すべての文字列から取り除く
@@ -6644,9 +6915,11 @@ FONT_SIZE = Pt(10.5)
 
 TABLE_HEADERS = ["氏名", "完了", "進行中", "期限超過", "進捗記載数", "月間負荷h", "余力h"]
 
-_MD_HEADING = re.compile(r"^#{1,6}\s*")
+# Markdown の見出し(「#」の後に空白)・箇条書き(「-」「*」「•」の後に空白)。「#3 の件」「-5%削減」のように
+# 空白が続かないものは本文のまま(記号を消すと意味が変わるため)。「・」は空白が無くても箇条書き
+_MD_HEADING = re.compile(r"^#{1,6}(?:\s+|$)")
 _MD_RULE = re.compile(r"^[-=_*]{3,}$")
-_BULLET_MARKS = ("・", "-", "*", "•")
+_BULLET_RE = re.compile(r"^(?:・|[-*•](?:\s+|$))")
 _HEADING_MARKS = ("■", "【")
 # XML 1.0 で使えない文字(タブ・改行以外の制御文字、サロゲート、U+FFFE/U+FFFF)
 _XML_INVALID = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
@@ -6706,8 +6979,8 @@ def add_text(doc, text):
             continue
         if is_md_heading or line.startswith(_HEADING_MARKS):
             doc.add_paragraph(line, style="Heading 2")
-        elif line.startswith(_BULLET_MARKS):
-            body = line[1:].strip()
+        elif _BULLET_RE.match(line):
+            body = _BULLET_RE.sub("", line, count=1).strip()
             if body:
                 doc.add_paragraph(body, style="List Bullet")
         else:
@@ -7371,10 +7644,17 @@ def _date_label(d, today):
 
 
 def _age_label(d, today):
-    """コメントの経過日数(営業日)。今日(以降)なら「本日」。"""
+    """コメントの経過日数(営業日)。今日(以降)なら「本日」。
+
+    今日が土日祝で、直前の営業日以降(その後の土日祝を含む)に書かれた記載は、営業日で数えると0日に
+    なるため、暦日で「N日前」とする(「0日前」と表示しない)。
+    """
     if d >= today:
         return "本日"
-    return "{}日前（土日祝除く）".format(business_days_ago(d, today))
+    days = business_days_ago(d, today)
+    if days == 0:
+        return "{}日前".format((today - d).days)
+    return "{}日前（土日祝除く）".format(days)
 
 
 def one_line(text, limit=COMMENT_TEXT_MAX):
@@ -8538,6 +8818,34 @@ def _active_questions(skill_id, level):
     ]
 
 
+# 受験の開始時に AI で問題を作っているスキル {skill_id: 作成中の数}。問題のまとめて停止
+# (admin_deactivate_all)は、このスキルの作成中は行わない(停止の後に、古い説明で作った問題が
+# 有効のまま保存されないように。補充〔_topup_lock〕と同じ考え方)
+_start_generating = {}
+_start_generating_lock = threading.Lock()
+
+
+def is_generating_at_start(skill_id):
+    """そのスキルの問題を、受験の開始時に AI で作っている最中か。"""
+    with _start_generating_lock:
+        return _start_generating.get(skill_id, 0) > 0
+
+
+def _generate_at_start(skill, level, count, stop_at):
+    """受験の開始時の問題の作成(作成中であることを _start_generating に記録する)。"""
+    with _start_generating_lock:
+        _start_generating[skill.id] = _start_generating.get(skill.id, 0) + 1
+    try:
+        return generate_questions(skill, level, count, stop_at=stop_at)
+    finally:
+        with _start_generating_lock:
+            left = _start_generating.get(skill.id, 1) - 1
+            if left > 0:
+                _start_generating[skill.id] = left
+            else:
+                _start_generating.pop(skill.id, None)
+
+
 def _pick_for_level(skill, level, count, served, state):
     """1つのレベルの問題を選ぶ: (問題のリスト, 再出題した数)。
 
@@ -8551,8 +8859,7 @@ def _pick_for_level(skill, level, count, served, state):
     picked = unseen[:count]
 
     if len(picked) < count and state["ai"]:
-        created, error = generate_questions(
-            skill, level, count - len(picked), stop_at=state["stop_at"])
+        created, error = _generate_at_start(skill, level, count - len(picked), state["stop_at"])
         picked += created[:count - len(picked)]
         state["generated"] += len(created)
         if error:
@@ -8699,13 +9006,20 @@ def _elapsed(answer, now):
     return (now - answer.served_at).total_seconds() if answer.served_at else 0.0
 
 
-def _close_timeout(answer, now, selected=None):
-    """時間切れとして確定する(不正解)。"""
+def _close_timeout(answer, now, selected=None, cap=False):
+    """時間切れとして確定する(不正解)。
+
+    cap=True(表示したまま離れていて、開き直したときに見つかった時間切れ)は、_expire と同じく
+    所要秒数を「制限時間＋猶予」まで、確定日時をその時点までにする(離れていた時間を所要時間に数えない)。
+    """
+    end = now
+    if cap and answer.served_at is not None:
+        end = min(now, answer.served_at + timedelta(seconds=answer.time_limit_sec + GRACE_SEC))
     answer.timed_out = True
     answer.is_correct = False
     answer.selected_index = selected
-    answer.answered_at = now
-    answer.elapsed_sec = round(_elapsed(answer, now), 1)
+    answer.answered_at = end
+    answer.elapsed_sec = round(_elapsed(answer, end), 1)
 
 
 def _finish_if_done(attempt, now):
@@ -8743,7 +9057,7 @@ def prepare_question(attempt_id, user_id):
                 changed = True
                 break
             if _elapsed(answer, now) > answer.time_limit_sec + GRACE_SEC:
-                _close_timeout(answer, now)
+                _close_timeout(answer, now, cap=True)
                 changed = True
                 continue
             break
@@ -8882,6 +9196,8 @@ def member_overview(user):
             "rating": rating,
             "last": last,
             "available": available,
+            # 再受験の間隔中なら、その終わりの日時(別のスキルを受験中でも表示する)
+            "locked_until": available if available is not None and now < available else None,
             "state": state,
             "top_level": levels[-1] if levels else 0,
             "capped": bool(levels) and level >= levels[-1],
@@ -9254,6 +9570,7 @@ def admin_attempts():
     )
     return render_template(
         "skilltest/admin_attempts.html",
+        nav_top_level=_rules(load_skilltest_settings())["top_level"],
         attempts=attempts,
         filters=filters,
         users=users,
@@ -9313,6 +9630,7 @@ def admin_pool():
         })
     return render_template(
         "skilltest/admin_pool.html",
+        nav_top_level=_rules(settings)["top_level"],
         rows=rows,
         levels=levels,
         settings=settings,
@@ -9340,13 +9658,19 @@ def admin_pool_skill(skill_id):
         query = query.filter(SkillTestQuestion.is_active.is_(state == STATE_ACTIVE))
     questions = query.order_by(SkillTestQuestion.level, SkillTestQuestion.id).all()
     settings = load_skilltest_settings()
+    counts = counts_by_skill().get(skill.id, {})
+    # レベルの選択肢・問題数: 判定するレベルに、問題があるレベル(上限を下げる前に作った問題など)と
+    # 絞り込み中のレベルを加える(選択肢に無いレベルの問題も選べ、絞り込みの表示とずれないように)
+    levels = set(tested_levels(settings, skill.max_level) or SKILLTEST_LEVELS) | set(counts)
+    if level in SKILLTEST_LEVELS:
+        levels.add(level)
     return render_template(
         "skilltest/admin_pool_skill.html",
         skill=skill,
         questions=questions,
         usage=usage_by_question(skill.id),
-        counts=counts_by_skill().get(skill.id, {}),
-        levels=tested_levels(settings, skill.max_level) or [1, 2, 3, 4],
+        counts=counts,
+        levels=sorted(levels),
         filters={"level": level, "state": state},
         testable=is_testable(skill),
         letters=CHOICE_LETTERS,
@@ -9387,12 +9711,17 @@ def admin_deactivate_all(skill_id):
     """そのスキルの有効な問題をすべて停止(無効)にする(受験履歴・問題は残す)。
 
     スキルの説明を変えた後、古い説明で作った問題を出題から外し、補充で入れ替えるために使う。
-    このスキルの補充の実行中は停止しない(補充が停止の後に問題を保存し、古い説明の問題が有効のまま残るため)。
+    このスキルの補充の実行中や、メンバーの受験開始時の問題の作成中は停止しない(停止の後に問題を保存し、
+    古い説明の問題が有効のまま残るため)。
     """
     skill = get_or_404(Skill, skill_id)
     if running_skill_id() == skill.id:
         flash("「{}」の問題を補充中のため停止できません。補充が終わってから、もう一度実行してください。".format(
             skill.name), "warning")
+        return redirect(url_for("skilltest.admin_pool_skill", skill_id=skill.id))
+    if is_generating_at_start(skill.id):
+        flash("「{}」の問題を、メンバーの受験の開始のためにAIで作成中のため停止できません。"
+              "1〜2分待ってから、もう一度実行してください。".format(skill.name), "warning")
         return redirect(url_for("skilltest.admin_pool_skill", skill_id=skill.id))
     count = (SkillTestQuestion.query
              .filter_by(skill_id=skill.id, is_active=True)
@@ -9421,8 +9750,8 @@ def admin_toggle_question(question_id):
     params = {"skill_id": question.skill_id}
     level = request.form.get("level", "")
     state = request.form.get("state", "")
-    if level.isdecimal():
-        params["level"] = int(level)
+    if to_int(level) is not None:
+        params["level"] = to_int(level)
     if state in (STATE_ACTIVE, STATE_INACTIVE):
         params["state"] = state
     return redirect(url_for("skilltest.admin_pool_skill", **params)
@@ -9838,11 +10167,25 @@ _ACK_PHRASES = (
     "ok", "okです", "オッケー", "おっけー", "good", "nice", "thanks", "thankyou",
 )
 _ACK_FILLERS = ("です", "ます", "でした", "ね", "よ", "ございます")
-_ACK_PATTERN = re.compile(
-    "(?:{})+".format("|".join(re.escape(p) for p in sorted(
-        _ACK_PHRASES + _ACK_FILLERS, key=len, reverse=True))))
 _ACK_STRIP = re.compile(r"[\s、。，．,.!！~〜ー…・♪☆★()（）「」『』:：;；]+")
 _ACK_MAX_CHARS = 40
+
+
+def _plain(text):
+    """比べるための正規化(全角英数を半角・小文字にし、空白・記号を除く)。"""
+    return _ACK_STRIP.sub("", unicodedata.normalize("NFKC", str(text or "")).lower())
+
+
+def _phrase_pattern(*phrase_lists):
+    """言葉の一覧の繰り返しに一致する正規表現。言葉も比べる文と同じく _plain で正規化する
+    (「オッケー」の「ー」のように _plain で取り除く文字を含む言葉も一致するように)。"""
+    phrases = dict.fromkeys(p for phrases in phrase_lists for p in (_plain(x) for x in phrases) if p)
+    return re.compile("(?:{})+".format("|".join(re.escape(p) for p in sorted(phrases, key=len, reverse=True))))
+
+
+# あいさつ・お礼・了解の言葉(_plain で正規化したもの)
+_ACK_PLAIN = tuple(dict.fromkeys(p for p in (_plain(x) for x in _ACK_PHRASES) if p))
+_ACK_PATTERN = _phrase_pattern(_ACK_PHRASES, _ACK_FILLERS)
 
 # 中身のない定型の進捗記載(これだけのものは「具体的な内容がない」)
 _GENERIC_PROGRESS_PHRASES = (
@@ -9854,14 +10197,7 @@ _GENERIC_PROGRESS_PHRASES = (
     "予定通りです", "予定通り", "予定どおり", "対応します", "やります", "実施します", "了解です", "了解",
     "承知しました", "承知", "完了しました", "完了です", "完了", "対応済みです", "対応済み", "済み", "済",
 )
-_GENERIC_PROGRESS_PATTERN = re.compile(
-    "(?:{})+".format("|".join(re.escape(p) for p in sorted(
-        _GENERIC_PROGRESS_PHRASES + _ACK_FILLERS, key=len, reverse=True))))
-
-
-def _plain(text):
-    """比べるための正規化(全角英数を半角・小文字にし、空白・記号を除く)。"""
-    return _ACK_STRIP.sub("", unicodedata.normalize("NFKC", str(text or "")).lower())
+_GENERIC_PROGRESS_PATTERN = _phrase_pattern(_GENERIC_PROGRESS_PHRASES, _ACK_FILLERS)
 
 
 def is_acknowledgement(text):
@@ -9873,7 +10209,7 @@ def is_acknowledgement(text):
     if not plain or len(plain) > _ACK_MAX_CHARS:
         return False
     # 了解・お礼などの言葉(と「です」「ね」など)だけでできている。「です」などだけのものは除く
-    return bool(_ACK_PATTERN.fullmatch(plain)) and any(p in plain for p in _ACK_PHRASES)
+    return bool(_ACK_PATTERN.fullmatch(plain)) and any(p in plain for p in _ACK_PLAIN)
 
 
 def progress_comment_issue(text):
@@ -10041,7 +10377,9 @@ def _progress_section(tasks, members, period, now, settings):
         if t["status"] == STATUS_TODO and due is not None and due >= today:
             left = business_days_ago(today, due)
             if left <= due_soon_days:
-                due_soon.append(dict(_task_ref(t), days_left=left, last_comment=last))
+                # due_today: 期限が今日(残り0営業日でも、期限が後の土日祝のものは「今日が期限」ではない)
+                due_soon.append(dict(_task_ref(t), days_left=left, due_today=due == today,
+                                     calendar_days_left=(due - today).days, last_comment=last))
         if t["status"] == STATUS_DOING:
             # 起点は最後の進捗記載。ただし進行中にした日より前の記載(未着手・保留の間の記載)なら進行中にした日
             last_at = t["last_progress"]["at"] if t["last_progress"] is not None else None
@@ -10599,6 +10937,13 @@ ACTION_CAPS = {
     "progress_writing": 1,
     "skilltest": 1,
 }
+# ルールの推奨アクションの元になる項目(画面の説明。_action_candidates で作る種類と揃える)
+RULE_ACTION_SOURCES = (
+    "期限超過", "マネージャーのコメントに返信なし", "進行中なのに記載がない", "期限が近いのに未着手", "長い保留",
+    "負荷が高い（{}h/月以上）".format(_LOAD_FULL), "対応できる人が1名以下の業務", "保有者が1名以下のスキル",
+    "成果や進捗の書き直し推奨", "スキルテスト（未受験・時間切れ・途中で終了・画面から離れることが多い受験）",
+)
+
 ACTION_CATEGORY_LABELS = {
     "overdue": "期限超過",
     "manager_comment": "コメントへの対応",
@@ -10832,6 +11177,14 @@ ANALYSIS_OTHER_LABEL = "担当者のいないタスク（マネージャーだ�
 ACTION_CANDIDATES_FOR_AI = 40
 # 分けて送るタスクの経過メモ・成果の事実メモの最大文字数(1件)
 AI_MEMO_MAX = 800
+# 各人の材料を分けて送るとき、1回の材料(chunk_chars)のうち【前の回までに分かったこと】に残す割合(1/N)。
+# 【材料】と【前の回までに分かったこと】を合わせて chunk_chars 文字までにする
+CARRY_SHARE = 3
+# 【前の回までに分かったこと】が長いとき、前の回で送ったマネージャーのコメントの本文を載せる長さ
+CARRY_EXCERPT = 200
+# 状態の変更がこれより多いタスクは、分けて送るときに繰り返す見出しでは最初と最後の
+# HEAD_CHANGES_SHOWN 件だけを書く(すべては1回目の材料に「見出しの全文」として送る)
+HEAD_CHANGES_SHOWN = 3
 # チームの材料の要約: 1回の呼び出しで観点ごとに返してもらう要点の数・要約を繰り返す回数の上限
 TEAM_DIGEST_POINTS = 3
 TEAM_DIGEST_ROUNDS = 3
@@ -10941,10 +11294,16 @@ def task_parts(t, facts):
     if facts.get(t["id"]):
         head.append("アプリの計算: " + " ／ ".join(facts[t["id"]]))
     changes = sorted((ch for ch in t["changes"] if ch["at"]), key=lambda ch: ch["at"])
+    listed = ["{} {}".format(_fmt_dt(ch["at"]), ch["status"]) for ch in changes]
     if changes:
-        head.append("状態の変更（古い順）: " + "、".join(
-            "{} {}".format(_fmt_dt(ch["at"]), ch["status"]) for ch in changes))
+        head.append("状態の変更（古い順）: " + "、".join(listed))
     parts = [_part("\n".join(head))]
+    if len(listed) > HEAD_CHANGES_SHOWN * 2:
+        # 分けて送るときに繰り返す短い見出し(状態の変更が多いと見出しだけで1回の材料を超えるため)
+        short = head[:-1] + ["状態の変更（古い順）: {}、…（ほか{}件。すべては1回目の材料の「見出しの全文」にあります）、{}".format(
+            "、".join(listed[:HEAD_CHANGES_SHOWN]), len(listed) - HEAD_CHANGES_SHOWN * 2,
+            "、".join(listed[-HEAD_CHANGES_SHOWN:]))]
+        parts[0]["short"] = "\n".join(short)
     if t["description"].strip():
         parts.append(_part("説明:\n" + _indent(t["description"])))
     if t["comments"]:
@@ -11005,12 +11364,15 @@ def _split_text(text, size):
     return [text[i:i + size] for i in range(0, len(text), size)] or [""]
 
 
-def pack_parts(units, budget):
+def pack_parts(units, budget, reserve=0):
     """部品のまとまり(units)を、1回 budget 文字以内の材料(chunk)に詰める(省略しない)。
 
     units: [(キー, 部品のリスト)]。キーはタスクID(スキル・チームの材料では部分の名前など)。
     1つのまとまりが budget を超えるときは、見出し(最初の部品)を繰り返して部品の区切りで分け、
-    1つの部品が長すぎるときは本文を分ける。
+    1つの部品が長すぎるときは本文を分ける。分けた各回は budget - reserve 文字までにする
+    (reserve は、分けて送るタスクの【前の回までに分かったこと】に残す文字数)。
+    見出しが長い(1回分の半分を超える)ときは、繰り返す見出しを短くし(部品の "short"。無ければ途中まで)、
+    見出しの全文は1回目に部品として送る。
     戻り値: [{"text", "keys", "comment_ids", "outcome_keys", "comments", "split"}]
       split: 分けたまとまりの {キー: "k/n"}(k 回目 / 全 n 回)
     """
@@ -11045,9 +11407,17 @@ def pack_parts(units, budget):
             chunks.append(current)
             current = new_chunk()
         head = parts[0]
-        room = max(budget - len(head["text"]) - 60, 200)
+        rest = list(parts[1:])
+        limit = max(budget - reserve, 400)
+        if len(head["text"]) + 60 > limit // 2:
+            short = head.get("short") or head["text"]
+            if len(short) + 60 > limit // 2:
+                short = short[:max(limit // 2 - 90, 40)] + "…（見出しの続きは1回目の材料にあります）"
+            rest.insert(0, _part("見出しの全文:\n" + head["text"]))
+            head = dict(head, text=short)
+        room = max(limit - len(head["text"]) - 60, 200)
         pieces = []
-        for p in parts[1:]:
+        for p in rest:
             if len(p["text"]) + 1 <= room:
                 pieces.append(p)
                 continue
@@ -11252,8 +11622,39 @@ def _items_text(data, group, items, chunk):
     return "\n".join(lines)
 
 
-def carry_text(data, items, chunk, carry):
-    """【前の回までに分かったこと】(分けて送っているタスクの、前の回の材料を AI が読んでまとめたメモ)。"""
+def carry_text(data, items, chunk, carry, limit=None):
+    """【前の回までに分かったこと】(分けて送っているタスクの、前の回の材料を AI が読んでまとめたメモ)。
+
+    limit(文字数)を超えるときは、前の回で送ったマネージャーのコメントの本文を短くし(CARRY_EXCERPT 文字)、
+    それでも長ければ本文を省き(コメントの ID・日時・書いた人とメモだけ)、さらにメモを同じ長さまで短くする
+    (【材料】と合わせて1回の文字数までにするため)。それでも入らない分は、入る所までにして注記する。
+    """
+    text = ""
+    for body in ("full", "excerpt", "none"):
+        text = _carry_text(data, items, chunk, carry, body, None)
+        if limit is None or len(text) <= limit:
+            return text
+    # メモの長さをそろえて短くする(すべてのメモが入る長さを探す。最短 30 文字)
+    memo_max = AI_MEMO_MAX
+    while memo_max > 30:
+        memo_max = max(memo_max * 2 // 3, 30)
+        text = _carry_text(data, items, chunk, carry, "none", memo_max)
+        if len(text) <= limit:
+            return text
+    note = "\n（1回に送る文字数の上限のため、ここまでにしました）"
+    if limit < len(note) + 60:
+        return ""
+    cut = text[:limit - len(note)]
+    return cut[:cut.rfind("\n")] + note if "\n" in cut else cut + note
+
+
+def _shorten(text, size):
+    text = str(text or "")
+    return text if len(text) <= size else text[:size] + "…"
+
+
+def _carry_text(data, items, chunk, carry, body, memo_max):
+    """carry_text の本体。body: 前の回で送ったコメントの本文 "full"(全文)/"excerpt"(先頭だけ)/"none"(省く)。"""
     tasks = data["tasks"]
     lines = []
     for task_id in items["split"]:
@@ -11267,13 +11668,22 @@ def carry_text(data, items, chunk, carry):
             if i["comment_id"] in chunk["comment_ids"]:
                 continue
             c = comments[i["comment_id"]]
-            block.append("  C{} マネージャーのコメント（前の回で送ったもの。{} {}）:".format(
-                c["id"], _fmt_dt(c["at"]), _inline(c["author"])))
-            block.append(_indent(c["body"], "    "))
-            block.append("  C{} の経過メモ: {}".format(
-                c["id"], state["memos"].get(c["id"]) or "（前の回のメモなし）"))
+            memo = state["memos"].get(c["id"])
+            memo = (_shorten(memo, memo_max) if memo and memo_max else memo) or "（前の回のメモなし）"
+            if body == "none":
+                # 本文は省く(前の回の材料で送った。ID・日時・書いた人とメモだけを1行で)
+                block.append("  C{}（{} {}。本文は前の回）の経過メモ: {}".format(
+                    c["id"], _fmt_dt(c["at"]), _inline(c["author"]), memo))
+                continue
+            block.append("  C{} マネージャーのコメント（前の回で送ったもの。{} {}{}）:".format(
+                c["id"], _fmt_dt(c["at"]), _inline(c["author"]),
+                "。長いため先頭だけ" if body == "excerpt" and len(c["body"]) > CARRY_EXCERPT else ""))
+            block.append(_indent(c["body"] if body == "full" else _shorten(c["body"], CARRY_EXCERPT), "    "))
+            block.append("  C{} の経過メモ: {}".format(c["id"], memo))
         if task_id in items["outcomes"] or task_id in items["memo_facts"]:
-            block.append("  成果の事実メモ: {}".format(state["facts"] or "（前の回のメモなし）"))
+            facts = state["facts"]
+            block.append("  成果の事実メモ: {}".format(
+                _shorten(facts, memo_max) if facts and memo_max else (facts or "（前の回のメモなし）")))
         if block:
             lines.append("T{}「{}」（前の回までに {} 回に分けて送りました）:".format(
                 task_id, _inline(t["title"]), state["pieces"]))
@@ -11367,7 +11777,9 @@ def person_chunk_messages(data, group, chunk, index, count, items, with_findings
     if is_person:
         material += [person_numbers_text(data, group["key"]), ""]
     material.append(_items_text(data, group, items, chunk))
-    carried = carry_text(data, items, chunk, carry or {})
+    # 【前の回までに分かったこと】は、【材料】と合わせて1回の文字数(chunk_chars)までにする
+    carried = carry_text(data, items, chunk, carry or {},
+                         limit=max(data["settings"]["chunk_chars"] - len(chunk["text"]), 0))
     if carried:
         material += ["", carried]
     material += ["", "【材料】", chunk["text"] or "（関係するタスクはありません）"]
@@ -11385,11 +11797,13 @@ def _interleave(lists):
     return out
 
 
-def findings_messages(data, group, notes, judged, budget):
+def findings_messages(data, group, notes, judged, budget, has_tasks=True, unread_note=""):
     """各人の所見だけを作る依頼(材料を分けて送ったとき)。戻り値: (messages, 材料の部分の文)。
 
     notes(各回の材料から分かったこと。_interleave で各回の分が先に並ぶ)は、材料が budget 文字に収まるまで入れ、
     入らなかった件数を書く(各回の材料は読み終えていて、課題・判定は結果に入っている)。
+    has_tasks : 関係するタスクがあるか(無いときだけ「記載はありません」と書く)
+    unread_note: 読み込めなかった回があるときの説明(材料に書く)
     """
     lines = [
         "■種類: {}（{}）".format(AI_KIND_FINDINGS, group["label"]),
@@ -11402,6 +11816,8 @@ def findings_messages(data, group, notes, judged, budget):
         "",
     ]
     material = [person_numbers_text(data, group["key"]), "", "【材料から分かったこと】"]
+    if unread_note:
+        material.append("・（注意: {}）".format(unread_note))
     tail = ["", "【AIの判定の件数（アプリが数えた値）】"] + ["・" + j for j in judged] if judged else []
     used = len("\n".join(material + tail)) + 80
     shown = []
@@ -11410,7 +11826,12 @@ def findings_messages(data, group, notes, judged, budget):
             break
         shown.append(n)
         used += len(n) + 3
-    material += ["・" + n for n in shown] or ["・（関係するタスクの記載はありません）"]
+    if shown:
+        material += ["・" + n for n in shown]
+    elif not has_tasks:
+        material.append("・（関係するタスクの記載はありません）")
+    else:
+        material.append("・（読み込めた材料から、特に挙げることはありませんでした）")
     if len(shown) < len(notes):
         material.append("・（ほかに{}件。1回に送る文字数の上限のため省きました。各回の材料はすべて読み、課題・判定は反映済みです）".format(
             len(notes) - len(shown)))
@@ -12033,7 +12454,7 @@ class AnalysisRun:
                 if task_id not in self.task_numbers:
                     self.task_numbers[task_id] = task_allowed_numbers(t, facts, parts)
                 units.append((task_id, parts))
-            plans.append((group, pack_parts(units, budget)))
+            plans.append((group, pack_parts(units, budget, reserve=budget // CARRY_SHARE)))
         skill_chunks = pack_parts(skills_units(data), budget)
         # チームの材料の要約の回数は、各人の結果が出てから決まる(run_team で足す)
         self.total = sum(len(chunks) + (1 if g["key"] != ANALYSIS_GROUP_OTHER and len(chunks) != 1 else 0)
@@ -12058,6 +12479,7 @@ class AnalysisRun:
     def run_group(self, group, chunks, owner):
         is_person = group["key"] != ANALYSIS_GROUP_OTHER
         notes_by_chunk, findings = [], None
+        failed = []   # 読み込めなかった回の (回, タスクID)
         carry = {}    # 分けて送っているタスクの、前の回までのメモ(_chunk_items の説明)
         for index, chunk in enumerate(chunks, 1):
             items = _chunk_items(self.data, group, chunk, owner, carry)
@@ -12075,6 +12497,7 @@ class AnalysisRun:
                     state["failed"] = True
             if parsed is None:
                 self.unread(label, error, chunk["keys"], chunk["comment_ids"])
+                failed.append((index, list(chunk["keys"])))
                 continue
             self.read_tasks.update(chunk["keys"])
             self.read_comment_ids |= chunk["comment_ids"]
@@ -12088,16 +12511,26 @@ class AnalysisRun:
         if not is_person:
             self.result["other_notes"] = notes[:AI_LIST_MAX * 2]
             return
-        if len(chunks) != 1:
+        label = "{}の所見".format(group["label"])
+        if len(chunks) > 1 and len(failed) == len(chunks):
+            # 分けて送った材料を1回も読めなかった: 所見は作らない(材料が無いものとして所見を作らせない)
+            self.unread(label, "材料をすべて読み込めなかったため、所見を作っていません。")
+        elif len(chunks) != 1:
+            unread_note = ""
+            if failed:
+                unread_note = "{}回のうち{}回分の材料を読み込めませんでした（{}）。その部分のタスク・コメントは所見に使えません".format(
+                    len(chunks), len(failed), "、".join(
+                        "{}回目: {}".format(k, "・".join("T{}".format(x) for x in keys) or "―") for k, keys in failed))
             messages, material = findings_messages(self.data, group, notes, self.judged_counts(group),
-                                                   self.data["settings"]["chunk_chars"])
-            label = "{}の所見".format(group["label"])
+                                                   self.data["settings"]["chunk_chars"],
+                                                   has_tasks=bool(chunks), unread_note=unread_note)
             parsed, error = self.call(label, messages)
             if parsed is None:
                 self.unread(label, error)
             else:
                 findings = self.take_findings(parsed.get("findings"), AllowedNumbers(material))
-        self.result["persons"][str(group["key"])] = {"notes": notes[:AI_LIST_MAX * 2], "findings": findings}
+        self.result["persons"][str(group["key"])] = {"notes": notes[:AI_LIST_MAX * 2], "findings": findings,
+                                                     "unread_parts": len(failed)}
 
     def judged_counts(self, group):
         """所見の材料にする、その人の項目の AI の判定の件数(アプリが数える)。"""
@@ -12114,8 +12547,15 @@ class AnalysisRun:
             out.append("成果の記載があいまい: {}件".format(vague))
         progress = sum(1 for k in self.result["progress_comments"]
                        if int(k) in group["progress_ids"])
-        if group["progress_ids"]:
-            out.append("進捗記載の書き直し推奨: {}件（期間内の記載 {}件のうち）".format(progress, len(group["progress_ids"])))
+        # 読み込めなかった記載は判定していないため、分母に数えない
+        judged_ids = group["progress_ids"] - self.unread_comment_ids
+        unread_progress = len(group["progress_ids"]) - len(judged_ids)
+        if judged_ids:
+            out.append("進捗記載の書き直し推奨: {}件（期間内の記載のうち判定した {}件のうち{}）".format(
+                progress, len(judged_ids),
+                "。ほかに読み込めなかった記載 {}件".format(unread_progress) if unread_progress else ""))
+        elif unread_progress:
+            out.append("進捗記載: 期間内の記載 {}件を読み込めなかったため、判定していません".format(unread_progress))
         issues = sum(1 for i in self.result["issues"] if i["task_id"] in mine and tasks[i["task_id"]]["is_open"])
         if issues:
             out.append("課題・相談: {}件".format(issues))
@@ -12300,34 +12740,48 @@ class AnalysisRun:
             lines = [line for line in detail.get(name) or [] if line]
             if lines:
                 units.append((name, [_part(line) for line in lines]))
+        def digest_lines(points):
+            lines = ["", "【詳細の要約（要フォローのコメント・課題・保留・各人の数値と所見を、AIが分けて読んでまとめた要点。"
+                         "件数は上のアプリの集計のとおり）】"]
+            for key, label in SUMMARY_KEYS:
+                for text in points[key]:
+                    lines.append("・{}: {}".format(label, text))
+            if len(lines) == 2:
+                lines.append("・（要点を作れませんでした。読み込めなかった材料は未読込の内訳のとおり）")
+            return lines
+
         digest = []
+        previous = None   # 前の回(要点の再要約の前)の要点
         for round_no in range(1, TEAM_DIGEST_ROUNDS + 1):
             if not units:
                 break
             chunks = pack_parts(units, budget)
             self.total += len(chunks)
             points = {key: [] for key, _label in SUMMARY_KEYS}
+            failed_keys = set()
             for index, chunk in enumerate(chunks, 1):
                 label = "チームの材料の要約（{}{}/{}）".format("要点の再要約 " if round_no > 1 else "", index, len(chunks))
                 parsed, error = self.call(label, team_digest_messages(chunk, index, len(chunks), round_no))
                 if parsed is None:
                     self.unread(label, error)
+                    failed_keys.update(chunk["keys"])
                     continue
                 allowed = AllowedNumbers(chunk["text"])
                 for key, _label in SUMMARY_KEYS:
                     for text in self.lines(parsed.get(key), allowed, TEAM_DIGEST_POINTS):
                         if text not in points[key]:
                             points[key].append(text)
-            digest = ["", "【詳細の要約（要フォローのコメント・課題・保留・各人の数値と所見を、AIが分けて読んでまとめた要点。"
-                          "件数は上のアプリの集計のとおり）】"]
-            for key, label in SUMMARY_KEYS:
-                for text in points[key]:
-                    digest.append("・{}: {}".format(label, text))
-            if len(digest) == 2:
-                digest.append("・（要点を作れませんでした。読み込めなかった材料は未読込の内訳のとおり）")
+            if previous is not None:
+                # 要点の再要約: 失敗した部分・要点が無くなった観点は、前の回の要点をそのまま使う(要点を失わない)
+                for key, _label in SUMMARY_KEYS:
+                    if key in failed_keys or not points[key]:
+                        points[key] += [t for t in previous[key] if t not in points[key]]
+            digest = digest_lines(points)
             # 要約そのものが長い(設定の文字数の半分を超える)ときだけ、要点をさらに要約する
-            if len(chunks) == 1 or len("\n".join(digest)) <= budget // 2:
+            # (再要約が失敗したときは、それ以上は繰り返さない)
+            if len(chunks) == 1 or len("\n".join(digest)) <= budget // 2 or (previous is not None and failed_keys):
                 break
+            previous = points
             units = [(key, [_part("{}の要点:".format(label))] + [_part("・" + t) for t in points[key]])
                      for key, label in SUMMARY_KEYS if points[key]]
         # 候補は入りきる数まで(少なくとも TEAM_MIN_CANDIDATES 件)
@@ -12679,10 +13133,18 @@ def apply_ai_result(data, stored):
     tasks = data["tasks"]
     unread = _result_ids((stored.get("unread") or {}).get("task_ids"))
     read = _result_ids((stored.get("read") or {}).get("task_ids"))
+    try:
+        generated_at = datetime.strptime(str(stored.get("generated_at") or ""), "%Y-%m-%d %H:%M")
+    except ValueError:
+        generated_at = None
 
-    def state(task_id, has_result):
+    def state(task_id, has_result, at=None):
+        """AI の判定が無い項目の状態。at はその項目の日時(コメントの日時・完了日時)。"""
         if has_result:
             return None
+        if at is not None and generated_at is not None and \
+                at.replace(second=0, microsecond=0) > generated_at:
+            return AI_STATE_NEW   # 分析(基準の日時)の後に書かれた・完了した項目
         if task_id in unread:
             return AI_STATE_UNREAD
         if task_id in read:
@@ -12723,7 +13185,7 @@ def apply_ai_result(data, stored):
                 # 後のコメント・状態の変更などが増えた: 求めたことは残し、判定は使わない(未判定)
                 ai, changed = dict(ai, judgement=None, remaining="", evidence=""), True
         item["ai"] = ai
-        item["ai_state"] = AI_STATE_CHANGED if changed else state(item["task_id"], ai is not None)
+        item["ai_state"] = AI_STATE_CHANGED if changed else state(item["task_id"], ai is not None, item.get("at"))
         if ai is not None and ai.get("needs_response") is False:
             item["judgement"] = MC_ACK_AI
             ai_acks.append(item)
@@ -12747,7 +13209,7 @@ def apply_ai_result(data, stored):
         if changed:
             ai = None    # 分析の後に成果・コメントなどが変わった: あいまいの判定・書き直し案は使わない
         r["ai"] = ai
-        r["ai_state"] = AI_STATE_CHANGED if changed else state(r["task_id"], ai is not None)
+        r["ai_state"] = AI_STATE_CHANGED if changed else state(r["task_id"], ai is not None, r.get("completed_at"))
         if ai and ai.get("vague"):
             r["problems"].append({"code": OUTCOME_VAGUE, "label": OUTCOME_VAGUE_LABEL, "field": "成果",
                                   "detail": ai.get("reason") or "何をどれだけ変えたかが読み取りにくい"})
@@ -12789,7 +13251,7 @@ def apply_ai_result(data, stored):
     for item in ab["progress_rewrite"]:
         if item.get("ai") is None:
             item["ai_state"] = (AI_STATE_CHANGED if item["comment_id"] in changed_pc
-                                else state(item["task_id"], False))
+                                else state(item["task_id"], False, item.get("at")))
     ab["progress_rewrite"].sort(key=lambda i: i["at"] or datetime.min, reverse=True)
     persons = entries("persons")
     out_rows = {r["user_id"]: r for r in outputs["rows"]}
@@ -12799,6 +13261,9 @@ def apply_ai_result(data, stored):
         person = persons.get(str(row["user_id"]))
         person = person if isinstance(person, dict) else {}
         row["ai"] = person.get("findings") if isinstance(person.get("findings"), dict) else None
+        # 所見を作るときに読み込めなかった回の数(所見は読めた範囲だけに基づく)
+        unread_parts = person.get("unread_parts")
+        row["ai_unread_parts"] = unread_parts if isinstance(unread_parts, int) and not isinstance(unread_parts, bool) else 0
         row["ai_notes"] = [n for n in person.get("notes") or [] if isinstance(n, str)]
 
     # 担当者のいないタスクを読んだ結果(チームのまとめの材料)
@@ -12893,6 +13358,7 @@ def analysis_dashboard():
         settings=settings,
         sample_note=sample_note,
         action_max=ACTION_MAX,
+        action_sources=RULE_ACTION_SOURCES,
         type_choices=SKILL_TYPE_CHOICES,
         ai_status=ai_status_label(),
         ai_configured=ai_is_configured(),
@@ -12992,9 +13458,33 @@ GROUPS = (
     (GROUP_RECIPIENTS, "宛先"),
     (GROUP_SERVER, "リンク"),
 )
-# ホスト名・IPアドレスに使える文字
+# ホスト名・IPアドレスに使える文字(形式の細かい確認は _check_host)
 _HOST_PATTERN = r"[A-Za-z0-9._:\-\[\]]+"
 _HOST_HELP = "ホスト名またはIPアドレスを入力してください（空白・記号の一部は使えません）。"
+_HOST_NAME_RE = re.compile(r"[A-Za-z0-9._\-]+")
+
+
+def _check_host(value):
+    """送信サーバーの値(ホスト名・IPv4 アドレス・IPv6 アドレス)の形式。誤りならメッセージ、正しければ None。
+
+    「smtp.example.com:587」のようにポート番号を付けたもの、「::::」のような値は受け付けない
+    (送信時にサーバー名として使われ、必ず接続に失敗するため。ポート番号は「ポート番号」の欄に入れる)。
+    """
+    if value.startswith("[") or value.endswith("]"):
+        return "IPv6 アドレスは [ ] を付けずに入力してください（例: 2001:db8::25）。"
+    if ":" in value:
+        try:
+            ipaddress.IPv6Address(value)
+            return None
+        except ValueError:
+            pass
+        host, _sep, port = value.rpartition(":")
+        if port.isdigit() and _HOST_NAME_RE.fullmatch(host or ""):
+            return "ポート番号は「ポート番号」の欄に入力してください（送信サーバーにはホスト名またはIPアドレスだけを入力します）。"
+        return _HOST_HELP
+    if not _HOST_NAME_RE.fullmatch(value) or value.strip(".") == "" or ".." in value:
+        return _HOST_HELP
+    return None
 
 
 @dataclass(frozen=True)
@@ -13010,6 +13500,7 @@ class Field:
     max: Optional[int] = None          # int の上限
     pattern: Optional[str] = None      # text の形式(正規表現。空欄は可)
     pattern_help: str = ""             # pattern に合わないときのメッセージ
+    check: Optional[object] = None     # text の形式の確認(値 → 誤りのメッセージ または None。空欄は確認しない)
     no_query: bool = False             # url: ?〜 や #〜 を付けられない
     confirm: bool = False              # secret: 確認のためもう一度入力する
     min_length: int = 0                # secret: 最小の文字数
@@ -13073,7 +13564,7 @@ FIELDS = (
         "MAIL_SMTP_SERVER", GROUP_MAIL, "送信サーバー",
         "ホスト名またはIPアドレスです（例: smtp.example.com）。空ならメールは送信できません。"
         "送信は暗号化（STARTTLS）・認証（ログイン）なしで行うため、認証なしで送信できるサーバーを指定します。",
-        pattern=_HOST_PATTERN, pattern_help=_HOST_HELP,
+        pattern=_HOST_PATTERN, pattern_help=_HOST_HELP, check=_check_host,
     ),
     Field(
         "MAIL_SMTP_PORT", GROUP_MAIL, "ポート番号",
@@ -13195,6 +13686,12 @@ SaveResult = namedtuple("SaveResult", "status errors state changed restart_chang
 
 MSG_CONFLICT = ("画面を開いた後に、設定ファイル（instance/config.py）が更新されています"
                 "（ほかの人の保存・直接の編集）。最新の内容を表示しましたので、もう一度変更してください。")
+# 設定ファイルが無いとき(サーバーの実行中に削除・名前の変更をした)は、画面からは保存しない。
+# 一部の項目だけのファイルを作ると、自動作成(見本・秘密鍵・admin のパスワード)が行われなくなり、
+# 実行中の設定も既定値(空の admin のパスワードなど)で上書きしてしまうため
+MSG_CONFIG_MISSING = ("instance/config.py がありません。サーバーを再起動すると見本から自動作成されます"
+                      "（SECRET_KEY と ADMIN_PASSWORD にはランダムな値が入ります）。その後に、もう一度保存してください。"
+                      "設定は保存していません。")
 
 
 # --------------------------------------------------------------------------- #
@@ -13272,6 +13769,10 @@ def _parse_text(field, raw):
         return None, "{}文字以内で入力してください。".format(CONFIG_TEXT_MAX)
     if field.pattern and value and not re.fullmatch(field.pattern, value):
         return None, field.pattern_help or "形式が正しくありません。"
+    if field.check is not None and value:
+        message = field.check(value)
+        if message:
+            return None, message
     return value, None
 
 
@@ -13468,6 +13969,8 @@ def save_config_form(app, form, username):
             info = read_config(app.instance_path)
         except ConfigFileError as exc:
             return result(CONFIG_SAVE_ERROR, message=str(exc))
+        if not info["exists"]:
+            return result(CONFIG_SAVE_ERROR, message=MSG_CONFIG_MISSING)
         if form.get("version", "") != info["version"]:
             return result(CONFIG_SAVE_CONFLICT, message=MSG_CONFLICT)
 
@@ -13516,6 +14019,8 @@ def remove_unused_config(app, form, username):
             info = read_config(app.instance_path)
         except ConfigFileError as exc:
             return CONFIG_SAVE_ERROR, [], str(exc)
+        if not info["exists"]:
+            return CONFIG_SAVE_ERROR, [], MSG_CONFIG_MISSING
         if form.get("version", "") != info["version"]:
             return CONFIG_SAVE_CONFLICT, [], MSG_CONFLICT
         keys = unused_keys_in_file(info["values"])
@@ -13573,6 +14078,9 @@ def _other_rows(app, file_values):
     keys = [(key, "app.py の見本・既定値") for key in documented if key not in FIELD_MAP]
     keys += [(key, "instance/config.py だけに記載") for key in file_values
              if key not in FIELD_MAP and key not in fixed and key not in documented]
+    # 固定設定(FixedConfig)を instance/config.py で上書きしている項目(実行中の動作が変わるため表示する)
+    keys += [(key, "instance/config.py で上書き（固定設定）") for key in file_values
+             if key in fixed and key not in FIELD_MAP]
     rows = []
     for key, source in keys:
         in_file = key in file_values
@@ -13601,11 +14109,12 @@ def config_form_context(app, state=None, errors=None):
     except ConfigFileError as exc:
         info, file_error = None, str(exc)
 
-    if info is not None:
+    if info is not None and info["exists"]:
         file_values = info["values"]
         current = effective(app, file_values)
         pending = pending_fields(app, file_values)
     else:
+        # 読み込めない・ファイルが無い: 実行中の値を表示する(画面からは保存できない)
         file_values = {}
         current = {f.key: app.config.get(f.key) for f in FIELDS}
         pending = []
@@ -13616,7 +14125,7 @@ def config_form_context(app, state=None, errors=None):
         rows = []
         for field in (f for f in FIELDS if f.group == group_key):
             value = current.get(field.key)
-            if field.type == TYPE_SECRET_KEY and info is None:
+            if field.type == TYPE_SECRET_KEY and not (info is not None and info["exists"]):
                 value = running_value(app, field.key)
             row = {
                 "field": field,
@@ -13639,8 +14148,10 @@ def config_form_context(app, state=None, errors=None):
 
     return {
         "file_error": file_error,
-        "can_save": info is not None,
+        "can_save": bool(info and info["exists"]),
         "exists": bool(info and info["exists"]),
+        # ファイルが無い(読み込めないのではない)
+        "missing": info is not None and not info["exists"],
         "version": info["version"] if info else "",
         "groups": groups,
         "other": _other_rows(app, file_values),
@@ -13747,6 +14258,9 @@ def _render_system_settings(tab, status=200, config_state=None, config_errors=No
     for key, feature in FEATURES.items():
         settings = inputs[key] if key in inputs else feature.load()
         contexts[key] = feature.context(settings)
+        if key in inputs:
+            # 入力中の値で再表示するとき、「保存済みの設定」の表示には保存済みの値を使う
+            contexts[key]["saved"] = feature.context(feature.load())
     return render_template(
         "system/settings.html",
         tab=tab,
@@ -13799,7 +14313,7 @@ def save_config():
         return redirect(_tab_url(TAB_CONFIG))
 
     message = "基本設定を保存しました（変更: {}）。変更前の内容は instance/config.py.bak に残しています。".format(
-        "、".join(result.changed))
+        "、".join(result.changed))  # 保存は instance/config.py があるときだけ(必ず .bak を作る)
     live = [key for key in result.changed if key not in result.restart_changed]
     if live:
         message += "{} はすぐに反映しました。".format("、".join(live))
@@ -13862,10 +14376,11 @@ def test_ai():
     if error:
         flash("AI接続テスト: 失敗しました。{}".format(mask_secrets(app, error)), "danger")
     else:
-        reply = " ".join(str(reply).split())
+        # 先に伏せ字にしてから短くする(短くした後では、キーの一部が伏せ字にならずに残るため)
+        reply = mask_secrets(app, " ".join(str(reply).split()))
         if len(reply) > AI_REPLY_MAX:
             reply = reply[:AI_REPLY_MAX] + "…"
-        flash("AI接続テスト: OK（応答: {}）".format(mask_secrets(app, reply)), "success")
+        flash("AI接続テスト: OK（応答: {}）".format(reply), "success")
     return redirect(_tab_url(TAB_CONFIG))
 
 
@@ -14309,11 +14824,17 @@ def _ensure_secret_key(app):
     )
 
 
-def prepare_instance(app):
+def instance_db_path(app):
+    """既定のDB(instance/app.db)のパス。"""
+    return os.path.join(app.instance_path, "app.db")
+
+
+def prepare_instance(app, create_tables=True):
     """instance フォルダ(DBファイル・環境ごとの設定ファイル置き場)を用意して、設定とDBを読み込む。
 
     instance/config.py が無ければ初回のみ自動作成し、その値で既定値を上書きする。
-    DB(instance/app.db)に足りないテーブルがあれば作成する。
+    DB(instance/app.db)に足りないテーブルがあれば作成する(create_tables が偽なら作成しない。
+    migrate --check の確認だけのとき)。
     用意済みのアプリ(DBを紐付け済み)では何もしない。
     """
     if "sqlalchemy" in app.extensions:
@@ -14324,11 +14845,22 @@ def prepare_instance(app):
     app.config.from_pyfile(CONFIG_FILENAME, silent=True)
     _ensure_secret_key(app)
 
-    db_path = os.path.join(app.instance_path, "app.db")
-    app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{db_path}"
+    app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///{}".format(instance_db_path(app))
     db.init_app(app)
-    with app.app_context():
-        db.create_all()
+    if create_tables:
+        with app.app_context():
+            db.create_all()
+
+
+class SqliteIntConverter(IntegerConverter):
+    """URL の <int:...>。SQLite の整数の範囲(SQLITE_INT_MAX)を超える値は一致しない(404 になる)。
+
+    DB の問い合わせで OverflowError(500)にしないため、create_app() で既定の int と差し替える。
+    """
+
+    def __init__(self, url_map, *args, **kwargs):
+        kwargs.setdefault("max", SQLITE_INT_MAX)
+        super().__init__(url_map, *args, **kwargs)
 
 
 def create_app():
@@ -14352,6 +14884,8 @@ def create_app():
     }
 
     login_manager.init_app(app)
+    # URL の <int:...> は SQLite の整数の範囲まで(範囲外の ID は 404。Blueprint の登録より前に差し替える)
+    app.url_map.converters["int"] = SqliteIntConverter
     for blueprint in BLUEPRINTS:
         app.register_blueprint(blueprint)
 
@@ -14392,6 +14926,7 @@ def seed_command():
     """初期データ(ダミーユーザー・動作確認用のサンプル)を投入する。
 
     ダミーユーザーと、動作確認用のサンプルタスクなどを作成する(既にあれば作らない)。
+    既にあるユーザーの表示名・役割・有効/無効は変えない(チーム管理で無効化したメンバーを有効に戻さない)。
     ※ ログイン認証自体は ldap_client.py の _DUMMY_USERS で行われる。
        このコマンドは「画面表示・担当者割り当て」用にDBへユーザーを登録する。
     """
@@ -14407,11 +14942,10 @@ def seed_command():
         for username, info in accounts.items():
             user = User.query.filter_by(username=username).first()
             if user is None:
-                user = User(username=username)
+                # 無いユーザーだけ作る(既にあるユーザーは、マネージャーが画面で変えた内容のまま)
+                user = User(username=username, display_name=info["display_name"],
+                            role=info["role"], is_active=True)
                 db.session.add(user)
-            user.display_name = info["display_name"]
-            user.role = info["role"]
-            user.is_active = True
             user_map[username] = user
         db.session.commit()
 
@@ -14592,10 +15126,12 @@ def seed_command():
 # 1回実行すれば、不足しているテーブル・列が追加されて動くようになる。
 #
 # やること:
-#   1. モデルにあってDBに無い「テーブル」を作成 (db.create_all)
+#   1. モデルにあってDBに無い「テーブル」を作成 (db.create_all。作成したテーブルの名前を表示する)
 #   2. モデルにあってDBに無い「列」を ALTER TABLE ADD COLUMN で追加
 #      ※SQLiteでは列の削除・型変更ができないため、追加のみ行う
 #   3. DBにだけ残っている未使用列は、そのまま放置(読み書きしないので無害)
+# --check は確認だけ(不足しているテーブル・列を表示し、テーブルの作成・列の追加をしない)。
+# --db は既にある DB ファイルだけを対象にする(パスの誤りで新しい DB を作らない)。
 #
 # 既存データは一切削除・変更しない。何度実行しても安全(冪等)。
 def collect_changes(insp):
@@ -14631,17 +15167,21 @@ def unused_columns(insp):
     return result
 
 
-def _migrate_target_app(path):
-    """対象DB用のアプリを用意する。
+def _migrate_target_app(path, check_only=False):
+    """対象DB用のアプリを用意する(テーブルはまだ作らない。migrate_command が不足を確かめてから作る)。
 
     Flask-SQLAlchemy は init_app 時に接続先を確定するため、あとから
     SQLALCHEMY_DATABASE_URI を書き換えても効かない。--db 指定時は
     専用のアプリを組み立てて、既定のDB(instance/app.db)には一切触れない。
+    --check で既定のDBが無いときは、新しいDBを作らずに止める。
     """
     if not path:
         # 通常はアプリ本体(= instance/app.db)を対象にする
         app = current_app._get_current_object()
-        prepare_instance(app)
+        if check_only and "sqlalchemy" not in app.extensions and not os.path.isfile(instance_db_path(app)):
+            raise click.ClickException("DBファイルがありません: {}（--check のため作成していません）".format(
+                instance_db_path(app)))
+        prepare_instance(app, create_tables=False)
         return app
 
     app = Flask(__name__)
@@ -14650,29 +15190,41 @@ def _migrate_target_app(path):
     )
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
     db.init_app(app)
-    with app.app_context():
-        db.create_all()  # 指定DBに対して不足テーブルを作成
     return app
 
 
 @click.command("migrate")
 @click.option("--check", "check_only", is_flag=True, help="確認のみ(DBを変更しない)。")
-@click.option("--db", "db_path", metavar="PATH", help="instance/app.db 以外のDBを対象にする。")
+@click.option("--db", "db_path", metavar="PATH",
+              type=click.Path(exists=True, dir_okay=False, resolve_path=True),
+              help="instance/app.db 以外の(既にある)DBファイルを対象にする。")
 @with_appcontext
 def migrate_command(check_only, db_path):
     """既存DBを最新のモデル定義に合わせる(不足しているテーブル・列を追加する)。"""
-    app = _migrate_target_app(db_path)
+    app = _migrate_target_app(db_path, check_only)
 
     with app.app_context():
         print("対象DB:", db.engine.url)  # 実際に接続しているDBを表示する
         insp = inspect(db.engine)
         missing_tables, missing_columns = collect_changes(insp)
 
-        # create_all 済みなので、ここで残っている missing_tables は基本無いはず
         if missing_tables:
-            print("作成されたテーブル:", ", ".join(missing_tables))
+            if check_only:
+                print("不足しているテーブル: {} 件".format(len(missing_tables)))
+                for name in missing_tables:
+                    print("  - {}".format(name))
+            else:
+                db.create_all()  # 不足しているテーブルを作成(既にあるテーブルは変更しない)
+                print("作成されたテーブル:", ", ".join(missing_tables))
+                insp = inspect(db.engine)
 
         if not missing_columns:
+            if check_only and missing_tables:
+                print("不足している列はありません。")
+                print("\n--check のため変更していません。"
+                      "実行するには: flask --app app migrate")
+                print("\n結果: ★まだ不足があります: テーブル {}".format(", ".join(missing_tables)))
+                return
             print("不足している列はありません。DBは最新の状態です。")
         else:
             print("不足している列: {} 件".format(len(missing_columns)))
