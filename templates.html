@@ -11,7 +11,7 @@
   ・最初の区切りより前(このコメント)は読み込まない。
 
   目次(区切りの名前。この順に並ぶ):
-    共通　　　　　　　  base.html  _macros.html
+    共通　　　　　　　  base.html  _macros.html  errors/too_large.html
     ログイン　　　　　  auth/login.html
     個人ダッシュボード  main/dashboard.html
     タスク　　　　　　  tasks/list.html  tasks/detail.html  tasks/form.html
@@ -187,6 +187,23 @@
 {% macro fmt_datetime(dt) -%}
   {%- if dt -%}{{ dt.strftime('%Y/%m/%d %H:%M') }}{%- else -%}―{%- endif -%}
 {%- endmacro %}
+{#=== errors/too_large.html ===#}
+{# 送信された入力が大きすぎる(413)ときの画面。limit_bytes は1回の送信の上限(バイト) #}
+{% extends "base.html" %}
+{% block title %}入力が大きすぎます &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+  <div class="col-lg-8">
+    <div class="alert alert-danger mt-4">
+      <h1 class="h5"><i class="bi bi-exclamation-octagon"></i> 入力が大きすぎるため、受け付けられませんでした</h1>
+      <p class="mb-2">1回の送信は約{{ limit_bytes // 10000 }}万バイト（日本語でおよそ{{ limit_bytes // 9 // 10000 }}万字）までです。入力した内容は保存されていません。</p>
+      <p class="mb-0">ブラウザの「戻る」で入力した画面に戻ると、入力した内容が残っている場合があります。長い内容は分けて登録してください（進捗の記載を何回かに分けるなど）。</p>
+    </div>
+    <a href="{{ url_for('main.dashboard') }}" class="btn btn-outline-secondary">トップへ</a>
+  </div>
+</div>
+{% endblock %}
 {#=== auth/login.html ===#}
 {% extends "base.html" %}
 {% block title %}ログイン &middot; {{ app_name }}{% endblock %}
@@ -382,7 +399,7 @@
     <div class="col-12 col-md-6 small text-muted">
       対象 {{ o_totals.tasks }} 件
       {% if o_undated %}<br><span class="text-danger"><i class="bi bi-exclamation-triangle"></i> 期限・開始日が未設定のため集計外: {{ o_undated }} 件</span>{% endif %}
-      {% if o_no_unit %}<br><span class="text-danger"><i class="bi bi-exclamation-triangle"></i> 単位が未選択のため集計外: {{ o_no_unit }} 件</span>{% endif %}
+      {% if o_no_unit %}<br><span class="text-danger"><i class="bi bi-exclamation-triangle"></i> 単位が未選択のため金額/時間に集計されないタスク: {{ o_no_unit }} 件</span>{% endif %}
       <noscript><button type="submit" class="btn btn-sm btn-outline-primary ms-2">この期間で表示</button></noscript>
     </div>
   </div>
@@ -1383,6 +1400,14 @@
       <button class="btn btn-sm btn-outline-danger"><i class="bi bi-x-lg"></i> 取消</button>
     </form>
   </div>
+  {% elif can_cancel %}
+  <div class="card-footer bg-white d-flex flex-wrap gap-2 align-items-center">
+    <form method="post" action="{{ url_for('leaves.cancel_leave', leave_id=leave.id) }}"
+          onsubmit="return confirm('この年休を取消しますか?');">
+      <button class="btn btn-sm btn-outline-danger"><i class="bi bi-x-lg"></i> 取消</button>
+    </form>
+    <span class="text-muted small"><i class="bi bi-info-circle"></i> 無効化したメンバーの年休のため、マネージャーが取消できます（編集は本人のみ）。</span>
+  </div>
   {% else %}
   <div class="card-footer bg-white text-muted small">
     <i class="bi bi-info-circle"></i> 取消・編集ができるのは本人のみです。
@@ -1822,6 +1847,7 @@
           <td class="text-nowrap">
             <a href="{{ url_for('skills.edit_item', skill_id=s.id) }}" class="btn btn-sm btn-outline-secondary"><i class="bi bi-pencil"></i></a>
             <form method="post" action="{{ url_for('skills.toggle_item', skill_id=s.id) }}" class="d-inline">
+              <input type="hidden" name="active" value="{{ '0' if s.is_active else '1' }}">
               <button class="btn btn-sm btn-outline-{{ 'danger' if s.is_active else 'success' }}">
                 {{ '無効化' if s.is_active else '有効化' }}
               </button>
@@ -1906,10 +1932,15 @@
         </div>
         <textarea name="description" id="item-description" class="form-control" rows="12">{{ val('description') }}</textarea>
         <div id="description-draft-status" class="small mt-1" role="status" aria-live="polite"></div>
-        <div class="form-text">
-          <p class="mb-1">
+        <div class="form-text" data-technical-type="{{ technical_type }}">
+          {# スキルテスト(テクニカルスキルだけ)の案内。追加の画面では区分の選択に合わせて切り替える(skill-item-form.js) #}
+          <p class="mb-1{% if current_type != technical_type %} d-none{% endif %}" data-skilltest="on">
             <strong>スキルテストの問題は、AIがこの説明を読んで作ります</strong>（スキル名・カテゴリ・到達尺度とあわせて使います）。
             説明が具体的なほど、範囲外の問題や的外れな問題が減ります。次の見出しで書くことをおすすめします。
+          </p>
+          <p class="mb-1{% if current_type == technical_type %} d-none{% endif %}" data-skilltest="off">
+            この区分はスキルテストの対象外です（問題を作るのはテクニカルスキルだけです）。
+            説明は到達度の判断基準として、次の見出しで書くことをおすすめします。
           </p>
           <ul class="mb-1 ps-3">
             <li><strong>■{{ headings[0] }}</strong> … このスキルで扱う知識・作業の範囲（テストで問う範囲）</li>
@@ -1922,7 +1953,7 @@
             <strong>保存はされません</strong>。内容を確認・修正してから「{{ '更新' if editing else '追加' }}」を押してください。
             {% if not ai_enabled %}<span class="text-danger">AIが未設定のため使えません（{{ ai_status }}）。</span>{% endif %}
           </p>
-          <p class="mb-1">
+          <p class="mb-1{% if current_type != technical_type %} d-none{% endif %}" data-skilltest="on">
             説明を変えたときは、古い説明で作られた問題を
             {% if editing %}<a href="{{ url_for('skilltest.admin_pool_skill', skill_id=skill.id) }}">問題プール</a>{% else %}問題プール{% endif %}
             の「このスキルの問題をすべて停止」で止めてから、「AIで補充」で作り直してください。
@@ -2078,6 +2109,7 @@
         <span class="text-muted small">必要スキル {{ o.active_skill_reqs|length }}件</span>
         <a href="{{ url_for('skills.edit_operation', op_id=o.id) }}" class="small">必要スキルを設定</a>
         <form method="post" action="{{ url_for('skills.toggle_operation', op_id=o.id) }}" class="ms-auto">
+          <input type="hidden" name="active" value="{{ '0' if o.is_active else '1' }}">
           <button class="btn btn-sm btn-outline-{{ 'danger' if o.is_active else 'success' }}">
             {{ '無効化' if o.is_active else '有効化' }}
           </button>
@@ -2144,6 +2176,8 @@
             </option>
             {% endfor %}
           </select>
+          {# 画面を開いたときの値(変えた行だけを保存し、開いた後にほかの操作で変わった行は上書きしない) #}
+          <input type="hidden" name="orig_level_{{ s.id }}" value="{{ r.level if r else 0 }}">
         </div>
       </div>
       {% else %}
@@ -2874,7 +2908,7 @@
             {% if c.inactive %}<span class="small text-muted">（{{ c.inactive }}）</span>{% endif %}
           </td>
           {% endfor %}
-          <td class="text-end">{{ row.total }}</td>
+          <td class="text-end text-nowrap">{{ row.total }}{% if row.total_inactive %}<span class="small text-muted">（{{ row.total_inactive }}）</span>{% endif %}</td>
           <td class="text-end text-nowrap">
             <a href="{{ url_for('skilltest.admin_pool_skill', skill_id=row.skill.id) }}" class="btn btn-sm btn-outline-secondary">問題の一覧</a>
             {% if row.testable %}
@@ -2938,13 +2972,13 @@
   </div>
 </div>
 
-{# スキルの説明(AIが問題を作るときの出題範囲の基準) #}
-{% if not (skill.description or '').strip() %}
+{# スキルの説明(AIが問題を作るときの出題範囲の基準)。説明なしの警告は受験の対象のスキルだけ #}
+{% if not (skill.description or '').strip() %}{% if testable %}
 <div class="alert alert-warning small py-2">
   <i class="bi bi-exclamation-triangle"></i> <strong>説明なし（問題の精度が下がります）</strong>
   AIはスキル名とカテゴリだけから問題を作るため、範囲外の問題が出やすくなります。
   <a href="{{ url_for('skills.edit_item', skill_id=skill.id, back='pool') }}">説明を書く</a>（「AIで下書き」で下書きを作れます）。
-</div>
+</div>{% endif %}
 {% else %}
 {% set missing = headings|reject('in', found_headings)|list %}
 <details class="card shadow-sm mb-2 small">
@@ -3004,6 +3038,7 @@
     <form method="post" action="{{ url_for('skilltest.admin_toggle_question', question_id=q.id) }}" class="d-inline">
       <input type="hidden" name="level" value="{{ filters.level or '' }}">
       <input type="hidden" name="state" value="{{ filters.state }}">
+      <input type="hidden" name="active" value="{{ '0' if q.is_active else '1' }}">
       {% if q.is_active %}
       <button class="btn btn-sm btn-outline-danger py-0"><i class="bi bi-slash-circle"></i> 無効にする</button>
       {% else %}
@@ -3506,14 +3541,15 @@
     <div class="card shadow-sm h-100">
       <div class="card-header bg-white fw-bold">
         <i class="bi bi-person"></i> {{ row.label }}
-        {% if row.user is none %}<span class="badge bg-secondary">未割当</span>{% endif %}
+        {% if row.kind == 'inactive' %}<span class="badge bg-secondary">無効</span>{% elif row.user is none %}<span class="badge bg-secondary">未割当</span>{% endif %}
       </div>
       <div class="card-body">
         {% for tk in row.tasks %}
         <div class="border rounded p-2 mb-2">
           <div class="mb-1">
             <a href="{{ url_for('tasks.detail', task_id=tk.task.id) }}" class="fw-medium">{{ tk.task.title }}</a>
-            <span class="badge bg-{{ tk.task.status_color }}">{{ tk.task.status }}</span>
+            <span class="badge bg-{{ tk.task.status_color }}">{{ tk.task.status }}</span>{% if row.kind == 'inactive' %}
+            <span class="small text-muted">担当: {% for a in tk.task.assignees %}{{ a.display_name }}{% if not a.is_active %}［無効］{% endif %}{% if not loop.last %}、{% endif %}{% endfor %}</span>{% endif %}
           </div>
           {% for c in tk.comments %}
           <div class="d-flex gap-2 small mb-1">
@@ -3668,7 +3704,8 @@
 
 {# 推奨アクションの対象へのリンク #}
 {% macro target_link(t) -%}
-  {%- if t.kind == 'task' -%}<a href="{{ url_for('tasks.detail', task_id=t.id) }}"><i class="bi bi-list-task"></i> {{ t.label }}</a>
+  {%- if t.stale -%}{{ t.label }} <span class="badge bg-warning text-dark">{{ t.stale }}</span>
+  {%- elif t.kind == 'task' -%}<a href="{{ url_for('tasks.detail', task_id=t.id) }}"><i class="bi bi-list-task"></i> {{ t.label }}</a>
   {%- elif t.kind == 'person' -%}<a href="{{ url_for('tasks.list_tasks', assignee=t.id) }}"><i class="bi bi-person"></i> {{ t.label }}</a>
   {%- elif t.kind == 'skill' -%}<a href="{{ url_for('skills.list_skills', type=t.skill_type) }}"><i class="bi bi-mortarboard"></i> {{ t.label }}</a>
   {%- elif t.kind == 'operation' -%}<a href="{{ url_for('skills.coverage') }}"><i class="bi bi-diagram-3"></i> {{ t.label }}</a>
@@ -4602,6 +4639,7 @@
       </div>
     </form>
     <form method="post" action="{{ url_for('departments.toggle_department', dept_id=d.id) }}" class="mb-3">
+      <input type="hidden" name="active" value="{{ '0' if d.is_active else '1' }}">
       <button class="btn btn-sm btn-outline-{{ 'danger' if d.is_active else 'success' }}">
         {{ '無効化' if d.is_active else '有効化' }}
       </button>
@@ -4648,6 +4686,8 @@
             <td class="text-end">
               {% if u.id == current_user.id %}
               <span class="text-muted small">（自分）</span>
+              {% elif u.username in local_usernames %}
+              <span class="text-muted small" title="ログインのたびに有効に戻るため、削除・無効化できません（ログインを止めるには instance/config.py の ADMIN_PASSWORD を変更）">（固定ローカル管理者）</span>
               {% else %}
               {# 確認文は data-confirm に入れる(表示名を onsubmit の JavaScript に直接書かない) #}
               <form method="post" action="{{ url_for('departments.delete_member', user_id=u.id) }}"
@@ -4752,7 +4792,11 @@
 <p class="text-muted small">
   タスクの情報（進捗記載・ステータス変更・成果・負荷）から、チーム全体のまとめと1人1ページの週報を Word で作成し、メールで送信します。マネージャーのみ。
   この画面では今すぐ作成と状況の確認ができます。曜日・時刻・対象者・見本などの設定は、システム設定の「週報」タブで変更します。
-</p>
+</p>{% if settings_error %}
+<div class="alert alert-danger small">
+  <i class="bi bi-x-octagon"></i> <strong>週報の設定ファイルを読み込めません。</strong> {{ settings_error }}<br>
+  この画面には既定値を表示しています。ファイルを直すまで、自動送信は行われず、今すぐ作成・送信もできません。
+</div>{% endif %}
 
 <div class="row g-3 mb-4">
   {# 次回の自動送信 #}
@@ -4933,7 +4977,11 @@
   営業日（土日・祝日以外）の毎朝、期限を過ぎた未完了タスクの一覧を1通のメールで送信します。
   状態（未着手／進行中・保留）ごと、担当者ごとにまとめ、各タスクに直近の進捗記載とタスクへのリンクを付けます。マネージャーのみ。
   この画面ではプレビュー・今すぐ送信と状況の確認ができます。自動送信・時刻・コメント件数の設定は、システム設定の「期限超過通知」タブで変更します。
-</p>
+</p>{% if settings_error %}
+<div class="alert alert-danger small">
+  <i class="bi bi-x-octagon"></i> <strong>期限超過通知の設定ファイルを読み込めません。</strong> {{ settings_error }}<br>
+  この画面には既定値を表示しています。ファイルを直すまで、自動送信は行われず、今すぐ送信もできません。
+</div>{% endif %}
 
 {% if link_problem %}
 <div class="alert alert-warning small py-2">
@@ -5164,6 +5212,10 @@
 {% extends "base.html" %}
 {% block title %}システム設定 &middot; {{ app_name }}{% endblock %}
 
+{# 機能の設定ファイル(instance/*.json)が読み込めないときの注意(タブの先頭に出す) #}
+{% macro file_error_alert(ctx) %}{% if ctx.file_error %}<div class="alert alert-danger small"><i class="bi bi-x-octagon"></i> <strong>設定ファイルを読み込めません。</strong> {{ ctx.file_error }}<br>このタブには既定値を表示しています。ファイルを直すまで、このタブの設定は保存できません（{{ ctx.file_error_note }}）。</div>
+{% endif %}{% endmacro %}
+
 {% block content %}
 <div class="d-flex justify-content-between align-items-center mb-1 flex-wrap gap-2">
   <h1 class="h3 mb-0"><i class="bi bi-gear"></i> システム設定</h1>
@@ -5213,16 +5265,16 @@
     {% include "system/_config_tab.html" %}
   </div>
   <div class="tab-pane fade {% if tab == 'weekly' %}show active{% endif %}" id="pane-weekly" role="tabpanel" aria-labelledby="tab-weekly">
-    {% include "system/_weekly_tab.html" %}
+    {{ file_error_alert(wk) }}{% include "system/_weekly_tab.html" %}
   </div>
   <div class="tab-pane fade {% if tab == 'overdue' %}show active{% endif %}" id="pane-overdue" role="tabpanel" aria-labelledby="tab-overdue">
-    {% include "system/_overdue_tab.html" %}
+    {{ file_error_alert(od) }}{% include "system/_overdue_tab.html" %}
   </div>
   <div class="tab-pane fade {% if tab == 'skilltest' %}show active{% endif %}" id="pane-skilltest" role="tabpanel" aria-labelledby="tab-skilltest">
-    {% include "system/_skilltest_tab.html" %}
+    {{ file_error_alert(st) }}{% include "system/_skilltest_tab.html" %}
   </div>
   <div class="tab-pane fade {% if tab == 'analysis' %}show active{% endif %}" id="pane-analysis" role="tabpanel" aria-labelledby="tab-analysis">
-    {% include "system/_analysis_tab.html" %}
+    {{ file_error_alert(an) }}{% include "system/_analysis_tab.html" %}
   </div>
 </div>
 {% endblock %}
@@ -5488,7 +5540,7 @@
       <div class="form-text mt-2">
         選んだ人ごとに1ページを作成し、「チーム全体」のまとめも選んだ人の担当タスクが対象です。
         新しく登録したユーザーは自動では選ばれません（必要に応じてここで選んでください）。
-        無効化したユーザーは、選んでいても週報に載りません。期間内に動きの無い人は「今週の記載なし」と未完了の担当タスクを載せます。
+        無効化したユーザーは、選んでいても週報に載りません（ここには表示されませんが選択は残り、復帰すると対象に戻ります）。期間内に動きの無い人は「今週の記載なし」と未完了の担当タスクを載せます。
       </div>
     </div>
   </div>
@@ -6187,9 +6239,17 @@ a:hover {
     var select = document.getElementById("item-type");
     if (!select || select.tagName !== "SELECT") return;
     var scales = document.querySelectorAll(".skill-scale[data-skill-type]");
+    // スキルテストの案内はテクニカルスキルだけに出す(data-skilltest="on" / "off")
+    var holder = document.querySelector("[data-technical-type]");
+    var technical = holder ? holder.getAttribute("data-technical-type") : "";
+    var testNotes = document.querySelectorAll("[data-skilltest]");
     select.addEventListener("change", function () {
       scales.forEach(function (el) {
         el.classList.toggle("d-none", el.getAttribute("data-skill-type") !== select.value);
+      });
+      var isTechnical = select.value === technical;
+      testNotes.forEach(function (el) {
+        el.classList.toggle("d-none", (el.getAttribute("data-skilltest") === "on") !== isTechnical);
       });
     });
   }
