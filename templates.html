@@ -1839,6 +1839,11 @@
     {# action を明示する(「AIで下書き」を JavaScript なしで使ったときの再表示でも、保存はこの URL に送る) #}
     <form method="post" class="card card-body shadow-sm" id="skill-item-form"
           action="{{ url_for('skills.edit_item', skill_id=skill.id) if editing else url_for('skills.new_item') }}">
+      {# 入力欄で Enter を押したときに使われるボタン(フォームの最初の送信ボタン)。「AIで下書き」より前に置き、
+         Enter では「更新/追加」と同じく保存する(見えない・Tab で移らない。display:none だと Enter で送信しない
+         ブラウザがあるため、1px に切り取って見えなくする) #}
+      <button type="submit" tabindex="-1" aria-hidden="true"
+              style="position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0;">{{ '更新' if editing else '追加' }}</button>
       {% if back %}<input type="hidden" name="back" value="{{ back }}">{% endif %}
       <div class="mb-3">
         <label class="form-label" for="item-name">スキル名 <span class="text-danger">*</span></label>
@@ -2893,10 +2898,13 @@
     {% if not testable %}<span class="badge bg-light text-dark border fs-6">受験の対象外</span>{% endif %}
   </h1>
   <div class="d-flex flex-wrap gap-2">
+    {# 確認文は data-confirm に入れる(スキル名を onclick の JavaScript に直接書くと、「'」を含む名前で
+       確認なしに送信されたり、名前に書いたスクリプトが動いたりするため) #}
     <form method="post" action="{{ url_for('skilltest.admin_deactivate_all', skill_id=skill.id) }}">
-      <button class="btn btn-sm btn-outline-danger" {% if not active_total %}disabled{% endif %}
-              title="説明を変えた後、古い説明で作った問題を入れ替えるときに使います"
-              onclick="return confirm('「{{ skill.name }}」の有効な問題 {{ active_total }}問をすべて停止（無効）にします。今後は出題しません（受験履歴には残り、1問ずつ有効に戻せます）。よろしいですか？');">
+      <button class="btn btn-sm btn-outline-danger" {% if not active_total or running_this %}disabled{% endif %}
+              title="{{ 'このスキルの問題を補充中のため、補充が終わってから使えます' if running_this else '説明を変えた後、古い説明で作った問題を入れ替えるときに使います' }}"
+              data-confirm="「{{ skill.name }}」の有効な問題 {{ active_total }}問をすべて停止（無効）にします。今後は出題しません（受験履歴には残り、1問ずつ有効に戻せます）。よろしいですか？"
+              onclick="return confirm(this.dataset.confirm);">
         <i class="bi bi-slash-circle"></i> このスキルの問題をすべて停止
       </button>
     </form>
@@ -3710,8 +3718,10 @@
               {% if u.id == current_user.id %}
               <span class="text-muted small">（自分）</span>
               {% else %}
+              {# 確認文は data-confirm に入れる(表示名を onsubmit の JavaScript に直接書かない) #}
               <form method="post" action="{{ url_for('departments.delete_member', user_id=u.id) }}"
-                    class="d-inline" onsubmit="return confirm('メンバー「{{ u.display_name }}」を削除します。よろしいですか？\n※タスク等の業務データがある場合は無効化されます。');">
+                    class="d-inline" data-confirm="メンバー「{{ u.display_name }}」を削除します。よろしいですか？&#10;※タスク等の業務データがある場合は無効化されます。"
+                    onsubmit="return confirm(this.dataset.confirm);">
                 <button class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i> 削除</button>
               </form>
               {% endif %}

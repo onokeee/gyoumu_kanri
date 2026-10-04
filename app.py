@@ -2571,6 +2571,20 @@ def _header_address(item):
         return item
 
 
+def mail_envelope(items):
+    """送信先(sendmail に渡す宛先)の一覧。表示名を外したアドレスにし、同じアドレスは1つにする。
+
+    「表示名 <アドレス>」と「アドレス」だけの書き方、大文字・小文字の違いも同じアドレスとみなす
+    (To と Cc に同じ人がいても1通だけ届ける)。順番は最初に出てきた順。
+    アドレスを読み取れない値はそのまま渡す(送信サーバーの拒否として結果に出る)。
+    """
+    envelope = {}
+    for item in items:
+        addr = parseaddr(item)[1] or item
+        envelope.setdefault(addr.lower(), addr)
+    return list(envelope.values())
+
+
 def mail_settings():
     """現在のメール設定(画面の読み取り専用表示にも使う)。"""
     config = current_app.config
@@ -2673,7 +2687,7 @@ def send_mail(subject, text, html=None, attachments=(), to=None, cc=None, test=F
     msg["Message-ID"] = make_msgid(domain=domain or None)
 
     # To と Cc に同じアドレスがあっても1通だけ届ける
-    envelope = list(dict.fromkeys(to + cc))
+    envelope = mail_envelope(to + cc)
 
     try:
         # 暗号化(STARTTLS)・認証(ログイン)はしない。接続して送るだけ(終わると QUIT で切断する)
@@ -8976,7 +8990,7 @@ def member_overview(user):
 
 # 補充は同時に1つだけ(AIの呼び出しが重ならないように)
 _topup_lock = threading.Lock()
-_running = {"skill_name": ""}
+_running = {"skill_name": "", "skill_id": None}
 
 
 def is_topup_running():
@@ -8987,6 +9001,11 @@ def is_topup_running():
 def running_skill_name():
     """補充を実行中のスキル名(実行中でなければ空)。"""
     return _running["skill_name"] if is_topup_running() else ""
+
+
+def running_skill_id():
+    """補充を実行中のスキルの ID(実行中でなければ None)。"""
+    return _running["skill_id"] if is_topup_running() else None
 
 
 def counts_by_skill():
@@ -9077,6 +9096,7 @@ def start_topup(app, skill):
     if not _topup_lock.acquire(blocking=False):
         return False
     _running["skill_name"] = skill.name
+    _running["skill_id"] = skill.id
     skill_id = skill.id
 
     def worker():
@@ -9086,12 +9106,14 @@ def start_topup(app, skill):
             app.logger.exception("スキルテストの問題の補充でエラーが発生しました")
         finally:
             _running["skill_name"] = ""
+            _running["skill_id"] = None
             _topup_lock.release()
 
     try:
         threading.Thread(target=worker, name="skilltest-topup", daemon=True).start()
     except Exception:
         _running["skill_name"] = ""
+        _running["skill_id"] = None
         _topup_lock.release()
         raise
     return True
@@ -9545,6 +9567,7 @@ def admin_pool_skill(skill_id):
         letters=CHOICE_LETTERS,
         scale=scale_for(skill.skill_type),
         running=is_topup_running(),
+        running_this=running_skill_id() == skill.id,
         ai_enabled=ai_is_configured(),
         target=settings["pool_target_per_level"],
         active_total=SkillTestQuestion.query.filter_by(skill_id=skill.id, is_active=True).count(),
@@ -9581,10 +9604,15 @@ def admin_deactivate_all(skill_id):
     """そのスキルの有効な問題をすべて停止(無効)にする(受験履歴・問題は残す)。
 
     スキルの説明を変えた後、古い説明で作った問題を出題から外し、補充で入れ替えるために使う。
+    このスキルの補充の実行中は停止しない(補充が停止の後に問題を保存し、古い説明の問題が有効のまま残るため)。
     """
     skill = db.session.get(Skill, skill_id)
     if skill is None:
         abort(404)
+    if running_skill_id() == skill.id:
+        flash("「{}」の問題を補充中のため停止できません。補充が終わってから、もう一度実行してください。".format(
+            skill.name), "warning")
+        return redirect(url_for("skilltest.admin_pool_skill", skill_id=skill.id))
     count = (SkillTestQuestion.query
              .filter_by(skill_id=skill.id, is_active=True)
              .update({SkillTestQuestion.is_active: False}, synchronize_session=False))
