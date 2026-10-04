@@ -3680,6 +3680,27 @@
 <a href="{{ url_for('tasks.list_tasks', assignee=row.user_id) }}">{{ row.name }}</a>
 {%- endmacro %}
 
+{# AI のまとめ(箇条書き)。lines が空なら何も出さない #}
+{% macro ai_box(lines, title='AIのまとめ') -%}
+  {%- if lines %}
+  <div class="border border-info-subtle rounded bg-info-subtle bg-opacity-25 px-3 py-2 mb-3 small">
+    <div class="fw-bold text-info-emphasis mb-1"><i class="bi bi-stars"></i> {{ title }}</div>
+    <ul class="mb-0 ps-3">{% for line in lines %}<li class="pre-wrap">{{ line }}</li>{% endfor %}</ul>
+  </div>
+  {%- endif %}
+{%- endmacro %}
+
+{# AI の結果が無い理由(未読込・判定なし・分析の後に追加) #}
+{% macro ai_state_badge(s) -%}
+  {%- if s -%}<span class="badge {{ 'bg-danger' if s == state_unread else 'bg-light text-muted border' }}">{{ s }}</span>{%- endif -%}
+{%- endmacro %}
+
+{# 書き直し案と「案をコピー」(コピーするのは id の要素の文字) #}
+{% macro suggestion_cell(id, text) -%}
+  <div class="pre-wrap border rounded bg-light px-2 py-1" id="{{ id }}">{{ text }}</div>
+  <button type="button" class="btn btn-sm btn-outline-secondary mt-1 py-0" data-copy-target="{{ id }}"><i class="bi bi-clipboard"></i> 案をコピー</button>
+{%- endmacro %}
+
 {% block content %}
 <div class="d-flex justify-content-between align-items-start mb-1 flex-wrap gap-2">
   <h1 class="h3 mb-0"><i class="bi bi-clipboard-data"></i> AI分析（サマリーと推奨アクション）</h1>
@@ -3726,12 +3747,81 @@
 <div class="alert alert-warning small"><i class="bi bi-exclamation-triangle"></i> {{ period.error }}</div>
 {% endif %}
 
-{# ===== 推奨アクション ===== #}
-<div class="card shadow-sm mb-4 border-primary" id="actions">
+{# ===== AIで分析(別スレッドで実行。結果は instance/ai_analysis.json に最新の1回分) ===== #}
+<div class="card shadow-sm mb-3" id="ai-panel" data-status-url="{{ url_for('manager.analysis_status') }}" data-running="{{ 1 if ai_run.running else 0 }}">
   <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
-    <span class="fw-bold"><i class="bi bi-lightning-charge"></i> 推奨アクション（優先度の高い順）</span>
-    <span class="small text-muted">集計のルールで選んでいます</span>
+    <span class="fw-bold"><i class="bi bi-stars"></i> AIによる分析</span>
+    <form method="post" action="{{ url_for('manager.analysis_run') }}" class="m-0">
+      <input type="hidden" name="period" value="{{ period.kind }}">
+      <input type="hidden" name="from" value="{{ period.start.strftime('%Y-%m-%d') }}">
+      <input type="hidden" name="to" value="{{ period.end.strftime('%Y-%m-%d') }}">
+      <button class="btn btn-sm btn-primary" {% if not ai_configured or ai_run.running %}disabled{% endif %}
+              title="{{ '表示している期間（' ~ period.label ~ '）で、AIが本文を読んで分析します' if ai_configured else 'AIが未設定です（システム設定の「基本設定」タブ）' }}">
+        <i class="bi bi-stars"></i> AIで分析
+      </button>
+    </form>
   </div>
+  <div class="card-body small">
+    {% if ai_run.running %}
+    <div class="alert alert-info py-2 mb-2" id="ai-running">
+      <span class="spinner-border spinner-border-sm" role="status"></span>
+      AIで分析しています（{{ ai_run.period }}・開始 {{ ai_run.started_at }}）:
+      <span id="ai-progress">{{ ai_run.done }}/{{ ai_run.total }} {{ ai_run.step }}</span><br>
+      終わると画面が自動で更新されます（更新されないときは、しばらくしてから再読み込みしてください）。
+    </div>
+    {% endif %}
+    {% if ai_run.last_error %}
+    <div class="alert alert-danger py-2 mb-2"><i class="bi bi-exclamation-triangle"></i> 前回の実行（{{ ai_run.finished_at }}）: {{ ai_run.last_error }}</div>
+    {% endif %}
+    {% if ai.error %}
+    <div class="alert alert-warning py-2 mb-2"><i class="bi bi-exclamation-triangle"></i> {{ ai.error }}</div>
+    {% endif %}
+    {% set r = ai.result %}
+    {% if r %}
+    <div class="mb-1">
+      <span class="fw-bold">保存されている結果:</span> {{ r.generated_at }} 時点
+      ／ 期間 {{ r.period_label }} ／ モデル {{ r.model or '―' }}
+      ／ AIの呼び出し {{ r.calls.ok or 0 }}/{{ r.calls.total or 0 }} 回成功
+      {% if r.status == 'ok' %}<span class="badge bg-success">すべて読み込み</span>{% else %}<span class="badge bg-warning text-dark">一部のみ</span>{% endif %}
+    </div>
+    {% if ai.applied %}
+    <div class="mb-1">
+      AIが読んだ材料: タスク {{ (r.read.task_ids or [])|length }} 件・コメント {{ r.read.comments or 0 }} 件
+      ／ <span class="{% if r.unread.count %}text-danger fw-bold{% endif %}">未読込: {{ r.unread.count or 0 }} 件</span>
+      {% if r.masked_numbers %}／ 材料に無い数値 {{ r.masked_numbers }} か所を「◯」に置き換えました{% endif %}
+    </div>
+    {% if r.unread_parts or r.errors %}
+    <details class="mb-1">
+      <summary class="{{ 'text-danger' if r.unread_parts else 'text-warning-emphasis' }}">読み込めなかった材料・注意（読み込めなかった呼び出し {{ r.unread_parts|length }} 回・注意 {{ r.errors|length }} 件）</summary>
+      <ul class="mb-0 ps-3">
+        {% for u in r.unread_parts %}
+        <li class="text-danger">未読込: {{ u.label }}{% if u.tasks %}（タスク {{ u.tasks }} 件・コメント {{ u.comments }} 件）{% endif %}: {{ u.reason }}</li>
+        {% endfor %}
+        {% for e in r.errors %}<li class="text-muted">{{ e }}</li>{% endfor %}
+      </ul>
+    </details>
+    {% endif %}
+    {% elif ai.other_period %}
+    <div class="alert alert-secondary py-2 mb-1">
+      保存されているAIの分析は、別の期間（{{ r.period_label }}）のものです。
+      <a href="{{ url_for('manager.analysis', **ai.other_period) }}">その期間で表示</a>するか、この期間で「AIで分析」を実行してください。
+    </div>
+    {% endif %}
+    {% elif not ai_run.running %}
+    <div class="text-muted mb-1">まだAIで分析していません。下の表はアプリの集計です。「AIで分析」を押すと、AIが本文を読んで、課題の抽出・コメントへの対応の判定・書き直し案・各人の所見・推奨アクションを加えます。</div>
+    {% endif %}
+    <div class="text-muted mt-2">
+      <i class="bi bi-shield-exclamation"></i>
+      「AIで分析」を押すと、タスクの名前・説明・コメント（書いた人の氏名・日時を含む）・状態の変更・成果・メンバーの氏名・スキル・スキルテストの結果が、
+      システム設定の「基本設定」で設定したAIの接続先に送られます{% if ai_configured %}（{{ ai_status }}）{% endif %}。
+      結果は <code>instance/ai_analysis.json</code> に最新の1回分だけを保存します（DB には保存しません。メンバーは見られません）。
+      {% if not ai_configured %}<br><span class="text-danger"><i class="bi bi-exclamation-circle"></i> AIが未設定のため、「AIで分析」は使えません（システム設定の「基本設定」タブで AI_API_KEY または AI_API_URL を設定すると使えます）。</span>{% endif %}
+    </div>
+  </div>
+</div>
+
+{# ===== 推奨アクション ===== #}
+{% macro actions_table(actions, show_source=false) -%}
   <div class="table-responsive">
     <table class="table align-middle mb-0">
       <thead class="table-light">
@@ -3744,10 +3834,11 @@
         </tr>
       </thead>
       <tbody>
-        {% for act in a.actions %}
+        {% for act in actions %}
         <tr>
           <td class="text-center fw-bold">{{ act.rank }}</td>
-          <td><span class="badge bg-secondary-subtle text-secondary-emphasis border">{{ act.category_label }}</span><br>{{ act.title }}</td>
+          <td><span class="badge bg-secondary-subtle text-secondary-emphasis border">{{ act.category_label }}</span>
+            {% if show_source and act.source == 'rule' %}<span class="badge bg-light text-muted border">ルールで補った候補</span>{% endif %}<br>{{ act.title }}</td>
           <td class="small">{{ target_link(act.target) }}</td>
           <td class="small pre-wrap">{{ act.reason }}</td>
           <td class="small">{% for n in act.numbers %}<div class="text-nowrap">{{ n }}</div>{% endfor %}</td>
@@ -3758,9 +3849,31 @@
       </tbody>
     </table>
   </div>
+{%- endmacro %}
+<div class="card shadow-sm mb-4 border-primary" id="actions">
+  <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <span class="fw-bold"><i class="bi bi-lightning-charge"></i> 推奨アクション（優先度の高い順）</span>
+    {% if a.ai_actions %}
+    <span class="small text-muted"><i class="bi bi-stars"></i> AIが材料とルールの候補から選んでいます（{{ ai.result.generated_at }} 時点）</span>
+    {% else %}
+    <span class="small text-muted">集計のルールで選んでいます</span>
+    {% endif %}
+  </div>
+  {% if a.ai_actions %}
+  {{ actions_table(a.ai_actions, true) }}
+  <div class="card-footer bg-white small">
+    <details>
+      <summary class="text-muted">ルールで選んだ推奨アクション（{{ a.actions|length }} 件）</summary>
+      <div class="mt-2">{{ actions_table(a.actions) }}</div>
+    </details>
+  </div>
+  {% else %}
+  {{ actions_table(a.actions) }}
   <div class="card-footer bg-white small text-muted">
     <i class="bi bi-info-circle"></i> 期限超過・マネージャーのコメントに返信なし・進行中なのに記載がない・期限が近いのに未着手・長い保留・対応できる人が1名以下の業務・保有者が1名以下のスキル・成果や進捗の書き直し推奨・スキルテストの未受験から、最大{{ action_max }}件を選んでいます（同じ種類は数件まで）。
+    {% if ai.applied %}<br><i class="bi bi-exclamation-triangle"></i> AIによる推奨アクションを作れなかったため（AIの呼び出しの失敗など）、ルールで選んだものを表示しています。{% endif %}
   </div>
+  {% endif %}
 </div>
 
 {# ===== ① タスクの進捗 ===== #}
@@ -3769,6 +3882,7 @@
   「完了・着手」は期間内、そのほかは現時点の状態です。未完了のタスクは期間に関係なくすべての記載を対象にしています。
   複数担当のタスクは各担当に数えます（チームは1件として数えます。担当者のいないタスクもチームに含みます）。
 </p>
+{{ ai_box(a.ai_summary.progress if a.ai_summary else none) }}
 {% set p = a.progress %}
 <div class="card shadow-sm mb-3">
   <div class="table-responsive">
@@ -3909,7 +4023,8 @@
               <td>{{ task_cell(r) }}</td>
               <td class="text-nowrap">{{ r.assignee_names or '未割当' }}</td>
               <td class="text-nowrap">{% if r.hold_days is not none %}{{ r.hold_days }}営業日{% if r.since_estimated %}<br><span class="text-muted">（推定）</span>{% endif %}{% else %}―{% endif %}</td>
-              <td>{{ last_comment(r.last_comment) }}</td>
+              <td>{{ last_comment(r.last_comment) }}
+                {% for i in r.ai or [] %}<div class="text-info-emphasis"><i class="bi bi-stars"></i> {{ i.kind }}: <span class="pre-wrap">{{ i.text }}</span></div>{% endfor %}</td>
             </tr>
             {% else %}
             <tr><td colspan="4" class="text-muted">ありません。</td></tr>
@@ -3921,17 +4036,67 @@
   </div>
 </div>
 
+{# 課題・相談(AI が未完了のタスクのコメントから抜き出したもの) #}
+{% if ai.applied %}
+<div class="card shadow-sm mb-3" id="issues">
+  <div class="card-header bg-white fw-bold"><i class="bi bi-stars text-info"></i> 課題・相談（AIが未完了のタスクのコメントから抽出・{{ (p.issues_ai or [])|length }} 件）</div>
+  <div class="table-responsive" style="max-height:320px; overflow-y:auto;">
+    <table class="table table-sm align-middle mb-0 small">
+      <thead class="table-light"><tr><th>タスク</th><th class="text-nowrap">担当</th><th class="text-nowrap">種類</th><th>内容</th><th class="text-nowrap">根拠</th></tr></thead>
+      <tbody>
+        {% for i in p.issues_ai or [] %}
+        <tr>
+          <td>{{ task_cell(i) }}</td>
+          <td class="text-nowrap">{{ i.assignee_names or '未割当' }}</td>
+          <td class="text-nowrap"><span class="badge {{ 'bg-warning text-dark' if i.kind == '課題' else 'bg-info text-dark' }}">{{ i.kind }}</span></td>
+          <td class="pre-wrap">{{ i.text }}</td>
+          <td class="text-nowrap text-muted">{% if i.source %}{{ i.source.at.strftime('%m/%d') if i.source.at else '' }} {{ i.source.author }}{% else %}―{% endif %}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="text-muted">AIが抜き出した課題・相談はありません。</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
 {# マネージャーのコメントへの対応 #}
 {% set mc = p.manager_comments %}
 <div class="card shadow-sm mb-3" id="manager-comments">
   <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
     <span class="fw-bold"><i class="bi bi-reply"></i> マネージャーのコメントへの対応（要フォロー {{ mc.follow|length }} 件）</span>
-    <span class="small text-muted">対象 {{ mc.total }} 件 ／ 返信あり {{ mc.replied }} 件 ／ 返信なし {{ mc.no_reply }} 件{% if mc.ack_count %} ／ 対応不要（了解・お礼など）{{ mc.ack_count }} 件は除外{% endif %}</span>
+    <span class="small text-muted">対象 {{ mc.total }} 件 ／ 返信あり {{ mc.replied }} 件 ／ 返信なし {{ mc.no_reply }} 件{% if mc.ack_count %} ／ 対応不要（了解・お礼など）{{ mc.ack_count }} 件は除外{% endif %}{% if mc.ai_acks %} ／ AIが対応不要と判定 {{ mc.ai_acks|length }} 件は除外{% endif %}</span>
   </div>
-  <div class="table-responsive" style="max-height:320px; overflow-y:auto;">
+  {% if ai.applied %}
+  {# ヒト別・チームの件数(AI の判定を含む) #}
+  <div class="table-responsive border-bottom">
+    <table class="table table-sm align-middle mb-0 small text-center">
+      <thead class="table-light">
+        <tr><th class="text-start">ヒト</th><th>対象</th><th>対応済み</th><th>一部対応</th><th>未対応</th><th>返信なし</th><th>未判定</th><th>要フォロー</th></tr>
+      </thead>
+      <tbody>
+        {% for r in mc.rows + [dict(mc.counts, name='チーム', user_id=none)] %}
+        <tr class="{% if r.user_id is none %}table-light fw-bold{% endif %}">
+          <td class="text-start text-nowrap">{% if r.user_id is none %}チーム{% else %}{{ person_link(r) }}{% endif %}</td>
+          <td>{{ r.total or '―' }}</td>
+          <td>{{ r['対応済み'] or '―' }}</td>
+          <td class="{% if r['一部対応'] %}text-warning-emphasis fw-bold{% endif %}">{{ r['一部対応'] or '―' }}</td>
+          <td class="{% if r['未対応'] %}text-danger fw-bold{% endif %}">{{ r['未対応'] or '―' }}</td>
+          <td class="{% if r['返信なし'] %}text-danger fw-bold{% endif %}">{{ r['返信なし'] or '―' }}</td>
+          <td>{{ r['未判定'] or '―' }}</td>
+          <td class="{% if r.follow %}text-danger fw-bold{% endif %}">{{ r.follow or '―' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+  <div class="table-responsive" style="max-height:420px; overflow-y:auto;">
     <table class="table table-sm align-middle mb-0 small">
       <thead class="table-light">
-        <tr><th>タスク</th><th class="text-nowrap">担当</th><th>マネージャーのコメント</th><th class="text-nowrap">判定</th><th class="text-nowrap">経過</th></tr>
+        <tr><th>タスク</th><th class="text-nowrap">担当</th><th>マネージャーのコメント</th><th class="text-nowrap">判定</th>
+          {% if ai.applied %}<th>残っている対応</th><th>根拠（AI）</th>{% endif %}<th class="text-nowrap">経過</th></tr>
       </thead>
       <tbody>
         {% for r in mc.follow %}
@@ -3939,18 +4104,48 @@
           <td>{{ task_cell(r) }}</td>
           <td class="text-nowrap">{{ r.assignee_names or '未割当' }}</td>
           <td><span class="text-muted text-nowrap">{{ r.at.strftime('%m/%d') }} {{ r.author }}：</span><span class="pre-wrap">{{ r.body }}</span></td>
-          <td class="text-nowrap"><span class="badge bg-danger">{{ r.judgement }}</span></td>
-          <td class="text-nowrap fw-bold">{{ r.elapsed_days }}営業日</td>
+          <td class="text-nowrap"><span class="badge {{ 'bg-danger' if r.judgement in ('返信なし', '未対応') else 'bg-warning text-dark' }}">{{ r.judgement }}</span></td>
+          {% if ai.applied %}
+          <td class="pre-wrap">{% if r.ai %}{{ r.ai.remaining or r.ai.request or '―' }}{% else %}{{ ai_state_badge(r.ai_state) }}{% endif %}</td>
+          <td class="pre-wrap text-muted">{{ r.ai.evidence if r.ai and r.ai.evidence else '―' }}</td>
+          {% endif %}
+          <td class="text-nowrap fw-bold">{{ r.age_days }}営業日</td>
         </tr>
         {% else %}
-        <tr><td colspan="5" class="text-muted">返信のないコメントはありません。</td></tr>
+        <tr><td colspan="{{ 7 if ai.applied else 5 }}" class="text-muted">{{ '要フォローのコメントはありません。' if ai.applied else '返信のないコメントはありません。' }}</td></tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
+  {% if ai.applied %}
+  <div class="card-footer bg-white small">
+    <details>
+      <summary class="text-muted">すべてのコメントの判定（{{ mc['items']|length + mc.ai_acks|length }} 件）</summary>
+      <div class="table-responsive mt-2" style="max-height:420px; overflow-y:auto;">
+        <table class="table table-sm align-middle mb-0 small">
+          <thead class="table-light"><tr><th>タスク</th><th>マネージャーのコメント</th><th class="text-nowrap">判定</th><th>求めたこと（AI）</th><th>残っている対応</th><th>根拠（AI）</th></tr></thead>
+          <tbody>
+            {% for r in mc['items'] + mc.ai_acks %}
+            <tr>
+              <td>{{ task_cell(r) }}</td>
+              <td><span class="text-muted text-nowrap">{{ r.at.strftime('%m/%d') }} {{ r.author }}：</span><span class="pre-wrap">{{ r.body }}</span></td>
+              <td class="text-nowrap"><span class="badge {{ 'bg-success' if r.judgement == '対応済み' else ('bg-secondary' if r.judgement in ('対応不要（AI判定）', '未判定') else ('bg-danger' if r.judgement in ('返信なし', '未対応') else 'bg-warning text-dark')) }}">{{ r.judgement }}</span>
+                {% if not r.ai %}{{ ai_state_badge(r.ai_state) }}{% endif %}</td>
+              <td class="pre-wrap">{{ r.ai.request if r.ai and r.ai.request else '―' }}</td>
+              <td class="pre-wrap">{{ r.ai.remaining if r.ai and r.ai.remaining else '―' }}</td>
+              <td class="pre-wrap text-muted">{{ r.ai.evidence if r.ai and r.ai.evidence else '―' }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </details>
+  </div>
+  {% endif %}
   <div class="card-footer bg-white small text-muted">
     <i class="bi bi-info-circle"></i> 対象は、未完了のタスクへのマネージャーのコメント（全期間）と、期間内に書かれたコメントです（そのタスクの担当者でもあるマネージャーの記載は除く）。
-    後に担当者のコメントが無いものを「返信なし」とし、書かれてからの営業日数を表示します。返信があるコメントが対応済みかどうかは、後のコメントと状態の変更から判定します。
+    後に担当者のコメントが無いものを「返信なし」とし、経過はコメントが書かれてからの営業日数です。返信があるコメントは、AIがマネージャーの求めたこと（指示・質問・依頼）を読み取り、後のコメントと状態の変更から「対応済み」「一部対応」「未対応」を判定します（「AIで分析」の後）。
+    要フォローは「返信なし」「未対応」「一部対応」です。
   </div>
 </div>
 
@@ -4005,6 +4200,12 @@
 {% set ts = sk.tests %}
 <h2 class="h4 mt-4 mb-1" id="skills"><i class="bi bi-mortarboard"></i> ② スキル状況</h2>
 <p class="text-muted small mb-2">スキルテストは期間内（受験を始めた日）、スキルの分布と偏りは現時点の到達度です。保有者は Lv{{ sk.proficient }} 以上（単独で実務可能）のメンバーです。</p>
+{{ ai_box(a.ai_summary.skills if a.ai_summary else none) }}
+{% if sk.ai %}
+{% set skill_lines = [] %}
+{% for key, label in skills_ai_keys %}{% for line in sk.ai[key] or [] %}{% set _ = skill_lines.append(label ~ '：' ~ line) %}{% endfor %}{% endfor %}
+{{ ai_box(skill_lines, 'AIがスキルの材料（分布・偏り・受験の内容）を読んだ結果') }}
+{% endif %}
 
 <div class="card shadow-sm mb-3">
   <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
@@ -4151,6 +4352,7 @@
   金額・時間は年換算（1年=12か月=360日）で、ヒト別は複数担当を均等割りしています。
   リードタイムは着手（開始日。無ければ登録日）から完了までの暦日で、規模の目安日数と比べます。
 </p>
+{{ ai_box(a.ai_summary.outputs if a.ai_summary else none) }}
 <div class="card shadow-sm mb-3">
   <div class="table-responsive">
     <table class="table table-sm table-hover align-middle mb-0 text-center small">
@@ -4199,29 +4401,39 @@
 
 <div class="card shadow-sm mb-3" id="outcome-rewrite">
   <div class="card-header bg-white fw-bold"><i class="bi bi-pencil-square"></i> 成果の書き直し推奨（{{ o.rewrite|length }} 件）</div>
-  <div class="table-responsive" style="max-height:480px; overflow-y:auto;">
+  <div class="table-responsive" style="max-height:600px; overflow-y:auto;">
     <table class="table table-sm align-middle mb-0 small">
       <thead class="table-light">
-        <tr><th>タスク</th><th class="text-nowrap">担当</th><th>指摘</th><th>今の記載</th></tr>
+        <tr><th>タスク</th><th class="text-nowrap">担当</th><th>指摘</th><th>今の記載</th>{% if ai.applied %}<th style="min-width:16rem;">書き直し案（AI）</th>{% endif %}</tr>
       </thead>
       <tbody>
         {% for r in o.rewrite %}
         <tr>
           <td>{{ task_cell(r) }}<br><span class="text-muted">完了 {{ fmt_date(r.completed_at) }}{% if r.completed_estimated %}（推定）{% endif %}</span></td>
           <td class="text-nowrap">{{ r.assignee_names or '未割当' }}</td>
-          <td>{% for pr in r.problems %}<div><span class="badge bg-warning text-dark">{{ pr.label }}</span> {{ pr.field }}: {{ pr.detail }}</div>{% endfor %}</td>
+          <td>{% for pr in r.problems %}<div><span class="badge {{ 'bg-info text-dark' if pr.code == 'vague' else 'bg-warning text-dark' }}">{{ pr.label }}</span> {{ pr.field }}: {{ pr.detail }}</div>{% endfor %}</td>
           <td>
             <div><span class="text-muted">定量:</span> 見込み {{ r.outcome.quant_estimate_label or '―' }} ／ 実績 {{ r.outcome.quant_actual_label or '―' }}</div>
             {% if r.outcome.quant_note %}<div class="pre-wrap"><span class="text-muted">補足:</span> {{ r.outcome.quant_note }}</div>{% endif %}
             <div class="pre-wrap"><span class="text-muted">定性の実績:</span> {{ r.outcome.qual_actual or '―' }}</div>
           </td>
+          {% if ai.applied %}
+          <td>{% if r.suggestion %}{{ suggestion_cell('outcome-suggestion-' ~ r.task_id, r.suggestion) }}
+            <div><a href="{{ url_for('tasks.detail', task_id=r.task_id) }}" class="small"><i class="bi bi-box-arrow-up-right"></i> タスクを開いて書き直す</a></div>
+            {% else %}{{ ai_state_badge(r.ai_state) or '―' }}{% endif %}</td>
+          {% endif %}
         </tr>
         {% else %}
-        <tr><td colspan="4" class="text-muted">ルールで見つかった書き直し推奨はありません。</td></tr>
+        <tr><td colspan="{{ 5 if ai.applied else 4 }}" class="text-muted">{{ '書き直し推奨はありません。' if ai.applied else 'ルールで見つかった書き直し推奨はありません。' }}</td></tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
+  {% if ai.applied %}
+  <div class="card-footer bg-white small text-muted">
+    <i class="bi bi-info-circle"></i> 書き直し案は、タスクとそのコメントに書かれた事実だけからAIが作った案です（材料に無い数値は「◯」）。自動では反映しません。内容を確かめ、「案をコピー」してタスクの成果の欄に貼り付けてください。
+  </div>
+  {% endif %}
 </div>
 
 {# ===== ④ 各人の能力（総合） ===== #}
@@ -4230,6 +4442,7 @@
 <p class="text-muted small mb-2">
   指導の参考です（<strong>順位・点数は付けません</strong>。表示名順）。同時進行数・負荷は現時点、そのほかは期間内です。
 </p>
+{{ ai_box(a.ai_summary.abilities if a.ai_summary else none) }}
 <div class="card shadow-sm mb-3">
   <div class="table-responsive">
     <table class="table table-sm align-middle mb-0 text-center small">
@@ -4257,7 +4470,7 @@
           <td class="text-nowrap">{% if r.completed %}{{ r.outcome_rewrite }}/{{ r.completed }}件{{ sample(r.completed) }}{% else %}―{% endif %}</td>
           <td class="text-nowrap">{% if r.progress_frequency is not none %}{{ r.progress_frequency }}<br><span class="text-muted">記載 {{ r.progress_comments }} 件・対象 {{ r.progress_tasks }} 件</span>{% else %}―{% endif %}</td>
           <td class="text-nowrap">{% if r.progress_comments %}{{ r.progress_vague }}/{{ r.progress_comments }}件{{ sample(r.progress_comments) }}{% else %}―{% endif %}</td>
-          <td class="text-nowrap">{% if r.mc_total %}{{ r.mc_replied }}/{{ r.mc_total }}件（{{ r.mc_rate }}%）{{ sample(r.mc_total) }}{% else %}―{% endif %}</td>
+          <td class="text-nowrap">{% if r.mc_total %}{{ r.mc_replied }}/{{ r.mc_total }}件（{{ r.mc_rate }}%）{% if r.mc_done is defined %}<br><span class="text-muted">対応済み {{ r.mc_done }}件</span>{% endif %}{{ sample(r.mc_total) }}{% else %}―{% endif %}</td>
         </tr>
         {% else %}
         <tr><td colspan="9" class="text-muted py-3">対象のメンバーがいません。</td></tr>
@@ -4268,31 +4481,72 @@
   <div class="card-footer bg-white small text-muted">
     <i class="bi bi-info-circle"></i> 負荷はマネージャーダッシュボードの「ヒト別 負荷・案件状況」と同じ計算です。
     進捗の記載は、期間内に本人が担当タスクに書いた記載の数 ÷（期間中に未完了だった担当タスクの数 × 週数 {{ ab.weeks }}）。
-    具体性は、定型の言葉だけ（「対応中」など）・短く数字の無い記載を書き直し推奨として数えています。
-    マネージャーのコメントへの返信は、期間内に書かれたマネージャーのコメントのうち担当者の返信があるものです。
+    具体性は、定型の言葉だけ（「対応中」など）・短く数字の無い記載を書き直し推奨として数えています{% if ai.applied %}（AIが具体性が低いと判定した記載を含む）{% endif %}。
+    マネージャーのコメントへの返信は、期間内に書かれたマネージャーのコメントのうち担当者の返信があるものです{% if ai.applied %}（対応済みはAIの判定）{% endif %}。
   </div>
 </div>
 
+{# 各人の所見(AI)。順位・点数は付けない #}
+{% if ai.applied %}
+<div class="card shadow-sm mb-3" id="findings">
+  <div class="card-header bg-white fw-bold"><i class="bi bi-stars text-info"></i> 各人の所見（AI。指導の参考で、順位・点数ではありません）</div>
+  <div class="card-body">
+    <div class="row g-3">
+      {% for r in ab.rows %}
+      <div class="col-lg-6">
+        <div class="border rounded p-2 h-100 small">
+          <div class="fw-bold mb-1">{{ person_link(r) }}</div>
+          {% if r.ai %}
+          {% for key, label in finding_keys %}
+          {% if r.ai[key] %}
+          <div class="mb-1"><span class="badge {{ {'strengths': 'bg-success', 'concerns': 'bg-warning text-dark', 'support': 'bg-primary'}[key] }}">{{ label }}</span>
+            <ul class="mb-0 ps-3">{% for line in r.ai[key] %}<li class="pre-wrap">{{ line }}</li>{% endfor %}</ul></div>
+          {% endif %}
+          {% endfor %}
+          {% else %}
+          <div class="text-muted">所見はありません（{% if ai.result.unread.count %}材料の一部を読み込めなかったか、{% endif %}AIの応答に所見がありませんでした）。</div>
+          {% endif %}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+{% endif %}
+
 <div class="card shadow-sm mb-3" id="progress-rewrite">
   <div class="card-header bg-white fw-bold"><i class="bi bi-pencil-square"></i> 進捗の記載の書き直し推奨（期間内・{{ ab.progress_rewrite|length }} 件）</div>
-  <div class="table-responsive" style="max-height:320px; overflow-y:auto;">
+  <div class="table-responsive" style="max-height:480px; overflow-y:auto;">
     <table class="table table-sm align-middle mb-0 small">
-      <thead class="table-light"><tr><th>タスク</th><th class="text-nowrap">記載者</th><th>記載</th><th>理由</th></tr></thead>
+      <thead class="table-light"><tr><th>タスク</th><th class="text-nowrap">記載者</th><th>記載</th><th>理由</th>{% if ai.applied %}<th style="min-width:16rem;">書き直し案（AI）</th>{% endif %}</tr></thead>
       <tbody>
         {% for r in ab.progress_rewrite %}
         <tr>
           <td>{{ task_cell(r) }}</td>
           <td class="text-nowrap">{{ r.name }}</td>
           <td><span class="text-muted text-nowrap">{{ r.at.strftime('%m/%d') }}：</span><span class="pre-wrap">{{ r.body }}</span></td>
-          <td>{{ r.reason }}</td>
+          <td>{{ r.reason }}{% if r.ai and r.ai.reason and not r.reason.startswith('AIの判定') %}<div class="text-info-emphasis"><i class="bi bi-stars"></i> {{ r.ai.reason }}</div>{% endif %}</td>
+          {% if ai.applied %}
+          <td>{% if r.suggestion %}{{ suggestion_cell('progress-suggestion-' ~ r.comment_id, r.suggestion) }}
+            <div><a href="{{ url_for('tasks.detail', task_id=r.task_id) }}" class="small"><i class="bi bi-box-arrow-up-right"></i> タスクを開く</a></div>
+            {% else %}{{ ai_state_badge(r.ai_state) or '―' }}{% endif %}</td>
+          {% endif %}
         </tr>
         {% else %}
-        <tr><td colspan="4" class="text-muted">ありません。</td></tr>
+        <tr><td colspan="{{ 5 if ai.applied else 4 }}" class="text-muted">ありません。</td></tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
+  {% if ai.applied %}
+  <div class="card-footer bg-white small text-muted">
+    <i class="bi bi-info-circle"></i> 書き直し案は、そのタスクとコメントに書かれた事実だけからAIが作った案です（材料に無い数値は「◯」）。自動では反映しません。本人に書き方を伝えるときの例として使ってください。
+  </div>
+  {% endif %}
 </div>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/ai-analysis.js') }}"></script>
 {% endblock %}
 {#=== departments/manage.html ===#}
 {% extends "base.html" %}
@@ -5426,7 +5680,7 @@
 {# システム設定「AI分析」タブ(instance/ai_analysis_settings.json に保存)。入力チェックは app.py の parse_ai_analysis_form #}
 <p class="small text-muted d-flex flex-wrap justify-content-between gap-2">
   <span>
-    マネージャーダッシュボードの「AI分析（サマリーと推奨アクション）」で使うしきい値です。日数は土日・祝日を除いた営業日で数えます。
+    マネージャーダッシュボードの「AI分析（サマリーと推奨アクション）」で使うしきい値と、AIへの送信の設定です。日数は土日・祝日を除いた営業日で数えます。
     設定は <code>instance/ai_analysis_settings.json</code> に保存され、DB には保存しません。
   </span>
   <a href="{{ url_for('manager.analysis') }}"><i class="bi bi-box-arrow-up-right"></i> AI分析の画面</a>
@@ -5445,6 +5699,25 @@
           <div class="form-text">{{ f.help }}（{{ f.min }}〜{{ f.max }}。既定 {{ f.default }}）</div>
         </div>
         {% endfor %}
+      </div>
+    </div>
+  </div>
+  <div class="card shadow-sm mb-4">
+    <div class="card-header bg-white fw-bold"><i class="bi bi-send"></i> AIへの送信</div>
+    <div class="card-body">
+      <div class="row g-3">
+        {% for f in an.send_fields %}
+        <div class="col-md-6">
+          <label class="form-label small mb-1 fw-bold" for="analysis-{{ f.key }}">{{ f.label }}</label>
+          <input type="number" class="form-control form-control-sm" id="analysis-{{ f.key }}" name="{{ f.key }}"
+                 value="{{ an.settings[f.key] }}" min="{{ f.min }}" max="{{ f.max }}" step="1" required>
+          <div class="form-text">{{ f.help }}（{{ f.min }}〜{{ f.max }}。既定 {{ f.default }}）</div>
+        </div>
+        {% endfor %}
+      </div>
+      <div class="form-text mt-2">
+        「AIで分析」を押すと、タスクの名前・説明・コメント（書いた人の氏名・日時を含む）・成果・メンバーの氏名・スキル・スキルテストの結果が、
+        「基本設定」タブの AI の接続先に送られます。結果は <code>instance/ai_analysis.json</code> に最新の1回分だけを保存します。
       </div>
     </div>
     <div class="card-footer bg-white d-flex justify-content-end">
@@ -6244,6 +6517,126 @@ a:hover {
   function init() {
     setupTabs();
     setupConfirm();
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();
+{#=== static/js/ai-analysis.js ===#}
+/* AI分析の画面(manager/analysis.html)用。
+ *
+ * ・「案をコピー」: data-copy-target で指定した要素の文字(書き直し案)をクリップボードにコピーする
+ *   (自動では反映しない。タスクの画面に貼り付けて使う)。
+ * ・実行中の表示: 「AIで分析」の実行中は、状態(/manager/analysis/status)を数秒ごとに確認して
+ *   進み具合を表示し、終わったら画面を再読み込みする。
+ *
+ * JavaScript が無効でも、実行中の表示と「しばらくしてから再読み込み」の案内は表示される(サーバー側)。
+ */
+(function () {
+  "use strict";
+
+  var POLL_MS = 3000;
+
+  // 画面に置かない入力欄を使ってコピーする(クリップボードの API が使えないとき)
+  function copyByTextarea(text) {
+    var area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.top = "-1000px";
+    document.body.appendChild(area);
+    area.select();
+    var ok = false;
+    try {
+      ok = document.execCommand("copy");
+    } catch (e) {
+      ok = false;
+    }
+    document.body.removeChild(area);
+    return ok;
+  }
+
+  function copyText(text) {
+    return new Promise(function (resolve, reject) {
+      function fallback() {
+        if (copyByTextarea(text)) {
+          resolve();
+        } else {
+          reject(new Error("copy failed"));
+        }
+      }
+      // http(LAN 内のサーバー)などではクリップボードの API が使えない
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(resolve, fallback);
+      } else {
+        fallback();
+      }
+    });
+  }
+
+  // コピーできなかったときは、案の文字を選んだ状態にする(Ctrl+C でコピーできるように)
+  function selectText(element) {
+    if (!window.getSelection || !document.createRange) return;
+    var range = document.createRange();
+    range.selectNodeContents(element);
+    var selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+
+  function setupCopy() {
+    document.addEventListener("click", function (event) {
+      var button = event.target.closest ? event.target.closest("[data-copy-target]") : null;
+      if (!button) return;
+      var source = document.getElementById(button.getAttribute("data-copy-target"));
+      if (!source) return;
+      var original = button.innerHTML;
+      copyText(source.textContent.trim()).then(function () {
+        button.innerHTML = '<i class="bi bi-check2"></i> コピーしました';
+      }).catch(function () {
+        selectText(source);
+        button.innerHTML = "コピーできませんでした（案を選んだので Ctrl+C でコピーしてください）";
+      }).then(function () {
+        window.setTimeout(function () { button.innerHTML = original; }, 2000);
+      });
+    });
+  }
+
+  function setupPolling() {
+    var panel = document.getElementById("ai-panel");
+    if (!panel || panel.getAttribute("data-running") !== "1" || !window.fetch) return;
+    var url = panel.getAttribute("data-status-url");
+    var progress = document.getElementById("ai-progress");
+
+    function tick() {
+      fetch(url, { credentials: "same-origin", headers: { "Accept": "application/json" } })
+        .then(function (response) {
+          if (!response.ok) throw new Error(String(response.status));
+          return response.json();
+        })
+        .then(function (state) {
+          if (!state.running) {
+            window.location.reload();
+            return;
+          }
+          if (progress) progress.textContent = state.done + "/" + state.total + " " + state.step;
+          window.setTimeout(tick, POLL_MS);
+        })
+        .catch(function () {
+          // 一時的な失敗は、少し待ってから確認し直す
+          window.setTimeout(tick, POLL_MS * 3);
+        });
+    }
+
+    window.setTimeout(tick, POLL_MS);
+  }
+
+  function init() {
+    setupCopy();
+    setupPolling();
   }
 
   if (document.readyState === "loading") {

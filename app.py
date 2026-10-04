@@ -80,7 +80,11 @@ Python のコードはすべてこの app.py にまとめている。ほかの�
       9-2. AI分析: 期間と材料
       9-3. AI分析: 集計(①〜④)
       9-4. AI分析: 推奨アクション(ルール)
-      9-5. AI分析: 画面
+      9-5. AI分析: AIに送る材料(テキスト)と分割
+      9-6. AI分析: AIの応答の検証
+      9-7. AI分析: 実行(バックグラウンド)と保存
+      9-8. AI分析: 結果の反映(画面・チームのまとめの材料)
+      9-9. AI分析: 画面
   10. システム設定
       10-1. システム設定: 基本設定の項目の定義
       10-2. システム設定: 基本設定の入力チェック・保存
@@ -2369,7 +2373,8 @@ class SkillTestAnswer(db.Model):
 # =============================================================================
 # 4-1. ChatGPT(OpenAI互換)API クライアント
 # =============================================================================
-# ChatGPT(OpenAI互換)API クライアント(アプリ共通。週報の文章整形・スキルテストの問題作成で使用)。
+# ChatGPT(OpenAI互換)API クライアント(アプリ共通。週報の文章整形・スキルテストの問題作成・
+# スキルの説明の下書き・AI分析で使用)。
 #
 # どの機能からも ai_chat() で使う(機能ごとに接続部分を持たない)。
 #
@@ -2386,7 +2391,7 @@ class SkillTestAnswer(db.Model):
 #   AI_TIMEOUT  : タイムアウト(秒)
 # AI_API_KEY と AI_API_URL がどちらも空なら機能は自動的に無効(ai_is_configured() が False)
 # になり、呼び出し側はAIを使わない動きになる(週報はルールベースの文章、
-# スキルテストは問題プールにある問題だけで出題)。
+# スキルテストは問題プールにある問題だけで出題、AI分析はコードの集計とルールの推奨アクションだけ)。
 # APIキーは画面・ログ・エラーメッセージのどこにも表示しない。
 
 AI_DEFAULT_API_URL = "https://api.openai.com/v1/chat/completions"
@@ -9689,9 +9694,11 @@ def admin_settings():
 #   推奨アクション   マネージャーが今やること(5〜10件。優先度の高い順)
 #
 # 数値・一覧はすべてコード(この章)で計算する。AI には数値を計算・創作させない。
-# AI(課題の抽出・コメントへの対応の判定・あいまいさの判定・書き直し案・所見・まとめ)は、
-# collect_analysis() の戻り値(下の「集計結果の形」)を材料にする。AI が未設定・失敗のときも、
-# コードの集計とルールによる推奨アクションはそのまま表示する。
+# AI(課題の抽出・コメントへの対応の判定・あいまいさの判定・書き直し案・所見・まとめ・推奨アクション)は、
+# collect_analysis() の戻り値(下の「集計結果の形」)と、タスク・コメントなどの本文すべてを材料にする(9-5)。
+# 画面を開くとコードの集計がすぐに表示され、「AIで分析」は別スレッドで実行して instance/ai_analysis.json に
+# 最新の1回分だけを保存する(9-7)。AI が未設定・失敗のときも、コードの集計とルールによる推奨アクションは
+# そのまま表示する。
 #
 # 期間:
 #   「期間内」  画面で選ぶ(直近 7/14/30/90 日、または日付の範囲。既定は直近30日。両端の日を含む)
@@ -9702,11 +9709,16 @@ def admin_settings():
 # チームの件数は、担当者のいないタスク・マネージャーだけが担当のタスクも含めて1件ずつ数える。
 # DB は読み取りのみ(テーブルは追加・変更しない)。
 #
-#   9-1 設定             しきい値 N1/N2(instance/ai_analysis_settings.json。システム設定の「AI分析」タブ)
+#   9-1 設定             しきい値 N1/N2・1回に送る材料の文字数(instance/ai_analysis_settings.json。
+#                        システム設定の「AI分析」タブ)
 #   9-2 期間と材料       期間の解釈、タスク・コメント・状態の変更の読み込み
 #   9-3 集計(①〜④)     コードで計算する数値・一覧・ルールによる確認
 #   9-4 推奨アクション   ルールによる推奨アクション
-#   9-5 画面             GET /manager/analysis
+#   9-5 AIに送る材料     本文のテキスト化と分割(各人 → スキル → チーム)
+#   9-6 応答の検証       JSON・ID・数値(材料に無い数値は ◯)の確認
+#   9-7 実行と保存       別スレッドでの実行・実行中の状態・instance/ai_analysis.json
+#   9-8 結果の反映       保存した結果を集計結果に ID で結び付ける
+#   9-9 画面             GET /manager/analysis・POST /manager/analysis/run・GET /manager/analysis/status
 #
 # 集計結果の形(collect_analysis の戻り値。日付・日時は date / datetime のまま):
 #   now, period(9-2), settings(9-1), members [{id, name}]
@@ -9718,17 +9730,23 @@ def admin_settings():
 #   outputs       ③ {tasks, rewrite, problem_counts, rows, team, lead_time}
 #   abilities     ④ {rows, progress_rewrite}
 #   actions       推奨アクション [{rank, category, title, target, reason, numbers, score}]
-# AI の結果を入れる欄(ai / suggestion)は None にしてある(AI の処理で埋める)。
+# AI の結果を入れる欄(ai / suggestion)は None にしてある(保存した AI の結果を 9-8 で反映する)。
+# 反映すると、次の欄が加わる: progress.issues_ai(課題・相談)、manager_comments の ai・ai_acks・counts・rows、
+# outputs の ai・suggestion(指摘に「あいまい（AI判定）」)、abilities の ai(所見)・ai_notes、skills.ai、
+# ai_other_notes(担当者のいないタスクを読んだ結果)、ai_summary(①〜④のまとめ)、ai_actions(AI の推奨アクション)。
+# actions は反映後の集計で選び直す。
 
 
 # =============================================================================
 # 9-1. AI分析: 設定(しきい値)
 # =============================================================================
-# AI分析のしきい値(営業日)。システム設定の「AI分析」タブで変更し、instance/ai_analysis_settings.json
+# AI分析の設定。システム設定の「AI分析」タブで変更し、instance/ai_analysis_settings.json
 # に保存する(DB には保存しない。読み書きは 2-3 の共通部品)。
 #   due_soon_days (N1) : 期限まで残りこの営業日数以内なのに「未着手」のタスクを「期限が近いのに未着手」にする
 #   stale_days    (N2) : 「進行中」で、担当者の最後の進捗記載からこの営業日数以上たったタスクを
 #                        「進行中なのに記載がない」にする
+#   chunk_chars        : AI に1回で送る材料(タスクの全文など)の最大文字数。これより長い材料は
+#                        タスクのまとまりごとに分けて複数回で送る(省略はしない。9-5)
 # ファイルが無い・読み込めない場合は既定値を使う(読み込めないファイルは上書きしない)。
 
 AI_ANALYSIS_SETTINGS_FILENAME = "ai_analysis_settings.json"
@@ -9738,10 +9756,12 @@ AI_ANALYSIS_SAVED_MESSAGE = "AI分析の設定を保存しました。"
 
 DUE_SOON_DAYS_MIN, DUE_SOON_DAYS_MAX = 1, 30
 STALE_DAYS_MIN, STALE_DAYS_MAX = 1, 60
+CHUNK_CHARS_MIN, CHUNK_CHARS_MAX = 2000, 100000
 
 AI_ANALYSIS_DEFAULTS = {
     "due_soon_days": 5,
     "stale_days": 10,
+    "chunk_chars": 12000,
 }
 
 # (キー, 表示名, 最小, 最大, 説明)。画面の入力チェックと読み込み時の検証に使う
@@ -9752,6 +9772,13 @@ AI_ANALYSIS_FIELDS = (
      "「進行中」のタスクで、担当者の最後の進捗記載（記載が無ければ進行中にした日）からこの営業日数以上たったものを"
      "「進行中なのに記載がない」にします。"),
 )
+# AI への送信の設定(画面では「AIへの送信」の欄に表示する。形は AI_ANALYSIS_FIELDS と同じ)
+AI_ANALYSIS_SEND_FIELDS = (
+    ("chunk_chars", "1回に送る材料の最大文字数", CHUNK_CHARS_MIN, CHUNK_CHARS_MAX,
+     "1人分の材料（タスクの説明・すべてのコメントなど）がこれより長いときは、タスクのまとまりごとに分けて"
+     "複数回で送ります（省略はしません）。接続先のAIが一度に受け取れる量が少ないときは小さくします。"),
+)
+_AI_ANALYSIS_ALL_FIELDS = AI_ANALYSIS_FIELDS + AI_ANALYSIS_SEND_FIELDS
 
 _ai_analysis_settings_lock = threading.RLock()
 
@@ -9765,7 +9792,7 @@ def _normalize_ai_analysis_settings(data):
     result = dict(AI_ANALYSIS_DEFAULTS)
     if not isinstance(data, dict):
         return result
-    for key, _label, low, high, _help in AI_ANALYSIS_FIELDS:
+    for key, _label, low, high, _help in _AI_ANALYSIS_ALL_FIELDS:
         if valid_int(data.get(key), low, high):
             result[key] = data[key]
     return result
@@ -9790,7 +9817,7 @@ def save_ai_analysis_settings(values):
     with _ai_analysis_settings_lock:
         current = _normalize_ai_analysis_settings(
             read_json(_ai_analysis_settings_path(), AI_ANALYSIS_SETTINGS_LABEL))
-        for key, _label, _low, _high, _help in AI_ANALYSIS_FIELDS:
+        for key, _label, _low, _high, _help in _AI_ANALYSIS_ALL_FIELDS:
             if key in values:
                 current[key] = values[key]
         data = _normalize_ai_analysis_settings(current)
@@ -9802,7 +9829,7 @@ def parse_ai_analysis_form(form):
     """フォームの入力を検証する。戻り値: (values, errors)。errors が空なら保存してよい。"""
     errors = []
     values = {}
-    for key, label, low, high, _help in AI_ANALYSIS_FIELDS:
+    for key, label, low, high, _help in _AI_ANALYSIS_ALL_FIELDS:
         value = _number(form, key)
         if valid_int(value, low, high):
             values[key] = value
@@ -9812,14 +9839,17 @@ def parse_ai_analysis_form(form):
 
 
 def ai_analysis_form_context(settings):
-    """AI分析の設定フォームの表示に使う値。"""
-    return {
-        "settings": settings,
-        "fields": [
+    """AI分析の設定フォームの表示に使う値(fields: しきい値、send_fields: AIへの送信)。"""
+    def view(fields):
+        return [
             {"key": key, "label": label, "min": low, "max": high, "help": help_text,
              "default": AI_ANALYSIS_DEFAULTS[key]}
-            for key, label, low, high, help_text in AI_ANALYSIS_FIELDS
-        ],
+            for key, label, low, high, help_text in fields
+        ]
+    return {
+        "settings": settings,
+        "fields": view(AI_ANALYSIS_FIELDS),
+        "send_fields": view(AI_ANALYSIS_SEND_FIELDS),
     }
 
 
@@ -10034,8 +10064,16 @@ CONCENTRATION_SHARE = 0.5
 MC_NO_REPLY = "返信なし"
 MC_REPLIED = "返信あり"
 MC_ACK = "対応不要"
+MC_DONE = "対応済み"
+MC_PARTIAL = "一部対応"
+MC_NOT_DONE = "未対応"
+MC_AI_JUDGEMENTS = (MC_DONE, MC_PARTIAL, MC_NOT_DONE)
+MC_ACK_AI = "対応不要（AI判定）"   # 指示・質問・依頼を含まないと AI が判定したもの(数から除く)
+MC_UNJUDGED = "未判定"             # 返信はあるが AI の判定が無い(AI 未実行・未読込・判定なし)
+# 要フォローにする判定(返信なしと、AI が未対応・一部対応と判定したもの)
+MC_FOLLOW = (MC_NO_REPLY, MC_NOT_DONE, MC_PARTIAL)
 
-# 成果の確認の指摘の種類(表示順)。AI のあいまいさの判定は "vague" として加える
+# 成果の確認の指摘の種類(表示順)。AI のあいまいさの判定は "vague" として加える(9-8)
 OUTCOME_PROBLEM_LABELS = {
     "empty_actual": "実績が空",
     "no_unit": "単位がない",
@@ -10043,6 +10081,8 @@ OUTCOME_PROBLEM_LABELS = {
     "big_gap": "見込みとの差が大きい",
     "too_short": "記載が短い",
 }
+OUTCOME_VAGUE = "vague"
+OUTCOME_VAGUE_LABEL = "あいまい（AI判定）"
 
 # あいさつ・お礼・了解だけのコメント(返信を求めていないので「対応不要」)
 _ACK_PHRASES = (
@@ -10207,6 +10247,8 @@ def _manager_comments(tasks, period, now):
                 # 返信までの営業日数 / 返信が無いときは今までの経過営業日数
                 response_days=business_days_ago(c["at"], replies[0]["at"]) if replies else None,
                 elapsed_days=None if replies else business_days_ago(c["at"], now),
+                # 書かれてから今までの営業日数(返信の有無にかかわらず。要フォローの並べ替えに使う)
+                age_days=business_days_ago(c["at"], now),
                 later_comment_ids=[x["id"] for x in later],
                 later_changes=[ch for ch in t["changes"] if ch["at"] and c["at"] and ch["at"] > c["at"]],
                 judgement=MC_REPLIED if replies else MC_NO_REPLY,
@@ -10607,13 +10649,30 @@ def _outputs_section(tasks, members, period):
             suggestion=None,
         ))
     rows.sort(key=lambda r: r["completed_at"] or datetime.min, reverse=True)
+    result = {
+        "tasks": rows,
+        "gap_low": round(OUTCOME_GAP_LOW * 100),
+        "gap_high": round(OUTCOME_GAP_HIGH * 100),
+    }
+    result.update(outputs_summary(rows, [{"id": u.id, "name": u.display_name} for u in members],
+                                  OUTCOME_PROBLEM_LABELS))
+    return result
+
+
+def outputs_summary(rows, members, labels):
+    """③ の書き直し推奨・指摘の種類ごとの件数・成果の合計・リードタイム(チームとヒト別)。
+
+    rows は _outputs_section の行、members は [{id, name}]、labels は指摘の種類 {コード: 表示名}。
+    AI の判定(あいまい)を反映した後にも呼び直す(9-8)。
+    """
     rewrite = [r for r in rows if r["problems"]]
 
     def problem_counts(items):
-        counts = {code: 0 for code in OUTCOME_PROBLEM_LABELS}
+        counts = {code: 0 for code in labels}
         for item in items:
             for code in {p["code"] for p in item["problems"]}:
-                counts[code] += 1
+                if code in counts:
+                    counts[code] += 1
         return counts
 
     def summary(items, share):
@@ -10631,18 +10690,15 @@ def _outputs_section(tasks, members, period):
 
     # ヒト別は担当者の数で均等割り(成果の集計(5-7)と同じ)。チームは1件ずつ
     person_rows = []
-    for u in members:
-        mine = [r for r in rows if u.id in r["assignee_ids"]]
+    for m in members:
+        mine = [r for r in rows if m["id"] in r["assignee_ids"]]
         person_rows.append(dict(summary(mine, lambda r: len(r["assignee_ids"]) or 1),
-                                user_id=u.id, name=u.display_name))
+                                user_id=m["id"], name=m["name"]))
     return {
-        "tasks": rows,
         "rewrite": rewrite,
-        "problem_labels": OUTCOME_PROBLEM_LABELS,
+        "problem_labels": labels,
         "rows": person_rows,
         "team": summary(rows, lambda r: 1),
-        "gap_low": round(OUTCOME_GAP_LOW * 100),
-        "gap_high": round(OUTCOME_GAP_HIGH * 100),
     }
 
 
@@ -10802,6 +10858,8 @@ ACTION_CATEGORY_LABELS = {
     "outcome": "成果の書き方",
     "progress_writing": "進捗の書き方",
     "skilltest": "スキルテスト",
+    # AI が候補に無いものを加えたとき(9-6)
+    "other": "そのほか",
 }
 
 
@@ -10843,6 +10901,21 @@ def _action_candidates(data):
              "最後の進捗記載: {}".format(last["at"].strftime("%m/%d") if last else "なし")])
     for item in progress["manager_comments"]["follow"]:
         if not item["is_open"]:
+            continue
+        if item["replied"]:
+            # 返信はあるが、AI が「未対応」「一部対応」と判定したもの(9-8 で要フォローに入る)
+            ai = item.get("ai") or {}
+            rest = one_line(ai.get("remaining") or ai.get("request") or "", 40)
+            add("manager_comment", (78 if item["judgement"] == MC_NOT_DONE else 74)
+                + min(item["age_days"] or 0, 20) / 2.0,
+                _ask(item, "と、コメントで求めた対応{}の進め方を確認する".format(
+                    "（{}）".format(rest) if rest else ""), "担当者を決めて、コメントへの対応を依頼する"),
+                _task_target(item),
+                "{} {}さんのコメント「{}」への対応が「{}」（AIの判定）。".format(
+                    item["at"].strftime("%m/%d"), item["author"], one_line(item["body"], 40),
+                    item["judgement"]),
+                ["コメントから {}営業日".format(item["age_days"]), "判定 {}".format(item["judgement"]),
+                 "状態 {}".format(item["status"])])
             continue
         add("manager_comment", 80 + min(item["elapsed_days"] or 0, 20) / 2.0,
             _ask(item, "に、コメントへの返信・対応を確認する", "担当者を決めて、コメントへの対応を依頼する"),
@@ -10970,11 +11043,1556 @@ def rule_actions(data):
 
 
 # =============================================================================
-# 9-5. AI分析: 画面
+# 9-5. AI分析: AIに送る材料(テキスト)と分割
 # =============================================================================
-# GET /manager/analysis   コードの集計(①〜④)とルールによる推奨アクションをすぐに表示する。
-#                         期間は ?period=7|14|30|90(既定 30)または ?period=range&from=...&to=...
+# AI には件数だけでなく本文をすべて渡す(タスクのタイトル・説明、すべてのコメント〔記載者・日時〕、
+# 状態の変更、成果、スキル、スキルテストの受験の内容)。数値はコードで計算したものを【数値】として渡し、
+# AI には計算・創作させない(応答に材料に無い数値があれば「◯」に置き換える。9-6)。
+#
+# AI を呼ぶ単位(この順に呼ぶ):
+#   1. 各人         その人に関係するタスク(collect_analysis の person_task_ids)の全文と、その人の数値。
+#                   1回の材料は設定 chunk_chars 文字まで。長いときはタスクのまとまりごとに複数回に分ける。
+#                   1件のタスクが長すぎるときは見出しを繰り返してコメントの区切りで分け、1件のコメントが
+#                   長すぎるときは本文を分ける(どちらも省略しない)。
+#                   1回で読めたときはその呼び出しで所見も作り、分けたときは最後に所見だけを作る呼び出しを加える。
+#   2. 担当者なし   メンバーのだれにも関係しないタスク(担当者がいない・マネージャーだけが担当)。所見は作らない
+#   3. スキル       スキルの偏り・メンバーごとのスキルの分布とスキルテストの受験の内容(長いときは分ける)
+#   4. チーム       ①〜④の数値・各人の所見・スキルのまとめ・ルールの推奨アクションの候補
+#                   → 観点ごとのまとめと推奨アクション
+# 判定を頼む項目(課題の抽出・マネージャーのコメント・成果・進捗記載)は、重複しないよう1つの呼び出しだけで頼む
+# (複数担当のタスクは表示名順で最初の担当者の呼び出し。進捗記載は書いた本人の呼び出し)。
+
+ANALYSIS_GROUP_OTHER = "other"
+ANALYSIS_OTHER_LABEL = "担当者のいないタスク（マネージャーだけが担当のものを含む）"
+# チームのまとめに渡す推奨アクションの候補の数の上限(点数の高い順。残りの件数は材料に書く)
+ACTION_CANDIDATES_FOR_AI = 40
+
+# 依頼文の「■種類」(AI の応答の種類の確認・動作確認の差し替えで使う)
+AI_KIND_PERSON = "各人の材料"
+AI_KIND_FINDINGS = "各人の所見"
+AI_KIND_SKILLS = "スキル状況"
+AI_KIND_TEAM = "チームのまとめ"
+
+
+def _fmt_dt(value):
+    return value.strftime("%Y/%m/%d %H:%M") if value else "―"
+
+
+def _fmt_d(value):
+    return value.strftime("%Y/%m/%d") if value else "―"
+
+
+def _indent(text):
+    """本文を字下げする(改行はそのまま。空なら「（空）」)。"""
+    body = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not body:
+        return "  （空）"
+    return "\n".join("  " + line for line in body.split("\n"))
+
+
+def _author_role(c):
+    if c["author_is_manager"] and c["author_is_assignee"]:
+        return "マネージャー・担当者"
+    if c["author_is_manager"]:
+        return "マネージャー"
+    if c["author_is_assignee"]:
+        return "担当者"
+    return "担当外"
+
+
+def _analysis_task_facts(data):
+    """タスクごとの、コードで計算した値(材料の「アプリの計算」の行)。{タスクID: [文]}"""
+    facts = {}
+
+    def add(task_id, text):
+        facts.setdefault(task_id, []).append(text)
+
+    p = data["progress"]
+    for r in p["overdue"]:
+        add(r["task_id"], "期限超過 {}営業日".format(r["overdue_days"]))
+    for r in p["due_soon"]:
+        add(r["task_id"], "期限まで残り{}営業日なのに未着手".format(r["days_left"]))
+    for r in p["stale"]:
+        add(r["task_id"], "進行中なのに{}から{}営業日記載なし".format(r["basis"], r["elapsed_days"]))
+    for r in p["hold"]:
+        if r["hold_days"] is not None:
+            add(r["task_id"], "保留 {}営業日{}".format(r["hold_days"], "（推定）" if r["since_estimated"] else ""))
+    for r in data["outputs"]["tasks"]:
+        lt = r["lead_time"]
+        if lt:
+            add(r["task_id"], "リードタイム（着手→完了）{}日{}{}".format(
+                lt["days"], "（規模の目安 {}日）".format(lt["target_days"]) if lt["target_days"] else "",
+                "（推定）" if lt["estimated"] else ""))
+    return facts
+
+
+def _part(text, comment_id=None, outcome=False):
+    return {"text": text, "comment_id": comment_id, "outcome": outcome}
+
+
+def task_parts(t, facts):
+    """1件のタスクの材料を、分けられる部品のリストにする(最初の部品は見出し)。
+
+    部品: {"text", "comment_id"(コメントの部品だけ), "outcome"(成果の部品か)}
+    """
+    info = ["状態: {}".format(t["status"]), "担当: {}".format(t["assignee_names"] or "なし"),
+            "優先度: {}".format(t["priority"] or "―")]
+    if t["scale_label"]:
+        info.append("規模: {}{}".format(
+            t["scale_label"], "（目安{}日）".format(t["scale_days"]) if t["scale_days"] else ""))
+    info += ["開始: {}".format(_fmt_d(t["start_date"])), "期限: {}".format(_fmt_d(t["due_date"])),
+             "登録: {}".format(_fmt_dt(t["created_at"]))]
+    if t["completed_at"] is not None:
+        info.append("完了: {}{}".format(_fmt_dt(t["completed_at"]),
+                                       "（推定）" if t["completed_estimated"] else ""))
+    head = ["=== T{}「{}」 ===".format(t["id"], t["title"]), " ／ ".join(info)]
+    if facts.get(t["id"]):
+        head.append("アプリの計算: " + " ／ ".join(facts[t["id"]]))
+    parts = [_part("\n".join(head))]
+    if t["description"].strip():
+        parts.append(_part("説明:\n" + _indent(t["description"])))
+    changes = sorted((ch for ch in t["changes"] if ch["at"]), key=lambda ch: ch["at"])
+    if changes:
+        parts.append(_part("状態の変更（古い順）: " + "、".join(
+            "{} {}".format(_fmt_dt(ch["at"]), ch["status"]) for ch in changes)))
+    if t["comments"]:
+        parts.append(_part("コメント（古い順・{}件）:".format(len(t["comments"]))))
+        for c in t["comments"]:
+            parts.append(_part("[C{}] {} {}（{}）:\n{}".format(
+                c["id"], _fmt_dt(c["at"]), c["author"], _author_role(c), _indent(c["body"])), comment_id=c["id"]))
+    else:
+        parts.append(_part("コメント: なし"))
+    if not t["is_open"]:
+        o = t["outcome"]
+        parts.append(_part("\n".join([
+            "成果（完了時の記載）:",
+            "  定量 見込み: {} ／ 実績: {}".format(o["quant_estimate_label"] or "未記入",
+                                              o["quant_actual_label"] or "未記入"),
+            "  定量の補足: {}".format(one_line(o["quant_note"], 2000) or "未記入"),
+            "  定性 見込み: {}".format(one_line(o["qual_estimate"], 2000) or "未記入"),
+            "  定性 実績: {}".format(one_line(o["qual_actual"], 2000) or "未記入"),
+        ]), outcome=True))
+    return parts
+
+
+def _split_text(text, size):
+    return [text[i:i + size] for i in range(0, len(text), size)] or [""]
+
+
+def pack_parts(units, budget):
+    """部品のまとまり(units)を、1回 budget 文字以内の材料(chunk)に詰める(省略しない)。
+
+    units: [(キー, 部品のリスト)]。キーはタスクID(スキルの材料ではメンバーIDなど)。
+    1つのまとまりが budget を超えるときは、見出し(最初の部品)を繰り返して部品の区切りで分け、
+    1つの部品が長すぎるときは本文を分ける。
+    戻り値: [{"text", "keys", "comment_ids", "outcome_keys", "comments", "split"}]
+      split: 分けたまとまりの {キー: "k/n"}
+    """
+    chunks = []
+
+    def new_chunk():
+        return {"texts": [], "size": 0, "keys": [], "comment_ids": set(), "outcome_keys": set(), "split": {}}
+
+    def put(chunk, key, parts):
+        text = "\n".join(p["text"] for p in parts)
+        chunk["texts"].append(text)
+        chunk["size"] += len(text) + 2
+        if key not in chunk["keys"]:
+            chunk["keys"].append(key)
+        for p in parts:
+            if p.get("comment_id"):
+                chunk["comment_ids"].add(p["comment_id"])
+            if p.get("outcome"):
+                chunk["outcome_keys"].add(key)
+
+    current = new_chunk()
+    for key, parts in units:
+        size = sum(len(p["text"]) + 1 for p in parts)
+        if size <= budget:
+            if current["texts"] and current["size"] + size + 2 > budget:
+                chunks.append(current)
+                current = new_chunk()
+            put(current, key, parts)
+            continue
+        # 1つで budget を超えるまとまり: 見出しを繰り返して分ける
+        if current["texts"]:
+            chunks.append(current)
+            current = new_chunk()
+        head = parts[0]
+        room = max(budget - len(head["text"]) - 60, 200)
+        pieces = []
+        for p in parts[1:]:
+            if len(p["text"]) + 1 <= room:
+                pieces.append(p)
+                continue
+            segments = _split_text(p["text"], room - 60)
+            for i, segment in enumerate(segments, 1):
+                pieces.append(dict(p, text="（長い記載のため分けて送ります {}/{}）\n{}".format(
+                    i, len(segments), segment)))
+        groups, group, used = [], [], 0
+        for p in pieces:
+            if group and used + len(p["text"]) + 1 > room:
+                groups.append(group)
+                group, used = [], 0
+            group.append(p)
+            used += len(p["text"]) + 1
+        if group or not groups:
+            groups.append(group)
+        for k, group in enumerate(groups, 1):
+            label = dict(head, text="{}\n（長いため分けて送ります {}/{}）".format(head["text"], k, len(groups)))
+            chunk = new_chunk()
+            put(chunk, key, [label] + group)
+            chunk["split"][key] = "{}/{}".format(k, len(groups))
+            chunks.append(chunk)
+    if current["texts"]:
+        chunks.append(current)
+    for chunk in chunks:
+        chunk["text"] = "\n\n".join(chunk.pop("texts"))
+        chunk.pop("size")
+        chunk["comments"] = len(chunk["comment_ids"])
+    return chunks
+
+
+def analysis_groups(data):
+    """AI を呼ぶ単位(各人・担当者なし)と、判定を頼む項目の持ち主。
+
+    戻り値: (groups, owner)
+      groups: [{"key": メンバーID または "other", "name", "label", "task_ids", "progress_ids"}]
+              progress_ids は、その人が期間内に担当タスクへ書いた進捗記載のコメントID
+      owner : {タスクID: 判定を頼む単位の key}
+    """
+    tasks = data["tasks"]
+    period = data["period"]
+    owner = {}
+    for m in data["members"]:
+        for task_id in data["person_task_ids"].get(m["id"], []):
+            owner.setdefault(task_id, m["id"])
+    groups = []
+    for m in data["members"]:
+        task_ids = data["person_task_ids"].get(m["id"], [])
+        groups.append({
+            "key": m["id"],
+            "name": m["name"],
+            "label": "{}さん".format(m["name"]),
+            "task_ids": task_ids,
+            "progress_ids": {c["id"] for task_id in task_ids for c in tasks[task_id]["comments"]
+                             if c["user_id"] == m["id"] and _in_period(c["at"], period)},
+        })
+    other = [task_id for task_id, t in tasks.items()
+             if task_id not in owner and _is_relevant_to_period(t, period)]
+    for task_id in other:
+        owner[task_id] = ANALYSIS_GROUP_OTHER
+    if other:
+        groups.append({"key": ANALYSIS_GROUP_OTHER, "name": "", "label": ANALYSIS_OTHER_LABEL,
+                       "task_ids": other, "progress_ids": set()})
+    return groups, owner
+
+
+def _chunk_items(data, group, chunk, owner):
+    """1回の呼び出しで判定を頼む項目。"""
+    tasks = data["tasks"]
+    mc = {i["comment_id"]: i for i in data["progress"]["manager_comments"]["items"]}
+    outputs = {r["task_id"]: r for r in data["outputs"]["tasks"]}
+    mine = [task_id for task_id in chunk["keys"] if owner.get(task_id) == group["key"]]
+    return {
+        "issues": [task_id for task_id in mine if tasks[task_id]["is_open"]],
+        "mc": [mc[c["id"]] for task_id in mine for c in tasks[task_id]["comments"]
+               if c["id"] in mc and c["id"] in chunk["comment_ids"]],
+        "outcomes": [task_id for task_id in mine
+                     if task_id in outputs and task_id in chunk["outcome_keys"]],
+        "progress": sorted(cid for cid in chunk["comment_ids"] if cid in group["progress_ids"]),
+    }
+
+
+def _note_suffix(count):
+    note = sample_note(count)
+    return "（{}）".format(note) if note and count else ""
+
+
+def person_numbers_text(data, user_id):
+    """1人分の【数値】(すべてアプリが計算した値)。"""
+    def find(rows, key="user_id"):
+        return next((r for r in rows if r[key] == user_id), None)
+
+    period = data["period"]
+    ab = find(data["abilities"]["rows"])
+    pr = find(data["progress"]["rows"])
+    out = find(data["outputs"]["rows"])
+    test = find(data["skills"]["tests"]["rows"])
+    dist = find(data["skills"]["distribution"])
+    lines = ["【数値（アプリが計算。期間内 = {}〜{}・現時点 = {}）】".format(
+        _fmt_d(period["start"]), _fmt_d(period["end"]), _fmt_dt(data["now"]))]
+    if ab:
+        level = ab["load_level"]["label"] if ab["load_level"] else "―"
+        lines.append("・現時点の担当: 進行中 {}件 ／ 未完了 {}件 ／ 負荷 {}h/月（水準 {}。フルタイム {}h/月）".format(
+            ab["doing"], ab["task_open"], ab["load_h"], level, _LOAD_FULL))
+    if pr:
+        lines.append("・現時点の遅れ: 期限超過 {}件 ／ 期限が近いのに未着手 {}件 ／ 進行中なのに記載がない {}件 ／ 保留 {}件".format(
+            pr["overdue"], pr["due_soon"], pr["stale"], pr["hold"]))
+        lines.append("・期間内の進み: 完了 {}件 ／ 着手 {}件".format(pr["done"], pr["started"]))
+    if out:
+        lines.append("・成果（期間内に完了・年換算・複数担当は均等割り）: 金額 {} ￥/年 ／ 時間 {} ｈ/年 ／ "
+                     "ルールで書き直し推奨 {}/{}件".format(_fmt_amount(out["money_act"]), _fmt_amount(out["hour_act"]),
+                                                    out["rewrite"], out["completed"]))
+        lt = out["lead_time"]
+        if lt["count"]:
+            lines.append("・リードタイム（着手→完了の暦日）: 中央値 {}日 ／ 規模の目安の中央値 {} ／ 目安超過 {}/{}件{}".format(
+                lt["median"], "{}日".format(lt["target_median"]) if lt["target_median"] is not None else "―",
+                lt["over"], lt["with_target"], _note_suffix(lt["count"])))
+    if ab:
+        lines.append("・進捗の記載（期間内）: {}件 ／ 期間中に未完了だった担当タスク {}件 ／ 1件1週あたり {}回 ／ "
+                     "ルールで書き直し推奨 {}件".format(
+                         ab["progress_comments"], ab["progress_tasks"],
+                         ab["progress_frequency"] if ab["progress_frequency"] is not None else "―",
+                         ab["progress_vague"]))
+        lines.append("・マネージャーのコメント（期間内に書かれたもの）: {}件 ／ 担当者の返信あり {}件{}".format(
+            ab["mc_total"], ab["mc_replied"], _note_suffix(ab["mc_total"])))
+    if dist:
+        lines.append("・スキル（Lv{}以上の数／項目数）: {}".format(
+            SKILL_PROFICIENT_LEVEL, " ／ ".join("{} {}/{}".format(t, v["proficient"], v["total"])
+                                               for t, v in dist["types"].items())))
+        if dist["strengths"]:
+            lines.append("・得意なスキル: {}".format("、".join(
+                "{} Lv{}".format(s["name"], s["level"]) for s in dist["strengths"])))
+    if test:
+        lines.append("・スキルテスト（期間内）: 受験 {}回 ／ 終了 {}回 ／ 時間切れ・途中で終了 {}回 ／ レベルアップ {}回 ／ "
+                     "離脱が多い（画面から{}回以上離れた）{}回 ／ 最後の受験 {}".format(
+                         test["attempts"], test["finished"], test["expired"], test["level_ups"], BLUR_MANY,
+                         test["many_blur"], _fmt_d(test["last_at"]) if test["last_at"] else "未受験"))
+    return "\n".join(lines)
+
+
+def _items_text(data, group, items):
+    """【判定する項目】の一覧。"""
+    outputs = {r["task_id"]: r for r in data["outputs"]["tasks"]}
+    rule_progress = {i["comment_id"]: i for i in data["abilities"]["progress_rewrite"]}
+    lines = ["【判定する項目】",
+             "課題を抜き出す未完了のタスク: {}".format("、".join("T{}".format(i) for i in items["issues"]) or "なし")]
+    lines.append("マネージャーのコメント:" + ("" if items["mc"] else " なし"))
+    for i in items["mc"]:
+        lines.append("  C{}（T{}・{}）".format(i["comment_id"], i["task_id"], "返信あり" if i["replied"] else "返信なし"))
+    lines.append("成果:" + ("" if items["outcomes"] else " なし"))
+    for task_id in items["outcomes"]:
+        problems = outputs[task_id]["problems"]
+        lines.append("  T{}（{}）".format(task_id, "ルールの指摘: " + "・".join(dict.fromkeys(
+            "{}（{}）".format(p["label"], p["field"]) for p in problems)) if problems else "ルールの指摘なし"))
+    lines.append("進捗記載（{}が期間内に書いたもの）:".format(group["label"]) + ("" if items["progress"] else " なし"))
+    for cid in items["progress"]:
+        rule = rule_progress.get(cid)
+        lines.append("  C{}{}".format(cid, "（ルールの指摘: {}）".format(rule["reason"]) if rule else ""))
+    return "\n".join(lines)
+
+
+ANALYSIS_SYSTEM_PROMPT = """あなたはチームのマネージャーを支援する分析担当です。次のルールを必ず守ってください。
+・【材料】【数値】に書かれた事実だけを使う。書かれていないことは書かない・推測しない。
+・数値は【材料】【数値】に書かれたものだけを使う。新しい数値を計算・創作しない（合計・平均・割合も出さない）。必要な数値が材料に無いときは「◯」と書く。
+・人に順位や点数を付けない。ほかの人と比べない。指導・支援の参考になるように、事実に基づいて具体的に書く。
+・タスク・コメントなどのIDは、材料に書かれたもの（T12・C345・P3 など）をそのまま使う。
+・出力は指定された形のJSONオブジェクトだけにする（前後に説明文やコードブロックを付けない）。"""
+
+REWRITE_RULES = ("書き直し案のルール: そのタスクの材料（タイトル・説明・コメント・成果）に書かれた事実だけを使う。"
+                 "材料に無い数値は「◯」と書き、推測で数値を入れない。担当者が自分で書く文として、そのまま貼り付けられる形で書く。")
+
+FINDINGS_FORMAT = '"findings": {"strengths": ["強み"], "concerns": ["気になる点"], "support": ["支援のポイント"]}'
+FINDINGS_RULES = ("findings: {}の所見。strengths（強み）・concerns（気になる点）・support（マネージャーの支援のポイント）を"
+                  "それぞれ3件まで。【数値】と材料の事実に基づいて書き、順位・点数・ほかの人との比較は書かない。")
+
+
+def _analysis_messages(user_text):
+    return [{"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
+            {"role": "user", "content": user_text}]
+
+
+def person_chunk_messages(data, group, chunk, index, count, items, with_findings):
+    """各人(または担当者なし)の材料1回分の依頼。"""
+    is_person = group["key"] != ANALYSIS_GROUP_OTHER
+    who = group["label"]
+    lines = [
+        "■種類: {}（{} {}/{}）".format(AI_KIND_PERSON, who, index, count),
+        "■依頼",
+        "【材料】は、{}に関係するタスクの全文です（タイトル・説明・状態の変更・すべてのコメント・成果）{}。".format(
+            who, "。数回に分けて送っているうちの{}回目".format(index) if count > 1 else ""),
+        "材料を読み、【判定する項目】について、下の「出力形式」のJSONを返してください。",
+        "1. issues: 「課題を抜き出す未完了のタスク」のコメントから、課題・相談事項（困っていること・判断や支援を求めていること・"
+        "作業が止まっている理由）を抜き出す。kind は「課題」か「相談」。source は根拠のコメントのID。無ければ空の配列。",
+        "2. manager_comments: 「マネージャーのコメント」の各コメントについて、マネージャーが求めたこと（指示・質問・依頼）を request に書く。"
+        "あいさつ・お礼・了解だけで求めていることが無いときは needs_response を false にする。"
+        "「返信あり」のものは、そのコメントより後のコメントと状態の変更だけを根拠に、judgement を「対応済み」「一部対応」「未対応」の"
+        "どれかにし、remaining（まだ残っている対応。対応済みなら空）と evidence（根拠にしたコメントのIDと要点、または状態の変更）を書く。"
+        "「返信なし」のものは judgement を空にし、request だけを書く。",
+        "3. outcomes: 「成果」の各タスクについて、成果の記載があいまい（何をどれだけ変えたか・数値の根拠・効果が読み取れない）かを"
+        " vague（true / false）で判定し、reason に理由を書く。vague が true、またはルールの指摘があるものは、suggestion に書き直し案を"
+        "書く（quant_actual: 定量の実績、quant_note: 定量の補足〔根拠・計算方法〕、qual_actual: 定性の実績。直す必要のない欄は空）。",
+        "4. progress: 「進捗記載」のうち、具体性が低く書き直したほうがよいもの（何をどこまで進めたか・次にやること・困っていることが"
+        "読み取れない）だけを返す。ルールの指摘があるものは必ず返す。reason に理由、suggestion に書き直し案を書く。",
+        "5. notes: このタスク群から分かる、{}の仕事の進め方の特徴（良い点・気になる点）を事実に基づいて3件まで。".format(
+            who if is_person else "チーム"),
+    ]
+    if with_findings:
+        lines.append("6. " + FINDINGS_RULES.format(who))
+    lines += [
+        REWRITE_RULES,
+        "",
+        "■出力形式（JSONオブジェクトだけ）",
+        '{"issues": [{"task": "T12", "kind": "課題か相談", "text": "課題・相談の内容", "source": "C345"}], '
+        '"manager_comments": [{"id": "C345", "request": "求めたこと", "needs_response": true, '
+        '"judgement": "対応済み・一部対応・未対応のどれか（返信なしは空）", "remaining": "残っている対応", '
+        '"evidence": "根拠"}], '
+        '"outcomes": [{"task": "T5", "vague": true, "reason": "理由", '
+        '"suggestion": {"quant_actual": "", "quant_note": "", "qual_actual": ""}}], '
+        '"progress": [{"id": "C346", "reason": "理由", "suggestion": "書き直し案"}], '
+        '"notes": ["特徴"]' + (", " + FINDINGS_FORMAT if with_findings else "") + "}",
+        "",
+    ]
+    if is_person:
+        lines += [person_numbers_text(data, group["key"]), ""]
+    lines += [_items_text(data, group, items), "", "【材料】", chunk["text"] or "（関係するタスクはありません）"]
+    return _analysis_messages("\n".join(lines))
+
+
+def findings_messages(data, group, notes, judged):
+    """各人の所見だけを作る依頼(材料を分けて送ったとき・関係するタスクが無いとき)。"""
+    lines = [
+        "■種類: {}（{}）".format(AI_KIND_FINDINGS, group["label"]),
+        "■依頼",
+        "{}について、【数値】と【材料から分かったこと】（材料を読んだ結果）をもとに findings を返してください。".format(group["label"]),
+        FINDINGS_RULES.format(group["label"]),
+        "",
+        "■出力形式（JSONオブジェクトだけ）",
+        "{" + FINDINGS_FORMAT + "}",
+        "",
+        person_numbers_text(data, group["key"]),
+        "",
+        "【材料から分かったこと】",
+    ]
+    lines += ["・" + n for n in notes] or ["・（関係するタスクの記載はありません）"]
+    if judged:
+        lines += ["", "【AIの判定の件数（アプリが数えた値）】"] + ["・" + j for j in judged]
+    return _analysis_messages("\n".join(lines))
+
+
+def skills_units(data):
+    """スキルの材料の部品(偏りの概要と、メンバーごとの分布・受験の内容)。"""
+    sk = data["skills"]
+    tests = sk["tests"]
+    cc = sk["concentration"]
+    overview = ["=== スキルの偏り（現時点。保有者は Lv{}以上） ===".format(SKILL_PROFICIENT_LEVEL)]
+    overview.append("保有者が1名以下のスキル（{}件）:".format(len(sk["thin_skills"])))
+    for s in sk["thin_skills"]:
+        overview.append("  S{}「{}」（{}）: {}{}".format(
+            s["skill_id"], s["name"], s["skill_type"],
+            "{}さん（Lv{}）だけ".format(s["holders"][0]["name"], s["holders"][0]["level"]) if s["holders"] else "保有者なし",
+            " ／ 必要な業務: {}".format("、".join(s["required_by"])) if s["required_by"] else ""))
+    overview.append("対応できる人が1名以下の業務（{}件）:".format(len(sk["single_operations"])))
+    for o in sk["single_operations"]:
+        overview.append("  O{}「{}」: {}（必要スキル {}件）".format(
+            o["operation_id"], o["name"], "{}さんだけ".format(o["capable"][0]) if o["capable"] else "対応できる人なし",
+            o["req_count"]))
+    if cc["total"]:
+        overview.append("Lv{}以上の保有 合計 {}件: {}{}".format(
+            SKILL_PROFICIENT_LEVEL, cc["total"], "、".join(
+                "{} {}件（{}%）".format(h["name"], h["count"], h["share"]) for h in cc["holdings"]),
+            " → {}さんに{}%が集中（{}%以上）".format(cc["top"]["name"], cc["top_share"], cc["threshold"])
+            if cc["flag"] else ""))
+    overview.append("スキルテストの対象スキル: {}件 ／ 一度も受験していない: {} ／ 期間内に受験していない（以前は受験）: {}".format(
+        tests["testable_count"], "、".join(r["name"] for r in tests["never"]) or "なし",
+        "、".join(r["name"] for r in tests["none_in_period"]) or "なし"))
+    # 1行ずつの部品にする(長いときは行の区切りで分けられるように。最初の行は見出し)
+    units = [("overview", [_part(line) for line in overview])]
+
+    attempts = {}
+    for a in tests["attempts"]:
+        attempts.setdefault(a["user_id"], []).append(a)
+    for d in sk["distribution"]:
+        parts = [_part("=== P{} {} ===\nスキル（区分ごとの Lv{}以上の数／項目数・平均）: {}\n得意なスキル: {}".format(
+            d["user_id"], d["name"], SKILL_PROFICIENT_LEVEL, " ／ ".join(
+                "{} {}/{}（平均 {}）".format(t, v["proficient"], v["total"],
+                                          "Lv{}".format(v["avg"]) if v["avg"] is not None else "―")
+                for t, v in d["types"].items()),
+            "、".join("{} Lv{}".format(s["name"], s["level"]) for s in d["strengths"]) or "なし"))]
+        mine = attempts.get(d["user_id"], [])
+        parts.append(_part("スキルテスト（期間内に始めた受験 {}回）:".format(len(mine)) + ("" if mine else " なし")))
+        for a in mine:
+            levels = "、".join("Lv{} {}/{}{}".format(r.get("level"), r.get("correct"), r.get("total"),
+                                                   "合格" if r.get("passed") else "")
+                               for r in a["level_results"])
+            parts.append(_part("  {} 「{}」 {} ／ 正答 {}/{}（{}%） ／ 判定 Lv{} ／ 到達度 Lv{}→Lv{}{} ／ "
+                               "画面から離れた回数 {}{}".format(
+                                   _fmt_dt(a["started_at"]), a["skill_name"], a["status_label"],
+                                   a["correct"] if a["correct"] is not None else "―",
+                                   a["total"] if a["total"] is not None else "―",
+                                   a["rate"] if a["rate"] is not None else "―",
+                                   a["result_level"] if a["result_level"] is not None else "―",
+                                   a["prev_level"] if a["prev_level"] is not None else "―",
+                                   a["new_level"] if a["new_level"] is not None else "―",
+                                   "（レベルアップ）" if a["level_up"] else "", a["blur_count"],
+                                   " ／ レベル別: " + levels if levels else "")))
+        units.append((d["user_id"], parts))
+    return units
+
+
+def skills_messages(chunk, index, count):
+    lines = [
+        "■種類: {}（{}/{}）".format(AI_KIND_SKILLS, index, count),
+        "■依頼",
+        "【材料】はチームのスキルの状況（偏り・メンバーごとのスキルの分布・期間内のスキルテストの受験の内容）です{}。".format(
+            "。数回に分けて送っているうちの{}回目".format(index) if count > 1 else ""),
+        "マネージャー向けに、summary（スキル状況のまとめ）・tests（スキルテストの受け方・結果で気になること、良いこと）・"
+        "bias（スキルの偏り・育成の優先順位）をそれぞれ3件まで書いてください。",
+        "",
+        "■出力形式（JSONオブジェクトだけ）",
+        '{"summary": ["まとめ"], "tests": ["テストについて"], "bias": ["偏りについて"]}',
+        "",
+        "【材料】",
+        chunk["text"],
+    ]
+    return _analysis_messages("\n".join(lines))
+
+
+def team_material_lines(data, candidates, hidden_candidates):
+    """チームのまとめの材料(AI の判定を反映した集計 data から作る)。"""
+    period = data["period"]
+    p = data["progress"]
+    team = p["team"]
+    mc = p["manager_comments"]
+    lines = [
+        "【期間】期間内 {}〜{}（{}日・営業日 {}日） ／ 現時点 {} ／ 対象メンバー {}名".format(
+            _fmt_d(period["start"]), _fmt_d(period["end"]), period["days"], period["business_days"],
+            _fmt_dt(data["now"]), len(data["members"])),
+        "",
+        "【① タスクの進捗（チーム。複数担当のタスクは1件として数える）】",
+        "・期間内: 完了 {}件 ／ 着手 {}件".format(team["done"], team["started"]),
+        "・現時点: 期限超過 {}件 ／ 期限が近いのに未着手（残り{}営業日以内）{}件 ／ 進行中なのに記載がない（{}営業日以上）{}件 ／ "
+        "保留 {}件".format(team["overdue"], p["due_soon_days"], team["due_soon"], p["stale_days"], team["stale"],
+                         team["hold"]),
+        "・マネージャーのコメント: 対象 {}件 ／ 返信なし {}件 ／ 対応済み {}件 ／ 一部対応 {}件 ／ 未対応 {}件 ／ 未判定 {}件 ／ "
+        "AIが対応不要と判定 {}件".format(
+            mc["total"], mc["counts"][MC_NO_REPLY], mc["counts"][MC_DONE], mc["counts"][MC_PARTIAL],
+            mc["counts"][MC_NOT_DONE], mc["counts"][MC_UNJUDGED], len(mc.get("ai_acks") or [])),
+        "・要フォローのコメント（返信なし・未対応・一部対応）:" + ("" if mc["follow"] else " なし"),
+    ]
+    for i in mc["follow"]:
+        ai = i.get("ai") or {}
+        lines.append("  T{}「{}」（担当 {}）: {} {}さん「{}」 → {}{} ／ コメントから {}営業日".format(
+            i["task_id"], i["title"], i["assignee_names"] or "なし", i["at"].strftime("%m/%d"), i["author"],
+            one_line(i["body"], 80), i["judgement"],
+            "（残っている対応: {}）".format(one_line(ai.get("remaining"), 80)) if ai.get("remaining") else "",
+            i["age_days"]))
+    lines.append("・課題・相談（AIが未完了のタスクのコメントから抽出）:" + ("" if p.get("issues_ai") else " なし"))
+    for i in p.get("issues_ai") or []:
+        lines.append("  T{}「{}」（担当 {}）: [{}] {}".format(
+            i["task_id"], i["title"], i["assignee_names"] or "なし", i["kind"], one_line(i["text"], 120)))
+    for text in data.get("ai_other_notes") or []:
+        lines.append("・担当者のいないタスクについて（材料から分かったこと）: {}".format(text))
+    lines.append("・保留中:" + ("" if p["hold"] else " なし"))
+    for r in p["hold"]:
+        lines.append("  T{}「{}」（担当 {}）: 保留 {}営業日".format(
+            r["task_id"], r["title"], r["assignee_names"] or "なし",
+            r["hold_days"] if r["hold_days"] is not None else "―"))
+
+    sk = data["skills"]
+    ts = sk["tests"]
+    lines += [
+        "",
+        "【② スキル状況】",
+        "・スキルテスト（期間内）: 受験 {}回 ／ 終了 {}回 ／ 時間切れ・途中で終了 {}回 ／ レベルアップ {}回 ／ 離脱が多い {}回".format(
+            ts["team"]["attempts"], ts["team"]["finished"], ts["team"]["expired"], ts["team"]["level_ups"],
+            ts["team"]["many_blur"]),
+        "・一度も受験していない: {} ／ 期間内に受験していない: {}".format(
+            "、".join(r["name"] for r in ts["never"]) or "なし",
+            "、".join(r["name"] for r in ts["none_in_period"]) or "なし"),
+        "・保有者が1名以下のスキル {}件 ／ 対応できる人が1名以下の業務 {}件{}".format(
+            len(sk["thin_skills"]), len(sk["single_operations"]),
+            " ／ {}さんにLv{}以上の保有の{}%が集中".format(
+                sk["concentration"]["top"]["name"], SKILL_PROFICIENT_LEVEL, sk["concentration"]["top_share"])
+            if sk["concentration"]["flag"] else ""),
+    ]
+    sai = sk.get("ai") or {}
+    for key, label in SKILLS_AI_KEYS:
+        for text in sai.get(key) or []:
+            lines.append("・AIのまとめ（{}）: {}".format(label, text))
+
+    o = data["outputs"]
+    t = o["team"]
+    lt = t["lead_time"]
+    lines += [
+        "",
+        "【③ 成果物の状況（期間内に完了したタスク）】",
+        "・完了 {}件 ／ 書き直し推奨 {}件（{}）".format(t["completed"], t["rewrite"], " ／ ".join(
+            "{} {}件".format(label, t["problems"].get(code, 0)) for code, label in o["problem_labels"].items())),
+        "・成果の実績（年換算）: 金額 {} ￥/年 ／ 時間 {} ｈ/年（見込み: 金額 {} ￥/年 ／ 時間 {} ｈ/年）".format(
+            _fmt_amount(t["money_act"]), _fmt_amount(t["hour_act"]),
+            _fmt_amount(t["money_est"]), _fmt_amount(t["hour_est"])),
+        "・リードタイム（着手→完了の暦日）: 中央値 {} ／ 規模の目安の中央値 {} ／ 目安超過 {}/{}件 ／ 推定を含む {}件{}".format(
+            "{}日".format(lt["median"]) if lt["median"] is not None else "―",
+            "{}日".format(lt["target_median"]) if lt["target_median"] is not None else "―",
+            lt["over"], lt["with_target"], lt["estimated"], _note_suffix(lt["count"])),
+    ]
+
+    lines += ["", "【④ 各人（表示名順。順位・点数ではなく指導の参考）】"]
+    for row in data["abilities"]["rows"]:
+        lines.append("■ P{} {}".format(row["user_id"], row["name"]))
+        lines.append(person_numbers_text(data, row["user_id"]).split("\n", 1)[-1])
+        findings = row.get("ai") or {}
+        for key, label in FINDING_KEYS:
+            for text in findings.get(key) or []:
+                lines.append("・AIの所見（{}）: {}".format(label, text))
+        for text in row.get("ai_notes") or []:
+            lines.append("・材料から分かったこと: {}".format(text))
+
+    lines += ["", "【推奨アクションの候補（アプリのルールで抽出。点数の高い順）】"]
+    for ref, c in candidates:
+        lines.append("{} [{}] {} ／ 対象: {} ／ 理由: {} ／ 根拠: {}".format(
+            ref, c["category_label"], c["title"], _target_text(c["target"]), c["reason"], "、".join(c["numbers"])))
+    if hidden_candidates:
+        lines.append("（ほかに点数の低い候補が {}件あります）".format(hidden_candidates))
+
+    lines += ["", "【対象のID】",
+              "メンバー: " + ("、".join("P{} {}".format(m["id"], m["name"]) for m in data["members"]) or "なし"),
+              "スキル: " + ("、".join("S{} {}".format(s["skill_id"], s["name"]) for s in sk["skills"]) or "なし"),
+              "業務: " + ("、".join("O{} {}".format(op["operation_id"], op["name"]) for op in sk["operations"])
+                        or "なし"),
+              "タスク: 【① タスクの進捗】【推奨アクションの候補】などに書かれた T の付いたID"]
+    return lines
+
+
+def _target_text(target):
+    kind = target.get("kind")
+    prefix = {"task": "T", "person": "P", "skill": "S", "operation": "O"}.get(kind)
+    if prefix and target.get("id") is not None:
+        return "{}{}「{}」".format(prefix, target["id"], target.get("label") or "")
+    return target.get("label") or ""
+
+
+def team_messages(data, candidates, hidden_candidates):
+    lines = [
+        "■種類: {}".format(AI_KIND_TEAM),
+        "■依頼",
+        "【材料】は、チームの状況をアプリが集計した数値と、各人の材料を読んだ結果（AIの所見・判定）です。",
+        "1. summary: ①〜④ のそれぞれについて、マネージャー向けのまとめを3件まで書く"
+        "（progress: ① タスクの進捗、skills: ② スキル状況、outputs: ③ 成果物の状況、abilities: ④ 各人の能力）。",
+        "2. actions: マネージャーがいま行うことを、優先度の高い順に{}〜{}件。【推奨アクションの候補】から選ぶときは ref に候補のID"
+        "（A1 など）を書く。候補に無いことを加えるときは ref を空にし、target に対象のID（T12・P3・S5・O2 のどれか）を書く。"
+        "title（やること）・reason（理由）・numbers（根拠の数値。【材料】に書かれた数値をそのまま使う）を書く。".format(
+            ACTION_MIN, ACTION_MAX),
+        "",
+        "■出力形式（JSONオブジェクトだけ）",
+        '{"summary": {"progress": ["まとめ"], "skills": ["まとめ"], "outputs": ["まとめ"], "abilities": ["まとめ"]}, '
+        '"actions": [{"ref": "A1", "target": "", "title": "やること", "reason": "理由", "numbers": ["根拠の数値"]}]}',
+        "",
+        "【材料】",
+    ] + team_material_lines(data, candidates, hidden_candidates)
+    return _analysis_messages("\n".join(lines))
+
+
+# =============================================================================
+# 9-6. AI分析: AIの応答の検証
+# =============================================================================
+# AI の応答は JSON として読み、形・ID・選択肢を確かめてから使う(合わないものは捨てる)。
+#   - ID は、その呼び出しで判定を頼んだ項目のものだけを受け付ける
+#   - 文は長さを制限し、制御文字を除く
+#   - 材料に無い数値は「◯」に置き換える(AI に数値を創作させない。置き換えた数を結果に残す)。
+#     書き直し案・課題・コメントの判定は、そのタスクの材料にある数値だけを使ってよい
+#   - 推奨アクションの対象は、候補(ref)か、実在するタスク・メンバー・スキル・業務の ID だけ。
+#     根拠の数値は材料にある数値だけ(無ければ候補・対象のコードの数値を使う)。5件に満たなければ
+#     ルールの推奨アクションで補う
+
+AI_TEXT_MAX = 400
+AI_SUGGESTION_MAX = 1500
+AI_LIST_MAX = 5
+ISSUE_KINDS = ("課題", "相談")
+FINDING_KEYS = (("strengths", "強み"), ("concerns", "気になる点"), ("support", "支援のポイント"))
+SKILLS_AI_KEYS = (("summary", "まとめ"), ("tests", "スキルテスト"), ("bias", "偏り"))
+SUMMARY_KEYS = (("progress", "① タスクの進捗"), ("skills", "② スキル状況"),
+                ("outputs", "③ 成果物の状況"), ("abilities", "④ 各人の能力"))
+OUTCOME_SUGGESTION_FIELDS = (("quant_actual", "成果（定量）の実績"), ("quant_note", "成果（定量）の補足"),
+                             ("qual_actual", "成果（定性）の実績"))
+
+_AI_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_NUMBER = re.compile(r"[0-9０-９]+(?:[.,．，][0-9０-９]+)*")
+
+
+def _extract_json_object(text):
+    """AI の応答から JSON のオブジェクトを取り出す(コードブロックや前後の文章があっても読む)。"""
+    body = str(text or "").strip()
+    fence = re.match(r"^```[A-Za-z0-9_-]*\s*\n?(.*?)\n?```\s*$", body, re.DOTALL)
+    if fence:
+        body = fence.group(1).strip()
+    try:
+        data = json.loads(body)
+    except ValueError:
+        start, end = body.find("{"), body.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            data = json.loads(body[start:end + 1])
+        except ValueError:
+            return None
+    return data if isinstance(data, dict) else None
+
+
+def _norm_number(text):
+    """数値の表記をそろえる(全角→半角・桁区切りを除く・先頭と小数の末尾の0を除く)。"""
+    s = unicodedata.normalize("NFKC", text).replace(",", "")
+    whole, _dot, frac = s.partition(".")
+    whole = whole.lstrip("0") or "0"
+    frac = frac.rstrip("0")
+    return whole + ("." + frac if frac else "")
+
+
+def numbers_in(text):
+    """文に含まれる数値(そろえた表記)の集合。"""
+    return {_norm_number(m) for m in _NUMBER.findall(str(text or ""))}
+
+
+def mask_numbers(text, allowed):
+    """allowed に無い数値を「◯」に置き換える。戻り値: (置き換えた文, 置き換えた数)。"""
+    count = [0]
+
+    def replace(match):
+        if _norm_number(match.group(0)) in allowed:
+            return match.group(0)
+        count[0] += 1
+        return "◯"
+
+    return _NUMBER.sub(replace, str(text or "")), count[0]
+
+
+def _ai_text(value, limit=AI_TEXT_MAX):
+    """AI の応答の文(文字列だけ)。制御文字を除き、長ければ切る。"""
+    if not isinstance(value, str):
+        return ""
+    text = _AI_CONTROL.sub("", value.replace("\r\n", "\n").replace("\r", "\n"))
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if len(text) > limit:
+        text = text[:limit - 1].rstrip() + "…"
+    return text
+
+
+def _ai_dicts(value):
+    return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
+
+
+def parse_ref(value, prefix):
+    """「T12」「C345」のような ID(数字だけも可)を数にする。読めなければ None。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    text = unicodedata.normalize("NFKC", str(value or "")).strip().upper()
+    match = re.fullmatch(re.escape(prefix) + r"?\s*(\d+)", text)
+    return int(match.group(1)) if match else None
+
+
+# =============================================================================
+# 9-7. AI分析: 実行(バックグラウンド)と保存
+# =============================================================================
+# 「AIで分析」(POST /manager/analysis/run)で別スレッドの実行を始める(同時に1つだけ)。
+# 画面は実行中の表示(GET /manager/analysis/status を数秒ごとに確認し、終わったら再読み込み)。
+# 結果は instance/ai_analysis.json に最新の1回分だけを上書きで保存する(DB には保存しない)。
+# AI の呼び出しが1回も成功しなかったときは保存せず(前の結果を残す)、失敗の理由を画面に表示する。
+# 1回の呼び出しが失敗しても残りは続け、読めなかった材料は「未読込」として結果に残す。
+# 同じ理由で続けて失敗する(接続できない・タイムアウトなど)ときは、ANALYSIS_MAX_FAILURES 回で残りを中止する。
+#
+# 保存する結果の形(JSON。ID のキーは文字列):
+#   version, generated_at(基準の日時), finished_at, period {kind, start, end, label}, settings, model,
+#   status("ok" / "partial"), calls {total, ok, failed}, errors [未読込のほかの注意の文], masked_numbers(◯にした数),
+#   read {task_ids, comments}, unread {count, task_ids, comments, parts [{label, reason, tasks, comments}]},
+#   issues [{task_id, kind, text, source}], manager_comments {コメントID: {request, needs_response, judgement,
+#   remaining, evidence}}, outcomes {タスクID: {vague, reason, suggestion}}, progress_comments {コメントID:
+#   {reason, suggestion, rule}}, persons {メンバーID: {notes, findings}}, other_notes, skills {summary, tests, bias},
+#   team {summary}, actions [推奨アクション], actions_source("ai" / "rule")
+
+AI_ANALYSIS_RESULT_FILENAME = "ai_analysis.json"
+AI_ANALYSIS_RESULT_LABEL = "AI分析の結果ファイル"
+AI_ANALYSIS_RESULT_VERSION = 1
+ANALYSIS_MAX_FAILURES = 3
+
+_analysis_lock = threading.Lock()
+_analysis_result_lock = threading.Lock()
+_analysis_state = {"step": "", "done": 0, "total": 0, "started_at": None, "period": "",
+                   "last_error": None, "finished_at": None}
+
+
+class AnalysisRun:
+    """1回の AI分析(collect_analysis の結果 data を材料に AI を呼び、保存する結果を作る)。"""
+
+    def __init__(self, data, progress=None):
+        self.data = data
+        self.progress = progress or (lambda done, total, step: None)
+        self.done = 0
+        self.total = 0
+        self.failures = 0
+        self.aborted = None
+        self.read_tasks = set()
+        self.read_comments = 0
+        self.unread_tasks = set()
+        self.task_numbers = {}
+        self.comment_task = {c["id"]: task_id for task_id, t in data["tasks"].items() for c in t["comments"]}
+        period = data["period"]
+        values = _ai_settings()
+        self.result = {
+            "version": AI_ANALYSIS_RESULT_VERSION,
+            "generated_at": data["now"].strftime("%Y-%m-%d %H:%M"),
+            "finished_at": None,
+            "period": {"kind": period["kind"], "start": period["start"].isoformat(),
+                       "end": period["end"].isoformat(), "label": period["label"]},
+            "settings": dict(data["settings"]),
+            "model": values["model"],
+            "status": "ok",
+            "calls": {"total": 0, "ok": 0, "failed": 0},
+            "errors": [],
+            "masked_numbers": 0,
+            "read": {"task_ids": [], "comments": 0},
+            "unread": {"count": 0, "task_ids": [], "comments": 0, "parts": []},
+            "issues": [],
+            "manager_comments": {},
+            "outcomes": {},
+            "progress_comments": {},
+            "persons": {},
+            "other_notes": [],
+            "skills": None,
+            "team": None,
+            "actions": [],
+            "actions_source": "rule",
+        }
+
+    # ------------------------------------------------------------------ 共通
+    def call(self, label, messages):
+        """AI を1回呼ぶ。戻り値: (応答の JSON オブジェクト または None, エラー)。"""
+        self.progress(self.done, self.total, label)
+        if self.aborted:
+            self.done += 1
+            return None, self.aborted
+        text, error = ai_chat(messages)
+        parsed = None
+        if error is None:
+            parsed = _extract_json_object(text)
+            if parsed is None:
+                # JSON として読めないときは1回だけ頼み直す
+                retry = messages + [{"role": "assistant", "content": text},
+                                    {"role": "user", "content": "応答をJSONとして読み取れませんでした。"
+                                                                "指定した形のJSONオブジェクトだけを出力してください。"}]
+                text, error = ai_chat(retry)
+                if error is None:
+                    parsed = _extract_json_object(text)
+                    if parsed is None:
+                        error = "AIの応答をJSONとして読み取れませんでした。"
+        self.done += 1
+        self.result["calls"]["total"] += 1
+        if parsed is None:
+            self.result["calls"]["failed"] += 1
+            self.failures += 1
+            if self.failures >= ANALYSIS_MAX_FAILURES:
+                self.aborted = "AIの呼び出しが{}回続けて失敗したため、残りを中止しました。".format(ANALYSIS_MAX_FAILURES)
+            return None, error
+        self.failures = 0
+        self.result["calls"]["ok"] += 1
+        return parsed, None
+
+    def unread(self, label, reason, task_ids=(), comments=0):
+        """読めなかった材料を「未読込」として残す。"""
+        self.unread_tasks.update(task_ids)
+        self.result["unread"]["parts"].append({
+            "label": label, "reason": one_line(reason, 300), "tasks": len(task_ids), "comments": comments})
+
+    def clean(self, value, allowed, limit=AI_TEXT_MAX):
+        text, count = mask_numbers(_ai_text(value, limit), allowed)
+        self.result["masked_numbers"] += count
+        return text
+
+    def lines(self, value, allowed, limit=AI_LIST_MAX):
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list):
+            return []
+        out = []
+        for v in value:
+            text = self.clean(v, allowed)
+            if text and text not in out:
+                out.append(text)
+        return out[:limit]
+
+    # ------------------------------------------------------------------ 実行
+    def execute(self):
+        data = self.data
+        budget = data["settings"]["chunk_chars"]
+        facts = _analysis_task_facts(data)
+        groups, owner = analysis_groups(data)
+        plans = []
+        for group in groups:
+            units = []
+            for task_id in group["task_ids"]:
+                parts = task_parts(data["tasks"][task_id], facts)
+                self.task_numbers.setdefault(task_id, numbers_in("\n".join(p["text"] for p in parts)))
+                units.append((task_id, parts))
+            plans.append((group, pack_parts(units, budget)))
+        skill_chunks = pack_parts(skills_units(data), budget)
+        self.total = sum(len(chunks) + (1 if g["key"] != ANALYSIS_GROUP_OTHER and len(chunks) != 1 else 0)
+                         for g, chunks in plans) + len(skill_chunks) + 1
+
+        for group, chunks in plans:
+            self.run_group(group, chunks, owner)
+        self.run_skills(skill_chunks)
+        self.run_team()
+
+        unread = self.result["unread"]
+        unread["task_ids"] = sorted(self.unread_tasks)
+        unread["comments"] = sum(p["comments"] for p in unread["parts"])
+        unread["count"] = len(self.unread_tasks) + sum(1 for p in unread["parts"] if not p["tasks"])
+        self.result["read"] = {"task_ids": sorted(self.read_tasks - self.unread_tasks),
+                               "comments": self.read_comments}
+        if self.result["errors"] or unread["count"]:
+            self.result["status"] = "partial"
+        self.progress(self.done, self.total, "保存しています")
+        return self.result
+
+    def run_group(self, group, chunks, owner):
+        is_person = group["key"] != ANALYSIS_GROUP_OTHER
+        notes, findings = [], None
+        for index, chunk in enumerate(chunks, 1):
+            items = _chunk_items(self.data, group, chunk, owner)
+            with_findings = is_person and len(chunks) == 1
+            messages = person_chunk_messages(self.data, group, chunk, index, len(chunks), items, with_findings)
+            label = "{}の材料（{}/{}）".format(group["label"], index, len(chunks))
+            parsed, error = self.call(label, messages)
+            if parsed is None:
+                self.unread(label, error, chunk["keys"], chunk["comments"])
+                continue
+            self.read_tasks.update(chunk["keys"])
+            self.read_comments += chunk["comments"]
+            allowed = numbers_in(messages[-1]["content"])
+            self.take_chunk(parsed, items, allowed)
+            notes += [n for n in self.lines(parsed.get("notes"), allowed) if n not in notes]
+            if with_findings:
+                findings = self.take_findings(parsed.get("findings"), allowed)
+        if not is_person:
+            self.result["other_notes"] = notes[:AI_LIST_MAX * 2]
+            return
+        if len(chunks) != 1:
+            messages = findings_messages(self.data, group, notes, self.judged_counts(group))
+            label = "{}の所見".format(group["label"])
+            parsed, error = self.call(label, messages)
+            if parsed is None:
+                self.unread(label, error)
+            else:
+                findings = self.take_findings(parsed.get("findings"), numbers_in(messages[-1]["content"]))
+        self.result["persons"][str(group["key"])] = {"notes": notes[:AI_LIST_MAX * 2], "findings": findings}
+
+    def judged_counts(self, group):
+        """所見の材料にする、その人の項目の AI の判定の件数(アプリが数える)。"""
+        tasks = self.data["tasks"]
+        mine = set(group["task_ids"])
+        mc = [v for k, v in self.result["manager_comments"].items()
+              if self.comment_task.get(int(k)) in mine and v.get("needs_response") is not False]
+        out = []
+        if mc:
+            out.append("マネージャーのコメントへの対応: " + " ／ ".join(
+                "{} {}件".format(j, sum(1 for v in mc if v.get("judgement") == j)) for j in MC_AI_JUDGEMENTS))
+        vague = sum(1 for k, v in self.result["outcomes"].items() if int(k) in mine and v.get("vague"))
+        if any(int(k) in mine for k in self.result["outcomes"]):
+            out.append("成果の記載があいまい: {}件".format(vague))
+        progress = sum(1 for k in self.result["progress_comments"]
+                       if int(k) in group["progress_ids"])
+        if group["progress_ids"]:
+            out.append("進捗記載の書き直し推奨: {}件（期間内の記載 {}件のうち）".format(progress, len(group["progress_ids"])))
+        issues = sum(1 for i in self.result["issues"] if i["task_id"] in mine and tasks[i["task_id"]]["is_open"])
+        if issues:
+            out.append("課題・相談: {}件".format(issues))
+        return out
+
+    def take_findings(self, value, allowed):
+        if not isinstance(value, dict):
+            return None
+        findings = {key: self.lines(value.get(key), allowed, 3) for key, _label in FINDING_KEYS}
+        return findings if any(findings.values()) else None
+
+    def take_chunk(self, parsed, items, allowed_all):
+        """1回分の応答から、判定を頼んだ項目の結果を取り出す。"""
+        tasks = self.data["tasks"]
+        result = self.result
+        issue_tasks = set(items["issues"])
+        seen = {(i["task_id"], i["text"]) for i in result["issues"]}
+        for raw in _ai_dicts(parsed.get("issues")):
+            task_id = parse_ref(raw.get("task"), "T")
+            if task_id not in issue_tasks:
+                continue
+            text = self.clean(raw.get("text"), self.task_numbers.get(task_id, set()))
+            if not text or (task_id, text) in seen:
+                continue
+            seen.add((task_id, text))
+            source = parse_ref(raw.get("source"), "C")
+            if self.comment_task.get(source) != task_id:
+                source = None
+            result["issues"].append({"task_id": task_id,
+                                     "kind": raw.get("kind") if raw.get("kind") in ISSUE_KINDS else ISSUE_KINDS[0],
+                                     "text": text, "source": source})
+
+        mc_items = {i["comment_id"]: i for i in items["mc"]}
+        for raw in _ai_dicts(parsed.get("manager_comments")):
+            item = mc_items.get(parse_ref(raw.get("id"), "C"))
+            if item is None:
+                continue
+            allowed = self.task_numbers.get(item["task_id"], set())
+            judgement = raw.get("judgement") if item["replied"] else None
+            if judgement not in MC_AI_JUDGEMENTS:
+                judgement = None
+            result["manager_comments"][str(item["comment_id"])] = {
+                "request": self.clean(raw.get("request"), allowed),
+                "needs_response": raw.get("needs_response") is not False,
+                "judgement": judgement,
+                "remaining": "" if judgement == MC_DONE else self.clean(raw.get("remaining"), allowed),
+                "evidence": self.clean(raw.get("evidence"), allowed),
+            }
+
+        rows = {r["task_id"]: r for r in self.data["outputs"]["tasks"]}
+        outcome_tasks = set(items["outcomes"])
+        for raw in _ai_dicts(parsed.get("outcomes")):
+            task_id = parse_ref(raw.get("task"), "T")
+            if task_id not in outcome_tasks:
+                continue
+            allowed = self.task_numbers.get(task_id, set())
+            vague = raw.get("vague") is True
+            suggestion = ""
+            if vague or rows[task_id]["problems"]:
+                suggestion = self.outcome_suggestion(raw.get("suggestion"), allowed)
+            result["outcomes"][str(task_id)] = {"vague": vague, "reason": self.clean(raw.get("reason"), allowed),
+                                                "suggestion": suggestion}
+
+        rule_progress = {i["comment_id"] for i in self.data["abilities"]["progress_rewrite"]}
+        progress_ids = set(items["progress"])
+        for raw in _ai_dicts(parsed.get("progress")):
+            cid = parse_ref(raw.get("id"), "C")
+            if cid not in progress_ids:
+                continue
+            allowed = self.task_numbers.get(self.comment_task.get(cid), set())
+            result["progress_comments"][str(cid)] = {
+                "reason": self.clean(raw.get("reason"), allowed),
+                "suggestion": self.clean(raw.get("suggestion"), allowed, AI_SUGGESTION_MAX),
+                "rule": cid in rule_progress,
+            }
+
+    def outcome_suggestion(self, value, allowed):
+        """成果の書き直し案(欄ごとの案を「欄の名前: 案」の行にまとめる)。"""
+        if isinstance(value, str):
+            return self.clean(value, allowed, AI_SUGGESTION_MAX)
+        if not isinstance(value, dict):
+            return ""
+        lines = []
+        for key, label in OUTCOME_SUGGESTION_FIELDS:
+            text = self.clean(value.get(key), allowed, AI_SUGGESTION_MAX // 2)
+            if text:
+                lines.append("{}: {}".format(label, text))
+        return "\n".join(lines)
+
+    def run_skills(self, chunks):
+        merged = {key: [] for key, _label in SKILLS_AI_KEYS}
+        ok = False
+        for index, chunk in enumerate(chunks, 1):
+            messages = skills_messages(chunk, index, len(chunks))
+            label = "スキル状況の材料（{}/{}）".format(index, len(chunks))
+            parsed, error = self.call(label, messages)
+            if parsed is None:
+                self.unread(label, error)
+                continue
+            ok = True
+            allowed = numbers_in(messages[-1]["content"])
+            for key, _label in SKILLS_AI_KEYS:
+                for text in self.lines(parsed.get(key), allowed, 3):
+                    if text not in merged[key]:
+                        merged[key].append(text)
+        if ok:
+            self.result["skills"] = {key: values[:AI_LIST_MAX] for key, values in merged.items()}
+
+    def run_team(self):
+        data = self.data
+        merged = copy.deepcopy(data)
+        apply_ai_result(merged, self.result)
+        ranked = sorted(_action_candidates(merged), key=lambda a: -a["score"])
+        shown = ranked[:ACTION_CANDIDATES_FOR_AI]
+        candidates = [("A{}".format(i), c) for i, c in enumerate(shown, 1)]
+        messages = team_messages(merged, candidates, len(ranked) - len(shown))
+        parsed, error = self.call("チームのまとめと推奨アクション", messages)
+        fallback = rule_actions(merged)
+        if parsed is None:
+            self.unread("チームのまとめと推奨アクション", error)
+            self.result["actions"] = _jsonable_actions(fallback)
+            return
+        allowed = numbers_in(messages[-1]["content"])
+        summary = parsed.get("summary") if isinstance(parsed.get("summary"), dict) else {}
+        self.result["team"] = {"summary": {key: self.lines(summary.get(key), allowed, 3)
+                                           for key, _label in SUMMARY_KEYS}}
+        actions = self.take_actions(parsed.get("actions"), dict(candidates), merged, allowed, fallback)
+        if actions:
+            self.result["actions"] = actions
+            self.result["actions_source"] = "ai"
+        else:
+            self.result["errors"].append("推奨アクション: AIの応答に使える推奨アクションが無かったため、ルールで選びました。")
+            self.result["actions"] = _jsonable_actions(fallback)
+
+    def take_actions(self, value, candidates, merged, allowed, fallback):
+        """AI の推奨アクションを検証する(5件に満たなければルールの推奨アクションで補う)。"""
+        out, keys = [], set()
+        for raw in _ai_dicts(value):
+            if len(out) >= ACTION_MAX:
+                break
+            ref = unicodedata.normalize("NFKC", str(raw.get("ref") or "")).strip().upper()
+            cand = candidates.get(ref)
+            target = cand["target"] if cand else _parse_target(raw.get("target"), merged)
+            if target is None:
+                continue
+            title = self.clean(raw.get("title"), allowed) or (cand["title"] if cand else "")
+            if not title:
+                continue
+            numbers = []
+            for v in raw.get("numbers") if isinstance(raw.get("numbers"), list) else []:
+                # 材料に無い数値を含む行は使わない
+                n = _ai_text(v, 120)
+                if n and numbers_in(n) <= allowed and n not in numbers:
+                    numbers.append(n)
+            if not numbers:
+                numbers = list(cand["numbers"]) if cand else _target_numbers(target, merged)
+            if not numbers:
+                continue
+            key = (target.get("kind"), target.get("id"), cand["category"] if cand else title)
+            if key in keys:
+                continue
+            keys.add(key)
+            out.append({
+                "category": cand["category"] if cand else "other",
+                "category_label": cand["category_label"] if cand else ACTION_CATEGORY_LABELS["other"],
+                "title": title,
+                "target": target,
+                "reason": self.clean(raw.get("reason"), allowed) or (cand["reason"] if cand else ""),
+                "numbers": numbers,
+                "ref": ref if cand else None,
+                "source": "ai",
+            })
+        if not out:
+            return []
+        for action in fallback:
+            if len(out) >= ACTION_MIN:
+                break
+            key = (action["target"].get("kind"), action["target"].get("id"), action["category"])
+            if key in keys:
+                continue
+            keys.add(key)
+            out.append(dict(_jsonable_actions([action])[0], source="rule"))
+        for rank, action in enumerate(out, 1):
+            action["rank"] = rank
+        return out
+
+
+def _jsonable_actions(actions):
+    """推奨アクションを保存できる形にする(rank・score などはそのまま)。"""
+    keys = ("rank", "category", "category_label", "title", "target", "reason", "numbers", "score")
+    return [dict({k: a.get(k) for k in keys}, source="rule") for a in actions]
+
+
+def _parse_target(value, data):
+    """AI が書いた対象の ID(T12・P3・S5・O2)を、推奨アクションの対象にする。実在しなければ None。"""
+    text = unicodedata.normalize("NFKC", str(value or "")).strip().upper()
+    match = re.fullmatch(r"([TPSO])\s*(\d+)", text)
+    if not match:
+        return None
+    kind, number = match.group(1), int(match.group(2))
+    if kind == "T":
+        t = data["tasks"].get(number)
+        return {"kind": "task", "id": number, "label": t["title"]} if t else None
+    if kind == "P":
+        m = next((m for m in data["members"] if m["id"] == number), None)
+        return {"kind": "person", "id": number, "label": m["name"]} if m else None
+    if kind == "S":
+        s = next((s for s in data["skills"]["skills"] if s["skill_id"] == number), None)
+        return ({"kind": "skill", "id": number, "label": s["name"], "skill_type": s["skill_type"]}
+                if s else None)
+    op = next((o for o in data["skills"]["operations"] if o["operation_id"] == number), None)
+    return {"kind": "operation", "id": number, "label": op["name"]} if op else None
+
+
+def _target_numbers(target, data):
+    """対象のコードの数値(AI が根拠の数値を書かなかった・使えなかったとき)。"""
+    kind, target_id = target.get("kind"), target.get("id")
+    if kind == "task":
+        t = data["tasks"].get(target_id)
+        if t is None:
+            return []
+        numbers = ["状態 {}".format(t["status"])]
+        if t["due_date"]:
+            numbers.append("期限 {}".format(t["due_date"].strftime("%m/%d")))
+        return numbers
+    if kind == "person":
+        row = next((r for r in data["abilities"]["rows"] if r["user_id"] == target_id), None)
+        return (["進行中 {}件".format(row["doing"]), "未完了 {}件".format(row["task_open"]),
+                 "負荷 {}h/月".format(row["load_h"])] if row else [])
+    if kind == "skill":
+        s = next((s for s in data["skills"]["skills"] if s["skill_id"] == target_id), None)
+        return ["保有者 {}名".format(s["holder_count"])] if s else []
+    if kind == "operation":
+        op = next((o for o in data["skills"]["operations"] if o["operation_id"] == target_id), None)
+        return ["対応できる人 {}名".format(op["capable_count"])] if op else []
+    return []
+
+
+def run_ai_analysis(data, progress=None):
+    """collect_analysis の結果を材料に AI で分析し、保存する結果(dict)を返す(DB は読み取りのみ)。
+
+    progress(done, total, step) は進み具合の通知(画面の実行中の表示)。
+    """
+    return AnalysisRun(data, progress).execute()
+
+
+def _ai_analysis_result_path():
+    return os.path.join(current_app.instance_path, AI_ANALYSIS_RESULT_FILENAME)
+
+
+def load_ai_analysis_result():
+    """保存した結果。戻り値: (結果 または None, 読めないときのメッセージ または None)。"""
+    with _analysis_result_lock:
+        try:
+            data = read_json(_ai_analysis_result_path(), AI_ANALYSIS_RESULT_LABEL)
+        except SettingsFileError as exc:
+            return None, str(exc)
+    if data is None:
+        return None, None
+    if (not isinstance(data, dict) or data.get("version") != AI_ANALYSIS_RESULT_VERSION
+            or not isinstance(data.get("period"), dict)):
+        return None, ("AI分析の結果ファイル（instance/{}）の形式が正しくありません。"
+                      "もう一度「AIで分析」を実行してください。".format(AI_ANALYSIS_RESULT_FILENAME))
+    return data, None
+
+
+def save_ai_analysis_result(result):
+    """結果を保存する(最新の1回分だけ。前の結果は上書き)。"""
+    with _analysis_result_lock:
+        write_json(_ai_analysis_result_path(), result)
+
+
+def ai_analysis_running():
+    """AI分析を実行中か。"""
+    return _analysis_lock.locked()
+
+
+def ai_analysis_status():
+    """実行中の表示に使う状態(画面と GET /manager/analysis/status)。"""
+    state = _analysis_state
+    running = ai_analysis_running()
+    return {
+        "running": running,
+        "step": state["step"] if running else "",
+        "done": state["done"] if running else 0,
+        "total": state["total"] if running else 0,
+        "started_at": state["started_at"].strftime("%Y/%m/%d %H:%M") if running and state["started_at"] else "",
+        "period": state["period"] if running else "",
+        "last_error": state["last_error"],
+        "finished_at": state["finished_at"].strftime("%Y/%m/%d %H:%M") if state["finished_at"] else "",
+    }
+
+
+def _set_progress(done, total, step):
+    _analysis_state.update(done=done, total=total, step=step)
+
+
+def run_ai_analysis_job(app, args):
+    """AIで分析して結果を保存する(呼び出したスレッドで最後まで実行)。
+
+    args は期間の指定(画面の period / from / to)。戻り値: (ok, message)。例外は外に出さない。
+    """
+    with app.app_context():
+        try:
+            now = _now()
+            period = analysis_period(args, now.date())
+            _analysis_state["period"] = period["label"]
+            data = collect_analysis(period, now, load_ai_analysis_settings())
+            result = run_ai_analysis(data, progress=_set_progress)
+            result["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+            if not result["calls"]["ok"]:
+                ok, message = False, "AIの呼び出しがすべて失敗したため、結果を保存しませんでした（保存済みの結果は前のままです）。{}".format(
+                    " ／ ".join("{}: {}".format(p["label"], p["reason"]) for p in result["unread"]["parts"][:2]))
+            else:
+                save_ai_analysis_result(result)
+                ok, message = True, "AI分析が終わりました（期間 {}）。".format(period["label"])
+        except Exception as exc:
+            app.logger.exception("AI分析に失敗しました")
+            ok, message = False, _mask_api_key("AI分析の実行中にエラーが発生しました: {}".format(exc),
+                                               _ai_settings()["api_key"])
+        _analysis_state.update(last_error=None if ok else one_line(message, 500), finished_at=datetime.now())
+        return ok, message
+
+
+def start_ai_analysis(app, args):
+    """AI分析を別スレッドで始める(画面の「AIで分析」)。既に実行中なら何もせず False を返す。"""
+    if not _analysis_lock.acquire(blocking=False):
+        return False
+    _analysis_state.update(step="準備しています", done=0, total=0, started_at=datetime.now(),
+                           period="", last_error=None)
+    args = {key: str(args.get(key) or "") for key in ("period", "from", "to")}
+
+    def worker():
+        try:
+            run_ai_analysis_job(app, args)
+        except Exception:
+            app.logger.exception("AI分析でエラーが発生しました")
+        finally:
+            _analysis_lock.release()
+
+    try:
+        threading.Thread(target=worker, name="ai-analysis", daemon=True).start()
+    except Exception:
+        _analysis_lock.release()
+        raise
+    return True
+
+
+# =============================================================================
+# 9-8. AI分析: 結果の反映(画面・チームのまとめの材料)
+# =============================================================================
+# 保存した AI の結果を、コードの集計(collect_analysis の戻り値)に ID で結び付けて反映する。
+# 画面では、表示している期間と結果の期間(開始日・終了日)が同じときだけ反映する
+# (違うときは、結果の期間で表示するためのリンクを出す)。
+# AI の結果が無い項目は ai_state に「未読込」(読めなかった材料)・「判定なし」(読んだが応答に無い)・
+# 「分析の後に追加」(分析の後に増えた項目)を入れる。
+
+AI_STATE_UNREAD = "未読込"
+AI_STATE_NONE = "判定なし"
+AI_STATE_NEW = "分析の後に追加"
+
+
+def _result_ids(values):
+    out = set()
+    for v in values or []:
+        if isinstance(v, int) and not isinstance(v, bool):
+            out.add(v)
+    return out
+
+
+def _comment_view(task, comment_id):
+    if comment_id is None:
+        return None
+    c = next((c for c in task["comments"] if c["id"] == comment_id), None)
+    return {"id": c["id"], "at": c["at"], "author": c["author"]} if c else None
+
+
+def recount_manager_comments(data):
+    """マネージャーのコメントへの対応の件数・要フォロー・ヒト別の件数を数え直す(AI の判定の反映後)。"""
+    progress = data["progress"]
+    mc = progress["manager_comments"]
+    items = mc["items"]
+    follow = sorted((i for i in items if i["judgement"] in MC_FOLLOW),
+                    key=lambda i: (-(i["age_days"] or 0), i["at"] or datetime.min))
+    judgements = (MC_DONE, MC_PARTIAL, MC_NOT_DONE, MC_NO_REPLY, MC_UNJUDGED)
+
+    def counts(rows):
+        out = {j: sum(1 for i in rows if i["judgement"] == j) for j in judgements}
+        out["total"] = len(rows)
+        out["follow"] = sum(1 for i in rows if i["judgement"] in MC_FOLLOW)
+        return out
+
+    mc.update(
+        follow=follow,
+        total=len(items),
+        no_reply=sum(1 for i in items if not i["replied"]),
+        replied=sum(1 for i in items if i["replied"]),
+        counts=counts(items),
+        rows=[dict(counts([i for i in items if m["id"] in i["assignee_ids"]]), user_id=m["id"], name=m["name"])
+              for m in data["members"]],
+    )
+    for row in progress["rows"]:
+        mine = [i for i in items if row["user_id"] in i["assignee_ids"]]
+        row["mc_total"] = len(mine)
+        row["mc_no_reply"] = sum(1 for i in mine if not i["replied"])
+        row["mc_follow"] = sum(1 for i in mine if i["judgement"] in MC_FOLLOW)
+    progress["team"]["mc_total"] = len(items)
+    progress["team"]["mc_no_reply"] = mc["no_reply"]
+    progress["team"]["mc_follow"] = len(follow)
+    # ④ のマネージャーのコメントへの返信(期間内に書かれたもの。対応不要と判定されたものは除く)
+    for row in data["abilities"]["rows"]:
+        mine = [i for i in items if i["in_period"] and row["user_id"] in i["assignee_ids"]]
+        row["mc_total"] = len(mine)
+        row["mc_replied"] = sum(1 for i in mine if i["replied"])
+        row["mc_done"] = sum(1 for i in mine if i["judgement"] == MC_DONE)
+        row["mc_rate"] = _rate(row["mc_replied"], len(mine))
+        row["mc_note"] = sample_note(len(mine))
+
+
+def apply_ai_result(data, stored):
+    """保存した AI の結果 stored を集計結果 data に反映する(data を書き換える)。"""
+    tasks = data["tasks"]
+    unread = _result_ids((stored.get("unread") or {}).get("task_ids"))
+    read = _result_ids((stored.get("read") or {}).get("task_ids"))
+
+    def state(task_id, has_result):
+        if has_result:
+            return None
+        if task_id in unread:
+            return AI_STATE_UNREAD
+        if task_id in read:
+            return AI_STATE_NONE
+        return AI_STATE_NEW
+
+    def entries(name):
+        value = stored.get(name)
+        return value if isinstance(value, dict) else {}
+
+    # ① 課題・相談(AI が抜き出したもの)
+    issues = []
+    for i in stored.get("issues") or []:
+        t = tasks.get(i.get("task_id")) if isinstance(i, dict) else None
+        if t is None or not i.get("text"):
+            continue
+        issues.append(dict(_task_ref(t), kind=i.get("kind") or ISSUE_KINDS[0], text=i["text"],
+                           source=_comment_view(t, i.get("source"))))
+    data["progress"]["issues_ai"] = issues
+    for r in data["progress"]["hold"]:
+        r["ai"] = [i for i in issues if i["task_id"] == r["task_id"]]
+
+    # ① マネージャーのコメントへの対応
+    mc = data["progress"]["manager_comments"]
+    stored_mc = entries("manager_comments")
+    items, ai_acks = [], []
+    for item in mc["items"]:
+        ai = stored_mc.get(str(item["comment_id"]))
+        ai = ai if isinstance(ai, dict) else None
+        item["ai"] = ai
+        item["ai_state"] = state(item["task_id"], ai is not None)
+        if ai is not None and ai.get("needs_response") is False:
+            item["judgement"] = MC_ACK_AI
+            ai_acks.append(item)
+            continue
+        if item["replied"]:
+            item["judgement"] = ai["judgement"] if ai and ai.get("judgement") in MC_AI_JUDGEMENTS else MC_UNJUDGED
+        items.append(item)
+    mc["items"] = items
+    mc["ai_acks"] = ai_acks
+    recount_manager_comments(data)
+
+    # ③ 成果(AI のあいまいさの判定・書き直し案)
+    outputs = data["outputs"]
+    stored_out = entries("outcomes")
+    labels = dict(OUTCOME_PROBLEM_LABELS)
+    labels[OUTCOME_VAGUE] = OUTCOME_VAGUE_LABEL
+    for r in outputs["tasks"]:
+        ai = stored_out.get(str(r["task_id"]))
+        ai = ai if isinstance(ai, dict) else None
+        r["ai"] = ai
+        r["ai_state"] = state(r["task_id"], ai is not None)
+        if ai and ai.get("vague"):
+            r["problems"].append({"code": OUTCOME_VAGUE, "label": OUTCOME_VAGUE_LABEL, "field": "成果",
+                                  "detail": ai.get("reason") or "何をどれだけ変えたかが読み取りにくい"})
+        r["suggestion"] = (ai.get("suggestion") or None) if ai and r["problems"] else None
+    outputs.update(outputs_summary(outputs["tasks"], data["members"], labels))
+
+    # ④ 進捗記載(AI の書き直し推奨・書き直し案)と所見
+    ab = data["abilities"]
+    stored_pc = entries("progress_comments")
+    by_id = {i["comment_id"]: i for i in ab["progress_rewrite"]}
+    member_names = {m["id"]: m["name"] for m in data["members"]}
+    for key, ai in stored_pc.items():
+        if not isinstance(ai, dict) or not str(key).isdecimal():
+            continue
+        cid = int(key)
+        item = by_id.get(cid)
+        if item is None:
+            found = next(((t, c) for t in tasks.values() for c in t["comments"] if c["id"] == cid), None)
+            if found is None:
+                continue
+            t, c = found
+            if c["user_id"] not in member_names or c["user_id"] not in t["assignee_ids"]:
+                continue
+            item = {"task_id": t["id"], "title": t["title"], "status": t["status"],
+                    "status_color": STATUS_COLORS.get(t["status"], "secondary"),
+                    "comment_id": cid, "user_id": c["user_id"], "name": member_names[c["user_id"]],
+                    "at": c["at"], "body": c["body"], "reason": "AIの判定: {}".format(ai.get("reason") or "具体性が低い"),
+                    "ai": None, "suggestion": None}
+            ab["progress_rewrite"].append(item)
+            by_id[cid] = item
+        item["ai"] = ai
+        item["suggestion"] = ai.get("suggestion") or None
+    for item in ab["progress_rewrite"]:
+        if item.get("ai") is None:
+            item["ai_state"] = state(item["task_id"], False)
+    ab["progress_rewrite"].sort(key=lambda i: i["at"] or datetime.min, reverse=True)
+    persons = entries("persons")
+    out_rows = {r["user_id"]: r for r in outputs["rows"]}
+    for row in ab["rows"]:
+        row["progress_vague"] = sum(1 for i in ab["progress_rewrite"] if i["user_id"] == row["user_id"])
+        row["outcome_rewrite"] = out_rows.get(row["user_id"], {}).get("rewrite", row["outcome_rewrite"])
+        person = persons.get(str(row["user_id"]))
+        person = person if isinstance(person, dict) else {}
+        row["ai"] = person.get("findings") if isinstance(person.get("findings"), dict) else None
+        row["ai_notes"] = [n for n in person.get("notes") or [] if isinstance(n, str)]
+
+    # 担当者のいないタスクを読んだ結果(チームのまとめの材料)
+    data["ai_other_notes"] = [n for n in stored.get("other_notes") or [] if isinstance(n, str)]
+
+    # ② スキル・まとめ・推奨アクション
+    data["skills"]["ai"] = stored.get("skills") if isinstance(stored.get("skills"), dict) else None
+    team = stored.get("team") if isinstance(stored.get("team"), dict) else {}
+    data["ai_summary"] = team.get("summary") if isinstance(team.get("summary"), dict) else None
+    data["ai_actions"] = ([a for a in stored.get("actions") or [] if isinstance(a, dict)]
+                          if stored.get("actions_source") == "ai" else None)
+    # ルールの推奨アクションも AI の判定を反映した集計から選び直す
+    data["actions"] = rule_actions(data)
+    return data
+
+
+def ai_result_matches(stored, period):
+    """保存した結果の期間が、表示している期間と同じか(開始日・終了日で比べる)。"""
+    p = stored.get("period") or {}
+    return p.get("start") == period["start"].isoformat() and p.get("end") == period["end"].isoformat()
+
+
+# =============================================================================
+# 9-9. AI分析: 画面
+# =============================================================================
+# GET  /manager/analysis          コードの集計(①〜④)とルールによる推奨アクションをすぐに表示する。
+#                                 期間は ?period=7|14|30|90(既定 30)または ?period=range&from=...&to=...
+#                                 保存した AI の結果の期間が同じなら、AI の結果も反映して表示する(9-8)
+# POST /manager/analysis/run      「AIで分析」。別スレッドで実行を始めて画面に戻る(9-7)
+# GET  /manager/analysis/status   実行中の表示用の状態(JSON。APIキー・接続先の URL は含まない)
 # マネージャーのみ(メンバーは 403、未ログインはログイン画面)。
+
+_ANALYSIS_PERIOD_ARGS = ("period", "from", "to")
+
+
+def _analysis_ai_view(data, period):
+    """保存した AI の結果を表示用にまとめる(期間が同じなら data に反映する)。"""
+    stored, error = load_ai_analysis_result()
+    view = {"result": None, "applied": False, "other_period": None, "error": error}
+    if stored is None:
+        return view
+    p = stored.get("period") or {}
+    unread = stored.get("unread") if isinstance(stored.get("unread"), dict) else {}
+    dates = "{}〜{}".format(str(p.get("start") or "").replace("-", "/"), str(p.get("end") or "").replace("-", "/"))
+    view["result"] = {
+        "generated_at": str(stored.get("generated_at") or "").replace("-", "/"),
+        "finished_at": str(stored.get("finished_at") or "").replace("-", "/"),
+        # 日付で指定した期間はラベルが日付なので、日付を重ねて書かない
+        "period_label": dates if p.get("kind") == ANALYSIS_PERIOD_RANGE else "{}（{}）".format(p.get("label") or "", dates),
+        "model": str(stored.get("model") or ""),
+        "status": stored.get("status"),
+        "calls": stored.get("calls") if isinstance(stored.get("calls"), dict) else {},
+        "errors": [str(e) for e in stored.get("errors") or []],
+        "masked_numbers": stored.get("masked_numbers") or 0,
+        "read": stored.get("read") if isinstance(stored.get("read"), dict) else {},
+        "unread": unread,
+        "unread_parts": [u for u in unread.get("parts") or [] if isinstance(u, dict)],
+        "actions_source": stored.get("actions_source"),
+    }
+    if not ai_result_matches(stored, period):
+        view["other_period"] = {"period": ANALYSIS_PERIOD_RANGE, "from": p.get("start"), "to": p.get("end")}
+        return view
+    try:
+        # 写しに反映してから入れ替える(途中で失敗しても、コードの集計はそのまま表示できるように)
+        merged = apply_ai_result(copy.deepcopy(data), stored)
+        data.clear()
+        data.update(merged)
+        view["applied"] = True
+    except Exception as exc:  # 手で書き換えたファイルなど(コードの集計だけを表示する)
+        current_app.logger.exception("AI分析の結果を反映できませんでした")
+        view["error"] = "保存されているAI分析の結果を表示できませんでした（{}）。もう一度「AIで分析」を実行してください。".format(
+            one_line(str(exc), 120))
+    return view
 
 
 @manager_bp.route("/analysis", endpoint="analysis")
@@ -10986,9 +12604,12 @@ def analysis_dashboard():
     period = analysis_period(request.args, now.date())
     settings = load_ai_analysis_settings()
     data = collect_analysis(period, now, settings)
+    ai = _analysis_ai_view(data, period)
     return render_template(
         "manager/analysis.html",
         a=data,
+        ai=ai,
+        ai_run=ai_analysis_status(),
         period=period,
         period_choices=ANALYSIS_PERIOD_DAYS,
         period_range=ANALYSIS_PERIOD_RANGE,
@@ -11000,7 +12621,37 @@ def analysis_dashboard():
         type_labels=SKILL_TYPE_LABELS,
         ai_status=ai_status_label(),
         ai_configured=ai_is_configured(),
+        finding_keys=FINDING_KEYS,
+        skills_ai_keys=SKILLS_AI_KEYS,
+        state_unread=AI_STATE_UNREAD,
     )
+
+
+@manager_bp.route("/analysis/run", methods=["POST"], endpoint="analysis_run")
+@login_required
+def analysis_run():
+    """「AIで分析」: 画面で選んでいる期間で、別スレッドの実行を始める。"""
+    if not current_user.is_manager:
+        abort(403)
+    args = {key: request.form.get(key, "").strip() for key in _ANALYSIS_PERIOD_ARGS}
+    back = url_for("manager.analysis", **{k: v for k, v in args.items() if v})
+    if not ai_is_configured():
+        flash("AI（ChatGPT互換API）が未設定のため、AIで分析できません。"
+              "システム設定の「基本設定」タブで AI_API_KEY または AI_API_URL を設定してください。", "danger")
+    elif start_ai_analysis(current_app._get_current_object(), args):
+        flash("AIで分析を始めました。終わると結果がこの画面に表示されます（人数・タスクの数によっては数分かかります）。", "info")
+    else:
+        flash("AIで分析しています。終わってからもう一度お試しください。", "warning")
+    return redirect(back)
+
+
+@manager_bp.route("/analysis/status", endpoint="analysis_status")
+@login_required
+def analysis_status():
+    """実行中の表示用の状態(JSON)。"""
+    if not current_user.is_manager:
+        abort(403)
+    return jsonify(ai_analysis_status())
 
 
 # #############################################################################
