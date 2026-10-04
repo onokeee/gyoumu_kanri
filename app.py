@@ -17,7 +17,7 @@ Python のコードはすべてこの app.py にまとめている。ほかの�
   flask --app app migrate [--check] [--db パス]     既存DBを最新のモデル定義に合わせる
 
 動作確認で差し替える関数(呼び出すたびにこのモジュールから探すので、app._now = ... で差し替えられる):
-  _now()            スキルテストの時刻(3-8)・AI分析の基準の日時(9)
+  _now()            スキルテストの時刻・AI分析の基準の日時(2-2)
   _call_chat_api()  AI(ChatGPT互換API)の呼び出し(4-1。独自APIへの移行もここだけを書き換える)
 
 目次(章は「# ####」、節は「# ====」の見出しで始まる):
@@ -30,6 +30,8 @@ Python のコードはすべてこの app.py にまとめている。ほかの�
       2-2. 小さなヘルパー関数
       2-3. 画面で編集する設定(JSONファイル)の読み書き
       2-4. 営業日カレンダー(土日・祝日)
+      2-5. 画面の権限の確認(マネージャーだけの画面)
+      2-6. 時間のかかる処理の別スレッドでの実行(同時に1つだけ)
   3. モデル(DBのテーブル)
       3-1. ユーザー
       3-2. タスク
@@ -70,10 +72,10 @@ Python のコードはすべてこの app.py にまとめている。ほかの�
       7-6. 期限超過通知: 画面
   8. スキルテスト
       8-1. スキルテスト: 設定の保存・読み込み
-      8-2. スキルテスト: AIによる問題の作成
-      8-3. スキルテスト: 受験の流れ
-      8-4. スキルテスト: 問題プールの集計と補充
-      8-5. スキルテスト: 設定フォーム
+      8-2. スキルテスト: 設定フォーム
+      8-3. スキルテスト: AIによる問題の作成
+      8-4. スキルテスト: 受験の流れ
+      8-5. スキルテスト: 問題プールの集計と補充
       8-6. スキルテスト: 画面
   9. AI分析(サマリーと推奨アクション)
       9-1. AI分析: 設定(しきい値)
@@ -133,7 +135,7 @@ from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr, formatdate, make_msgid, parseaddr
-from functools import lru_cache
+from functools import lru_cache, wraps
 from io import BytesIO
 from time import monotonic
 from typing import Optional
@@ -607,12 +609,16 @@ _PLAIN_TYPES = (type(None), bool, int, float, str, list, tuple, dict)
 
 
 # --------------------------------------------------------------------------- #
-# 画面からの更新
+# 書き換えの共通の手順(画面からの更新・項目の行の削除で使う)
 # --------------------------------------------------------------------------- #
-def _write_atomic(path, data):
-    """一時ファイルに書いてから置き換える(書き込み途中で壊れたファイルを残さない)。"""
+def write_file_atomic(path, data, prefix):
+    """data(bytes)を同じフォルダの一時ファイルに書いてから path と置き換える。
+
+    書き込み途中で壊れたファイルを残さない(失敗したら一時ファイルを消して例外をそのまま送出する)。
+    一時ファイルの名前は prefix で始まる。画面で編集する設定(JSON。2-3)の保存にも使う。
+    """
     folder = os.path.dirname(path)
-    fd, tmp_path = tempfile.mkstemp(prefix=".config_", suffix=".tmp", dir=folder)
+    fd, tmp_path = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=folder)
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
@@ -627,6 +633,84 @@ def _write_atomic(path, data):
         raise
 
 
+def _read_for_change(instance_path, expected_version):
+    """書き換える前に instance/config.py を読む(config_file_lock の中で呼ぶ)。
+
+    expected_version を渡すと、ファイルの版がそれと違う場合は ConfigConflictError。
+    文字コードの指定(coding)が UTF-8 でない場合は ConfigFileError(画面からは書き換えない)。
+    """
+    current = read_config(instance_path)
+    if expected_version is not None and current["version"] != expected_version:
+        raise ConfigConflictError(
+            "画面を開いた後に instance/{} が更新されています。".format(CONFIG_FILENAME))
+    declared = _declared_encoding(current["text"])
+    if declared is not None and not _is_utf8(declared):
+        raise ConfigFileError(
+            "instance/{} の文字コードの指定（coding）が UTF-8 ではないため、画面から更新できません。"
+            "ファイルは変更していません。ファイルを直接編集してください。".format(CONFIG_FILENAME))
+    return current
+
+
+def _stamp(text, action, username, now, newline):
+    """「# 最終更新: 日時（画面から<action>: 変更した人）」の行を付け直す。"""
+    stamp = (now or datetime.now()).strftime("%Y-%m-%d %H:%M")
+    return _refresh_header(
+        text, "{} {}（画面から{}: {}）".format(HEADER_PREFIX, stamp, action, _clean_label(username)),
+        newline)
+
+
+def _encode_config(text, bom):
+    """書き込むバイト列(元のファイルに BOM があれば付け直す)。"""
+    data = text.encode("utf-8")
+    if bom:
+        data = _UTF8_BOM.encode("utf-8") + data
+    return data
+
+
+def _evaluate_new(data, path, stage):
+    """書き換え後の内容(書き込むバイト列そのもの)を、起動時の from_pyfile と同じ方法で評価する。
+
+    stage はエラーメッセージに使う「更新後」「削除後」。評価できなければ ConfigFileError。
+    """
+    try:
+        ast.parse(data)
+        return evaluate(data, path)
+    except Exception as exc:
+        raise ConfigFileError("{}の instance/{} を確認できませんでした（{}）。"
+                              "ファイルは変更していません。".format(
+                                  stage, CONFIG_FILENAME, exc.__class__.__name__)) from exc
+
+
+def _other_keys_changed(old_values, new_values, targets):
+    """書き換えの対象(targets)ではないのに、値が変わってしまった項目(書き方のために起きる)。"""
+    return [key for key, old in old_values.items()
+            if key not in targets and isinstance(old, _PLAIN_TYPES)
+            and (key not in new_values or not same_value(new_values[key], old))]
+
+
+def _unsafe_error(keys, verb):
+    """書き方のために画面から安全に書き換えられないときのエラー(verb は「更新」「削除」)。"""
+    return ConfigFileError(
+        "instance/{} の書き方のため、画面から安全に{}できませんでした（{}）。"
+        "ファイルは変更していません。ファイルを直接編集してください。".format(
+            CONFIG_FILENAME, verb, "、".join(sorted(set(keys)))))
+
+
+def _save_config_file(path, data, backup):
+    """元のファイルを instance/config.py.bak にコピーして(backup が真のとき)、data に置き換える。"""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if backup:
+            shutil.copy2(path, path + BACKUP_SUFFIX)
+        write_file_atomic(path, data, ".config_")
+    except OSError as exc:
+        raise ConfigFileError("instance/{} を保存できませんでした（{}）。".format(
+            CONFIG_FILENAME, exc.__class__.__name__)) from exc
+
+
+# --------------------------------------------------------------------------- #
+# 画面からの更新
+# --------------------------------------------------------------------------- #
 def update_config(instance_path, changes, username, expected_version=None, now=None):
     """instance/config.py の項目を書き換える(changes = {KEY: 新しい値})。
 
@@ -636,60 +720,24 @@ def update_config(instance_path, changes, username, expected_version=None, now=N
     失敗した場合は ConfigFileError(ファイルは変更しない)。
     """
     with config_file_lock:
-        current = read_config(instance_path)
+        current = _read_for_change(instance_path, expected_version)
         path = current["path"]
-        if expected_version is not None and current["version"] != expected_version:
-            raise ConfigConflictError(
-                "画面を開いた後に instance/{} が更新されています。".format(CONFIG_FILENAME))
-
         text = current["text"]
-        declared = _declared_encoding(text)
-        if declared is not None and not _is_utf8(declared):
-            raise ConfigFileError(
-                "instance/{} の文字コードの指定（coding）が UTF-8 ではないため、画面から更新できません。"
-                "ファイルは変更していません。ファイルを直接編集してください。".format(CONFIG_FILENAME))
         newline = _newline_of(text)
         for key, value in changes.items():
             text = _set_value(text, key, value, newline)
-        stamp = (now or datetime.now()).strftime("%Y-%m-%d %H:%M")
-        text = _refresh_header(
-            text, "{} {}（画面から変更: {}）".format(HEADER_PREFIX, stamp, _clean_label(username)),
-            newline)
-
-        data = text.encode("utf-8")
-        if current["bom"]:
-            data = _UTF8_BOM.encode("utf-8") + data
+        text = _stamp(text, "変更", username, now, newline)
+        data = _encode_config(text, current["bom"])
 
         # 新しい内容が正しく、期待どおりの値になることを確かめてから置き換える
-        # (書き込むバイト列そのものを、起動時の from_pyfile と同じ方法で評価する)
-        try:
-            ast.parse(data)
-            values = evaluate(data, path)
-        except Exception as exc:
-            raise ConfigFileError("更新後の instance/{} を確認できませんでした（{}）。"
-                                  "ファイルは変更していません。".format(
-                                      CONFIG_FILENAME, exc.__class__.__name__)) from exc
+        values = _evaluate_new(data, path, "更新後")
         wrong = [key for key, value in changes.items()
                  if key not in values or not same_value(values[key], value)]
-        for key, old in current["values"].items():
-            if key in changes or not isinstance(old, _PLAIN_TYPES):
-                continue
-            if key not in values or not same_value(values[key], old):
-                wrong.append(key)
+        wrong += _other_keys_changed(current["values"], values, changes)
         if wrong:
-            raise ConfigFileError(
-                "instance/{} の書き方のため、画面から安全に更新できませんでした（{}）。"
-                "ファイルは変更していません。ファイルを直接編集してください。".format(
-                    CONFIG_FILENAME, "、".join(sorted(set(wrong)))))
+            raise _unsafe_error(wrong, "更新")
 
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            if current["exists"]:
-                shutil.copy2(path, path + BACKUP_SUFFIX)
-            _write_atomic(path, data)
-        except OSError as exc:
-            raise ConfigFileError("instance/{} を保存できませんでした（{}）。".format(
-                CONFIG_FILENAME, exc.__class__.__name__)) from exc
+        _save_config_file(path, data, backup=current["exists"])
         return values
 
 
@@ -791,20 +839,12 @@ def remove_config_keys(instance_path, keys, username, expected_version=None, now
     """
     keys = set(keys)
     with config_file_lock:
-        current = read_config(instance_path)
+        current = _read_for_change(instance_path, expected_version)
         path = current["path"]
-        if expected_version is not None and current["version"] != expected_version:
-            raise ConfigConflictError(
-                "画面を開いた後に instance/{} が更新されています。".format(CONFIG_FILENAME))
         if not current["exists"]:
             return [], {}
 
         text = current["text"]
-        declared = _declared_encoding(text)
-        if declared is not None and not _is_utf8(declared):
-            raise ConfigFileError(
-                "instance/{} の文字コードの指定（coding）が UTF-8 ではないため、画面から更新できません。"
-                "ファイルは変更していません。ファイルを直接編集してください。".format(CONFIG_FILENAME))
         try:
             tree = ast.parse(text)
         except SyntaxError as exc:
@@ -813,52 +853,24 @@ def remove_config_keys(instance_path, keys, username, expected_version=None, now
         lines = _split_lines(text)
         remove, blocked = _lines_to_remove(lines, tree, keys)
         if blocked:
-            raise ConfigFileError(
-                "instance/{} の書き方のため、画面から安全に削除できませんでした（{}）。"
-                "ファイルは変更していません。ファイルを直接編集してください。".format(
-                    CONFIG_FILENAME, "、".join(sorted(set(blocked)))))
+            raise _unsafe_error(blocked, "削除")
         if not remove:
             return [], current["values"]
 
         removed = [key for key in current["values"] if key in keys]
         newline = _newline_of(text)
         text = "".join(line for index, line in enumerate(lines) if index not in remove)
-        stamp = (now or datetime.now()).strftime("%Y-%m-%d %H:%M")
-        text = _refresh_header(
-            text, "{} {}（画面から未使用の設定を削除: {}）".format(
-                HEADER_PREFIX, stamp, _clean_label(username)),
-            newline)
-
-        data = text.encode("utf-8")
-        if current["bom"]:
-            data = _UTF8_BOM.encode("utf-8") + data
+        text = _stamp(text, "未使用の設定を削除", username, now, newline)
+        data = _encode_config(text, current["bom"])
 
         # 削除後の内容が正しく、削除した項目だけが無くなっていることを確かめてから置き換える
-        try:
-            ast.parse(data)
-            values = evaluate(data, path)
-        except Exception as exc:
-            raise ConfigFileError("削除後の instance/{} を確認できませんでした（{}）。"
-                                  "ファイルは変更していません。".format(
-                                      CONFIG_FILENAME, exc.__class__.__name__)) from exc
+        values = _evaluate_new(data, path, "削除後")
         wrong = [key for key in keys if key in values]
-        for key, old in current["values"].items():
-            if key in keys or not isinstance(old, _PLAIN_TYPES):
-                continue
-            if key not in values or not same_value(values[key], old):
-                wrong.append(key)
+        wrong += _other_keys_changed(current["values"], values, keys)
         if wrong:
-            raise ConfigFileError(
-                "instance/{} の書き方のため、画面から安全に削除できませんでした（{}）。"
-                "ファイルは変更していません。ファイルを直接編集してください。".format(
-                    CONFIG_FILENAME, "、".join(sorted(set(wrong)))))
+            raise _unsafe_error(wrong, "削除")
 
-        try:
-            shutil.copy2(path, path + BACKUP_SUFFIX)
-            _write_atomic(path, data)
-        except OSError as exc:
-            raise ConfigFileError("instance/{} を保存できませんでした（{}）。".format(
-                CONFIG_FILENAME, exc.__class__.__name__)) from exc
+        _save_config_file(path, data, backup=True)
         return removed, values
 
 
@@ -976,16 +988,23 @@ login_manager.login_message_category = "warning"
 # =============================================================================
 # 2-2. 小さなヘルパー関数
 # =============================================================================
-# アプリ共通の小さなヘルパー関数。
-#
-# 複数のBlueprintから再利用する純粋関数を置く。
+# 複数の画面・機能から使う小さなヘルパー関数(現在の日時・フォームの値の読み取り・
+# 主キーでの取り出し・アプリの名前・よく使う問い合わせ)。
+
+# 改行・タブ以外の制御文字(AIの応答・AIが作った問題から除く。Excel出力や画面表示で問題になるため)
+CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _now():
+    """現在の日時。スキルテストの時刻と AI分析の基準の日時はすべてここから取る。
+
+    動作確認ではこの関数を差し替える(app._now = ...。呼び出すたびにこのモジュールから探す)。
+    """
+    return datetime.now()
 
 
 def parse_date(value):
-    """フォームの日付文字列(YYYY-MM-DD)をdateに変換する。空・不正ならNone。
-
-    tasks / leaves で共通利用する。
-    """
+    """フォームの日付文字列(YYYY-MM-DD)をdateに変換する。空・不正ならNone。"""
     value = (value or "").strip()
     if not value:
         return None
@@ -1006,6 +1025,34 @@ def parse_hhmm(value):
         return None
 
 
+def form_int(values, name):
+    """フォーム・URL の値(values は request.form / request.args など)を 0 以上の整数にする。
+
+    前後の空白は無視する。数字だけでなければ None。
+    """
+    raw = (values.get(name) or "").strip()
+    return int(raw) if raw.isdecimal() else None
+
+
+def form_sort_order(form, default=0):
+    """フォームの並び順(sort_order。負の数も可)。無い・整数でなければ default。"""
+    raw = form.get("sort_order", str(default))
+    return int(raw) if raw.lstrip("-").isdigit() else default
+
+
+def get_or_404(model, ident):
+    """主キーが ident の行を返す。無ければ 404 にする。"""
+    obj = db.session.get(model, ident)
+    if obj is None:
+        abort(404)
+    return obj
+
+
+def display_app_name(app=None):
+    """メール・Word に書くアプリの名前(設定 APP_NAME。空なら「業務管理システム」)。"""
+    return (app or current_app).config.get("APP_NAME") or "業務管理システム"
+
+
 def get_active_users():
     """有効なユーザーを表示名順で取得する(担当者・受信者の選択肢用)。"""
     return User.query.filter_by(is_active=True).order_by(User.display_name).all()
@@ -1016,18 +1063,21 @@ def get_active_users():
 # =============================================================================
 # 画面で編集する設定(JSONファイル)の読み書きの共通部品。
 #
-# 週報(instance/weekly_settings.json)・期限超過通知(instance/overdue_settings.json)など、
+# 週報(instance/weekly_settings.json)・期限超過通知(instance/overdue_settings.json)・
+# スキルテスト(instance/skilltest_settings.json)・AI分析(instance/ai_analysis_settings.json)など、
 # DBを使わずに instance/ のJSONファイルへ設定と「前回の結果」を保存する機能で使う。
 #
 #   read_json(path, label)      : 読む。無ければ None、あるのに読めなければ SettingsFileError
 #   write_json(path, data)      : 一時ファイルに書いてから置き換える(書き込み途中で壊れない)
+#   JsonSettings(...)           : 1つの設定ファイルの読み込み(load)・画面からの保存(save)・
+#                                 前回の結果の記録(set_last_result)。機能ごとに1つ作る
 #   normalize_last_result(v)    : 読み込んだ「前回の結果」を検証する(不正なら None)
 #   new_last_result(...)        : 新しい「前回の結果」(日時・きっかけ・成否・メッセージ)
 #
-# 画面の保存とバックグラウンドの送信が同時に書き込んでも壊れないよう、呼び出し側は
-# 機能ごとのロックで「読む→書く」を直列化する。
-# ファイルがあるのに読み込めない(壊れている・開けない)ときは、保存済みの設定を
-# 消さないよう上書きしない(SettingsFileError を送出する)。
+# 画面の保存とバックグラウンドの送信が同時に書き込んでも壊れないよう、JsonSettings は
+# 設定ファイルごとのロックで「読む→書く」を直列化する。
+# ファイルがあるのに読み込めない(壊れている・開けない)ときは、表示や自動送信の判定には
+# 既定値を使うが、保存済みの設定を消さないよう上書きしない(SettingsFileError を送出する)。
 
 # 実行のきっかけ(前回の結果の表示用)
 TRIGGER_AUTO = "自動"
@@ -1062,24 +1112,12 @@ def read_json(path, label):
 
 
 def write_json(path, data):
-    """一時ファイルに書いてから置き換える(書き込み途中で壊れたファイルを残さない)。"""
+    """JSON(UTF-8・字下げ2・末尾に改行)を一時ファイルに書いてから置き換える(1-3 の write_file_atomic)。"""
     folder = os.path.dirname(path)
     os.makedirs(folder, exist_ok=True)
     stem = os.path.splitext(os.path.basename(path))[0]
-    fd, tmp_path = tempfile.mkstemp(prefix=".{}_".format(stem), suffix=".tmp", dir=folder)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-    except BaseException:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-        raise
+    text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    write_file_atomic(path, text.encode("utf-8"), ".{}_".format(stem))
 
 
 def normalize_last_result(value):
@@ -1102,6 +1140,67 @@ def new_last_result(trigger, ok, message):
         "ok": bool(ok),
         "message": str(message or "")[:MESSAGE_MAX],
     }
+
+
+class JsonSettings:
+    """画面で編集する設定(instance/ の JSON ファイル1つ)の読み込み・保存。
+
+    filename  : instance/ の中のファイル名
+    label     : エラーメッセージに使う設定の名前(例: 「週報の設定ファイル」)
+    normalize : 読み込んだ値を検証して整える関数(不正・欠落した項目は既定値で補う。
+                辞書でなければ既定値だけを返す)
+    editable  : 画面から保存できる項目(last_result は実行の結果の記録だけが書き込む)
+    """
+
+    def __init__(self, filename, label, normalize, editable):
+        self.filename = filename
+        self.label = label
+        self.normalize = normalize
+        self.editable = tuple(editable)
+        self.lock = threading.RLock()
+
+    def path(self):
+        return os.path.join(current_app.instance_path, self.filename)
+
+    def load(self):
+        """現在の設定を返す(ファイルが無い・読み込めない場合は既定値)。"""
+        with self.lock:
+            try:
+                data = read_json(self.path(), self.label)
+            except SettingsFileError as exc:
+                current_app.logger.warning("%s（既定値を使用）", exc)
+                data = None
+            return self.normalize(data)
+
+    def _load_for_update(self):
+        """書き込む前に現在の設定を読む(ロックの中で呼ぶ)。
+
+        ファイルがあるのに読み込めない場合は SettingsFileError を送出する
+        (既定値で上書きして、保存済みの設定を消さないため)。
+        """
+        return self.normalize(read_json(self.path(), self.label))
+
+    def save(self, values):
+        """画面で編集した項目(editable)を保存する。戻り値: 保存した設定。"""
+        with self.lock:
+            current = self._load_for_update()
+            for key in self.editable:
+                if key in values:
+                    current[key] = values[key]
+            data = self.normalize(current)
+            write_json(self.path(), data)
+            return data
+
+    def set_last_result(self, trigger, ok, message):
+        """前回の結果を上書きする(他の設定項目は変更しない)。戻り値: 記録した前回の結果。
+
+        設定ファイルが読み込めない場合は書き込まずに SettingsFileError を送出する。
+        """
+        with self.lock:
+            current = self._load_for_update()
+            current["last_result"] = new_last_result(trigger, ok, message)
+            write_json(self.path(), current)
+            return current["last_result"]
 
 
 # =============================================================================
@@ -1315,6 +1414,84 @@ def business_days_ago(past_date, today):
     return count
 
 
+# =============================================================================
+# 2-5. 画面の権限の確認(マネージャーだけの画面)
+# =============================================================================
+# マネージャーだけが使える画面の確認(未ログインはログイン画面へ、メンバーは 403)。
+#   managers_only    : Blueprint 全体に付ける before_request(スキル管理・データ出力・週報・
+#                      期限超過通知・システム設定)
+#   manager_required : 画面の関数ごとに付けるデコレーター(マネージャーダッシュボード・AI分析・チーム管理)
+# 画面ごとの細かい権限(タスクの編集は担当者も可など)は、各画面の節にある。
+
+
+def managers_only():
+    """Blueprint の before_request: マネージャーだけ(未ログインはログイン画面へ、メンバーは 403)。
+
+    login_required は OPTIONS を素通しするため使わず、ここで直接確認する。
+    """
+    if not current_user.is_authenticated:
+        return current_app.login_manager.unauthorized()
+    if not getattr(current_user, "is_manager", False):
+        abort(403)
+    return None
+
+
+def manager_required(view):
+    """画面の関数のデコレーター: マネージャーだけ(未ログインはログイン画面へ、メンバーは 403)。
+
+    login_required と同じく、関数の名前(エンドポイント名)は変えない。
+    """
+    @wraps(view)
+    def checked(*args, **kwargs):
+        if not current_user.is_manager:
+            abort(403)
+        return view(*args, **kwargs)
+
+    return login_required(checked)
+
+
+# =============================================================================
+# 2-6. 時間のかかる処理の別スレッドでの実行(同時に1つだけ)
+# =============================================================================
+# 画面から始める時間のかかる処理(週報・期限超過通知の送信、スキルテストの問題の補充、AI分析)は、
+# 別スレッドで実行して画面はすぐに戻す。処理ごとのロックで同時に1つだけにする
+# (ロックを取れなければ「処理中」として始めない)。結果は各機能の「前回の結果」などに残す。
+
+
+def start_in_thread(app, lock, name, work, error_message, prepare=None, cleanup=None):
+    """lock を取れたら work() を別スレッドで実行する。取れなければ何もせず False を返す。
+
+    prepare : ロックを取った後、スレッドを始める前に呼ぶ(実行中の表示の準備など)
+    cleanup : 終わったとき(失敗しても)、ロックを放す前に呼ぶ
+    work の例外はログに残す(error_message)。終わったら(失敗しても)ロックを放す。
+    準備・スレッドの開始に失敗したときは、ロックを放して例外をそのまま送出する。
+    """
+    if not lock.acquire(blocking=False):
+        return False
+
+    def release():
+        if cleanup is not None:
+            cleanup()
+        lock.release()
+
+    def worker():
+        try:
+            work()
+        except Exception:
+            app.logger.exception(error_message)
+        finally:
+            release()
+
+    try:
+        if prepare is not None:
+            prepare()
+        threading.Thread(target=worker, name=name, daemon=True).start()
+    except Exception:
+        release()
+        raise
+    return True
+
+
 # #############################################################################
 # 3. モデル(DBのテーブル)
 # #############################################################################
@@ -1392,18 +1569,9 @@ class User(UserMixin, db.Model):
     def role_label(self):
         return ROLE_LABELS.get(self.role, self.role)
 
-    # ロールはマネージャー/メンバーの2種類。マネージャー=全権限。
-    # 既存コードの呼び出し互換のため3つのヘルパを残すが、いずれも「マネージャーかどうか」を返す。
-    @property
-    def is_admin(self):
-        return self.role == ROLE_MANAGER
-
     @property
     def is_manager(self):
-        return self.role == ROLE_MANAGER
-
-    @property
-    def is_leader(self):
+        """マネージャーか(マネージャーは全機能を使える。権限の確認はすべてこれで行う)。"""
         return self.role == ROLE_MANAGER
 
     @property
@@ -1585,6 +1753,13 @@ class Task(db.Model):
 
     def is_assigned_to(self, user):
         return user is not None and any(u.id == user.id for u in self.assignees)
+
+    def last_changed_to(self, status):
+        """最後に status へ変更した日時(状態の変更の記録が無ければ None)。"""
+        for change in reversed(self.status_changes):
+            if change.status == status and change.changed_at:
+                return change.changed_at
+        return None
 
     # --- 規模(負荷)関連 ---
     @property
@@ -1790,10 +1965,6 @@ class RoutineWork(db.Model):
         return MANUAL_COLORS.get(self.manual_status, "secondary")
 
     @property
-    def is_manual_done(self):
-        return self.manual_status == MANUAL_DONE
-
-    @property
     def frequency_label(self):
         """例: 「3回/週」。回数未設定なら単位のみ。"""
         if self.frequency_count:
@@ -1895,7 +2066,7 @@ SKILL_LEVEL_COLORS = {
 SKILL_PROFICIENT_LEVEL = 2
 
 # --- スキルの説明(skills.description)の見出し ---
-# 説明は、スキルテストの問題をAIが作るときの出題範囲・難易度の基準になる(8-2 の build_messages)。
+# 説明は、スキルテストの問題をAIが作るときの出題範囲・難易度の基準になる(8-3 の build_messages)。
 # スキル項目の編集画面の「AIで下書き」(5-6)は、この4つの見出しで下書きを作る。
 DESC_SCOPE = "対象範囲"
 DESC_TOOLS = "使う道具・言語・ソフト"
@@ -1982,15 +2153,6 @@ class Skill(db.Model):
             return None
         return next((r for r in self.ratings if r.user_id == user.id), None)
 
-    def level_of(self, user):
-        """指定ユーザーの到達度(未評価は0)。"""
-        r = self.rating_for(user)
-        return r.level if r else 0
-
-    def holder_count(self, min_level=SKILL_PROFICIENT_LEVEL):
-        """一定レベル以上を保有するメンバー数(スキル保有状況の指標)。"""
-        return sum(1 for r in self.ratings if r.level >= min_level)
-
     def __repr__(self):
         return f"<Skill {self.id} {self.skill_type}:{self.name}>"
 
@@ -2023,10 +2185,6 @@ class SkillRating(db.Model):
     @property
     def level_color(self):
         return SKILL_LEVEL_COLORS.get(self.level, "secondary")
-
-    @property
-    def is_unrated(self):
-        return self.level == 0
 
     def __repr__(self):
         return f"<SkillRating skill={self.skill_id} user={self.user_id} lv={self.level}>"
@@ -2087,10 +2245,6 @@ class Operation(db.Model):
         sid = skill.id if hasattr(skill, "id") else skill
         return next((r for r in self.skill_reqs if r.skill_id == sid), None)
 
-    def required_level(self, skill):
-        r = self.req_for(skill)
-        return r.level if r else 0
-
     def __repr__(self):
         return f"<Operation {self.id}: {self.name}>"
 
@@ -2146,7 +2300,7 @@ class Department(db.Model):
 # 回答には出題時点の問題文・選択肢(並べ替えた順)・正解の位置を控えとして保存する。
 # 後から問題を無効にしたり内容が変わったりしても、受験履歴はそのまま読める。
 #
-# 日時はすべて _now() から取る(受験の流れ(8-3)も _now() を使う)。
+# 日時はすべて _now()(2-2)から取る(受験の流れ(8-4)も _now() を使う)。
 # 動作確認では app._now を差し替えると、制限時間・期限・再受験の間隔などを時刻を固定して確かめられる。
 
 # --- 受験の状態 ---
@@ -2171,11 +2325,6 @@ SOURCE_LABELS = {SOURCE_AI: "AI"}
 
 # 選択肢の表示記号(index 0〜3)
 CHOICE_LETTERS = ["A", "B", "C", "D"]
-
-
-def _now():
-    """現在の日時。スキルテストの時刻はすべてここから取る(動作確認ではこの関数を差し替える)。"""
-    return datetime.now()
 
 
 def choice_letter(index):
@@ -2459,7 +2608,7 @@ def _call_chat_api(messages):
 
     独自APIに差し替える場合は、この関数だけをそのAPIの仕様に合わせて書き換える。
     (認証ヘッダ・リクエスト形式・レスポンスの取り出し方など)
-    例外はそのまま送出し、呼び出し元の chat() で文言に変換する。
+    例外はそのまま送出し、呼び出し元の ai_chat() で文言に変換する。
     """
     values = _ai_settings()
     url = values["api_url"] or AI_DEFAULT_API_URL
@@ -2525,6 +2674,40 @@ def ai_chat(messages):
     if not text:
         return None, "AIの応答が空でした。"
     return text, None
+
+
+# --------------------------------------------------------------------------- #
+# 応答の読み取り(AIが応答の前後に付けるコードブロック・説明文を除いて読む)
+# --------------------------------------------------------------------------- #
+# 応答全体を囲むコードブロック(```json … ``` など)
+_CODE_FENCE = re.compile(r"^```[A-Za-z0-9_-]*\s*\n?(.*?)\n?```\s*$", re.DOTALL)
+
+
+def strip_code_fence(text):
+    """応答の前後の空白と、応答全体を囲むコードブロックの記号を除く。"""
+    body = str(text or "").strip()
+    fence = _CODE_FENCE.match(body)
+    if fence:
+        body = fence.group(1).strip()
+    return body
+
+
+def parse_json_reply(text, opener, closer):
+    """応答を JSON として読む。読めなければ、最初の opener から最後の closer までを読む。
+
+    opener / closer は "[" と "]"(配列)または "{" と "}"(オブジェクト)。読めなければ None。
+    """
+    body = strip_code_fence(text)
+    try:
+        return json.loads(body)
+    except ValueError:
+        start, end = body.find(opener), body.rfind(closer)
+        if start < 0 or end <= start:
+            return None
+        try:
+            return json.loads(body[start:end + 1])
+        except ValueError:
+            return None
 
 
 # =============================================================================
@@ -2649,7 +2832,7 @@ def check_mail_settings(test=False, to=None, to_label="宛先（MAIL_TO）"):
     return None
 
 
-def _build_message(subject, text, html, attachments):
+def _build_message(text, html, attachments):
     """送信するメッセージを組み立てる(ヘッダは呼び出し元で付ける)。"""
     body = MIMEText(text or "", "plain", "utf-8")
     if html is not None:
@@ -2687,7 +2870,7 @@ def send_mail(subject, text, html=None, attachments=(), to=None, cc=None, test=F
     mail_from = values["mail_from"]
     to, cc = mail_recipients(test, to=to, cc=cc)
 
-    msg = _build_message(subject, text, html, attachments)
+    msg = _build_message(text, html, attachments)
     msg["From"] = _header_address(mail_from)
     msg["To"] = ", ".join(_header_address(item) for item in to)
     if cc:
@@ -2879,13 +3062,12 @@ def main_dashboard():
     my_overdue = [t for t in my_tasks if t.is_overdue]
 
     # ステータス別の件数: 全体数 と 自分の担当数(例 4(1))
-    statuses = [STATUS_TODO, STATUS_DOING, STATUS_HOLD, STATUS_DONE]
-    status_counts = {s: Task.query.filter_by(status=s).count() for s in statuses}
+    status_counts = {s: Task.query.filter_by(status=s).count() for s in STATUS_CHOICES}
     my_status_counts = {
         s: Task.query.filter(
             Task.assignees.any(User.id == current_user.id), Task.status == s
         ).count()
-        for s in statuses
+        for s in STATUS_CHOICES
     }
 
     # ---- 自分の分だけの 活動状況 / 成果 / ガントチャート ----
@@ -3005,9 +3187,9 @@ def _log_status(task, status):
 
 
 def _can_edit(task):
-    """編集・削除の権限:作成者・担当者(いずれか)・マネージャーのみ。"""
+    """編集・状態の変更・進捗の記載の権限:作成者・担当者(いずれか)・マネージャーのみ。"""
     return (
-        current_user.is_leader
+        current_user.is_manager
         or task.creator_id == current_user.id
         or task.is_assigned_to(current_user)
     )
@@ -3120,18 +3302,14 @@ def new_task():
 @tasks_bp.route("/<int:task_id>", endpoint="detail")
 @login_required
 def task_detail(task_id):
-    task = db.session.get(Task, task_id)
-    if task is None:
-        abort(404)
+    task = get_or_404(Task, task_id)
     return render_template("tasks/detail.html", task=task, can_edit=_can_edit(task))
 
 
 @tasks_bp.route("/<int:task_id>/edit", methods=["GET", "POST"])
 @login_required
 def edit_task(task_id):
-    task = db.session.get(Task, task_id)
-    if task is None:
-        abort(404)
+    task = get_or_404(Task, task_id)
     if not _can_edit(task):
         flash("このタスクを編集する権限がありません。", "danger")
         return redirect(url_for("tasks.detail", task_id=task.id))
@@ -3180,9 +3358,7 @@ def edit_task(task_id):
 @login_required
 def update_status(task_id):
     """一覧/詳細からワンクリックでステータスを変更する。"""
-    task = db.session.get(Task, task_id)
-    if task is None:
-        abort(404)
+    task = get_or_404(Task, task_id)
     if not _can_edit(task):
         flash("このタスクを更新する権限がありません。", "danger")
         return redirect(request.referrer or url_for("tasks.list_tasks"))
@@ -3203,9 +3379,7 @@ def update_status(task_id):
 @login_required
 def add_comment(task_id):
     """進捗状況の記載。担当者・作成者・マネージャーのみ(担当外のメンバーは不可)。"""
-    task = db.session.get(Task, task_id)
-    if task is None:
-        abort(404)
+    task = get_or_404(Task, task_id)
     if not _can_edit(task):
         flash("進捗状況を記載できるのは担当者・マネージャーのみです。", "danger")
         return redirect(url_for("tasks.detail", task_id=task.id))
@@ -3230,9 +3404,7 @@ def _can_edit_comment(comment):
 @login_required
 def edit_comment(task_id, comment_id):
     """進捗状況の記載内容を変更する。記載者本人・マネージャーのみ。"""
-    task = db.session.get(Task, task_id)
-    if task is None:
-        abort(404)
+    task = get_or_404(Task, task_id)
     comment = db.session.get(TaskComment, comment_id)
     if comment is None or comment.task_id != task.id:
         abort(404)
@@ -3253,9 +3425,7 @@ def edit_comment(task_id, comment_id):
 @tasks_bp.route("/<int:task_id>/delete", methods=["POST"])
 @login_required
 def delete_task(task_id):
-    task = db.session.get(Task, task_id)
-    if task is None:
-        abort(404)
+    task = get_or_404(Task, task_id)
     # 削除はマネージャーのみ(担当メンバーは編集・状態変更は可、削除は不可)
     if not current_user.is_manager:
         flash("タスクを削除できるのはマネージャーのみです。", "danger")
@@ -3311,13 +3481,6 @@ def _to_int(value):
     return int(value) if value.isdigit() else None
 
 
-def _get_routine_or_404(routine_id):
-    r = db.session.get(RoutineWork, routine_id)
-    if r is None:
-        abort(404)
-    return r
-
-
 def _can_edit_routine(rw):
     """編集できるか:マネージャー、または自分が担当のもの(メンバーは自分の分のみ)。"""
     return current_user.is_manager or rw.assignee_id == current_user.id
@@ -3331,6 +3494,14 @@ def _assignee_users():
 def _forced_assignee_id():
     """メンバーは担当者を自分に固定する(マネージャーはNone=フォームの選択に従う)。"""
     return None if current_user.is_manager else current_user.id
+
+
+def _render_routine_form(routine, users, form=None):
+    """登録・編集の画面を表示する(form は入力エラーで再表示する入力)。"""
+    return render_template(
+        "routine/form.html", routine=routine, users=users,
+        freq_choices=FREQ_UNIT_CHOICES, manual_choices=MANUAL_CHOICES, form=form,
+    )
 
 
 def _fill_from_form(rw, form, forced_assignee_id=None):
@@ -3423,20 +3594,13 @@ def new_routine():
         if errors:
             for e in errors:
                 flash(e, "danger")
-            return render_template(
-                "routine/form.html", routine=None, users=users,
-                freq_choices=FREQ_UNIT_CHOICES, manual_choices=MANUAL_CHOICES,
-                form=request.form,
-            )
+            return _render_routine_form(None, users, request.form)
         db.session.add(rw)
         db.session.commit()
         flash("定型・定期業務を登録しました。", "success")
         return redirect(url_for("routine.detail", routine_id=rw.id))
 
-    return render_template(
-        "routine/form.html", routine=None, users=users,
-        freq_choices=FREQ_UNIT_CHOICES, manual_choices=MANUAL_CHOICES, form=None,
-    )
+    return _render_routine_form(None, users)
 
 
 # --------------------------------------------------------------------------- #
@@ -3445,7 +3609,7 @@ def new_routine():
 @routine_bp.route("/<int:routine_id>", endpoint="detail")
 @login_required
 def routine_detail(routine_id):
-    rw = _get_routine_or_404(routine_id)
+    rw = get_or_404(RoutineWork, routine_id)
     return render_template("routine/detail.html", routine=rw, can_edit=_can_edit_routine(rw))
 
 
@@ -3455,7 +3619,7 @@ def routine_detail(routine_id):
 @routine_bp.route("/<int:routine_id>/edit", methods=["GET", "POST"])
 @login_required
 def edit_routine(routine_id):
-    rw = _get_routine_or_404(routine_id)
+    rw = get_or_404(RoutineWork, routine_id)
     if not _can_edit_routine(rw):
         flash("この定型・定期業務を編集できるのは担当者・マネージャーのみです。", "danger")
         return redirect(url_for("routine.detail", routine_id=rw.id))
@@ -3465,19 +3629,12 @@ def edit_routine(routine_id):
         if errors:
             for e in errors:
                 flash(e, "danger")
-            return render_template(
-                "routine/form.html", routine=rw, users=users,
-                freq_choices=FREQ_UNIT_CHOICES, manual_choices=MANUAL_CHOICES,
-                form=request.form,
-            )
+            return _render_routine_form(rw, users, request.form)
         db.session.commit()
         flash("定型・定期業務を更新しました。", "success")
         return redirect(url_for("routine.detail", routine_id=rw.id))
 
-    return render_template(
-        "routine/form.html", routine=rw, users=users,
-        freq_choices=FREQ_UNIT_CHOICES, manual_choices=MANUAL_CHOICES, form=None,
-    )
+    return _render_routine_form(rw, users)
 
 
 # --------------------------------------------------------------------------- #
@@ -3486,7 +3643,7 @@ def edit_routine(routine_id):
 @routine_bp.route("/<int:routine_id>/delete", methods=["POST"])
 @login_required
 def delete_routine(routine_id):
-    rw = _get_routine_or_404(routine_id)
+    rw = get_or_404(RoutineWork, routine_id)
     if not current_user.is_manager:
         flash("定型・定期業務を削除できるのはマネージャーのみです。", "danger")
         return redirect(url_for("routine.detail", routine_id=rw.id))
@@ -3518,11 +3675,20 @@ def _can_modify_leave(leave):
     return leave.user_id == current_user.id
 
 
-def _get_leave_or_404(leave_id):
-    leave = db.session.get(LeaveRequest, leave_id)
-    if leave is None:
-        abort(404)
-    return leave
+def _render_leave_form(leave, form=None):
+    """登録・編集の画面を表示する(form は入力エラーで再表示する入力)。"""
+    return render_template(
+        "leaves/form.html", leave=leave,
+        type_choices=LEAVE_TYPE_CHOICES, daily_limit=LEAVE_DAILY_LIMIT, form=form,
+    )
+
+
+def _read_leave_form():
+    """フォームの取得日(不正・未入力は None)と種別(不正・未選択は全休)。"""
+    leave_type = request.form.get("leave_type") or LEAVE_FULL
+    if leave_type not in LEAVE_TYPE_CHOICES:
+        leave_type = LEAVE_FULL
+    return parse_date(request.form.get("leave_date")), leave_type
 
 
 def _duplicate_on(user_id, leave_date, exclude_id=None):
@@ -3663,7 +3829,6 @@ def calendar_view():
         dept_id=dept_id,
         prev=(prev_year, prev_month),
         next=(next_year, next_month),
-        today=today,
         daily_limit=LEAVE_DAILY_LIMIT,
     )
 
@@ -3692,12 +3857,10 @@ def list_leaves():
     leaves = query.order_by(LeaveRequest.leave_date.desc(), LeaveRequest.id.desc()).all()
     total_days = round(sum(lv.day_count for lv in leaves), 2)
 
-    users = User.query.filter_by(is_active=True).order_by(User.display_name).all()
-
     return render_template(
         "leaves/list.html",
         leaves=leaves,
-        users=users,
+        users=get_active_users(),
         filters={
             "user": user_id,
             "scope": scope,
@@ -3715,18 +3878,10 @@ def list_leaves():
 @login_required
 def new_leave():
     if request.method == "POST":
-        leave_date = parse_date(request.form.get("leave_date"))
-        leave_type = request.form.get("leave_type") or LEAVE_FULL
-        if leave_type not in LEAVE_TYPE_CHOICES:
-            leave_type = LEAVE_FULL
-
+        leave_date, leave_type = _read_leave_form()
         if leave_date is None:
             flash("取得日を入力してください。", "danger")
-            return render_template(
-                "leaves/form.html", leave=None,
-                type_choices=LEAVE_TYPE_CHOICES, daily_limit=LEAVE_DAILY_LIMIT,
-                form=request.form,
-            )
+            return _render_leave_form(None, request.form)
 
         dup = _duplicate_on(current_user.id, leave_date)
         if dup:
@@ -3742,10 +3897,7 @@ def new_leave():
         _registration_messages(current_user, leave_date, exclude_id=leave.id)
         return redirect(url_for("leaves.calendar_view", year=leave_date.year, month=leave_date.month))
 
-    return render_template(
-        "leaves/form.html", leave=None,
-        type_choices=LEAVE_TYPE_CHOICES, daily_limit=LEAVE_DAILY_LIMIT, form=None,
-    )
+    return _render_leave_form(None)
 
 
 # --------------------------------------------------------------------------- #
@@ -3754,7 +3906,7 @@ def new_leave():
 @leaves_bp.route("/<int:leave_id>", endpoint="detail")
 @login_required
 def leave_detail(leave_id):
-    leave = _get_leave_or_404(leave_id)
+    leave = get_or_404(LeaveRequest, leave_id)
     return render_template(
         "leaves/detail.html", leave=leave, can_modify=_can_modify_leave(leave)
     )
@@ -3766,23 +3918,16 @@ def leave_detail(leave_id):
 @leaves_bp.route("/<int:leave_id>/edit", methods=["GET", "POST"])
 @login_required
 def edit_leave(leave_id):
-    leave = _get_leave_or_404(leave_id)
+    leave = get_or_404(LeaveRequest, leave_id)
     if not _can_modify_leave(leave):
         flash("年休を編集できるのは本人のみです。", "danger")
         return redirect(url_for("leaves.detail", leave_id=leave.id))
 
     if request.method == "POST":
-        leave_date = parse_date(request.form.get("leave_date"))
-        leave_type = request.form.get("leave_type") or LEAVE_FULL
-        if leave_type not in LEAVE_TYPE_CHOICES:
-            leave_type = LEAVE_FULL
+        leave_date, leave_type = _read_leave_form()
         if leave_date is None:
             flash("取得日を入力してください。", "danger")
-            return render_template(
-                "leaves/form.html", leave=leave,
-                type_choices=LEAVE_TYPE_CHOICES, daily_limit=LEAVE_DAILY_LIMIT,
-                form=request.form,
-            )
+            return _render_leave_form(leave, request.form)
         dup = _duplicate_on(current_user.id, leave_date, exclude_id=leave.id)
         if dup:
             flash("その取得日の年休は既に登録されています。", "warning")
@@ -3794,10 +3939,7 @@ def edit_leave(leave_id):
         _registration_messages(current_user, leave_date, exclude_id=leave.id)
         return redirect(url_for("leaves.detail", leave_id=leave.id))
 
-    return render_template(
-        "leaves/form.html", leave=leave,
-        type_choices=LEAVE_TYPE_CHOICES, daily_limit=LEAVE_DAILY_LIMIT, form=None,
-    )
+    return _render_leave_form(leave)
 
 
 # --------------------------------------------------------------------------- #
@@ -3806,7 +3948,7 @@ def edit_leave(leave_id):
 @leaves_bp.route("/<int:leave_id>/cancel", methods=["POST"])
 @login_required
 def cancel_leave(leave_id):
-    leave = _get_leave_or_404(leave_id)
+    leave = get_or_404(LeaveRequest, leave_id)
     if not _can_modify_leave(leave):
         flash("年休を取消できるのは本人のみです。", "danger")
         return redirect(url_for("leaves.detail", leave_id=leave.id))
@@ -3821,8 +3963,9 @@ def cancel_leave(leave_id):
 # =============================================================================
 # スキル管理のルーティング。
 #
-# スキルの閲覧・編集はいずれもマネージャーのみ(メンバーは before_request で403)。
-# スキルマップ(マトリクス)、個人スキル、項目定義、到達度の設定を扱う。
+# スキルの閲覧・編集はいずれもマネージャーのみ(Blueprint 全体を managers_only〔2-5〕で確認。
+# メンバーは403)。スキルマップ(マトリクス)、個人スキル、項目定義、到達度の設定を扱う。
+# 画面の編集のリンク・ボタン(can_edit)はマネージャーに表示する(この画面を開けるのはマネージャーだけ)。
 #
 # スキル項目の説明(skills.description)は、スキルテストの問題をAIが作るときの出題範囲の基準になる。
 # 項目の追加・編集の画面の「AIで下書き」(POST /skills/items/description-draft)は、スキル名・区分・
@@ -3839,17 +3982,7 @@ AXIS_PERSON = "person"
 AXIS_OPERATION = "operation"
 
 
-@skills_bp.before_request
-@login_required
-def _restrict_to_managers():
-    """スキル管理はマネージャーのみ。メンバーは一切アクセス不可(403)。"""
-    if not current_user.is_manager:
-        abort(403)
-
-
-def _can_edit_skill():
-    """スキル項目の定義・到達度の編集はマネージャー。"""
-    return current_user.is_leader
+skills_bp.before_request(managers_only)
 
 
 def _skill_users():
@@ -3890,7 +4023,6 @@ def _active_operations():
 # スキルマップ(マトリクス)
 # --------------------------------------------------------------------------- #
 @skills_bp.route("/")
-@login_required
 def list_skills():
     # 既定は「全スキル」(一番左のタブ)。個別区分は ?type=<区分> で表示。
     skill_type = request.args.get("type", SKILL_TYPE_ALL)
@@ -3961,8 +4093,6 @@ def list_skills():
         show=show,
         show_person=show_person,
         show_op=show_op,
-        axis_person=AXIS_PERSON,
-        axis_operation=AXIS_OPERATION,
         operations=operations,
         req_by_skill=req_by_skill,
         users=users,
@@ -3970,21 +4100,14 @@ def list_skills():
         holder_counts=holder_counts,
         level_colors=SKILL_LEVEL_COLORS,
         proficient=SKILL_PROFICIENT_LEVEL,
-        can_edit=_can_edit_skill(),
+        can_edit=current_user.is_manager,
     )
 
 
 @skills_bp.route("/operations/<int:op_id>/edit", methods=["GET", "POST"])
-@login_required
 def edit_operation(op_id):
     """業務ごとの必要スキル(ヒトと同じ到達尺度のレベル)を設定する(マネージャー)。"""
-    op = db.session.get(Operation, op_id)
-    if op is None:
-        abort(404)
-    if not _can_edit_skill():
-        flash("業務の必要スキルを編集する権限がありません(マネージャー)。", "danger")
-        return redirect(url_for("skills.list_skills", show=[AXIS_OPERATION]))
-
+    op = get_or_404(Operation, op_id)
     all_skills = []
     for stype in SKILL_TYPE_CHOICES:
         all_skills.extend(_active_skills(stype))
@@ -4022,7 +4145,6 @@ def edit_operation(op_id):
 
 
 @skills_bp.route("/coverage")
-@login_required
 def coverage():
     """別の見方: 縦=業務、横=ヒト。各ヒトがその業務に対応できるか(必要スキル充足)。"""
     operations = _active_operations()
@@ -4071,7 +4193,7 @@ def coverage():
         users=users,
         rows=rows,
         per_user_doable=per_user_doable,
-        can_edit=_can_edit_skill(),
+        can_edit=current_user.is_manager,
     )
 
 
@@ -4079,11 +4201,8 @@ def coverage():
 # メンバー個人のスキル
 # --------------------------------------------------------------------------- #
 @skills_bp.route("/member/<int:user_id>")
-@login_required
 def member(user_id):
-    member = db.session.get(User, user_id)
-    if member is None:
-        abort(404)
+    member = get_or_404(User, user_id)
     if not _is_skill_target(member):
         # manager権限のユーザーはスキル管理の対象外
         flash("マネージャーはスキル管理の対象外です。", "info")
@@ -4153,23 +4272,17 @@ def member(user_id):
         training=training,
         doable=doable,
         op_total=len(op_rows),
-        can_edit=_can_edit_skill(),
+        can_edit=current_user.is_manager,
     )
 
 
 @skills_bp.route("/member/<int:user_id>/edit", methods=["GET", "POST"])
-@login_required
 def edit_member(user_id):
-    member = db.session.get(User, user_id)
-    if member is None:
-        abort(404)
+    member = get_or_404(User, user_id)
     if not _is_skill_target(member):
         # manager権限のユーザーはスキル管理の対象外
         flash("マネージャーはスキル管理の対象外です。", "info")
         return redirect(url_for("skills.list_skills"))
-    if not _can_edit_skill():
-        flash("スキル到達度を編集する権限がありません(マネージャー)。", "danger")
-        return redirect(url_for("skills.member", user_id=user_id))
 
     # 全区分の有効スキルをまとめて編集
     all_skills = []
@@ -4216,20 +4329,11 @@ def edit_member(user_id):
 # スキル項目の管理(マネージャー)
 # --------------------------------------------------------------------------- #
 @skills_bp.route("/items")
-@login_required
 def items():
-    if not _can_edit_skill():
-        flash("スキル項目を管理する権限がありません(マネージャー)。", "danger")
-        return redirect(url_for("skills.list_skills"))
     skills = Skill.query.order_by(
         Skill.skill_type, Skill.sort_order, Skill.name
     ).all()
-    return render_template(
-        "skills/items.html",
-        skills=skills,
-        type_labels=SKILL_TYPE_LABELS,
-        proficient=SKILL_PROFICIENT_LEVEL,
-    )
+    return render_template("skills/items.html", skills=skills)
 
 
 # スキル項目の編集画面から戻る先(?back=pool: スキルテストの問題プールのそのスキルの画面)
@@ -4237,8 +4341,6 @@ ITEM_BACK_POOL = "pool"
 
 # AIの下書きの最大文字数(これより長い部分は切り捨てる)
 DESCRIPTION_DRAFT_MAX = 2000
-# 下書きから除く制御文字(改行・タブ以外)
-_DRAFT_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 # 見出しだけの行の、見出しの語の後ろ(（Lv1〜Lv4）・閉じ括弧・コロンだけなら見出しの行とみなす)
 _HEADING_TAIL = re.compile(r"[ \t　]*(?:（[^）]*）|\([^)]*\))?[ \t　]*[】\]:：]?[ \t　]*$")
 
@@ -4322,13 +4424,10 @@ def build_description_messages(name, skill_type, category, current=""):
 
 def clean_description_draft(text):
     """AIの応答を説明の下書きに整える(コードブロック・Markdown の記号を除き、見出しを「■」にそろえる)。"""
-    body = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    fence = re.match(r"^```[A-Za-z0-9_-]*\s*\n?(.*?)\n?```\s*$", body, re.DOTALL)
-    if fence:
-        body = fence.group(1).strip()
+    body = strip_code_fence(str(text or "").replace("\r\n", "\n").replace("\r", "\n"))
     lines = []
     for line in body.split("\n"):
-        line = _DRAFT_CONTROL.sub("", line).rstrip().replace("**", "")
+        line = CONTROL_CHARS.sub("", line).rstrip().replace("**", "")
         stripped = line.strip()
         known = _DESCRIPTION_HEADING_RE.match(stripped)
         heading = re.match(r"^#{1,6}\s*(.+)$", stripped)
@@ -4368,12 +4467,7 @@ def draft_skill_description(name, skill_type, category, current=""):
 
 
 @skills_bp.route("/items/new", methods=["GET", "POST"])
-@login_required
 def new_item():
-    if not _can_edit_skill():
-        flash("スキル項目を作成する権限がありません(マネージャー)。", "danger")
-        return redirect(url_for("skills.list_skills"))
-
     if request.method == "POST":
         name = request.form.get("name", "").strip()
         if not name:
@@ -4382,13 +4476,12 @@ def new_item():
         stype = request.form.get("skill_type")
         if stype not in SKILL_TYPE_CHOICES:
             stype = SKILL_TECHNICAL
-        order_raw = request.form.get("sort_order", "0")
         skill = Skill(
             name=name,
             skill_type=stype,
             category=request.form.get("category", "").strip(),
             description=request.form.get("description", "").strip(),
-            sort_order=int(order_raw) if order_raw.lstrip("-").isdigit() else 0,
+            sort_order=form_sort_order(request.form),
         )
         db.session.add(skill)
         db.session.commit()
@@ -4399,15 +4492,8 @@ def new_item():
 
 
 @skills_bp.route("/items/<int:skill_id>/edit", methods=["GET", "POST"])
-@login_required
 def edit_item(skill_id):
-    if not _can_edit_skill():
-        flash("スキル項目を編集する権限がありません(マネージャー)。", "danger")
-        return redirect(url_for("skills.list_skills"))
-    skill = db.session.get(Skill, skill_id)
-    if skill is None:
-        abort(404)
-
+    skill = get_or_404(Skill, skill_id)
     if request.method == "POST":
         name = request.form.get("name", "").strip()
         if not name:
@@ -4417,8 +4503,7 @@ def edit_item(skill_id):
         skill.name = name
         skill.category = request.form.get("category", "").strip()
         skill.description = request.form.get("description", "").strip()
-        order_raw = request.form.get("sort_order", "0")
-        skill.sort_order = int(order_raw) if order_raw.lstrip("-").isdigit() else 0
+        skill.sort_order = form_sort_order(request.form)
         db.session.commit()
         flash("スキル項目を更新しました。", "success")
         if _item_back() == ITEM_BACK_POOL:
@@ -4429,7 +4514,6 @@ def edit_item(skill_id):
 
 
 @skills_bp.route("/items/description-draft", methods=["POST"])
-@login_required
 def description_draft():
     """スキルの説明の下書きをAIで作る(保存はしない)。
 
@@ -4440,11 +4524,6 @@ def description_draft():
     """
     wants_json = request.accept_mimetypes.best_match(
         ["application/json", "text/html"]) == "application/json"
-    if not _can_edit_skill():
-        if wants_json:
-            return jsonify(ok=False, message="権限がありません(マネージャー)。"), 403
-        abort(403)
-
     skill = None
     raw_id = request.values.get("skill_id", "").strip()
     if raw_id:
@@ -4474,14 +4553,8 @@ def description_draft():
 
 
 @skills_bp.route("/items/<int:skill_id>/toggle", methods=["POST"])
-@login_required
 def toggle_item(skill_id):
-    if not _can_edit_skill():
-        flash("権限がありません(マネージャー)。", "danger")
-        return redirect(url_for("skills.list_skills"))
-    skill = db.session.get(Skill, skill_id)
-    if skill is None:
-        abort(404)
+    skill = get_or_404(Skill, skill_id)
     skill.is_active = not skill.is_active
     db.session.commit()
     flash(
@@ -4494,32 +4567,23 @@ def toggle_item(skill_id):
 # 業務(Operation)項目の管理(マネージャー)。横軸「業務」ビューの列に使う。
 # --------------------------------------------------------------------------- #
 @skills_bp.route("/operations")
-@login_required
 def operations():
-    if not _can_edit_skill():
-        flash("業務項目を管理する権限がありません(マネージャー)。", "danger")
-        return redirect(url_for("skills.list_skills"))
     ops = Operation.query.order_by(Operation.sort_order, Operation.name).all()
     return render_template("skills/operations.html", operations=ops)
 
 
 @skills_bp.route("/operations/new", methods=["POST"])
-@login_required
 def new_operation():
-    if not _can_edit_skill():
-        flash("業務項目を作成する権限がありません(マネージャー)。", "danger")
-        return redirect(url_for("skills.list_skills"))
     name = request.form.get("name", "").strip()
     if not name:
         flash("業務名を入力してください。", "danger")
     elif Operation.query.filter_by(name=name).first():
         flash("同じ名称の業務が既にあります。", "warning")
     else:
-        order_raw = request.form.get("sort_order", "0")
         db.session.add(Operation(
             name=name,
             description=request.form.get("description", "").strip() or None,
-            sort_order=int(order_raw) if order_raw.lstrip("-").isdigit() else 0,
+            sort_order=form_sort_order(request.form),
         ))
         db.session.commit()
         flash(f"業務「{name}」を追加しました。", "success")
@@ -4527,14 +4591,8 @@ def new_operation():
 
 
 @skills_bp.route("/operations/<int:op_id>/rename", methods=["POST"])
-@login_required
 def rename_operation(op_id):
-    if not _can_edit_skill():
-        flash("業務項目を編集する権限がありません(マネージャー)。", "danger")
-        return redirect(url_for("skills.list_skills"))
-    op = db.session.get(Operation, op_id)
-    if op is None:
-        abort(404)
+    op = get_or_404(Operation, op_id)
     name = request.form.get("name", "").strip()
     if not name:
         flash("業務名を入力してください。", "danger")
@@ -4545,22 +4603,15 @@ def rename_operation(op_id):
         else:
             op.name = name
             op.description = request.form.get("description", "").strip() or None
-            order_raw = request.form.get("sort_order", str(op.sort_order))
-            op.sort_order = int(order_raw) if order_raw.lstrip("-").isdigit() else op.sort_order
+            op.sort_order = form_sort_order(request.form, op.sort_order)
             db.session.commit()
             flash("業務を更新しました。", "success")
     return redirect(url_for("skills.operations"))
 
 
 @skills_bp.route("/operations/<int:op_id>/toggle", methods=["POST"])
-@login_required
 def toggle_operation(op_id):
-    if not _can_edit_skill():
-        flash("権限がありません(マネージャー)。", "danger")
-        return redirect(url_for("skills.list_skills"))
-    op = db.session.get(Operation, op_id)
-    if op is None:
-        abort(404)
+    op = get_or_404(Operation, op_id)
     op.is_active = not op.is_active
     db.session.commit()
     flash(f"業務「{op.name}」を{'有効' if op.is_active else '無効'}にしました。", "info")
@@ -4572,7 +4623,8 @@ def toggle_operation(op_id):
 # =============================================================================
 # マネージャー(manager)向けダッシュボードのルーティング。
 #
-# マネージャーのみアクセス可。チーム全体を俯瞰する読み取り専用の集計ビュー。年休は事由を出さない。
+# マネージャーのみアクセス可(各画面に manager_required〔2-5〕)。チーム全体を俯瞰する読み取り専用の
+# 集計ビュー。年休は事由を出さない。
 # 「AI分析（サマリーと推奨アクション）」(/manager/analysis)は 9 章(同じ manager_bp に登録する)。
 
 manager_bp = Blueprint("manager", __name__, url_prefix="/manager")
@@ -4979,11 +5031,8 @@ def _build_gantt(today, only_user_id=None):
 
 
 @manager_bp.route("/", endpoint="dashboard")
-@login_required
+@manager_required
 def manager_dashboard():
-    if not current_user.is_manager:
-        abort(403)
-
     today = date.today()
     users = get_active_users()
     members = [u for u in users if u.role == ROLE_MEMBER]
@@ -5095,11 +5144,9 @@ def manager_dashboard():
 
 
 @manager_bp.route("/gantt")
-@login_required
+@manager_required
 def gantt_full():
     """全タスクのガントチャートを全画面で表示する専用ページ。"""
-    if not current_user.is_manager:
-        abort(403)
     gctx = _build_gantt(date.today())
     return render_template(
         "manager/gantt_full.html",
@@ -5112,16 +5159,11 @@ def gantt_full():
 # =============================================================================
 # 5-8. チーム管理
 # =============================================================================
-# チーム(Department)の管理ルーティング。マネージャーのみ。
+# チーム(Department)の管理ルーティング。マネージャーのみ(各画面に manager_required〔2-5〕)。
 #
 # チームの追加・名称変更・有効/無効、および 人とチームの紐づけ(兼務対応)を管理する。
 
 departments_bp = Blueprint("departments", __name__, url_prefix="/departments")
-
-
-def _require_admin():
-    if not current_user.is_admin:
-        abort(403)
 
 
 def _member_has_history(user):
@@ -5145,11 +5187,10 @@ def _member_has_history(user):
 
 
 @departments_bp.route("/")
-@login_required
+@manager_required
 def manage():
-    _require_admin()
     departments = Department.query.order_by(Department.sort_order, Department.name).all()
-    users = User.query.filter_by(is_active=True).order_by(User.display_name).all()
+    users = get_active_users()
     inactive_members = (
         User.query.filter_by(is_active=False).order_by(User.display_name).all()
     )
@@ -5168,10 +5209,9 @@ def manage():
 
 
 @departments_bp.route("/members/new", methods=["POST"])
-@login_required
+@manager_required
 def new_member():
     """メンバー(ユーザー)を追加する。マネージャーのみ。"""
-    _require_admin()
     username = request.form.get("username", "").strip()
     display_name = request.form.get("display_name", "").strip()
     role = request.form.get("role", ROLE_MEMBER)
@@ -5195,17 +5235,14 @@ def new_member():
 
 
 @departments_bp.route("/members/<int:user_id>/delete", methods=["POST"])
-@login_required
+@manager_required
 def delete_member(user_id):
     """メンバーを削除する。マネージャーのみ。
 
     業務データ(タスク・進捗・年休・スキル・定型業務)がある場合は、参照を壊さない
     よう物理削除せず「無効化」する(一覧・割り当てから外れる)。データが無ければ物理削除。
     """
-    _require_admin()
-    user = db.session.get(User, user_id)
-    if user is None:
-        abort(404)
+    user = get_or_404(User, user_id)
     if user.id == current_user.id:
         flash("自分自身は削除できません。", "warning")
         return redirect(url_for("departments.manage"))
@@ -5229,13 +5266,10 @@ def delete_member(user_id):
 
 
 @departments_bp.route("/members/<int:user_id>/reactivate", methods=["POST"])
-@login_required
+@manager_required
 def reactivate_member(user_id):
     """無効化したメンバーを復帰させる。マネージャーのみ。"""
-    _require_admin()
-    user = db.session.get(User, user_id)
-    if user is None:
-        abort(404)
+    user = get_or_404(User, user_id)
     user.is_active = True
     db.session.commit()
     flash(f"メンバー「{user.display_name}」を復帰しました。", "success")
@@ -5243,32 +5277,24 @@ def reactivate_member(user_id):
 
 
 @departments_bp.route("/new", methods=["POST"])
-@login_required
+@manager_required
 def new_department():
-    _require_admin()
     name = request.form.get("name", "").strip()
     if not name:
         flash("チームの名称を入力してください。", "danger")
     elif Department.query.filter_by(name=name).first():
         flash("同じ名称のチームが既にあります。", "warning")
     else:
-        order_raw = request.form.get("sort_order", "0")
-        db.session.add(Department(
-            name=name,
-            sort_order=int(order_raw) if order_raw.lstrip("-").isdigit() else 0,
-        ))
+        db.session.add(Department(name=name, sort_order=form_sort_order(request.form)))
         db.session.commit()
         flash(f"チーム「{name}」を追加しました。", "success")
     return redirect(url_for("departments.manage"))
 
 
 @departments_bp.route("/<int:dept_id>/rename", methods=["POST"])
-@login_required
+@manager_required
 def rename_department(dept_id):
-    _require_admin()
-    dept = db.session.get(Department, dept_id)
-    if dept is None:
-        abort(404)
+    dept = get_or_404(Department, dept_id)
     name = request.form.get("name", "").strip()
     if not name:
         flash("チームの名称を入力してください。", "danger")
@@ -5278,20 +5304,16 @@ def rename_department(dept_id):
             flash("同じ名称のチームが既にあります。", "warning")
         else:
             dept.name = name
-            order_raw = request.form.get("sort_order", str(dept.sort_order))
-            dept.sort_order = int(order_raw) if order_raw.lstrip("-").isdigit() else dept.sort_order
+            dept.sort_order = form_sort_order(request.form, dept.sort_order)
             db.session.commit()
             flash("チームを更新しました。", "success")
     return redirect(url_for("departments.manage"))
 
 
 @departments_bp.route("/<int:dept_id>/toggle", methods=["POST"])
-@login_required
+@manager_required
 def toggle_department(dept_id):
-    _require_admin()
-    dept = db.session.get(Department, dept_id)
-    if dept is None:
-        abort(404)
+    dept = get_or_404(Department, dept_id)
     dept.is_active = not dept.is_active
     db.session.commit()
     flash(
@@ -5301,10 +5323,9 @@ def toggle_department(dept_id):
 
 
 @departments_bp.route("/memberships", methods=["POST"])
-@login_required
+@manager_required
 def save_memberships():
     """人とチームの紐づけ(兼務対応)を一括保存する。"""
-    _require_admin()
     users = User.query.filter_by(is_active=True).all()
     user_by_id = {u.id: u for u in users}
     for dept in Department.query.all():
@@ -5319,20 +5340,13 @@ def save_memberships():
 # =============================================================================
 # 5-9. Excel データ出力
 # =============================================================================
-# 全データの Excel(.xlsx) 出力。マネージャーのみ。
+# 全データの Excel(.xlsx) 出力。マネージャーのみ(Blueprint 全体を managers_only〔2-5〕で確認)。
 #
 # 各メニューのデータ(現在データ＋履歴データ)を openpyxl で xlsx 化し、
 # 添付ファイルとしてダウンロードさせる。読み取り専用(DBは変更しない)。
 
 export_bp = Blueprint("export", __name__, url_prefix="/export")
-
-
-@export_bp.before_request
-@login_required
-def _export_managers_only():
-    """データ出力はマネージャーのみ。"""
-    if not current_user.is_manager:
-        abort(403)
+export_bp.before_request(managers_only)
 
 
 def _fmt(v):
@@ -5619,7 +5633,7 @@ def all_xlsx():
 #   6-8 画面           週報の画面と「今すぐ作成」(Blueprint: weekly_bp, /weekly)
 #
 # アプリ共通の部品を使う: AI(4-1 ai_chat)・メール送信(4-2 send_mail)・
-# 自動送信のスケジューラ(10。「flask --app app run」で起動したときだけ動く)。
+# 自動送信のスケジューラ(11。「flask --app app run」で起動したときだけ動く)。
 # 接続設定(メール・AI)はすべて instance/config.py から読み込む(システム設定の「基本設定」タブで変更)。
 
 
@@ -5804,11 +5818,8 @@ def build_weekly_subject(pattern, start, end, send_date):
 #   filename_pattern / subject_pattern / mail_body : ファイル名・件名・メール本文
 #   last_result      : 前回の結果(日時・きっかけ・成否・メッセージ)。毎回上書き
 #
-# 画面の保存とバックグラウンドの送信が同時に書き込んでも壊れないよう、
-# ロックで直列化し、一時ファイルに書いてから置き換える(os.replace)。
-# ファイルがあるのに読み込めない(壊れている・開けない)ときは、表示や自動送信の判定には
-# 既定値を使うが、保存済みの設定を消さないよう上書きはしない(SettingsFileError)。
-# ファイルの読み書きは期限超過通知と共通の部品(2-3)を使う。
+# ファイルの読み書きは共通の部品(2-3 の JsonSettings)を使う(画面の保存とバックグラウンドの送信が
+# 同時に書き込んでも壊れない。読み込めないファイルは上書きしない)。
 
 WEEKLY_SETTINGS_FILENAME = "weekly_settings.json"
 WEEKLY_SETTINGS_LABEL = "週報の設定ファイル"
@@ -5873,12 +5884,6 @@ _TEXT_KEYS = (
     "filename_pattern", "subject_pattern", "mail_body",
 )
 
-_weekly_settings_lock = threading.RLock()
-
-
-def _weekly_settings_path():
-    return os.path.join(current_app.instance_path, WEEKLY_SETTINGS_FILENAME)
-
 
 def _normalize_weekly_settings(data):
     """読み込んだ値を検証し、不正・欠落した項目は既定値で補う。"""
@@ -5915,54 +5920,17 @@ def _normalize_weekly_settings(data):
     return result
 
 
-def load_weekly_settings():
-    """現在の設定を返す(ファイルが無い・読み込めない場合は既定値)。"""
-    with _weekly_settings_lock:
-        try:
-            data = read_json(_weekly_settings_path(), WEEKLY_SETTINGS_LABEL)
-        except SettingsFileError as exc:
-            current_app.logger.warning("%s（既定値を使用）", exc)
-            data = None
-        return _normalize_weekly_settings(data)
-
-
-def _load_weekly_settings_for_update():
-    """書き込む前に現在の設定を読む。
-
-    ファイルがあるのに読み込めない場合は SettingsFileError を送出する
-    (既定値で上書きして、保存済みの対象者・見本などを消さないため)。
-    """
-    return _normalize_weekly_settings(read_json(_weekly_settings_path(), WEEKLY_SETTINGS_LABEL))
+WEEKLY_SETTINGS = JsonSettings(WEEKLY_SETTINGS_FILENAME, WEEKLY_SETTINGS_LABEL,
+                               _normalize_weekly_settings, WEEKLY_EDITABLE_KEYS)
+load_weekly_settings = WEEKLY_SETTINGS.load              # 現在の設定(読み込めなければ既定値)
+save_weekly_settings = WEEKLY_SETTINGS.save              # 画面で編集した項目を保存する
+set_weekly_last_result = WEEKLY_SETTINGS.set_last_result  # 前回の結果を上書きする
 
 
 def is_weekly_target(settings, user):
     """user が対象者として選ばれているか(ユーザーIDとログインIDの両方が一致する場合だけ)。"""
     names = settings.get("target_usernames") or {}
     return bool(user.username) and names.get(str(user.id)) == user.username
-
-
-def save_weekly_settings(values):
-    """画面で編集した項目を保存する(last_result は変更しない)。"""
-    with _weekly_settings_lock:
-        current = _load_weekly_settings_for_update()
-        for key in WEEKLY_EDITABLE_KEYS:
-            if key in values:
-                current[key] = values[key]
-        data = _normalize_weekly_settings(current)
-        write_json(_weekly_settings_path(), data)
-        return data
-
-
-def set_weekly_last_result(trigger, ok, message):
-    """前回の結果を上書きする(他の設定項目は変更しない)。
-
-    設定ファイルが読み込めない場合は書き込まずに SettingsFileError を送出する。
-    """
-    with _weekly_settings_lock:
-        current = _load_weekly_settings_for_update()
-        current["last_result"] = new_last_result(trigger, ok, message)
-        write_json(_weekly_settings_path(), current)
-        return current["last_result"]
 
 
 # =============================================================================
@@ -6091,7 +6059,7 @@ DUE_SOON_DAYS = 7
 COMMENT_MAX = 400
 
 
-def _one_line(text, limit=None):
+def _join_lines(text, limit=None):
     """複数行のテキストを「 / 」区切りの1行にまとめる(長すぎる場合は切り詰める)。"""
     text = " / ".join(line.strip() for line in (text or "").splitlines() if line.strip())
     if limit and len(text) > limit:
@@ -6111,9 +6079,9 @@ def _completed_on(task):
     """
     if task.status != STATUS_DONE:
         return None
-    for change in reversed(task.status_changes):
-        if change.status == STATUS_DONE and change.changed_at:
-            return change.changed_at.date()
+    done_at = task.last_changed_to(STATUS_DONE)
+    if done_at is not None:
+        return done_at.date()
     return task.updated_at.date() if task.updated_at else None
 
 
@@ -6129,7 +6097,7 @@ def _task_facts(task, start, end):
         {
             "at": c.created_at,
             "author": c.user.display_name if c.user else "",
-            "text": _one_line(c.body, COMMENT_MAX),
+            "text": _join_lines(c.body, COMMENT_MAX),
         }
         for c in task.comments if in_period(c.created_at)
     ]
@@ -6166,7 +6134,7 @@ def _task_facts(task, start, end):
         "due_soon": (is_open and due is not None
                      and end < due <= end + timedelta(days=DUE_SOON_DAYS)),
         "outcome_quant": task.outcome_quant_actual_label or "",
-        "outcome_qual": _one_line(task.outcome_qual_actual),
+        "outcome_qual": _join_lines(task.outcome_qual_actual),
         "outcome_value": task.outcome_quant_actual,
         "outcome_unit": task.outcome_quant_actual_unit,
     }
@@ -6904,7 +6872,7 @@ def _build_weekly(app, start, end, send_date):
     material = collect_weekly_material(start, end, users)
     written = write_report(material, settings, send_date)
     data = build_docx(
-        material, written, datetime.now(), app.config.get("APP_NAME") or "業務管理システム")
+        material, written, datetime.now(), display_app_name(app))
     return {
         "data": data,
         "filename": build_weekly_filename(settings["filename_pattern"], start, end, send_date),
@@ -6914,7 +6882,7 @@ def _build_weekly(app, start, end, send_date):
 
 
 def _deliver_weekly(app, start, end, trigger, deliver, send_date):
-    """テスト送信・本番送信の本体(_send_lock を持った状態で呼ぶ)。
+    """テスト送信・本番送信の本体(_weekly_send_lock を持った状態で呼ぶ)。
 
     成否にかかわらず「前回の結果」を上書きする。
     """
@@ -6980,24 +6948,11 @@ def start_weekly_background(app, start, end, trigger, deliver, send_date=None):
     """
     if deliver not in (DELIVER_TEST, DELIVER_SEND):
         raise ValueError("deliver が不正です: {}".format(deliver))
-    if not _weekly_send_lock.acquire(blocking=False):
-        return False
     send_date = send_date or date.today()
-
-    def worker():
-        try:
-            _deliver_weekly(app, start, end, trigger, deliver, send_date)
-        except Exception:
-            app.logger.exception("週報の送信処理でエラーが発生しました")
-        finally:
-            _weekly_send_lock.release()
-
-    try:
-        threading.Thread(target=worker, name="weekly-send", daemon=True).start()
-    except Exception:
-        _weekly_send_lock.release()
-        raise
-    return True
+    return start_in_thread(
+        app, _weekly_send_lock, "weekly-send",
+        lambda: _deliver_weekly(app, start, end, trigger, deliver, send_date),
+        "週報の送信処理でエラーが発生しました")
 
 
 def _weekly_error_message(app, exc):
@@ -7026,22 +6981,12 @@ def _weekly_error_message(app, exc):
 # (instance/config.py)で変更する(この画面では状況だけを表示する)。
 
 weekly_bp = Blueprint("weekly", __name__, url_prefix="/weekly")
+# 週報の画面・作成はマネージャーのみ(未ログインはログイン画面へ。2-5)
+weekly_bp.before_request(managers_only)
 
 DOCX_MIMETYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 # 「今すぐ作成」で指定できる期間の上限(日数)
 RUN_MAX_DAYS = 366
-
-
-@weekly_bp.before_request
-def _weekly_managers_only():
-    """週報の画面・作成はマネージャーのみ(未ログインはログイン画面へ)。
-
-    login_required は OPTIONS を素通しするため使わず、ここで直接確認する。
-    """
-    if not current_user.is_authenticated:
-        return current_app.login_manager.unauthorized()
-    if not getattr(current_user, "is_manager", False):
-        abort(403)
 
 
 def _render_weekly(settings):
@@ -7173,7 +7118,7 @@ def weekly_run_now():
 #   7-6 画面           画面・プレビュー・今すぐ送信(Blueprint: overdue_bp, /overdue)
 #
 # アプリ共通の部品を使う: メール送信(4-2 send_mail)・営業日カレンダー(2-4)・
-# 自動送信のスケジューラ(10。「flask --app app run」で起動したときだけ動く)。
+# 自動送信のスケジューラ(11。「flask --app app run」で起動したときだけ動く)。
 # メールの送信サーバー・宛先・リンクの基準URL(APP_BASE_URL)は instance/config.py から読み込む
 # (システム設定の「基本設定」タブで変更)。
 
@@ -7245,10 +7190,8 @@ def next_overdue_run(settings, now):
 #   comment_count : 各タスクに載せる進捗記載(コメント)の件数(直近から。1〜10、既定 1)
 #   last_result   : 前回の結果(日時・きっかけ・成否・メッセージ)。毎回上書き
 #
-# 画面の保存とバックグラウンドの送信が同時に書き込んでも壊れないよう、ロックで直列化し、
-# 一時ファイルに書いてから置き換える(週報と共通の部品。2-3)。
-# ファイルがあるのに読み込めない(壊れている・開けない)ときは、表示や自動送信の判定には
-# 既定値を使うが、保存済みの設定を消さないよう上書きはしない(SettingsFileError)。
+# ファイルの読み書きは週報と共通の部品(2-3 の JsonSettings)を使う(画面の保存とバックグラウンドの
+# 送信が同時に書き込んでも壊れない。読み込めないファイルは上書きしない)。
 
 OVERDUE_SETTINGS_FILENAME = "overdue_settings.json"
 OVERDUE_SETTINGS_LABEL = "期限超過通知の設定ファイル"
@@ -7266,12 +7209,6 @@ OVERDUE_DEFAULTS = {
 
 # 画面から保存できる項目(last_result は送信処理だけが書き込む)
 OVERDUE_EDITABLE_KEYS = [k for k in OVERDUE_DEFAULTS if k != "last_result"]
-
-_overdue_settings_lock = threading.RLock()
-
-
-def _overdue_settings_path():
-    return os.path.join(current_app.instance_path, OVERDUE_SETTINGS_FILENAME)
 
 
 def valid_comment_count(value):
@@ -7297,48 +7234,11 @@ def _normalize_overdue_settings(data):
     return result
 
 
-def load_overdue_settings():
-    """現在の設定を返す(ファイルが無い・読み込めない場合は既定値)。"""
-    with _overdue_settings_lock:
-        try:
-            data = read_json(_overdue_settings_path(), OVERDUE_SETTINGS_LABEL)
-        except SettingsFileError as exc:
-            current_app.logger.warning("%s（既定値を使用）", exc)
-            data = None
-        return _normalize_overdue_settings(data)
-
-
-def _load_overdue_settings_for_update():
-    """書き込む前に現在の設定を読む。
-
-    ファイルがあるのに読み込めない場合は SettingsFileError を送出する
-    (既定値で上書きして、保存済みの設定を消さないため)。
-    """
-    return _normalize_overdue_settings(read_json(_overdue_settings_path(), OVERDUE_SETTINGS_LABEL))
-
-
-def save_overdue_settings(values):
-    """画面で編集した項目を保存する(last_result は変更しない)。"""
-    with _overdue_settings_lock:
-        current = _load_overdue_settings_for_update()
-        for key in OVERDUE_EDITABLE_KEYS:
-            if key in values:
-                current[key] = values[key]
-        data = _normalize_overdue_settings(current)
-        write_json(_overdue_settings_path(), data)
-        return data
-
-
-def set_overdue_last_result(trigger, ok, message):
-    """前回の結果を上書きする(他の設定項目は変更しない)。
-
-    設定ファイルが読み込めない場合は書き込まずに SettingsFileError を送出する。
-    """
-    with _overdue_settings_lock:
-        current = _load_overdue_settings_for_update()
-        current["last_result"] = new_last_result(trigger, ok, message)
-        write_json(_overdue_settings_path(), current)
-        return current["last_result"]
+OVERDUE_SETTINGS = JsonSettings(OVERDUE_SETTINGS_FILENAME, OVERDUE_SETTINGS_LABEL,
+                                _normalize_overdue_settings, OVERDUE_EDITABLE_KEYS)
+load_overdue_settings = OVERDUE_SETTINGS.load              # 現在の設定(読み込めなければ既定値)
+save_overdue_settings = OVERDUE_SETTINGS.save              # 画面で編集した項目を保存する
+set_overdue_last_result = OVERDUE_SETTINGS.set_last_result  # 前回の結果を上書きする
 
 
 # =============================================================================
@@ -7370,8 +7270,7 @@ def parse_overdue_form(form):
     else:
         errors.append("送信する時刻を「時:分」（例: 05:00）で入力してください。")
 
-    raw_count = (form.get("comment_count") or "").strip()
-    count = int(raw_count) if raw_count.isdecimal() else None
+    count = form_int(form, "comment_count")
     if valid_comment_count(count):
         values["comment_count"] = count
     else:
@@ -7596,8 +7495,7 @@ def _intro(data):
 
 
 def _footer():
-    return "※このメールは{}から送信しています。".format(
-        current_app.config.get("APP_NAME") or "業務管理システム")
+    return "※このメールは{}から送信しています。".format(display_app_name())
 
 
 def section_heading(section):
@@ -7701,7 +7599,7 @@ def _overdue_summary(mail, send_message):
 
 
 def _deliver_overdue(app, trigger, test, today):
-    """送信の本体(_send_lock を持った状態で呼ぶ)。成否にかかわらず「前回の結果」を上書きする。"""
+    """送信の本体(_overdue_send_lock を持った状態で呼ぶ)。成否にかかわらず「前回の結果」を上書きする。"""
     with app.app_context():
         try:
             problem = check_mail_settings(test)
@@ -7742,24 +7640,11 @@ def start_overdue_background(app, trigger, test=False):
     既に送信処理中なら何もせず False を返す(二重送信の防止)。
     結果は「前回の結果」に記録される。
     """
-    if not _overdue_send_lock.acquire(blocking=False):
-        return False
     today = date.today()
-
-    def worker():
-        try:
-            _deliver_overdue(app, trigger, test, today)
-        except Exception:
-            app.logger.exception("期限超過通知の送信処理でエラーが発生しました")
-        finally:
-            _overdue_send_lock.release()
-
-    try:
-        threading.Thread(target=worker, name="overdue-send", daemon=True).start()
-    except Exception:
-        _overdue_send_lock.release()
-        raise
-    return True
+    return start_in_thread(
+        app, _overdue_send_lock, "overdue-send",
+        lambda: _deliver_overdue(app, trigger, test, today),
+        "期限超過通知の送信処理でエラーが発生しました")
 
 
 # =============================================================================
@@ -7778,21 +7663,8 @@ def start_overdue_background(app, trigger, test=False):
 # (instance/config.py)で変更する(この画面では状況だけを表示する)。
 
 overdue_bp = Blueprint("overdue", __name__, url_prefix="/overdue")
-
-ACTION_TEST = "test"
-ACTION_SEND = "send"
-
-
-@overdue_bp.before_request
-def _overdue_managers_only():
-    """期限超過通知の画面・送信はマネージャーのみ(未ログインはログイン画面へ)。
-
-    login_required は OPTIONS を素通しするため使わず、ここで直接確認する。
-    """
-    if not current_user.is_authenticated:
-        return current_app.login_manager.unauthorized()
-    if not getattr(current_user, "is_manager", False):
-        abort(403)
+# 期限超過通知の画面・送信はマネージャーのみ(未ログインはログイン画面へ。2-5)
+overdue_bp.before_request(managers_only)
 
 
 def _preview_document(html):
@@ -7843,9 +7715,9 @@ def overdue_save_settings():
 @overdue_bp.route("/run", methods=["POST"], endpoint="run_now")
 def overdue_run_now():
     action = request.form.get("action", "")
-    if action == ACTION_TEST:
+    if action == DELIVER_TEST:
         trigger, label, test = TRIGGER_TEST, "テスト送信", True
-    elif action == ACTION_SEND:
+    elif action == DELIVER_SEND:
         trigger, label, test = TRIGGER_MANUAL, "本番の宛先への送信", False
     else:
         abort(400)
@@ -7870,10 +7742,10 @@ def overdue_run_now():
 # (マネージャーはスキル管理の対象外のため受験しない)。
 #
 #   8-1 設定の保存     画面で編集する設定(instance/skilltest_settings.json)
-#   8-2 問題の作成     AIによる問題の作成と検証(4-1 の ai_chat() を使用)
-#   8-3 受験の流れ     開始・出題・回答・離脱の記録・自動終了・採点・到達度の自動登録
-#   8-4 問題プール     問題プールの集計と補充(バックグラウンド)
-#   8-5 設定フォーム   設定フォームの入力チェック(システム設定の「スキルテスト」タブで使う)
+#   8-2 設定フォーム   設定フォームの入力チェック(システム設定の「スキルテスト」タブで使う)
+#   8-3 問題の作成     AIによる問題の作成と検証(4-1 の ai_chat() を使用)
+#   8-4 受験の流れ     開始・出題・回答・離脱の記録・自動終了・採点・到達度の自動登録
+#   8-5 問題プール     問題プールの集計と補充(バックグラウンド)
 #   8-6 画面           Blueprint: skilltest_bp, /skilltest。メンバー用と管理用(/skilltest/admin)
 #
 # DBにはスキルテスト用のテーブル(skill_test_questions / skill_test_attempts / skill_test_answers。
@@ -7901,10 +7773,8 @@ def overdue_run_now():
 # 受験中のテストは開始時点の設定の控え(SkillTestAttempt.settings_snapshot)で採点するため、
 # 設定を変えても受験中・受験済みのテストには影響しない。
 #
-# 画面の保存とバックグラウンドの補充が同時に書き込んでも壊れないよう、ロックで直列化し、
-# 一時ファイルに書いてから置き換える(週報・期限超過通知と共通の部品。2-3)。
-# ファイルがあるのに読み込めない(壊れている・開けない)ときは既定値で動き、
-# 保存済みの設定を消さないよう上書きはしない(SettingsFileError)。
+# ファイルの読み書きは週報・期限超過通知と共通の部品(2-3 の JsonSettings)を使う(画面の保存と
+# バックグラウンドの補充が同時に書き込んでも壊れない。読み込めないファイルは既定値で動き、上書きしない)。
 
 SKILLTEST_SETTINGS_FILENAME = "skilltest_settings.json"
 SKILLTEST_SETTINGS_LABEL = "スキルテストの設定ファイル"
@@ -7942,12 +7812,6 @@ SKILLTEST_DEFAULTS = {
 
 # 画面から保存できる項目(last_result は問題の補充だけが書き込む)
 SKILLTEST_EDITABLE_KEYS = [k for k in SKILLTEST_DEFAULTS if k != "last_result"]
-
-_skilltest_settings_lock = threading.RLock()
-
-
-def _skilltest_settings_path():
-    return os.path.join(current_app.instance_path, SKILLTEST_SETTINGS_FILENAME)
 
 
 def valid_int(value, low, high):
@@ -7988,42 +7852,11 @@ def _normalize_skilltest_settings(data):
     return result
 
 
-def load_skilltest_settings():
-    """現在の設定を返す(ファイルが無い・読み込めない場合は既定値)。"""
-    with _skilltest_settings_lock:
-        try:
-            data = read_json(_skilltest_settings_path(), SKILLTEST_SETTINGS_LABEL)
-        except SettingsFileError as exc:
-            current_app.logger.warning("%s（既定値を使用）", exc)
-            data = None
-        return _normalize_skilltest_settings(data)
-
-
-def _load_skilltest_settings_for_update():
-    """書き込む前に現在の設定を読む(読み込めなければ SettingsFileError。上書きしない)。"""
-    return _normalize_skilltest_settings(
-        read_json(_skilltest_settings_path(), SKILLTEST_SETTINGS_LABEL))
-
-
-def save_skilltest_settings(values):
-    """画面で編集した項目を保存する(last_result は変更しない)。"""
-    with _skilltest_settings_lock:
-        current = _load_skilltest_settings_for_update()
-        for key in SKILLTEST_EDITABLE_KEYS:
-            if key in values:
-                current[key] = values[key]
-        data = _normalize_skilltest_settings(current)
-        write_json(_skilltest_settings_path(), data)
-        return data
-
-
-def set_skilltest_last_result(trigger, ok, message):
-    """前回の問題の補充の結果を上書きする(他の設定項目は変更しない)。"""
-    with _skilltest_settings_lock:
-        current = _load_skilltest_settings_for_update()
-        current["last_result"] = new_last_result(trigger, ok, message)
-        write_json(_skilltest_settings_path(), current)
-        return current["last_result"]
+SKILLTEST_SETTINGS = JsonSettings(SKILLTEST_SETTINGS_FILENAME, SKILLTEST_SETTINGS_LABEL,
+                                  _normalize_skilltest_settings, SKILLTEST_EDITABLE_KEYS)
+load_skilltest_settings = SKILLTEST_SETTINGS.load              # 現在の設定(読み込めなければ既定値)
+save_skilltest_settings = SKILLTEST_SETTINGS.save              # 画面で編集した項目を保存する
+set_skilltest_last_result = SKILLTEST_SETTINGS.set_last_result  # 前回の問題の補充の結果を上書きする
 
 
 # --------------------------------------------------------------------------- #
@@ -8057,7 +7890,90 @@ def skilltest_plan(settings, levels):
 
 
 # =============================================================================
-# 8-2. スキルテスト: AIによる問題の作成
+# 8-2. スキルテスト: 設定フォーム
+# =============================================================================
+# スキルテストの設定フォームの入力チェックと表示用の値(システム設定の「スキルテスト」タブで使う)。
+#
+# 設定の画面はシステム設定(/system/settings?tab=skilltest)にまとめてあり、
+# スキルテスト管理(/skilltest/admin)には受験履歴と問題プールだけが残る。
+# 保存先は設定の保存(8-1)のまま(instance/skilltest_settings.json)。
+#
+#   parse_skilltest_form(form)       フォームの入力を検証する → (保存する値, エラーメッセージの一覧)
+#   skilltest_with_input(cur, v)     入力エラーで再表示するとき、保存済みの設定に入力中の値を重ねる
+#   skilltest_form_context(settings) フォームの表示に使う値
+
+SKILLTEST_LABEL = "スキルテスト"
+SKILLTEST_SAVED_MESSAGE = "スキルテストの設定を保存しました（受験中・受験済みのテストには影響しません）。"
+
+# レベルごと以外の数値の項目: (キー, 表示名, 下限, 上限, 単位)
+_SCALAR_FIELDS = (
+    ("pass_rate", "合格ライン", PASS_RATE_MIN, PASS_RATE_MAX, "%"),
+    ("retake_days", "再受験までの日数", RETAKE_DAYS_MIN, RETAKE_DAYS_MAX, "日"),
+    ("max_auto_level", "判定・自動登録するレベルの上限", AUTO_LEVEL_MIN, AUTO_LEVEL_MAX, ""),
+    ("pool_target_per_level", "問題プールの目標数", POOL_TARGET_MIN, POOL_TARGET_MAX, "問"),
+)
+
+
+def parse_skilltest_form(form):
+    """フォームの入力を検証する。戻り値: (values, errors)。errors が空なら保存してよい。"""
+    errors = []
+    values = {"questions_per_level": {}, "time_limits": {}}
+
+    for level in SKILLTEST_LEVELS:
+        count = form_int(form, "questions_{}".format(level))
+        if valid_int(count, QUESTIONS_MIN, QUESTIONS_MAX):
+            values["questions_per_level"][str(level)] = count
+        else:
+            errors.append("Lv{}の問題数は{}〜{}の数字で入力してください。".format(
+                level, QUESTIONS_MIN, QUESTIONS_MAX))
+        limit = form_int(form, "limit_{}".format(level))
+        if valid_int(limit, TIME_LIMIT_MIN, TIME_LIMIT_MAX):
+            values["time_limits"][str(level)] = limit
+        else:
+            errors.append("Lv{}の制限時間は{}〜{}秒の数字で入力してください。".format(
+                level, TIME_LIMIT_MIN, TIME_LIMIT_MAX))
+
+    for key, label, low, high, unit in _SCALAR_FIELDS:
+        value = form_int(form, key)
+        if valid_int(value, low, high):
+            values[key] = value
+        else:
+            errors.append("{}は{}〜{}{}の数字で入力してください。".format(label, low, high, unit))
+    return values, errors
+
+
+def skilltest_with_input(current, values):
+    """保存済みの設定に入力中の値を重ねる(入力エラー時の再表示用。保存はしない)。
+
+    レベルごとの値は、正しく入力されたレベルだけを重ねる。
+    """
+    current["questions_per_level"].update(values.get("questions_per_level", {}))
+    current["time_limits"].update(values.get("time_limits", {}))
+    for key, _label, _low, _high, _unit in _SCALAR_FIELDS:
+        if key in values:
+            current[key] = values[key]
+    return current
+
+
+def skilltest_form_context(settings):
+    """スキルテストの設定フォームの表示に使う値。"""
+    scale = scale_for(SKILL_TECHNICAL)
+    _rows, total, seconds = skilltest_plan(
+        settings, tested_levels(settings, len(scale) - 1))
+    return {
+        "settings": settings,
+        "levels": SKILLTEST_LEVELS,
+        "plan_total": total,
+        "plan_minutes": int(round(seconds / 60.0)),
+        "scale": scale,
+        "limits": SKILLTEST_LIMITS,
+        "grace_sec": GRACE_SEC,
+        "margin_min": DEADLINE_MARGIN_MIN,
+    }
+
+
+# =============================================================================
+# 8-3. スキルテスト: AIによる問題の作成
 # =============================================================================
 # スキルテストの問題(4択)をAIで作成し、検証して問題プールに保存する。
 #
@@ -8199,21 +8115,8 @@ def build_messages(skill, level, count, avoid=()):
 
 
 def _extract_json_array(text):
-    """AIの応答からJSONの配列を取り出す(コードブロックや前後の文章があっても読む)。"""
-    body = str(text or "").strip()
-    fence = re.match(r"^```[A-Za-z0-9_-]*\s*\n?(.*?)\n?```\s*$", body, re.DOTALL)
-    if fence:
-        body = fence.group(1).strip()
-    try:
-        data = json.loads(body)
-    except ValueError:
-        start, end = body.find("["), body.rfind("]")
-        if start < 0 or end <= start:
-            return None
-        try:
-            data = json.loads(body[start:end + 1])
-        except ValueError:
-            return None
+    """AIの応答からJSONの配列を取り出す(コードブロックや前後の文章があっても読む。4-1)。"""
+    data = parse_json_reply(text, "[", "]")
     if isinstance(data, dict):
         # {"questions": [...]} の形で返ってきた場合も受け付ける
         for value in data.values():
@@ -8223,15 +8126,11 @@ def _extract_json_array(text):
     return data if isinstance(data, list) else None
 
 
-# 保存しない制御文字(改行・タブ以外。Excel出力や画面表示で問題になるため除く)
-_QUESTION_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-
-
 def _clean_question_text(value):
-    """制御文字と前後の空白を除いた文字列(文字列でなければ None)。"""
+    """制御文字(改行・タブ以外。2-2 の CONTROL_CHARS)と前後の空白を除いた文字列(文字列でなければ None)。"""
     if not isinstance(value, str):
         return None
-    return _QUESTION_CONTROL.sub("", value.replace("\r\n", "\n").replace("\r", "\n")).strip()
+    return CONTROL_CHARS.sub("", value.replace("\r\n", "\n").replace("\r", "\n")).strip()
 
 
 def validate_item(item):
@@ -8358,7 +8257,7 @@ def generate_questions(skill, level, count, max_calls=None, stop_at=None):
 
 
 # =============================================================================
-# 8-3. スキルテスト: 受験の流れ
+# 8-4. スキルテスト: 受験の流れ
 # =============================================================================
 # スキルテストの受験の流れ(開始・出題・回答・離脱の記録・採点・到達度の自動登録)。
 #
@@ -8377,7 +8276,7 @@ def generate_questions(skill, level, count, max_calls=None, stop_at=None):
 #   ・受験できるのは有効なメンバー(role=member)だけ。受験中のテストは1人1つ(開くと再開)
 #   ・同じスキルの再受験は、前回の受験開始から retake_days 日後から
 #
-# 時刻はすべてモデルの _now()(3-8)から取る(動作確認で app._now を差し替えられるように)。
+# 時刻はすべて _now()(2-2)から取る(動作確認で app._now を差し替えられるように)。
 # 同じ人の操作(開始・出題・回答・離脱の記録・自動終了)はプロセス内のロックで直列化する。
 
 # 制限時間を過ぎてから回答を受け付ける猶予(秒。通信の遅れの分)
@@ -8443,22 +8342,21 @@ def testable_skills():
     )
 
 
+def newest_attempts_first(query):
+    """受験の問い合わせを新しい順(開始日時・IDの降順)に並べる。"""
+    return query.order_by(SkillTestAttempt.started_at.desc(), SkillTestAttempt.id.desc())
+
+
 def in_progress_attempt(user_id):
     """受験中のテスト(1人1つ。無ければ None)。"""
-    return (
-        SkillTestAttempt.query.filter_by(user_id=user_id, status=ATTEMPT_IN_PROGRESS)
-        .order_by(SkillTestAttempt.started_at.desc(), SkillTestAttempt.id.desc())
-        .first()
-    )
+    return newest_attempts_first(
+        SkillTestAttempt.query.filter_by(user_id=user_id, status=ATTEMPT_IN_PROGRESS)).first()
 
 
 def last_attempt(user_id, skill_id):
     """そのスキルの直近の受験(無ければ None)。"""
-    return (
-        SkillTestAttempt.query.filter_by(user_id=user_id, skill_id=skill_id)
-        .order_by(SkillTestAttempt.started_at.desc(), SkillTestAttempt.id.desc())
-        .first()
-    )
+    return newest_attempts_first(
+        SkillTestAttempt.query.filter_by(user_id=user_id, skill_id=skill_id)).first()
 
 
 def next_available(attempt, settings):
@@ -8992,7 +8890,7 @@ def member_overview(user):
 
 
 # =============================================================================
-# 8-4. スキルテスト: 問題プールの集計と補充
+# 8-5. スキルテスト: 問題プールの集計と補充
 # =============================================================================
 # スキルテストの問題プールの集計と補充(マネージャー向け)。
 #
@@ -9106,124 +9004,20 @@ def _topup(app, skill_id):
 
 def start_topup(app, skill):
     """補充を別スレッドで始める。既に補充中なら何もせず False を返す。"""
-    if not _topup_lock.acquire(blocking=False):
-        return False
-    _running["skill_name"] = skill.name
-    _running["skill_id"] = skill.id
     skill_id = skill.id
 
-    def worker():
-        try:
-            _topup(app, skill_id)
-        except Exception:
-            app.logger.exception("スキルテストの問題の補充でエラーが発生しました")
-        finally:
-            _running["skill_name"] = ""
-            _running["skill_id"] = None
-            _topup_lock.release()
+    def mark_running():
+        _running["skill_name"] = skill.name
+        _running["skill_id"] = skill_id
 
-    try:
-        threading.Thread(target=worker, name="skilltest-topup", daemon=True).start()
-    except Exception:
+    def clear_running():
         _running["skill_name"] = ""
         _running["skill_id"] = None
-        _topup_lock.release()
-        raise
-    return True
 
-
-def run_topup(app, skill_id):
-    """補充を呼び出したスレッドで最後まで実行する(動作確認用。補充中なら終わるまで待つ)。"""
-    with _topup_lock:
-        return _topup(app, skill_id)
-
-
-# =============================================================================
-# 8-5. スキルテスト: 設定フォーム
-# =============================================================================
-# スキルテストの設定フォームの入力チェックと表示用の値(システム設定の「スキルテスト」タブで使う)。
-#
-# 設定の画面はシステム設定(/system/settings?tab=skilltest)にまとめてあり、
-# スキルテスト管理(/skilltest/admin)には受験履歴と問題プールだけが残る。
-# 保存先は設定の保存(8-1)のまま(instance/skilltest_settings.json)。
-#
-#   parse_skilltest_form(form)       フォームの入力を検証する → (保存する値, エラーメッセージの一覧)
-#   skilltest_with_input(cur, v)     入力エラーで再表示するとき、保存済みの設定に入力中の値を重ねる
-#   skilltest_form_context(settings) フォームの表示に使う値
-
-SKILLTEST_LABEL = "スキルテスト"
-SKILLTEST_SAVED_MESSAGE = "スキルテストの設定を保存しました（受験中・受験済みのテストには影響しません）。"
-
-# レベルごと以外の数値の項目: (キー, 表示名, 下限, 上限, 単位)
-_SCALAR_FIELDS = (
-    ("pass_rate", "合格ライン", PASS_RATE_MIN, PASS_RATE_MAX, "%"),
-    ("retake_days", "再受験までの日数", RETAKE_DAYS_MIN, RETAKE_DAYS_MAX, "日"),
-    ("max_auto_level", "判定・自動登録するレベルの上限", AUTO_LEVEL_MIN, AUTO_LEVEL_MAX, ""),
-    ("pool_target_per_level", "問題プールの目標数", POOL_TARGET_MIN, POOL_TARGET_MAX, "問"),
-)
-
-
-def _number(form, name):
-    raw = (form.get(name) or "").strip()
-    return int(raw) if raw.isdecimal() else None
-
-
-def parse_skilltest_form(form):
-    """フォームの入力を検証する。戻り値: (values, errors)。errors が空なら保存してよい。"""
-    errors = []
-    values = {"questions_per_level": {}, "time_limits": {}}
-
-    for level in SKILLTEST_LEVELS:
-        count = _number(form, "questions_{}".format(level))
-        if valid_int(count, QUESTIONS_MIN, QUESTIONS_MAX):
-            values["questions_per_level"][str(level)] = count
-        else:
-            errors.append("Lv{}の問題数は{}〜{}の数字で入力してください。".format(
-                level, QUESTIONS_MIN, QUESTIONS_MAX))
-        limit = _number(form, "limit_{}".format(level))
-        if valid_int(limit, TIME_LIMIT_MIN, TIME_LIMIT_MAX):
-            values["time_limits"][str(level)] = limit
-        else:
-            errors.append("Lv{}の制限時間は{}〜{}秒の数字で入力してください。".format(
-                level, TIME_LIMIT_MIN, TIME_LIMIT_MAX))
-
-    for key, label, low, high, unit in _SCALAR_FIELDS:
-        value = _number(form, key)
-        if valid_int(value, low, high):
-            values[key] = value
-        else:
-            errors.append("{}は{}〜{}{}の数字で入力してください。".format(label, low, high, unit))
-    return values, errors
-
-
-def skilltest_with_input(current, values):
-    """保存済みの設定に入力中の値を重ねる(入力エラー時の再表示用。保存はしない)。
-
-    レベルごとの値は、正しく入力されたレベルだけを重ねる。
-    """
-    current["questions_per_level"].update(values.get("questions_per_level", {}))
-    current["time_limits"].update(values.get("time_limits", {}))
-    for key, _label, _low, _high, _unit in _SCALAR_FIELDS:
-        if key in values:
-            current[key] = values[key]
-    return current
-
-
-def skilltest_form_context(settings):
-    """スキルテストの設定フォームの表示に使う値。"""
-    scale = scale_for(SKILL_TECHNICAL)
-    _rows, total, seconds = skilltest_plan(
-        settings, tested_levels(settings, len(scale) - 1))
-    return {
-        "settings": settings,
-        "levels": SKILLTEST_LEVELS,
-        "plan_total": total,
-        "plan_minutes": int(round(seconds / 60.0)),
-        "scale": scale,
-        "limits": SKILLTEST_LIMITS,
-        "grace_sec": GRACE_SEC,
-        "margin_min": DEADLINE_MARGIN_MIN,
-    }
+    return start_in_thread(
+        app, _topup_lock, "skilltest-topup", lambda: _topup(app, skill_id),
+        "スキルテストの問題の補充でエラーが発生しました",
+        prepare=mark_running, cleanup=clear_running)
 
 
 # =============================================================================
@@ -9323,12 +9117,7 @@ def skilltest_index():
     expire_due(me.id)
     rows, running = member_overview(me)
     settings = load_skilltest_settings()
-    history = (
-        SkillTestAttempt.query.filter_by(user_id=me.id)
-        .order_by(SkillTestAttempt.started_at.desc(), SkillTestAttempt.id.desc())
-        .limit(100)
-        .all()
-    )
+    history = newest_attempts_first(SkillTestAttempt.query.filter_by(user_id=me.id)).limit(100).all()
     return render_template(
         "skilltest/index.html",
         rows=rows,
@@ -9342,9 +9131,7 @@ def skilltest_index():
 
 @skilltest_bp.route("/start/<int:skill_id>", methods=["POST"])
 def start(skill_id):
-    skill = db.session.get(Skill, skill_id)
-    if skill is None:
-        abort(404)
+    skill = get_or_404(Skill, skill_id)
     outcome = start_attempt(current_user._get_current_object(), skill)
     if outcome.error:
         flash(outcome.error, "danger" if outcome.error == MSG_NOT_READY else "warning")
@@ -9378,8 +9165,7 @@ def question(attempt_id):
 @skilltest_bp.route("/attempt/<int:attempt_id>/answer", methods=["POST"])
 def answer(attempt_id):
     seq = request.form.get("seq", type=int)
-    raw = (request.form.get("choice") or "").strip()
-    choice = int(raw) if raw.isdecimal() else None
+    choice = form_int(request.form, "choice")
     attempt, outcome = submit_answer(attempt_id, current_user.id, seq, choice)
     if attempt is None:
         abort(404)
@@ -9427,7 +9213,6 @@ def result(attempt_id):
         attempt=attempt,
         level_results=attempt.level_result_list,
         scale=_tech_scale(),
-        level_colors=SKILL_LEVEL_COLORS,
         available=available,
         now=_now(),
     )))
@@ -9436,17 +9221,12 @@ def result(attempt_id):
 # --------------------------------------------------------------------------- #
 # マネージャー: 受験履歴
 # --------------------------------------------------------------------------- #
-def _int_arg(name):
-    value = request.args.get(name, "").strip()
-    return int(value) if value.isdecimal() else None
-
-
 @skilltest_bp.route("/admin")
 def admin_attempts():
     expire_due()
     filters = {
-        "user_id": _int_arg("user_id"),
-        "skill_id": _int_arg("skill_id"),
+        "user_id": form_int(request.args, "user_id"),
+        "skill_id": form_int(request.args, "skill_id"),
         "status": request.args.get("status", ""),
     }
     if filters["status"] not in ATTEMPT_STATUS_LABELS:
@@ -9459,8 +9239,7 @@ def admin_attempts():
         query = query.filter(SkillTestAttempt.skill_id == filters["skill_id"])
     if filters["status"]:
         query = query.filter(SkillTestAttempt.status == filters["status"])
-    attempts = query.order_by(
-        SkillTestAttempt.started_at.desc(), SkillTestAttempt.id.desc()).all()
+    attempts = newest_attempts_first(query).all()
 
     # 絞り込みの選択肢: 受験したことのある人＋今のメンバー / テクニカルスキル
     taker_ids = {row[0] for row in db.session.query(SkillTestAttempt.user_id).distinct()}
@@ -9481,15 +9260,12 @@ def admin_attempts():
         skills=skills,
         status_labels=ATTEMPT_STATUS_LABELS,
         scale=_tech_scale(),
-        level_colors=SKILL_LEVEL_COLORS,
     )
 
 
 @skilltest_bp.route("/admin/attempt/<int:attempt_id>")
 def admin_attempt(attempt_id):
-    attempt = db.session.get(SkillTestAttempt, attempt_id)
-    if attempt is None:
-        abort(404)
+    attempt = get_or_404(SkillTestAttempt, attempt_id)
     if attempt.status == ATTEMPT_IN_PROGRESS:
         expire_due(attempt.user_id)
         db.session.expire_all()
@@ -9501,8 +9277,6 @@ def admin_attempt(attempt_id):
         snapshot=attempt.settings_dict,
         letters=CHOICE_LETTERS,
         scale=_tech_scale(),
-        level_colors=SKILL_LEVEL_COLORS,
-        status_finished=ATTEMPT_FINISHED,
     )
 
 
@@ -9554,10 +9328,8 @@ def admin_pool():
 
 @skilltest_bp.route("/admin/pool/<int:skill_id>")
 def admin_pool_skill(skill_id):
-    skill = db.session.get(Skill, skill_id)
-    if skill is None:
-        abort(404)
-    level = _int_arg("level")
+    skill = get_or_404(Skill, skill_id)
+    level = form_int(request.args, "level")
     state = request.args.get("state", "")
     if state not in (STATE_ACTIVE, STATE_INACTIVE):
         state = ""
@@ -9591,9 +9363,7 @@ def admin_pool_skill(skill_id):
 
 @skilltest_bp.route("/admin/pool/<int:skill_id>/topup", methods=["POST"])
 def admin_topup(skill_id):
-    skill = db.session.get(Skill, skill_id)
-    if skill is None:
-        abort(404)
+    skill = get_or_404(Skill, skill_id)
     back = url_for("skilltest.admin_pool_skill", skill_id=skill.id) \
         if request.form.get("back") == "skill" else url_for("skilltest.admin_pool")
     if not is_testable(skill):
@@ -9619,9 +9389,7 @@ def admin_deactivate_all(skill_id):
     スキルの説明を変えた後、古い説明で作った問題を出題から外し、補充で入れ替えるために使う。
     このスキルの補充の実行中は停止しない(補充が停止の後に問題を保存し、古い説明の問題が有効のまま残るため)。
     """
-    skill = db.session.get(Skill, skill_id)
-    if skill is None:
-        abort(404)
+    skill = get_or_404(Skill, skill_id)
     if running_skill_id() == skill.id:
         flash("「{}」の問題を補充中のため停止できません。補充が終わってから、もう一度実行してください。".format(
             skill.name), "warning")
@@ -9645,9 +9413,7 @@ def admin_deactivate_all(skill_id):
 
 @skilltest_bp.route("/admin/questions/<int:question_id>/toggle", methods=["POST"])
 def admin_toggle_question(question_id):
-    question = db.session.get(SkillTestQuestion, question_id)
-    if question is None:
-        abort(404)
+    question = get_or_404(SkillTestQuestion, question_id)
     question.is_active = not question.is_active
     db.session.commit()
     flash("問題 #{} を{}にしました。".format(
@@ -9741,7 +9507,7 @@ def admin_settings():
 # 9-1. AI分析: 設定(しきい値)
 # =============================================================================
 # AI分析の設定。システム設定の「AI分析」タブで変更し、instance/ai_analysis_settings.json
-# に保存する(DB には保存しない。読み書きは 2-3 の共通部品)。
+# に保存する(DB には保存しない。読み書きは 2-3 の共通部品 JsonSettings)。
 #   due_soon_days (N1) : 期限まで残りこの営業日数以内なのに「未着手」のタスクを「期限が近いのに未着手」にする
 #   stale_days    (N2) : 「進行中」で、担当者の最後の進捗記載(進行中にした後に記載が無ければ進行中にした日)
 #                        からこの営業日数以上たったタスクを「進行中なのに記載がない」にする
@@ -9782,12 +9548,6 @@ AI_ANALYSIS_SEND_FIELDS = (
 )
 _AI_ANALYSIS_ALL_FIELDS = AI_ANALYSIS_FIELDS + AI_ANALYSIS_SEND_FIELDS
 
-_ai_analysis_settings_lock = threading.RLock()
-
-
-def _ai_analysis_settings_path():
-    return os.path.join(current_app.instance_path, AI_ANALYSIS_SETTINGS_FILENAME)
-
 
 def _normalize_ai_analysis_settings(data):
     """読み込んだ値を検証し、不正・欠落した項目は既定値で補う。"""
@@ -9800,31 +9560,11 @@ def _normalize_ai_analysis_settings(data):
     return result
 
 
-def load_ai_analysis_settings():
-    """現在の設定を返す(ファイルが無い・読み込めない場合は既定値)。"""
-    with _ai_analysis_settings_lock:
-        try:
-            data = read_json(_ai_analysis_settings_path(), AI_ANALYSIS_SETTINGS_LABEL)
-        except SettingsFileError as exc:
-            current_app.logger.warning("%s（既定値を使用）", exc)
-            data = None
-        return _normalize_ai_analysis_settings(data)
-
-
-def save_ai_analysis_settings(values):
-    """画面で編集した項目を保存する。
-
-    ファイルがあるのに読み込めない場合は SettingsFileError を送出する(上書きしない)。
-    """
-    with _ai_analysis_settings_lock:
-        current = _normalize_ai_analysis_settings(
-            read_json(_ai_analysis_settings_path(), AI_ANALYSIS_SETTINGS_LABEL))
-        for key, _label, _low, _high, _help in _AI_ANALYSIS_ALL_FIELDS:
-            if key in values:
-                current[key] = values[key]
-        data = _normalize_ai_analysis_settings(current)
-        write_json(_ai_analysis_settings_path(), data)
-        return data
+AI_ANALYSIS_SETTINGS = JsonSettings(
+    AI_ANALYSIS_SETTINGS_FILENAME, AI_ANALYSIS_SETTINGS_LABEL, _normalize_ai_analysis_settings,
+    [key for key, _label, _low, _high, _help in _AI_ANALYSIS_ALL_FIELDS])
+load_ai_analysis_settings = AI_ANALYSIS_SETTINGS.load  # 現在の設定(読み込めなければ既定値)
+save_ai_analysis_settings = AI_ANALYSIS_SETTINGS.save  # 画面で編集した項目を保存する
 
 
 def parse_ai_analysis_form(form):
@@ -9832,7 +9572,7 @@ def parse_ai_analysis_form(form):
     errors = []
     values = {}
     for key, label, low, high, _help in _AI_ANALYSIS_ALL_FIELDS:
-        value = _number(form, key)
+        value = form_int(form, key)
         if valid_int(value, low, high):
             values[key] = value
         else:
@@ -9954,18 +9694,10 @@ def _completion_of(task):
     """完了日時と、それが推定(状態の変更の記録が無く更新日時で代用)か。未完了なら (None, False)。"""
     if task.status != STATUS_DONE:
         return None, False
-    for change in reversed(task.status_changes):
-        if change.status == STATUS_DONE and change.changed_at:
-            return change.changed_at, False
+    done_at = task.last_changed_to(STATUS_DONE)
+    if done_at is not None:
+        return done_at, False
     return (task.updated_at or task.created_at), True
-
-
-def _entered_at(task, status):
-    """今の状態(status)になった日時(最後にその状態へ変更した日時)。記録が無ければ None。"""
-    for change in reversed(task.status_changes):
-        if change.status == status and change.changed_at:
-            return change.changed_at
-    return None
 
 
 def _analysis_task(task, period):
@@ -10016,7 +9748,8 @@ def _analysis_task(task, period):
         "completed_in": completed_at is not None and _in_period(completed_at, period),
         "started_in": any(ch["status"] == STATUS_DOING and _in_period(ch["at"], period)
                           for ch in changes),
-        "status_since": _entered_at(task, task.status),
+        # 今の状態になった日時(最後にその状態へ変更した日時。記録が無ければ None)
+        "status_since": task.last_changed_to(task.status),
     }
 
 
@@ -10641,7 +10374,7 @@ def _lt_summary(entries):
     }
 
 
-def _outputs_section(tasks, members, period):
+def _outputs_section(tasks, members):
     """③ 成果物の状況(期間内に完了したタスク。チーム全体とヒト別)。"""
     rows = []
     for t in tasks.values():
@@ -10813,7 +10546,7 @@ def collect_analysis(period, now, settings):
     tasks = load_analysis_tasks(period)
     progress = _progress_section(tasks, members, period, now, settings)
     skills = _skills_section(members, period, now)
-    outputs = _outputs_section(tasks, members, period)
+    outputs = _outputs_section(tasks, members)
     abilities = _abilities_section(tasks, members, period, now, progress, outputs)
     person_task_ids = {
         u.id: [t["id"] for t in tasks.values()
@@ -11899,11 +11632,6 @@ def team_id_lines(data):
             "タスク: 【① タスクの進捗】【推奨アクションの候補】などに書かれた T の付いたID"]
 
 
-def team_material_lines(data, candidates, hidden_candidates):
-    """チームのまとめの材料(全文。1回で送れるとき)。"""
-    return [line for _name, lines in team_material_sections(data, candidates, hidden_candidates) for line in lines]
-
-
 def _target_text(target):
     kind = target.get("kind")
     prefix = {"task": "T", "person": "P", "skill": "S", "operation": "O"}.get(kind)
@@ -11982,7 +11710,6 @@ SUMMARY_KEYS = (("progress", "① タスクの進捗"), ("skills", "② スキ�
 OUTCOME_SUGGESTION_FIELDS = (("quant_actual", "成果（定量）の実績"), ("quant_note", "成果（定量）の補足"),
                              ("qual_actual", "成果（定性）の実績"))
 
-_AI_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _NUMBER = re.compile(r"[0-9０-９]+(?:[.,．，][0-9０-９]+)*")
 # 数値の確認で読む字句(左から順に): ID・年月日・年月・月日・年・時刻・数値
 _D = "[0-9０-９]"
@@ -11999,21 +11726,8 @@ _NUMBER_TOKEN = re.compile(
 
 
 def _extract_json_object(text):
-    """AI の応答から JSON のオブジェクトを取り出す(コードブロックや前後の文章があっても読む)。"""
-    body = str(text or "").strip()
-    fence = re.match(r"^```[A-Za-z0-9_-]*\s*\n?(.*?)\n?```\s*$", body, re.DOTALL)
-    if fence:
-        body = fence.group(1).strip()
-    try:
-        data = json.loads(body)
-    except ValueError:
-        start, end = body.find("{"), body.rfind("}")
-        if start < 0 or end <= start:
-            return None
-        try:
-            data = json.loads(body[start:end + 1])
-        except ValueError:
-            return None
+    """AI の応答から JSON のオブジェクトを取り出す(コードブロックや前後の文章があっても読む。4-1)。"""
+    data = parse_json_reply(text, "{", "}")
     return data if isinstance(data, dict) else None
 
 
@@ -12116,11 +11830,6 @@ class AllowedNumbers:
         return mask_numbers(text, self)[1] == 0
 
 
-def numbers_in(text):
-    """文に含まれる数量(そろえた表記)の集合(日付・時刻・ID の数字は含めない)。"""
-    return set(AllowedNumbers(text).quantities)
-
-
 def mask_numbers(text, allowed):
     """allowed(AllowedNumbers)に無い数値を「◯」に置き換える。戻り値: (置き換えた文, 置き換えた数)。
 
@@ -12152,7 +11861,7 @@ def _ai_text(value, limit=AI_TEXT_MAX):
     """AI の応答の文(文字列だけ)。制御文字を除き、長ければ切る。"""
     if not isinstance(value, str):
         return ""
-    text = _AI_CONTROL.sub("", value.replace("\r\n", "\n").replace("\r", "\n"))
+    text = CONTROL_CHARS.sub("", value.replace("\r\n", "\n").replace("\r", "\n"))
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     if len(text) > limit:
         text = text[:limit - 1].rstrip() + "…"
@@ -12831,26 +12540,14 @@ def run_ai_analysis_job(app, args):
 
 def start_ai_analysis(app, args):
     """AI分析を別スレッドで始める(画面の「AIで分析」)。既に実行中なら何もせず False を返す。"""
-    if not _analysis_lock.acquire(blocking=False):
-        return False
-    _analysis_state.update(step="準備しています", done=0, total=0, started_at=datetime.now(),
-                           period="", last_error=None)
     args = {key: str(args.get(key) or "") for key in ("period", "from", "to")}
 
-    def worker():
-        try:
-            run_ai_analysis_job(app, args)
-        except Exception:
-            app.logger.exception("AI分析でエラーが発生しました")
-        finally:
-            _analysis_lock.release()
+    def reset_state():
+        _analysis_state.update(step="準備しています", done=0, total=0, started_at=datetime.now(),
+                               period="", last_error=None)
 
-    try:
-        threading.Thread(target=worker, name="ai-analysis", daemon=True).start()
-    except Exception:
-        _analysis_lock.release()
-        raise
-    return True
+    return start_in_thread(app, _analysis_lock, "ai-analysis", lambda: run_ai_analysis_job(app, args),
+                           "AI分析でエラーが発生しました", prepare=reset_state)
 
 
 # =============================================================================
@@ -13132,7 +12829,7 @@ def ai_result_matches(stored, period):
 #                                 保存した AI の結果の期間が同じなら、AI の結果も反映して表示する(9-8)
 # POST /manager/analysis/run      「AIで分析」。別スレッドで実行を始めて画面に戻る(9-7)
 # GET  /manager/analysis/status   実行中の表示用の状態(JSON。APIキー・接続先の URL は含まない)
-# マネージャーのみ(メンバーは 403、未ログインはログイン画面)。
+# マネージャーのみ(manager_required〔2-5〕。メンバーは 403、未ログインはログイン画面)。
 
 _ANALYSIS_PERIOD_ARGS = ("period", "from", "to")
 
@@ -13178,10 +12875,8 @@ def _analysis_ai_view(data, period):
 
 
 @manager_bp.route("/analysis", endpoint="analysis")
-@login_required
+@manager_required
 def analysis_dashboard():
-    if not current_user.is_manager:
-        abort(403)
     now = _now()
     period = analysis_period(request.args, now.date())
     settings = load_ai_analysis_settings()
@@ -13198,9 +12893,7 @@ def analysis_dashboard():
         settings=settings,
         sample_note=sample_note,
         action_max=ACTION_MAX,
-        status_colors=STATUS_COLORS,
         type_choices=SKILL_TYPE_CHOICES,
-        type_labels=SKILL_TYPE_LABELS,
         ai_status=ai_status_label(),
         ai_configured=ai_is_configured(),
         finding_keys=FINDING_KEYS,
@@ -13211,11 +12904,9 @@ def analysis_dashboard():
 
 
 @manager_bp.route("/analysis/run", methods=["POST"], endpoint="analysis_run")
-@login_required
+@manager_required
 def analysis_run():
     """「AIで分析」: 画面で選んでいる期間で、別スレッドの実行を始める。"""
-    if not current_user.is_manager:
-        abort(403)
     args = {key: request.form.get(key, "").strip() for key in _ANALYSIS_PERIOD_ARGS}
     back = url_for("manager.analysis", **{k: v for k, v in args.items() if v})
     if not ai_is_configured():
@@ -13229,11 +12920,9 @@ def analysis_run():
 
 
 @manager_bp.route("/analysis/status", endpoint="analysis_status")
-@login_required
+@manager_required
 def analysis_status():
     """実行中の表示用の状態(JSON)。"""
-    if not current_user.is_manager:
-        abort(403)
     return jsonify(ai_analysis_status())
 
 
@@ -13253,7 +12942,7 @@ def analysis_status():
 #                        AI分析             : instance/ai_analysis_settings.json
 #
 # 週報・期限超過通知・スキルテスト・AI分析の入力チェックと表示用の値は、各機能の設定フォーム
-# (6-3・7-3・8-5・9-1)にあり(保存先も各機能の設定の保存のまま)、この画面から使う。
+# (6-3・7-3・8-2・9-1)にあり(保存先も各機能の設定の保存のまま)、この画面から使う。
 # 各機能の画面には、実行・状況の表示だけが残る(設定はこの画面へのリンク)。
 
 
@@ -14038,17 +13727,8 @@ AI_TEST_MESSAGES = [
 ]
 AI_REPLY_MAX = 80
 
-
-@system_bp.before_request
-def _system_managers_only():
-    """システム設定はマネージャーのみ(未ログインはログイン画面へ)。
-
-    login_required は OPTIONS を素通しするため使わず、ここで直接確認する。
-    """
-    if not current_user.is_authenticated:
-        return current_app.login_manager.unauthorized()
-    if not getattr(current_user, "is_manager", False):
-        abort(403)
+# システム設定はマネージャーのみ(未ログインはログイン画面へ。2-5)
+system_bp.before_request(managers_only)
 
 
 def _tab_url(tab):
@@ -14156,14 +13836,14 @@ def remove_unused():
 def test_mail():
     """保存済みの設定で、差出人(MAIL_FROM)宛てに短いメールを送る。"""
     app = current_app._get_current_object()
-    subject = "【接続テスト】{}".format(app.config.get("APP_NAME") or "業務管理システム")
+    subject = "【接続テスト】{}".format(display_app_name(app))
     text = (
         "このメールは、{} の「システム設定」のメール接続テストで送信しました。\n"
         "送信日時: {}\n"
         "実行した人: {}\n"
         "\n"
         "返信は不要です。\n"
-    ).format(app.config.get("APP_NAME") or "業務管理システム",
+    ).format(display_app_name(app),
              datetime.now().strftime("%Y/%m/%d %H:%M"), current_user.display_name)
     ok, message = send_mail(subject, text, test=True)
     message = mask_secrets(app, message)

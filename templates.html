@@ -10,9 +10,32 @@
   ・区切りの行の前後に空行を足さないこと(空行もそのファイルの中身になる)。
   ・最初の区切りより前(このコメント)は読み込まない。
 
-  並び: 共通(base.html・_macros.html) → ログイン → 個人ダッシュボード → タスク → 定型業務 → 年休
-        → スキル → スキルテスト → マネージャー → チーム管理 → 週報 → 期限超過通知 → システム設定
-        → 静的ファイル(CSS・JavaScript)
+  目次(区切りの名前。この順に並ぶ):
+    共通　　　　　　　  base.html  _macros.html
+    ログイン　　　　　  auth/login.html
+    個人ダッシュボード  main/dashboard.html
+    タスク　　　　　　  tasks/list.html  tasks/detail.html  tasks/form.html
+    定型業務　　　　　  routine/list.html  routine/detail.html  routine/form.html
+    年休　　　　　　　  leaves/list.html  leaves/calendar.html  leaves/detail.html  leaves/form.html
+    スキル　　　　　　  skills/map.html  skills/member.html  skills/member_edit.html  skills/items.html
+                        skills/item_form.html  skills/coverage.html  skills/operations.html
+                        skills/operation_edit.html
+    スキルテスト　　　  skilltest/index.html  skilltest/question.html  skilltest/result.html
+                        skilltest/_admin_nav.html  skilltest/admin_attempts.html
+                        skilltest/admin_attempt.html  skilltest/admin_pool.html
+                        skilltest/admin_pool_skill.html
+    マネージャー　　　  manager/dashboard.html  manager/_gantt.html  manager/gantt_full.html
+                        manager/analysis.html
+    チーム管理　　　　  departments/manage.html
+    週報　　　　　　　  weekly/index.html
+    期限超過通知　　　  overdue/index.html  overdue/mail.html
+    システム設定　　　  system/settings.html  system/_config_tab.html  system/_weekly_tab.html
+                        system/_overdue_tab.html  system/_skilltest_tab.html
+                        system/_analysis_tab.html
+    静的ファイル　　　  static/css/style.css  static/js/sort-table.js  static/js/auto-filter.js
+                        static/js/skill-item-form.js  static/js/skilltest.js
+                        static/js/weekly-settings.js  static/js/system-settings.js
+                        static/js/ai-analysis.js
 #}
 {#=== base.html ===#}
 <!doctype html>
@@ -90,7 +113,7 @@
                href="{{ url_for('manager.dashboard') }}"><i class="bi bi-graph-up-arrow"></i> マネージャーダッシュボード</a>
           </li>
           {% endif %}
-          {% if current_user.is_admin %}
+          {% if current_user.is_manager %}
           <li class="nav-item">
             <a class="nav-link {% if request.blueprint == 'departments' %}active{% endif %}"
                href="{{ url_for('departments.manage') }}"><i class="bi bi-diagram-3"></i> チーム管理</a>
@@ -163,16 +186,6 @@
 {# 日時 YYYY/MM/DD HH:MM。Noneは ― #}
 {% macro fmt_datetime(dt) -%}
   {%- if dt -%}{{ dt.strftime('%Y/%m/%d %H:%M') }}{%- else -%}―{%- endif -%}
-{%- endmacro %}
-
-{# ステータスバッジ。obj.status_color と obj.status を持つオブジェクトに使う #}
-{% macro status_badge(obj) -%}
-  <span class="badge bg-{{ obj.status_color }}">{{ obj.status }}</span>
-{%- endmacro %}
-
-{# 優先度バッジ #}
-{% macro priority_badge(obj) -%}
-  <span class="badge bg-{{ obj.priority_color }} text-dark">{{ obj.priority }}</span>
 {%- endmacro %}
 {#=== auth/login.html ===#}
 {% extends "base.html" %}
