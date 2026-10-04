@@ -3690,9 +3690,9 @@
   {%- endif %}
 {%- endmacro %}
 
-{# AI の結果が無い理由(未読込・判定なし・分析の後に追加) #}
+{# AI の結果が無い・使わない理由(未読込・判定なし・分析の後に追加・分析の後に変更あり) #}
 {% macro ai_state_badge(s) -%}
-  {%- if s -%}<span class="badge {{ 'bg-danger' if s == state_unread else 'bg-light text-muted border' }}">{{ s }}</span>{%- endif -%}
+  {%- if s -%}<span class="badge {{ 'bg-danger' if s == state_unread else ('bg-warning text-dark' if s == state_changed else 'bg-light text-muted border') }}">{{ s }}</span>{%- endif -%}
 {%- endmacro %}
 
 {# 書き直し案と「案をコピー」(コピーするのは id の要素の文字) #}
@@ -3790,6 +3790,7 @@
       ／ <span class="{% if r.unread.count %}text-danger fw-bold{% endif %}">未読込: {{ r.unread.count or 0 }} 件</span>
       {% if r.masked_numbers %}／ 材料に無い数値 {{ r.masked_numbers }} か所を「◯」に置き換えました{% endif %}
     </div>
+    <div class="mb-1 text-muted">分析の後にコメント・状態・成果などが変わった項目は「{{ state_changed }}」とし、そのAIの判定・書き直し案は使っていません（もう一度「AIで分析」を実行すると判定し直します）。</div>
     {% if r.unread_parts or r.errors %}
     <details class="mb-1">
       <summary class="{{ 'text-danger' if r.unread_parts else 'text-warning-emphasis' }}">読み込めなかった材料・注意（読み込めなかった呼び出し {{ r.unread_parts|length }} 回・注意 {{ r.errors|length }} 件）</summary>
@@ -4024,7 +4025,7 @@
               <td class="text-nowrap">{{ r.assignee_names or '未割当' }}</td>
               <td class="text-nowrap">{% if r.hold_days is not none %}{{ r.hold_days }}営業日{% if r.since_estimated %}<br><span class="text-muted">（推定）</span>{% endif %}{% else %}―{% endif %}</td>
               <td>{{ last_comment(r.last_comment) }}
-                {% for i in r.ai or [] %}<div class="text-info-emphasis"><i class="bi bi-stars"></i> {{ i.kind }}: <span class="pre-wrap">{{ i.text }}</span></div>{% endfor %}</td>
+                {% for i in r.ai or [] %}<div class="text-info-emphasis"><i class="bi bi-stars"></i> {{ i.kind }}: <span class="pre-wrap">{{ i.text }}</span>{% if i.changed %} {{ ai_state_badge(state_changed) }}{% endif %}</div>{% endfor %}</td>
             </tr>
             {% else %}
             <tr><td colspan="4" class="text-muted">ありません。</td></tr>
@@ -4049,7 +4050,7 @@
           <td>{{ task_cell(i) }}</td>
           <td class="text-nowrap">{{ i.assignee_names or '未割当' }}</td>
           <td class="text-nowrap"><span class="badge {{ 'bg-warning text-dark' if i.kind == '課題' else 'bg-info text-dark' }}">{{ i.kind }}</span></td>
-          <td class="pre-wrap">{{ i.text }}</td>
+          <td class="pre-wrap">{{ i.text }}{% if i.changed %} {{ ai_state_badge(state_changed) }}{% endif %}</td>
           <td class="text-nowrap text-muted">{% if i.source %}{{ i.source.at.strftime('%m/%d') if i.source.at else '' }} {{ i.source.author }}{% else %}―{% endif %}</td>
         </tr>
         {% else %}
@@ -4106,7 +4107,7 @@
           <td><span class="text-muted text-nowrap">{{ r.at.strftime('%m/%d') }} {{ r.author }}：</span><span class="pre-wrap">{{ r.body }}</span></td>
           <td class="text-nowrap"><span class="badge {{ 'bg-danger' if r.judgement in ('返信なし', '未対応') else 'bg-warning text-dark' }}">{{ r.judgement }}</span></td>
           {% if ai.applied %}
-          <td class="pre-wrap">{% if r.ai %}{{ r.ai.remaining or r.ai.request or '―' }}{% else %}{{ ai_state_badge(r.ai_state) }}{% endif %}</td>
+          <td class="pre-wrap">{% if r.ai and (r.ai.remaining or r.ai.request) %}<div>{{ r.ai.remaining or r.ai.request }}</div>{% elif not r.ai_state %}―{% endif %}{{ ai_state_badge(r.ai_state) }}</td>
           <td class="pre-wrap text-muted">{{ r.ai.evidence if r.ai and r.ai.evidence else '―' }}</td>
           {% endif %}
           <td class="text-nowrap fw-bold">{{ r.age_days }}営業日</td>
@@ -4130,7 +4131,7 @@
               <td>{{ task_cell(r) }}</td>
               <td><span class="text-muted text-nowrap">{{ r.at.strftime('%m/%d') }} {{ r.author }}：</span><span class="pre-wrap">{{ r.body }}</span></td>
               <td class="text-nowrap"><span class="badge {{ 'bg-success' if r.judgement == '対応済み' else ('bg-secondary' if r.judgement in ('対応不要（AI判定）', '未判定') else ('bg-danger' if r.judgement in ('返信なし', '未対応') else 'bg-warning text-dark')) }}">{{ r.judgement }}</span>
-                {% if not r.ai %}{{ ai_state_badge(r.ai_state) }}{% endif %}</td>
+                {{ ai_state_badge(r.ai_state) }}</td>
               <td class="pre-wrap">{{ r.ai.request if r.ai and r.ai.request else '―' }}</td>
               <td class="pre-wrap">{{ r.ai.remaining if r.ai and r.ai.remaining else '―' }}</td>
               <td class="pre-wrap text-muted">{{ r.ai.evidence if r.ai and r.ai.evidence else '―' }}</td>
@@ -4470,7 +4471,7 @@
           <td class="text-nowrap">{% if r.completed %}{{ r.outcome_rewrite }}/{{ r.completed }}件{{ sample(r.completed) }}{% else %}―{% endif %}</td>
           <td class="text-nowrap">{% if r.progress_frequency is not none %}{{ r.progress_frequency }}<br><span class="text-muted">記載 {{ r.progress_comments }} 件・対象 {{ r.progress_tasks }} 件</span>{% else %}―{% endif %}</td>
           <td class="text-nowrap">{% if r.progress_comments %}{{ r.progress_vague }}/{{ r.progress_comments }}件{{ sample(r.progress_comments) }}{% else %}―{% endif %}</td>
-          <td class="text-nowrap">{% if r.mc_total %}{{ r.mc_replied }}/{{ r.mc_total }}件（{{ r.mc_rate }}%）{% if r.mc_done is defined %}<br><span class="text-muted">対応済み {{ r.mc_done }}件</span>{% endif %}{{ sample(r.mc_total) }}{% else %}―{% endif %}</td>
+          <td class="text-nowrap">{% if r.mc_total %}{{ r.mc_replied }}/{{ r.mc_total }}件（{{ r.mc_rate }}%）{% if r.mc_replied_other %}<br><span class="text-muted">共同担当が返信 {{ r.mc_replied_other }}件</span>{% endif %}{% if r.mc_done is defined %}<br><span class="text-muted">対応済み {{ r.mc_done }}件</span>{% endif %}{{ sample(r.mc_total) }}{% else %}―{% endif %}</td>
         </tr>
         {% else %}
         <tr><td colspan="9" class="text-muted py-3">対象のメンバーがいません。</td></tr>
@@ -4482,7 +4483,7 @@
     <i class="bi bi-info-circle"></i> 負荷はマネージャーダッシュボードの「ヒト別 負荷・案件状況」と同じ計算です。
     進捗の記載は、期間内に本人が担当タスクに書いた記載の数 ÷（期間中に未完了だった担当タスクの数 × 週数 {{ ab.weeks }}）。
     具体性は、定型の言葉だけ（「対応中」など）・短く数字の無い記載を書き直し推奨として数えています{% if ai.applied %}（AIが具体性が低いと判定した記載を含む）{% endif %}。
-    マネージャーのコメントへの返信は、期間内に書かれたマネージャーのコメントのうち担当者の返信があるものです{% if ai.applied %}（対応済みはAIの判定）{% endif %}。
+    マネージャーのコメントへの返信は、期間内に書かれたマネージャーのコメントのうち本人が返信したものです（複数担当のタスクで共同担当だけが返信したものは「共同担当が返信」）{% if ai.applied %}。対応済みはAIによるタスクとしての判定です{% endif %}。
   </div>
 </div>
 
