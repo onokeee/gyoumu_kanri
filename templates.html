@@ -3018,6 +3018,8 @@
 {% block content %}
 <div class="d-flex justify-content-between align-items-start mb-1 flex-wrap gap-2">
   <h1 class="h3 mb-0"><i class="bi bi-graph-up-arrow"></i> マネージャーダッシュボード</h1>
+  <div class="d-flex flex-wrap gap-2">
+  <a href="{{ url_for('manager.analysis') }}" class="btn btn-outline-primary"><i class="bi bi-clipboard-data"></i> AI分析（サマリーと推奨アクション）</a>
   <div class="dropdown">
     <button class="btn btn-outline-success dropdown-toggle" type="button" data-bs-toggle="dropdown">
       <i class="bi bi-file-earmark-excel"></i> Excelデータ出力
@@ -3032,6 +3034,7 @@
       <li><a class="dropdown-item" href="{{ url_for('export.leaves_xlsx') }}">年休</a></li>
       <li><a class="dropdown-item" href="{{ url_for('export.teams_xlsx') }}">チーム・メンバー</a></li>
     </ul>
+  </div>
   </div>
 </div>
 <p class="text-muted small mb-4">チームの全体俯瞰（対象メンバー {{ member_count }} 名）</p>
@@ -3637,6 +3640,659 @@
 
 {% block content %}
 {% include "manager/_gantt.html" %}
+{% endblock %}
+{#=== manager/analysis.html ===#}
+{# マネージャーダッシュボード「AI分析（サマリーと推奨アクション）」。集計は app.py の 9 章(collect_analysis) #}
+{% extends "base.html" %}
+{% from '_macros.html' import fmt_date, fmt_datetime %}
+{% block title %}AI分析（サマリーと推奨アクション） &middot; {{ app_name }}{% endblock %}
+
+{# 推奨アクションの対象へのリンク #}
+{% macro target_link(t) -%}
+  {%- if t.kind == 'task' -%}<a href="{{ url_for('tasks.detail', task_id=t.id) }}"><i class="bi bi-list-task"></i> {{ t.label }}</a>
+  {%- elif t.kind == 'person' -%}<a href="{{ url_for('tasks.list_tasks', assignee=t.id) }}"><i class="bi bi-person"></i> {{ t.label }}</a>
+  {%- elif t.kind == 'skill' -%}<a href="{{ url_for('skills.list_skills', type=t.skill_type) }}"><i class="bi bi-mortarboard"></i> {{ t.label }}</a>
+  {%- elif t.kind == 'operation' -%}<a href="{{ url_for('skills.coverage') }}"><i class="bi bi-diagram-3"></i> {{ t.label }}</a>
+  {%- elif t.kind == 'skilltest' -%}<a href="{{ url_for('skilltest.admin_attempts', user_id=t.id) if t.id else url_for('skilltest.admin_attempts') }}"><i class="bi bi-patch-check"></i> {{ t.label }}</a>
+  {%- else -%}{{ t.label }}{%- endif -%}
+{%- endmacro %}
+
+{# タスクへのリンクと状態 #}
+{% macro task_cell(r) -%}
+<a href="{{ url_for('tasks.detail', task_id=r.task_id) }}">{{ r.title }}</a>
+<span class="badge bg-{{ r.status_color }}">{{ r.status }}</span>
+{%- endmacro %}
+
+{# 最後の記載(日付・記載者・本文の先頭) #}
+{% macro last_comment(c) -%}
+  {%- if c -%}<span class="text-muted text-nowrap">{{ c.at.strftime('%m/%d') }} {{ c.author }}：</span><span class="pre-wrap">{{ c.text }}</span>
+  {%- else -%}<span class="text-muted">記載なし</span>{%- endif -%}
+{%- endmacro %}
+
+{# 件数が少ないときの注記(「対象○件のため参考値」) #}
+{% macro sample(n) -%}
+  {%- set s = sample_note(n) -%}
+  {%- if s %}<div class="text-muted" style="font-size:.75em;">{{ s }}</div>{% endif -%}
+{%- endmacro %}
+
+{# ヒトへのリンク(担当タスクの一覧) #}
+{% macro person_link(row) -%}
+<a href="{{ url_for('tasks.list_tasks', assignee=row.user_id) }}">{{ row.name }}</a>
+{%- endmacro %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-start mb-1 flex-wrap gap-2">
+  <h1 class="h3 mb-0"><i class="bi bi-clipboard-data"></i> AI分析（サマリーと推奨アクション）</h1>
+  <a href="{{ url_for('manager.dashboard') }}" class="btn btn-outline-secondary"><i class="bi bi-arrow-left"></i> マネージャーダッシュボード</a>
+</div>
+<p class="text-muted small mb-3">
+  チームの状況を「① タスクの進捗」「② スキル状況」「③ 成果物の状況」「④ 各人の能力」にまとめ、いま対応することを推奨アクションとして示します。
+  数値と一覧はアプリが計算しています。④ は指導の参考で、順位・点数は付けません。
+</p>
+
+{# 期間 #}
+<form method="get" class="card card-body shadow-sm mb-3" id="analysis-period-form">
+  <div class="row g-2 align-items-end">
+    <div class="col-sm-6 col-md-3">
+      <label class="form-label small mb-1" for="analysis-period">期間内</label>
+      <select name="period" id="analysis-period" class="form-select form-select-sm">
+        {% for d in period_choices %}
+        <option value="{{ d }}" {% if period.kind == d|string %}selected{% endif %}>直近{{ d }}日</option>
+        {% endfor %}
+        <option value="{{ period_range }}" {% if period.kind == period_range %}selected{% endif %}>日付で指定</option>
+      </select>
+    </div>
+    <div class="col-6 col-md-3">
+      <label class="form-label small mb-1" for="analysis-from">開始日（日付で指定）</label>
+      <input type="date" name="from" id="analysis-from" value="{{ period.start.strftime('%Y-%m-%d') }}" class="form-control form-control-sm">
+    </div>
+    <div class="col-6 col-md-3">
+      <label class="form-label small mb-1" for="analysis-to">終了日（日付で指定）</label>
+      <input type="date" name="to" id="analysis-to" value="{{ period.end.strftime('%Y-%m-%d') }}" class="form-control form-control-sm">
+    </div>
+    <div class="col-md-3 d-grid">
+      <button class="btn btn-sm btn-primary"><i class="bi bi-funnel"></i> この期間で表示</button>
+    </div>
+  </div>
+  <div class="small text-muted mt-2">
+    <strong>期間内</strong>: {{ period.start.strftime('%Y/%m/%d') }}〜{{ period.end.strftime('%Y/%m/%d') }}（{{ period.days }}日・営業日 {{ period.business_days }}日）
+    ／ <strong>現時点</strong>: {{ a.now.strftime('%Y/%m/%d %H:%M') }}
+    ／ 対象メンバー {{ a.members|length }} 名
+    ／ しきい値: 期限が近い {{ settings.due_soon_days }}営業日以内・記載がない {{ settings.stale_days }}営業日以上
+    （<a href="{{ url_for('system.settings', tab='analysis') }}">システム設定の「AI分析」タブで変更</a>）
+  </div>
+</form>
+{% if period.error %}
+<div class="alert alert-warning small"><i class="bi bi-exclamation-triangle"></i> {{ period.error }}</div>
+{% endif %}
+
+{# ===== 推奨アクション ===== #}
+<div class="card shadow-sm mb-4 border-primary" id="actions">
+  <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <span class="fw-bold"><i class="bi bi-lightning-charge"></i> 推奨アクション（優先度の高い順）</span>
+    <span class="small text-muted">集計のルールで選んでいます</span>
+  </div>
+  <div class="table-responsive">
+    <table class="table align-middle mb-0">
+      <thead class="table-light">
+        <tr>
+          <th class="text-center" style="width:3rem;">#</th>
+          <th style="min-width:16rem;">やること</th>
+          <th style="min-width:10rem;">対象</th>
+          <th>理由</th>
+          <th>根拠の数値</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for act in a.actions %}
+        <tr>
+          <td class="text-center fw-bold">{{ act.rank }}</td>
+          <td><span class="badge bg-secondary-subtle text-secondary-emphasis border">{{ act.category_label }}</span><br>{{ act.title }}</td>
+          <td class="small">{{ target_link(act.target) }}</td>
+          <td class="small pre-wrap">{{ act.reason }}</td>
+          <td class="small">{% for n in act.numbers %}<div class="text-nowrap">{{ n }}</div>{% endfor %}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="text-muted text-center py-3">いま対応が必要な項目はありません。</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="card-footer bg-white small text-muted">
+    <i class="bi bi-info-circle"></i> 期限超過・マネージャーのコメントに返信なし・進行中なのに記載がない・期限が近いのに未着手・長い保留・対応できる人が1名以下の業務・保有者が1名以下のスキル・成果や進捗の書き直し推奨・スキルテストの未受験から、最大{{ action_max }}件を選んでいます（同じ種類は数件まで）。
+  </div>
+</div>
+
+{# ===== ① タスクの進捗 ===== #}
+<h2 class="h4 mt-4 mb-1" id="progress"><i class="bi bi-list-task"></i> ① タスクの進捗</h2>
+<p class="text-muted small mb-2">
+  「完了・着手」は期間内、そのほかは現時点の状態です。未完了のタスクは期間に関係なくすべての記載を対象にしています。
+  複数担当のタスクは各担当に数えます（チームは1件として数えます。担当者のいないタスクもチームに含みます）。
+</p>
+{% set p = a.progress %}
+<div class="card shadow-sm mb-3">
+  <div class="table-responsive">
+    <table class="table table-sm table-hover align-middle mb-0 text-center">
+      <thead class="table-light">
+        <tr>
+          <th rowspan="2" class="text-start align-middle">ヒト</th>
+          <th colspan="2">進み（期間内）</th>
+          <th colspan="4">遅れ・課題（現時点）</th>
+          <th colspan="2">マネージャーのコメント</th>
+        </tr>
+        <tr>
+          <th class="text-nowrap">完了</th>
+          <th class="text-nowrap">着手</th>
+          <th class="text-nowrap">期限超過</th>
+          <th class="text-nowrap">期限が近い<br>未着手</th>
+          <th class="text-nowrap">記載がない<br>（進行中）</th>
+          <th class="text-nowrap">保留</th>
+          <th class="text-nowrap">対象</th>
+          <th class="text-nowrap">返信なし</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in p.rows %}
+        <tr>
+          <td class="text-start text-nowrap">{{ person_link(r) }}</td>
+          <td>{{ r.done or '―' }}</td>
+          <td>{{ r.started or '―' }}</td>
+          <td class="{% if r.overdue %}text-danger fw-bold{% endif %}">{{ r.overdue or '―' }}</td>
+          <td class="{% if r.due_soon %}text-warning-emphasis fw-bold{% endif %}">{{ r.due_soon or '―' }}</td>
+          <td class="{% if r.stale %}text-warning-emphasis fw-bold{% endif %}">{{ r.stale or '―' }}</td>
+          <td>{{ r.hold or '―' }}</td>
+          <td>{{ r.mc_total or '―' }}</td>
+          <td class="{% if r.mc_no_reply %}text-danger fw-bold{% endif %}">{{ r.mc_no_reply or '―' }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="9" class="text-muted py-3">対象のメンバーがいません。</td></tr>
+        {% endfor %}
+      </tbody>
+      <tfoot class="table-light fw-bold">
+        <tr>
+          <td class="text-start">チーム</td>
+          <td>{{ p.team.done }}</td>
+          <td>{{ p.team.started }}</td>
+          <td class="{% if p.team.overdue %}text-danger{% endif %}">{{ p.team.overdue }}</td>
+          <td>{{ p.team.due_soon }}</td>
+          <td>{{ p.team.stale }}</td>
+          <td>{{ p.team.hold }}</td>
+          <td>{{ p.team.mc_total }}</td>
+          <td class="{% if p.team.mc_no_reply %}text-danger{% endif %}">{{ p.team.mc_no_reply }}</td>
+        </tr>
+      </tfoot>
+    </table>
+  </div>
+</div>
+
+<div class="row g-3 mb-3">
+  {# 遅れ: 期限超過 #}
+  <div class="col-lg-6">
+    <div class="card shadow-sm h-100">
+      <div class="card-header bg-white fw-bold"><i class="bi bi-exclamation-octagon text-danger"></i> 期限超過（{{ p.overdue|length }} 件）</div>
+      <div class="table-responsive" style="max-height:320px; overflow-y:auto;">
+        <table class="table table-sm align-middle mb-0 small">
+          <thead class="table-light"><tr><th>タスク</th><th class="text-nowrap">担当</th><th class="text-nowrap">期限</th><th class="text-nowrap">超過</th><th>最後の進捗記載</th></tr></thead>
+          <tbody>
+            {% for r in p.overdue %}
+            <tr>
+              <td>{{ task_cell(r) }}</td>
+              <td class="text-nowrap">{{ r.assignee_names or '未割当' }}</td>
+              <td class="text-nowrap">{{ fmt_date(r.due_date) }}</td>
+              <td class="text-nowrap text-danger fw-bold">{{ r.overdue_days }}営業日</td>
+              <td>{{ last_comment(r.last_comment) }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="5" class="text-muted">ありません。</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  {# 遅れ: 期限が近いのに未着手 #}
+  <div class="col-lg-6">
+    <div class="card shadow-sm h-100">
+      <div class="card-header bg-white fw-bold"><i class="bi bi-hourglass-split text-warning"></i> 期限が近いのに未着手（残り{{ p.due_soon_days }}営業日以内・{{ p.due_soon|length }} 件）</div>
+      <div class="table-responsive" style="max-height:320px; overflow-y:auto;">
+        <table class="table table-sm align-middle mb-0 small">
+          <thead class="table-light"><tr><th>タスク</th><th class="text-nowrap">担当</th><th class="text-nowrap">期限</th><th class="text-nowrap">残り</th></tr></thead>
+          <tbody>
+            {% for r in p.due_soon %}
+            <tr>
+              <td>{{ task_cell(r) }}</td>
+              <td class="text-nowrap">{{ r.assignee_names or '未割当' }}</td>
+              <td class="text-nowrap">{{ fmt_date(r.due_date) }}</td>
+              <td class="text-nowrap fw-bold">{% if r.days_left == 0 %}今日が期限{% else %}{{ r.days_left }}営業日{% endif %}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="4" class="text-muted">ありません。</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  {# 遅れ: 進行中なのに記載がない #}
+  <div class="col-lg-6">
+    <div class="card shadow-sm h-100">
+      <div class="card-header bg-white fw-bold"><i class="bi bi-chat-square-dots text-warning"></i> 進行中なのに記載がない（{{ p.stale_days }}営業日以上・{{ p.stale|length }} 件）</div>
+      <div class="table-responsive" style="max-height:320px; overflow-y:auto;">
+        <table class="table table-sm align-middle mb-0 small">
+          <thead class="table-light"><tr><th>タスク</th><th class="text-nowrap">担当</th><th class="text-nowrap">経過</th><th>起点</th></tr></thead>
+          <tbody>
+            {% for r in p.stale %}
+            <tr>
+              <td>{{ task_cell(r) }}</td>
+              <td class="text-nowrap">{{ r.assignee_names or '未割当' }}</td>
+              <td class="text-nowrap fw-bold">{{ r.elapsed_days }}営業日</td>
+              <td>{{ r.basis }}（{{ fmt_date(r.since) }}）{% if r.last_comment %}<br>{{ last_comment(r.last_comment) }}{% endif %}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="4" class="text-muted">ありません。</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  {# 課題: 保留中 #}
+  <div class="col-lg-6">
+    <div class="card shadow-sm h-100">
+      <div class="card-header bg-white fw-bold"><i class="bi bi-pause-circle text-warning"></i> 課題: 保留中（{{ p.hold|length }} 件）</div>
+      <div class="table-responsive" style="max-height:320px; overflow-y:auto;">
+        <table class="table table-sm align-middle mb-0 small">
+          <thead class="table-light"><tr><th>タスク</th><th class="text-nowrap">担当</th><th class="text-nowrap">保留</th><th>最後の記載</th></tr></thead>
+          <tbody>
+            {% for r in p.hold %}
+            <tr>
+              <td>{{ task_cell(r) }}</td>
+              <td class="text-nowrap">{{ r.assignee_names or '未割当' }}</td>
+              <td class="text-nowrap">{% if r.hold_days is not none %}{{ r.hold_days }}営業日{% if r.since_estimated %}<br><span class="text-muted">（推定）</span>{% endif %}{% else %}―{% endif %}</td>
+              <td>{{ last_comment(r.last_comment) }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="4" class="text-muted">ありません。</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+{# マネージャーのコメントへの対応 #}
+{% set mc = p.manager_comments %}
+<div class="card shadow-sm mb-3" id="manager-comments">
+  <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <span class="fw-bold"><i class="bi bi-reply"></i> マネージャーのコメントへの対応（要フォロー {{ mc.follow|length }} 件）</span>
+    <span class="small text-muted">対象 {{ mc.total }} 件 ／ 返信あり {{ mc.replied }} 件 ／ 返信なし {{ mc.no_reply }} 件{% if mc.ack_count %} ／ 対応不要（了解・お礼など）{{ mc.ack_count }} 件は除外{% endif %}</span>
+  </div>
+  <div class="table-responsive" style="max-height:320px; overflow-y:auto;">
+    <table class="table table-sm align-middle mb-0 small">
+      <thead class="table-light">
+        <tr><th>タスク</th><th class="text-nowrap">担当</th><th>マネージャーのコメント</th><th class="text-nowrap">判定</th><th class="text-nowrap">経過</th></tr>
+      </thead>
+      <tbody>
+        {% for r in mc.follow %}
+        <tr>
+          <td>{{ task_cell(r) }}</td>
+          <td class="text-nowrap">{{ r.assignee_names or '未割当' }}</td>
+          <td><span class="text-muted text-nowrap">{{ r.at.strftime('%m/%d') }} {{ r.author }}：</span><span class="pre-wrap">{{ r.body }}</span></td>
+          <td class="text-nowrap"><span class="badge bg-danger">{{ r.judgement }}</span></td>
+          <td class="text-nowrap fw-bold">{{ r.elapsed_days }}営業日</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="text-muted">返信のないコメントはありません。</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="card-footer bg-white small text-muted">
+    <i class="bi bi-info-circle"></i> 対象は、未完了のタスクへのマネージャーのコメント（全期間）と、期間内に書かれたコメントです（そのタスクの担当者でもあるマネージャーの記載は除く）。
+    後に担当者のコメントが無いものを「返信なし」とし、書かれてからの営業日数を表示します。返信があるコメントが対応済みかどうかは、後のコメントと状態の変更から判定します。
+  </div>
+</div>
+
+{# 進み(期間内) #}
+<div class="row g-3 mb-3">
+  <div class="col-lg-6">
+    <div class="card shadow-sm h-100">
+      <div class="card-header bg-white fw-bold"><i class="bi bi-check2-circle text-success"></i> 期間内に完了（{{ p.done|length }} 件）</div>
+      <div class="table-responsive" style="max-height:320px; overflow-y:auto;">
+        <table class="table table-sm align-middle mb-0 small">
+          <thead class="table-light"><tr><th>タスク</th><th class="text-nowrap">担当</th><th class="text-nowrap">完了日</th></tr></thead>
+          <tbody>
+            {% for r in p.done %}
+            <tr>
+              <td>{{ task_cell(r) }}</td>
+              <td class="text-nowrap">{{ r.assignee_names or '未割当' }}</td>
+              <td class="text-nowrap">{{ fmt_date(r.completed_at) }}{% if r.completed_estimated %} <span class="text-muted">（推定）</span>{% endif %}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="3" class="text-muted">ありません。</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <div class="col-lg-6">
+    <div class="card shadow-sm h-100">
+      <div class="card-header bg-white fw-bold"><i class="bi bi-play-circle text-primary"></i> 期間内に着手（{{ p.started|length }} 件）</div>
+      <div class="table-responsive" style="max-height:320px; overflow-y:auto;">
+        <table class="table table-sm align-middle mb-0 small">
+          <thead class="table-light"><tr><th>タスク</th><th class="text-nowrap">担当</th><th class="text-nowrap">着手日</th></tr></thead>
+          <tbody>
+            {% for r in p.started %}
+            <tr>
+              <td>{{ task_cell(r) }}</td>
+              <td class="text-nowrap">{{ r.assignee_names or '未割当' }}</td>
+              <td class="text-nowrap">{{ fmt_date(r.started_at) }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="3" class="text-muted">ありません。</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+{# ===== ② スキル状況 ===== #}
+{% set sk = a.skills %}
+{% set ts = sk.tests %}
+<h2 class="h4 mt-4 mb-1" id="skills"><i class="bi bi-mortarboard"></i> ② スキル状況</h2>
+<p class="text-muted small mb-2">スキルテストは期間内（受験を始めた日）、スキルの分布と偏りは現時点の到達度です。保有者は Lv{{ sk.proficient }} 以上（単独で実務可能）のメンバーです。</p>
+
+<div class="card shadow-sm mb-3">
+  <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <span class="fw-bold"><i class="bi bi-patch-check"></i> スキルテストの状況（期間内）</span>
+    <a href="{{ url_for('skilltest.admin_attempts') }}" class="btn btn-sm btn-outline-secondary">受験履歴</a>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-sm table-hover align-middle mb-0 text-center small">
+      <thead class="table-light">
+        <tr>
+          <th class="text-start">ヒト</th>
+          <th class="text-nowrap">受験</th>
+          <th class="text-nowrap">終了</th>
+          <th class="text-nowrap">時間切れ・<br>途中で終了</th>
+          <th class="text-nowrap">受験中</th>
+          <th class="text-nowrap">レベル<br>アップ</th>
+          <th class="text-nowrap">離脱が多い<br>（{{ ts.blur_many }}回以上）</th>
+          <th class="text-nowrap">最後の受験<br>（全期間）</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in ts.rows %}
+        <tr>
+          <td class="text-start text-nowrap">{{ r.name }}</td>
+          <td>{{ r.attempts or '―' }}</td>
+          <td>{{ r.finished or '―' }}</td>
+          <td class="{% if r.expired %}text-warning-emphasis fw-bold{% endif %}">{{ r.expired or '―' }}</td>
+          <td>{{ r.in_progress or '―' }}</td>
+          <td class="{% if r.level_ups %}text-success fw-bold{% endif %}">{{ r.level_ups or '―' }}</td>
+          <td class="{% if r.many_blur %}text-danger fw-bold{% endif %}">{{ r.many_blur or '―' }}</td>
+          <td class="text-nowrap">{% if r.last_at %}{{ fmt_date(r.last_at) }}{% else %}<span class="text-muted">未受験</span>{% endif %}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="8" class="text-muted py-3">対象のメンバーがいません。</td></tr>
+        {% endfor %}
+      </tbody>
+      <tfoot class="table-light fw-bold">
+        <tr>
+          <td class="text-start">チーム</td>
+          <td>{{ ts.team.attempts }}</td>
+          <td>{{ ts.team.finished }}</td>
+          <td>{{ ts.team.expired }}</td>
+          <td>{{ ts.team.in_progress }}</td>
+          <td>{{ ts.team.level_ups }}</td>
+          <td>{{ ts.team.many_blur }}</td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+  </div>
+  <div class="card-footer bg-white small">
+    {% if not ts.testable_count %}
+    <span class="text-muted">テストの対象スキル（有効なテクニカルスキル）がありません。</span>
+    {% else %}
+    <div><span class="fw-bold">一度も受験していない:</span>
+      {% for r in ts.never %}{{ r.name }}{% if not loop.last %}、{% endif %}{% else %}<span class="text-muted">なし</span>{% endfor %}</div>
+    <div><span class="fw-bold">期間内に受験していない（以前は受験）:</span>
+      {% for r in ts.none_in_period %}{{ r.name }}（最後 {{ fmt_date(r.last_at) }}）{% if not loop.last %}、{% endif %}{% else %}<span class="text-muted">なし</span>{% endfor %}</div>
+    {% endif %}
+  </div>
+</div>
+
+<div class="row g-3 mb-3">
+  <div class="col-lg-7">
+    <div class="card shadow-sm h-100">
+      <div class="card-header bg-white d-flex justify-content-between align-items-center">
+        <span class="fw-bold"><i class="bi bi-person-lines-fill"></i> メンバーのスキル分布（現時点・Lv{{ sk.proficient }}以上の数）</span>
+        <a href="{{ url_for('skills.list_skills') }}" class="btn btn-sm btn-outline-secondary">スキルマップ</a>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-sm align-middle mb-0 small text-center">
+          <thead class="table-light">
+            <tr>
+              <th class="text-start">ヒト</th>
+              {% for t in type_choices %}<th class="text-nowrap">{{ t }}</th>{% endfor %}
+              <th class="text-start">得意なスキル（上位）</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for d in sk.distribution %}
+            <tr>
+              <td class="text-start text-nowrap"><a href="{{ url_for('skills.member', user_id=d.user_id) }}">{{ d.name }}</a></td>
+              {% for t in type_choices %}
+              {% set ty = d.types[t] %}
+              <td class="text-nowrap">{{ ty.proficient }}/{{ ty.total }}{% if ty.avg is not none %}<br><span class="text-muted">平均 Lv{{ ty.avg }}</span>{% endif %}</td>
+              {% endfor %}
+              <td class="text-start">{% for s in d.strengths %}<span class="badge bg-light text-dark border fw-normal">{{ s.name }} Lv{{ s.level }}</span> {% else %}<span class="text-muted">なし</span>{% endfor %}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="{{ type_choices|length + 2 }}" class="text-muted py-3">対象のメンバーがいません。</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <div class="col-lg-5">
+    <div class="card shadow-sm h-100">
+      <div class="card-header bg-white fw-bold"><i class="bi bi-exclamation-diamond text-warning"></i> 偏り</div>
+      <div class="card-body small">
+        <div class="fw-bold mb-1">保有者が1名以下のスキル（{{ sk.thin_skills|length }} 件）</div>
+        <ul class="mb-3 ps-3" style="max-height:220px; overflow-y:auto;">
+          {% for s in sk.thin_skills %}
+          <li><a href="{{ url_for('skills.list_skills', type=s.skill_type) }}">{{ s.name }}</a>
+            <span class="badge bg-{{ s.type_color }}">{{ s.skill_type }}</span>:
+            {% if s.holders %}{{ s.holders[0].name }}（Lv{{ s.holders[0].level }}）だけ{% else %}<span class="text-danger">保有者なし</span>{% endif %}
+            {% if s.required_by %}<span class="text-muted">／ 必要な業務: {{ s.required_by|join('、') }}</span>{% endif %}</li>
+          {% else %}
+          <li class="text-muted">ありません。</li>
+          {% endfor %}
+        </ul>
+        <div class="fw-bold mb-1">対応できる人が1名以下の業務（{{ sk.single_operations|length }} 件）</div>
+        <ul class="mb-3 ps-3">
+          {% for o in sk.single_operations %}
+          <li><a href="{{ url_for('skills.coverage') }}">{{ o.name }}</a>:
+            {% if o.capable %}{{ o.capable[0] }}だけ{% else %}<span class="text-danger">対応できる人なし</span>{% endif %}
+            <span class="text-muted">（必要スキル {{ o.req_count }} 件）</span></li>
+          {% else %}
+          <li class="text-muted">ありません。</li>
+          {% endfor %}
+        </ul>
+        {% if sk.operations_without_reqs %}<div class="text-muted mb-3">必要スキルが未設定の業務 {{ sk.operations_without_reqs }} 件は判定していません。</div>{% endif %}
+        {% set cc = sk.concentration %}
+        <div class="fw-bold mb-1">少数の人への集中</div>
+        {% if cc.total %}
+        <div>Lv{{ sk.proficient }}以上の保有 合計 {{ cc.total }} 件のうち:
+          {% for h in cc.holdings %}{{ h.name }} {{ h.count }}件（{{ h.share }}%）{% if not loop.last %}、{% endif %}{% endfor %}</div>
+        {% if cc.flag %}
+        <div class="text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> {{ cc.top.name }}さんに保有の {{ cc.top_share }}% が集まっています（{{ cc.threshold }}%以上）。</div>
+        {% endif %}
+        {% else %}
+        <div class="text-muted">Lv{{ sk.proficient }}以上の保有がまだありません。</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+{# ===== ③ 成果物の状況 ===== #}
+{% set o = a.outputs %}
+<h2 class="h4 mt-4 mb-1" id="outputs"><i class="bi bi-trophy"></i> ③ 成果物の状況</h2>
+<p class="text-muted small mb-2">
+  期間内に完了したタスクの成果（定量の見込み・実績・単位・補足、定性の見込み・実績）を確認しています。
+  金額・時間は年換算（1年=12か月=360日）で、ヒト別は複数担当を均等割りしています。
+  リードタイムは着手（開始日。無ければ登録日）から完了までの暦日で、規模の目安日数と比べます。
+</p>
+<div class="card shadow-sm mb-3">
+  <div class="table-responsive">
+    <table class="table table-sm table-hover align-middle mb-0 text-center small">
+      <thead class="table-light">
+        <tr>
+          <th rowspan="2" class="text-start align-middle">ヒト</th>
+          <th rowspan="2" class="text-nowrap align-middle">完了</th>
+          <th colspan="2">成果（実績・年換算）</th>
+          <th rowspan="2" class="text-nowrap align-middle">書き直し<br>推奨</th>
+          <th colspan="{{ o.problem_labels|length }}">指摘の内訳（件数）</th>
+          <th colspan="3">リードタイム（暦日）</th>
+        </tr>
+        <tr>
+          <th class="text-nowrap">金額(￥/年)</th>
+          <th class="text-nowrap">時間(ｈ/年)</th>
+          {% for code, label in o.problem_labels.items() %}<th class="text-nowrap">{{ label }}</th>{% endfor %}
+          <th class="text-nowrap">中央値</th>
+          <th class="text-nowrap">目安の<br>中央値</th>
+          <th class="text-nowrap">目安超過</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in o.rows + [dict(o.team, name='チーム', user_id=none)] %}
+        <tr class="{% if r.user_id is none %}table-light fw-bold{% endif %}">
+          <td class="text-start text-nowrap">{% if r.user_id is none %}チーム{% else %}{{ person_link(r) }}{% endif %}</td>
+          <td>{{ r.completed or '―' }}</td>
+          <td>{{ "{:,.0f}".format(r.money_act) }}</td>
+          <td>{{ "{:,.1f}".format(r.hour_act) }}</td>
+          <td class="{% if r.rewrite %}text-danger fw-bold{% endif %}">{{ r.rewrite or '―' }}</td>
+          {% for code, label in o.problem_labels.items() %}<td>{{ r.problems[code] or '―' }}</td>{% endfor %}
+          {% set lt = r.lead_time %}
+          <td class="text-nowrap">{% if lt.median is not none %}{{ lt.median }}日{% else %}―{% endif %}{{ sample(lt.count) if lt.count else '' }}</td>
+          <td class="text-nowrap">{% if lt.target_median is not none %}{{ lt.target_median }}日{% else %}―{% endif %}</td>
+          <td class="text-nowrap">{% if lt.with_target %}{{ lt.over }}/{{ lt.with_target }}{% else %}―{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="card-footer bg-white small text-muted">
+    <i class="bi bi-info-circle"></i> 指摘のルール: 実績が空（見込みだけ）／ 数値に単位がない ／ 定量の実績に補足（根拠・計算方法）がない ／
+    実績が見込みの{{ o.gap_low }}%未満・{{ o.gap_high }}%超（年換算）／ 定性の実績が15文字未満・補足が10文字未満。
+    完了日時は「完了」にした記録の日時です（記録が無いタスクは更新日時で代用し「推定」としています。リードタイムの推定 {{ o.team.lead_time.estimated }} 件）。
+  </div>
+</div>
+
+<div class="card shadow-sm mb-3" id="outcome-rewrite">
+  <div class="card-header bg-white fw-bold"><i class="bi bi-pencil-square"></i> 成果の書き直し推奨（{{ o.rewrite|length }} 件）</div>
+  <div class="table-responsive" style="max-height:480px; overflow-y:auto;">
+    <table class="table table-sm align-middle mb-0 small">
+      <thead class="table-light">
+        <tr><th>タスク</th><th class="text-nowrap">担当</th><th>指摘</th><th>今の記載</th></tr>
+      </thead>
+      <tbody>
+        {% for r in o.rewrite %}
+        <tr>
+          <td>{{ task_cell(r) }}<br><span class="text-muted">完了 {{ fmt_date(r.completed_at) }}{% if r.completed_estimated %}（推定）{% endif %}</span></td>
+          <td class="text-nowrap">{{ r.assignee_names or '未割当' }}</td>
+          <td>{% for pr in r.problems %}<div><span class="badge bg-warning text-dark">{{ pr.label }}</span> {{ pr.field }}: {{ pr.detail }}</div>{% endfor %}</td>
+          <td>
+            <div><span class="text-muted">定量:</span> 見込み {{ r.outcome.quant_estimate_label or '―' }} ／ 実績 {{ r.outcome.quant_actual_label or '―' }}</div>
+            {% if r.outcome.quant_note %}<div class="pre-wrap"><span class="text-muted">補足:</span> {{ r.outcome.quant_note }}</div>{% endif %}
+            <div class="pre-wrap"><span class="text-muted">定性の実績:</span> {{ r.outcome.qual_actual or '―' }}</div>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="4" class="text-muted">ルールで見つかった書き直し推奨はありません。</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{# ===== ④ 各人の能力（総合） ===== #}
+{% set ab = a.abilities %}
+<h2 class="h4 mt-4 mb-1" id="abilities"><i class="bi bi-people"></i> ④ 各人の能力（総合）</h2>
+<p class="text-muted small mb-2">
+  指導の参考です（<strong>順位・点数は付けません</strong>。表示名順）。同時進行数・負荷は現時点、そのほかは期間内です。
+</p>
+<div class="card shadow-sm mb-3">
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0 text-center small">
+      <thead class="table-light">
+        <tr>
+          <th class="text-start">ヒト</th>
+          <th class="text-nowrap">同時進行<br>（進行中／未完了）</th>
+          <th class="text-nowrap">負荷<br>（h/月）</th>
+          <th class="text-nowrap">リードタイム<br>（中央値）</th>
+          <th class="text-nowrap">成果<br>（完了・年換算）</th>
+          <th class="text-nowrap">成果の書き方<br>（書き直し推奨）</th>
+          <th class="text-nowrap">進捗の記載<br>（回/件・週）</th>
+          <th class="text-nowrap">進捗の具体性<br>（書き直し推奨）</th>
+          <th class="text-nowrap">マネージャーの<br>コメントへの返信</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in ab.rows %}
+        <tr>
+          <td class="text-start text-nowrap">{{ person_link(r) }}</td>
+          <td>{{ r.doing }}／{{ r.task_open }}</td>
+          <td class="text-nowrap">{{ r.load_h }}{% if r.load_level %} <span class="badge bg-{{ r.load_level.color }}">{{ r.load_level.label }}</span>{% endif %}</td>
+          <td class="text-nowrap">{% if r.lead_time and r.lead_time.median is not none %}{{ r.lead_time.median }}日{{ sample(r.lead_time.count) }}{% else %}―{% endif %}</td>
+          <td class="text-nowrap">{{ r.completed }}件{% if r.money_act %}<br>{{ "{:,.0f}".format(r.money_act) }} ￥/年{% endif %}{% if r.hour_act %}<br>{{ "{:,.1f}".format(r.hour_act) }} ｈ/年{% endif %}</td>
+          <td class="text-nowrap">{% if r.completed %}{{ r.outcome_rewrite }}/{{ r.completed }}件{{ sample(r.completed) }}{% else %}―{% endif %}</td>
+          <td class="text-nowrap">{% if r.progress_frequency is not none %}{{ r.progress_frequency }}<br><span class="text-muted">記載 {{ r.progress_comments }} 件・対象 {{ r.progress_tasks }} 件</span>{% else %}―{% endif %}</td>
+          <td class="text-nowrap">{% if r.progress_comments %}{{ r.progress_vague }}/{{ r.progress_comments }}件{{ sample(r.progress_comments) }}{% else %}―{% endif %}</td>
+          <td class="text-nowrap">{% if r.mc_total %}{{ r.mc_replied }}/{{ r.mc_total }}件（{{ r.mc_rate }}%）{{ sample(r.mc_total) }}{% else %}―{% endif %}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="9" class="text-muted py-3">対象のメンバーがいません。</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="card-footer bg-white small text-muted">
+    <i class="bi bi-info-circle"></i> 負荷はマネージャーダッシュボードの「ヒト別 負荷・案件状況」と同じ計算です。
+    進捗の記載は、期間内に本人が担当タスクに書いた記載の数 ÷（期間中に未完了だった担当タスクの数 × 週数 {{ ab.weeks }}）。
+    具体性は、定型の言葉だけ（「対応中」など）・短く数字の無い記載を書き直し推奨として数えています。
+    マネージャーのコメントへの返信は、期間内に書かれたマネージャーのコメントのうち担当者の返信があるものです。
+  </div>
+</div>
+
+<div class="card shadow-sm mb-3" id="progress-rewrite">
+  <div class="card-header bg-white fw-bold"><i class="bi bi-pencil-square"></i> 進捗の記載の書き直し推奨（期間内・{{ ab.progress_rewrite|length }} 件）</div>
+  <div class="table-responsive" style="max-height:320px; overflow-y:auto;">
+    <table class="table table-sm align-middle mb-0 small">
+      <thead class="table-light"><tr><th>タスク</th><th class="text-nowrap">記載者</th><th>記載</th><th>理由</th></tr></thead>
+      <tbody>
+        {% for r in ab.progress_rewrite %}
+        <tr>
+          <td>{{ task_cell(r) }}</td>
+          <td class="text-nowrap">{{ r.name }}</td>
+          <td><span class="text-muted text-nowrap">{{ r.at.strftime('%m/%d') }}：</span><span class="pre-wrap">{{ r.body }}</span></td>
+          <td>{{ r.reason }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="4" class="text-muted">ありません。</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
 {% endblock %}
 {#=== departments/manage.html ===#}
 {% extends "base.html" %}
@@ -4284,6 +4940,9 @@
   <div class="tab-pane fade {% if tab == 'skilltest' %}show active{% endif %}" id="pane-skilltest" role="tabpanel" aria-labelledby="tab-skilltest">
     {% include "system/_skilltest_tab.html" %}
   </div>
+  <div class="tab-pane fade {% if tab == 'analysis' %}show active{% endif %}" id="pane-analysis" role="tabpanel" aria-labelledby="tab-analysis">
+    {% include "system/_analysis_tab.html" %}
+  </div>
 </div>
 {% endblock %}
 
@@ -4760,6 +5419,36 @@
     </div>
     <div class="card-footer bg-white d-flex justify-content-end">
       <button class="btn btn-primary btn-sm"><i class="bi bi-save"></i> スキルテストの設定を保存</button>
+    </div>
+  </div>
+</form>
+{#=== system/_analysis_tab.html ===#}
+{# システム設定「AI分析」タブ(instance/ai_analysis_settings.json に保存)。入力チェックは app.py の parse_ai_analysis_form #}
+<p class="small text-muted d-flex flex-wrap justify-content-between gap-2">
+  <span>
+    マネージャーダッシュボードの「AI分析（サマリーと推奨アクション）」で使うしきい値です。日数は土日・祝日を除いた営業日で数えます。
+    設定は <code>instance/ai_analysis_settings.json</code> に保存され、DB には保存しません。
+  </span>
+  <a href="{{ url_for('manager.analysis') }}"><i class="bi bi-box-arrow-up-right"></i> AI分析の画面</a>
+</p>
+
+<form method="post" action="{{ url_for('system.save_analysis') }}">
+  <div class="card shadow-sm mb-4">
+    <div class="card-header bg-white fw-bold"><i class="bi bi-sliders"></i> しきい値（営業日）</div>
+    <div class="card-body">
+      <div class="row g-3">
+        {% for f in an.fields %}
+        <div class="col-md-6">
+          <label class="form-label small mb-1 fw-bold" for="analysis-{{ f.key }}">{{ f.label }}</label>
+          <input type="number" class="form-control form-control-sm" id="analysis-{{ f.key }}" name="{{ f.key }}"
+                 value="{{ an.settings[f.key] }}" min="{{ f.min }}" max="{{ f.max }}" step="1" required>
+          <div class="form-text">{{ f.help }}（{{ f.min }}〜{{ f.max }}。既定 {{ f.default }}）</div>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    <div class="card-footer bg-white d-flex justify-content-end">
+      <button class="btn btn-primary btn-sm"><i class="bi bi-save"></i> AI分析の設定を保存</button>
     </div>
   </div>
 </form>

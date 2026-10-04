@@ -17,7 +17,7 @@ Python のコードはすべてこの app.py にまとめている。ほかの�
   flask --app app migrate [--check] [--db パス]     既存DBを最新のモデル定義に合わせる
 
 動作確認で差し替える関数(呼び出すたびにこのモジュールから探すので、app._now = ... で差し替えられる):
-  _now()            スキルテストの時刻(3-8)
+  _now()            スキルテストの時刻(3-8)・AI分析の基準の日時(9)
   _call_chat_api()  AI(ChatGPT互換API)の呼び出し(4-1。独自APIへの移行もここだけを書き換える)
 
 目次(章は「# ####」、節は「# ====」の見出しで始まる):
@@ -75,19 +75,25 @@ Python のコードはすべてこの app.py にまとめている。ほかの�
       8-4. スキルテスト: 問題プールの集計と補充
       8-5. スキルテスト: 設定フォーム
       8-6. スキルテスト: 画面
-  9. システム設定
-      9-1. システム設定: 基本設定の項目の定義
-      9-2. システム設定: 基本設定の入力チェック・保存
-      9-3. システム設定: 画面
-  10. 定期メールの自動送信スケジューラ
-      10-1. スケジューラ(週報・期限超過通知)
-      10-2. サーバーとして起動したときの開始(プロセス間で1つだけ)
-  11. アプリの組み立て
-      11-1. 画面テンプレート・静的ファイル(templates.html)
-      11-2. create_app(アプリの作成)
-  12. flask コマンド(seed / migrate)
-      12-1. seed: 初期データの投入
-      12-2. migrate: 既存DBを最新のモデル定義に合わせる
+  9. AI分析(サマリーと推奨アクション)
+      9-1. AI分析: 設定(しきい値)
+      9-2. AI分析: 期間と材料
+      9-3. AI分析: 集計(①〜④)
+      9-4. AI分析: 推奨アクション(ルール)
+      9-5. AI分析: 画面
+  10. システム設定
+      10-1. システム設定: 基本設定の項目の定義
+      10-2. システム設定: 基本設定の入力チェック・保存
+      10-3. システム設定: 画面
+  11. 定期メールの自動送信スケジューラ
+      11-1. スケジューラ(週報・期限超過通知)
+      11-2. サーバーとして起動したときの開始(プロセス間で1つだけ)
+  12. アプリの組み立て
+      12-1. 画面テンプレート・静的ファイル(templates.html)
+      12-2. create_app(アプリの作成)
+  13. flask コマンド(seed / migrate)
+      13-1. seed: 初期データの投入
+      13-2. migrate: 既存DBを最新のモデル定義に合わせる
 """
 import ast
 import calendar
@@ -107,6 +113,7 @@ import shutil
 import smtplib
 import socket
 import sqlite3
+import statistics
 import sys
 import tempfile
 import threading
@@ -4561,6 +4568,7 @@ def toggle_operation(op_id):
 # マネージャー(manager)向けダッシュボードのルーティング。
 #
 # マネージャーのみアクセス可。チーム全体を俯瞰する読み取り専用の集計ビュー。年休は事由を出さない。
+# 「AI分析（サマリーと推奨アクション）」(/manager/analysis)は 9 章(同じ manager_bp に登録する)。
 
 manager_bp = Blueprint("manager", __name__, url_prefix="/manager")
 
@@ -9666,26 +9674,1357 @@ def admin_settings():
 
 
 # #############################################################################
-# 9. システム設定
+# 9. AI分析(サマリーと推奨アクション)
+# #############################################################################
+# マネージャーダッシュボードの「AI分析（サマリーと推奨アクション）」(/manager/analysis)。
+# マネージャーのみ(メンバーは画面・データのどれにもアクセスできない。403)。
+#
+# チームの状況を4つの観点でまとめ、マネージャーが今やることを推奨アクションとして示す:
+#   ① タスクの進捗   進み(期間内の完了・着手)/遅れ(期限超過・期限が近いのに未着手・
+#                    進行中なのに記載がない)/課題(保留中)/マネージャーのコメントへの対応
+#   ② スキル状況     スキルテストの状況・未受験/メンバーのスキル分布/偏り
+#   ③ 成果物の状況   期間内に完了したタスクの成果の確認(書き直し推奨)・成果の合計・リードタイム
+#   ④ 各人の能力     同時進行数・負荷・リードタイム・成果・書き方・マネージャーのコメントへの対応率
+#                    (指導の参考。順位・点数は付けない)
+#   推奨アクション   マネージャーが今やること(5〜10件。優先度の高い順)
+#
+# 数値・一覧はすべてコード(この章)で計算する。AI には数値を計算・創作させない。
+# AI(課題の抽出・コメントへの対応の判定・あいまいさの判定・書き直し案・所見・まとめ)は、
+# collect_analysis() の戻り値(下の「集計結果の形」)を材料にする。AI が未設定・失敗のときも、
+# コードの集計とルールによる推奨アクションはそのまま表示する。
+#
+# 期間:
+#   「期間内」  画面で選ぶ(直近 7/14/30/90 日、または日付の範囲。既定は直近30日。両端の日を含む)
+#   「現時点」  期限超過・期限が近いのに未着手・記載がない・保留・負荷・スキルの分布と偏り(今の状態)
+#   未完了のタスクは、期間に関係なく全履歴(すべてのコメント・状態の変更)を読む
+# 営業日は土日・祝日を除いて数える(2-4)。基準の日時は _now()(動作確認では app._now を差し替える)。
+# 対象者は有効なメンバー(role=member。マネージャーはスキル管理と同じく対象外)。
+# チームの件数は、担当者のいないタスク・マネージャーだけが担当のタスクも含めて1件ずつ数える。
+# DB は読み取りのみ(テーブルは追加・変更しない)。
+#
+#   9-1 設定             しきい値 N1/N2(instance/ai_analysis_settings.json。システム設定の「AI分析」タブ)
+#   9-2 期間と材料       期間の解釈、タスク・コメント・状態の変更の読み込み
+#   9-3 集計(①〜④)     コードで計算する数値・一覧・ルールによる確認
+#   9-4 推奨アクション   ルールによる推奨アクション
+#   9-5 画面             GET /manager/analysis
+#
+# 集計結果の形(collect_analysis の戻り値。日付・日時は date / datetime のまま):
+#   now, period(9-2), settings(9-1), members [{id, name}]
+#   tasks         {タスクID: タスクの材料(_analysis_task)。タイトル・説明・担当・状態・期限・規模・成果、
+#                  全コメント(記載者・日時・本文・マネージャーか・担当者か)・全状態の変更・完了日時(推定か)}
+#   person_task_ids {メンバーID: そのメンバーに関係するタスクIDの一覧(未完了・期間内に完了・期間内に動き)}
+#   progress      ① {done, started, overdue, due_soon, stale, hold, manager_comments, rows, team}
+#   skills        ② {tests, distribution, skills, thin_skills, operations, single_operations, concentration}
+#   outputs       ③ {tasks, rewrite, problem_counts, rows, team, lead_time}
+#   abilities     ④ {rows, progress_rewrite}
+#   actions       推奨アクション [{rank, category, title, target, reason, numbers, score}]
+# AI の結果を入れる欄(ai / suggestion)は None にしてある(AI の処理で埋める)。
+
+
+# =============================================================================
+# 9-1. AI分析: 設定(しきい値)
+# =============================================================================
+# AI分析のしきい値(営業日)。システム設定の「AI分析」タブで変更し、instance/ai_analysis_settings.json
+# に保存する(DB には保存しない。読み書きは 2-3 の共通部品)。
+#   due_soon_days (N1) : 期限まで残りこの営業日数以内なのに「未着手」のタスクを「期限が近いのに未着手」にする
+#   stale_days    (N2) : 「進行中」で、担当者の最後の進捗記載からこの営業日数以上たったタスクを
+#                        「進行中なのに記載がない」にする
+# ファイルが無い・読み込めない場合は既定値を使う(読み込めないファイルは上書きしない)。
+
+AI_ANALYSIS_SETTINGS_FILENAME = "ai_analysis_settings.json"
+AI_ANALYSIS_SETTINGS_LABEL = "AI分析の設定ファイル"
+AI_ANALYSIS_LABEL = "AI分析"
+AI_ANALYSIS_SAVED_MESSAGE = "AI分析の設定を保存しました。"
+
+DUE_SOON_DAYS_MIN, DUE_SOON_DAYS_MAX = 1, 30
+STALE_DAYS_MIN, STALE_DAYS_MAX = 1, 60
+
+AI_ANALYSIS_DEFAULTS = {
+    "due_soon_days": 5,
+    "stale_days": 10,
+}
+
+# (キー, 表示名, 最小, 最大, 説明)。画面の入力チェックと読み込み時の検証に使う
+AI_ANALYSIS_FIELDS = (
+    ("due_soon_days", "期限が近いとみなす営業日数（N1）", DUE_SOON_DAYS_MIN, DUE_SOON_DAYS_MAX,
+     "「未着手」のタスクで、期限まで残りこの営業日数以内のものを「期限が近いのに未着手」にします（今日が期限なら残り0）。"),
+    ("stale_days", "記載がないとみなす営業日数（N2）", STALE_DAYS_MIN, STALE_DAYS_MAX,
+     "「進行中」のタスクで、担当者の最後の進捗記載（記載が無ければ進行中にした日）からこの営業日数以上たったものを"
+     "「進行中なのに記載がない」にします。"),
+)
+
+_ai_analysis_settings_lock = threading.RLock()
+
+
+def _ai_analysis_settings_path():
+    return os.path.join(current_app.instance_path, AI_ANALYSIS_SETTINGS_FILENAME)
+
+
+def _normalize_ai_analysis_settings(data):
+    """読み込んだ値を検証し、不正・欠落した項目は既定値で補う。"""
+    result = dict(AI_ANALYSIS_DEFAULTS)
+    if not isinstance(data, dict):
+        return result
+    for key, _label, low, high, _help in AI_ANALYSIS_FIELDS:
+        if valid_int(data.get(key), low, high):
+            result[key] = data[key]
+    return result
+
+
+def load_ai_analysis_settings():
+    """現在の設定を返す(ファイルが無い・読み込めない場合は既定値)。"""
+    with _ai_analysis_settings_lock:
+        try:
+            data = read_json(_ai_analysis_settings_path(), AI_ANALYSIS_SETTINGS_LABEL)
+        except SettingsFileError as exc:
+            current_app.logger.warning("%s（既定値を使用）", exc)
+            data = None
+        return _normalize_ai_analysis_settings(data)
+
+
+def save_ai_analysis_settings(values):
+    """画面で編集した項目を保存する。
+
+    ファイルがあるのに読み込めない場合は SettingsFileError を送出する(上書きしない)。
+    """
+    with _ai_analysis_settings_lock:
+        current = _normalize_ai_analysis_settings(
+            read_json(_ai_analysis_settings_path(), AI_ANALYSIS_SETTINGS_LABEL))
+        for key, _label, _low, _high, _help in AI_ANALYSIS_FIELDS:
+            if key in values:
+                current[key] = values[key]
+        data = _normalize_ai_analysis_settings(current)
+        write_json(_ai_analysis_settings_path(), data)
+        return data
+
+
+def parse_ai_analysis_form(form):
+    """フォームの入力を検証する。戻り値: (values, errors)。errors が空なら保存してよい。"""
+    errors = []
+    values = {}
+    for key, label, low, high, _help in AI_ANALYSIS_FIELDS:
+        value = _number(form, key)
+        if valid_int(value, low, high):
+            values[key] = value
+        else:
+            errors.append("{}は{}〜{}の数字で入力してください。".format(label, low, high))
+    return values, errors
+
+
+def ai_analysis_form_context(settings):
+    """AI分析の設定フォームの表示に使う値。"""
+    return {
+        "settings": settings,
+        "fields": [
+            {"key": key, "label": label, "min": low, "max": high, "help": help_text,
+             "default": AI_ANALYSIS_DEFAULTS[key]}
+            for key, label, low, high, help_text in AI_ANALYSIS_FIELDS
+        ],
+    }
+
+
+# =============================================================================
+# 9-2. AI分析: 期間と材料
+# =============================================================================
+# 期間の解釈(画面の ?period=7|14|30|90|range&from=YYYY-MM-DD&to=YYYY-MM-DD)と、
+# タスク・コメント・状態の変更の読み込み(全タスク。DB は読み取りのみ)。
+#
+# 完了日時 = 最後に「完了」にした状態の変更の日時。変更の記録が無い完了タスク(古いデータなど)は
+#            更新日時で代用し「推定」とする。
+# 着手     = 期間内に「進行中」になった(登録時から進行中の場合も含む。週報と同じ)。
+
+ANALYSIS_PERIOD_DAYS = (7, 14, 30, 90)
+ANALYSIS_DEFAULT_DAYS = 30
+ANALYSIS_PERIOD_RANGE = "range"
+
+# 画面・AI に渡す本文の1件あたりの最大文字数(一覧の表示用。AI には全文を渡す)
+ANALYSIS_TEXT_PREVIEW = 120
+
+
+def analysis_period(args, today):
+    """画面の指定から期間を決める。
+
+    戻り値: {kind, days, start, end, start_dt, end_dt, label, business_days, error}
+      kind  : "7" / "14" / "30" / "90" / "range"
+      start / end : 期間の最初と最後の日(両端を含む)。範囲の指定で今日より後の日は今日にする
+      error : 指定が正しくないときのメッセージ(そのときは直近30日)
+    """
+    kind = str(args.get("period") or "").strip()
+    error = None
+    if kind == ANALYSIS_PERIOD_RANGE:
+        start = parse_date(args.get("from"))
+        end = parse_date(args.get("to"))
+        if start is None or end is None:
+            error = "期間を指定するときは開始日と終了日を入力してください（直近{}日で表示しています）。".format(
+                ANALYSIS_DEFAULT_DAYS)
+        else:
+            if end < start:
+                start, end = end, start
+            end = min(end, today)
+            start = min(start, end)
+            return _period_dict(ANALYSIS_PERIOD_RANGE, start, end,
+                                "{}〜{}".format(start.strftime("%Y/%m/%d"), end.strftime("%Y/%m/%d")))
+        kind = ""
+    if not (kind.isdecimal() and int(kind) in ANALYSIS_PERIOD_DAYS):
+        if kind:
+            error = error or "期間の指定が正しくありません（直近{}日で表示しています）。".format(
+                ANALYSIS_DEFAULT_DAYS)
+        kind = str(ANALYSIS_DEFAULT_DAYS)
+    days = int(kind)
+    result = _period_dict(kind, today - timedelta(days=days - 1), today, "直近{}日".format(days))
+    result["error"] = error
+    return result
+
+
+def _period_dict(kind, start, end, label):
+    return {
+        "kind": kind,
+        "start": start,
+        "end": end,
+        "start_dt": datetime.combine(start, time.min),
+        "end_dt": datetime.combine(end, time.max),
+        "days": (end - start).days + 1,
+        # 両端を含む営業日の日数
+        "business_days": business_days_ago(start - _ONE_DAY, end),
+        "label": label,
+        "error": None,
+    }
+
+
+def _in_period(dt, period):
+    return dt is not None and period["start_dt"] <= dt <= period["end_dt"]
+
+
+def _text_length(text):
+    """空白・改行を除いた文字数。"""
+    return len(re.sub(r"\s+", "", str(text or "")))
+
+
+def _analysis_comment(comment, assignee_ids):
+    author = comment.user
+    return {
+        "id": comment.id,
+        "user_id": comment.user_id,
+        "author": author.display_name if author else "",
+        "author_is_manager": bool(author is not None and author.role == ROLE_MANAGER),
+        "author_is_assignee": comment.user_id in assignee_ids,
+        "at": comment.created_at,
+        "body": comment.body or "",
+    }
+
+
+def _completion_of(task):
+    """完了日時と、それが推定(状態の変更の記録が無く更新日時で代用)か。未完了なら (None, False)。"""
+    if task.status != STATUS_DONE:
+        return None, False
+    for change in reversed(task.status_changes):
+        if change.status == STATUS_DONE and change.changed_at:
+            return change.changed_at, False
+    return (task.updated_at or task.created_at), True
+
+
+def _entered_at(task, status):
+    """今の状態(status)になった日時(最後にその状態へ変更した日時)。記録が無ければ None。"""
+    for change in reversed(task.status_changes):
+        if change.status == status and change.changed_at:
+            return change.changed_at
+    return None
+
+
+def _analysis_task(task, period):
+    """1件のタスクの材料(全コメント・全状態の変更を含む。表示・AI の材料に使う素の値)。"""
+    assignees = list(task.assignees)
+    assignee_ids = [u.id for u in assignees]
+    id_set = set(assignee_ids)
+    comments = [_analysis_comment(c, id_set) for c in task.comments]
+    comments.sort(key=lambda c: (c["at"] or datetime.min, c["id"]))
+    changes = [{"status": ch.status, "at": ch.changed_at} for ch in task.status_changes]
+    completed_at, completed_estimated = _completion_of(task)
+    is_open = task.status != STATUS_DONE
+    # 担当者の進捗記載(担当者がいないタスクは、だれの記載でもよい)
+    progress = [c for c in comments if c["author_is_assignee"] or not assignee_ids]
+    return {
+        "id": task.id,
+        "title": task.title or "",
+        "description": task.description or "",
+        "status": task.status,
+        "priority": task.priority,
+        "scale": task.scale,
+        "scale_label": task.scale_label or "",
+        "scale_days": TASK_SCALE_DAYS.get(task.scale),
+        "start_date": task.start_date,
+        "due_date": task.due_date,
+        "created_at": task.created_at,
+        "updated_at": task.updated_at,
+        "assignee_ids": assignee_ids,
+        "assignee_list": [u.display_name for u in assignees],
+        "assignee_names": "、".join(u.display_name for u in assignees),
+        "comments": comments,
+        "changes": changes,
+        "last_progress": progress[-1] if progress else None,
+        "outcome": {
+            "quant_estimate": task.outcome_quant_estimate,
+            "quant_estimate_unit": task.outcome_quant_estimate_unit,
+            "quant_estimate_label": task.outcome_quant_estimate_label,
+            "quant_actual": task.outcome_quant_actual,
+            "quant_actual_unit": task.outcome_quant_actual_unit,
+            "quant_actual_label": task.outcome_quant_actual_label,
+            "quant_note": task.outcome_quant_note or "",
+            "qual_estimate": task.outcome_qual_estimate or "",
+            "qual_actual": task.outcome_qual_actual or "",
+        },
+        "is_open": is_open,
+        "completed_at": completed_at,
+        "completed_estimated": completed_estimated,
+        "completed_in": completed_at is not None and _in_period(completed_at, period),
+        "started_in": any(ch["status"] == STATUS_DOING and _in_period(ch["at"], period)
+                          for ch in changes),
+        "status_since": _entered_at(task, task.status),
+    }
+
+
+def load_analysis_tasks(period):
+    """全タスクの材料 {タスクID: 材料}(期間より後に登録されたタスクは除く)。"""
+    tasks = (
+        Task.query.options(
+            selectinload(Task.assignees),
+            selectinload(Task.comments).selectinload(TaskComment.user),
+            selectinload(Task.status_changes),
+        )
+        .order_by(Task.id)
+        .all()
+    )
+    result = {}
+    for task in tasks:
+        if task.created_at is not None and task.created_at > period["end_dt"]:
+            continue
+        result[task.id] = _analysis_task(task, period)
+    return result
+
+
+def analysis_members():
+    """対象者(有効なメンバー。表示名順)。"""
+    return (
+        User.query.filter_by(is_active=True, role=ROLE_MEMBER)
+        .order_by(User.display_name, User.id)
+        .all()
+    )
+
+
+# =============================================================================
+# 9-3. AI分析: 集計(①〜④)
+# =============================================================================
+# ルールによる確認(AI を使わない)のしきい値。N1/N2 だけは画面(9-1)で変更できる。
+
+# 件数がこれ未満の中央値・割合には「対象○件のため参考値」と付ける
+SMALL_SAMPLE = 5
+# スキルテストで画面から離れた回数(1回の受験)がこの回数以上なら「離脱が多い」
+BLUR_MANY = 3
+# 成果: 実績÷見込み(年換算)がこの範囲の外なら「見込みとの差が大きい」
+OUTCOME_GAP_LOW, OUTCOME_GAP_HIGH = 0.5, 2.0
+# 成果: 定性の実績・定量の補足がこの文字数未満なら「記載が短い」
+OUTCOME_SHORT_CHARS = 15
+NOTE_SHORT_CHARS = 10
+# 進捗記載: この文字数未満で数字を含まないものは「記載が短い」
+PROGRESS_SHORT_CHARS = 10
+# スキルの集中: 対象者が3名以上で、Lv2以上の保有の合計のうち1名がこの割合以上を持っていれば「集中」
+CONCENTRATION_SHARE = 0.5
+
+# マネージャーのコメントへの対応(コードの判定。AI の判定は 対応済み/一部対応/未対応)
+MC_NO_REPLY = "返信なし"
+MC_REPLIED = "返信あり"
+MC_ACK = "対応不要"
+
+# 成果の確認の指摘の種類(表示順)。AI のあいまいさの判定は "vague" として加える
+OUTCOME_PROBLEM_LABELS = {
+    "empty_actual": "実績が空",
+    "no_unit": "単位がない",
+    "no_basis": "数値の根拠がない",
+    "big_gap": "見込みとの差が大きい",
+    "too_short": "記載が短い",
+}
+
+# あいさつ・お礼・了解だけのコメント(返信を求めていないので「対応不要」)
+_ACK_PHRASES = (
+    "了解いたしました", "了解しました", "了解です", "了解", "りょうかい",
+    "承知いたしました", "承知しました", "承知です", "承知",
+    "確認いたしました", "確認しました", "拝見しました",
+    "ありがとうございました", "ありがとうございます", "ありがとう", "有難うございます", "有り難うございます",
+    "お疲れ様でした", "お疲れ様です", "お疲れさまでした", "お疲れさまです", "お疲れ様", "お疲れさま",
+    "おつかれさまです", "おつかれさま",
+    "よろしくお願いいたします", "よろしくお願いします", "宜しくお願いします", "よろしくです", "よろしく",
+    "いいですね", "良いですね", "素晴らしいです", "素晴らしい", "すばらしい", "さすがです", "さすが",
+    "助かりました", "助かります", "感謝します", "感謝です", "ナイスです", "ナイス", "グッド",
+    "ok", "okです", "オッケー", "おっけー", "good", "nice", "thanks", "thankyou",
+)
+_ACK_FILLERS = ("です", "ます", "でした", "ね", "よ", "ございます")
+_ACK_PATTERN = re.compile(
+    "(?:{})+".format("|".join(re.escape(p) for p in sorted(
+        _ACK_PHRASES + _ACK_FILLERS, key=len, reverse=True))))
+_ACK_STRIP = re.compile(r"[\s、。，．,.!！~〜ー…・♪☆★()（）「」『』:：;；]+")
+_ACK_MAX_CHARS = 40
+
+# 中身のない定型の進捗記載(これだけのものは「具体的な内容がない」)
+_GENERIC_PROGRESS_PHRASES = (
+    "対応中です", "対応中", "作業中です", "作業中", "進めています", "進めております", "進めてます",
+    "進行中です", "進行中", "継続中です", "継続中", "継続します", "継続", "実施中です", "実施中",
+    "検討中です", "検討中", "確認中です", "確認中", "調整中です", "調整中", "準備中です", "準備中",
+    "特になし", "特に無し", "とくになし", "変化なし", "変更なし", "進捗なし", "進展なし",
+    "引き続き対応します", "引き続き進めます", "引き続き", "順調です", "順調", "問題ありません", "問題なし",
+    "予定通りです", "予定通り", "予定どおり", "対応します", "やります", "実施します", "了解です", "了解",
+    "承知しました", "承知", "完了しました", "完了です", "完了", "対応済みです", "対応済み", "済み", "済",
+)
+_GENERIC_PROGRESS_PATTERN = re.compile(
+    "(?:{})+".format("|".join(re.escape(p) for p in sorted(
+        _GENERIC_PROGRESS_PHRASES + _ACK_FILLERS, key=len, reverse=True))))
+
+
+def _plain(text):
+    """比べるための正規化(全角英数を半角・小文字にし、空白・記号を除く)。"""
+    return _ACK_STRIP.sub("", unicodedata.normalize("NFKC", str(text or "")).lower())
+
+
+def is_acknowledgement(text):
+    """あいさつ・お礼・了解だけのコメントか(質問・依頼を含まない短い文)。"""
+    raw = unicodedata.normalize("NFKC", str(text or ""))
+    if "?" in raw:
+        return False
+    plain = _plain(raw)
+    if not plain or len(plain) > _ACK_MAX_CHARS:
+        return False
+    # 了解・お礼などの言葉(と「です」「ね」など)だけでできている。「です」などだけのものは除く
+    return bool(_ACK_PATTERN.fullmatch(plain)) and any(p in plain for p in _ACK_PHRASES)
+
+
+def progress_comment_issue(text):
+    """進捗記載のルールによる確認。問題があれば理由、なければ None。"""
+    plain = _plain(text)
+    if not plain:
+        return "記載が空"
+    if _GENERIC_PROGRESS_PATTERN.fullmatch(plain):
+        return "具体的な内容がない（「{}」のような定型の言葉だけ）".format(one_line(text, 20))
+    if len(plain) < PROGRESS_SHORT_CHARS and not re.search(r"\d", plain):
+        return "記載が短い（{}文字。何をどこまで進めたかが分からない）".format(len(plain))
+    return None
+
+
+def sample_note(count):
+    """件数が少ないときの注記(「対象○件のため参考値」)。0件は「対象なし」。"""
+    if not count:
+        return "対象なし"
+    if count < SMALL_SAMPLE:
+        return "対象{}件のため参考値".format(count)
+    return ""
+
+
+def _median(values):
+    values = [v for v in values if v is not None]
+    if not values:
+        return None
+    return round(statistics.median(values), 1)
+
+
+def _rate(part, total):
+    """割合(%。整数)。total が 0 なら None。"""
+    return round(part * 100.0 / total) if total else None
+
+
+def _task_ref(t):
+    """一覧の行の共通部分(タスクの識別と表示に使う値)。"""
+    return {
+        "task_id": t["id"],
+        "title": t["title"],
+        "status": t["status"],
+        "status_color": STATUS_COLORS.get(t["status"], "secondary"),
+        "priority": t["priority"],
+        "assignee_ids": t["assignee_ids"],
+        "assignee_list": t["assignee_list"],
+        "assignee_names": t["assignee_names"],
+        "start_date": t["start_date"],
+        "due_date": t["due_date"],
+        "scale_label": t["scale_label"],
+    }
+
+
+def _last_comment_view(comment):
+    if comment is None:
+        return None
+    return {"at": comment["at"], "author": comment["author"],
+            "text": one_line(comment["body"], ANALYSIS_TEXT_PREVIEW)}
+
+
+def _count_rows(members, lists, extra=None):
+    """ヒト別の件数の行。lists は {キー: 一覧}(行の assignee_ids で数える)。"""
+    rows = []
+    for u in members:
+        row = {"user_id": u.id, "name": u.display_name}
+        for key, items in lists.items():
+            row[key] = sum(1 for item in items if u.id in item["assignee_ids"])
+        if extra:
+            row.update(extra(u))
+        rows.append(row)
+    return rows
+
+
+# --------------------------------------------------------------------------- #
+# ① タスクの進捗
+# --------------------------------------------------------------------------- #
+def _manager_comments(tasks, period, now):
+    """マネージャーのコメントへの対応(コードの判定)。
+
+    対象: マネージャーが書いたコメント(そのタスクの担当者でもあるマネージャーの記載は除く)のうち、
+          未完了のタスクのもの(全履歴)と、期間内に書かれたもの(完了したタスクも含む)。
+    返信なし: そのコメントより後に、担当者のコメントが1件も無い(経過した営業日数を付ける)。
+              担当者のいないタスクは、マネージャー以外のだれかのコメントがあれば返信ありとする。
+    返信あり: 担当者のコメントがある。対応済み/一部対応/未対応は AI が後のコメント・状態の変更から判定する。
+    あいさつ・お礼・了解だけのコメントは「対応不要」として数から除く。
+    """
+    items = []
+    acks = []
+    for t in tasks.values():
+        comments = t["comments"]
+        for index, c in enumerate(comments):
+            if not c["author_is_manager"] or c["author_is_assignee"] or c["at"] is None:
+                continue
+            in_period = _in_period(c["at"], period)
+            if not (t["is_open"] or in_period):
+                continue
+            later = comments[index + 1:]
+            if t["assignee_ids"]:
+                replies = [x for x in later if x["author_is_assignee"]]
+            else:
+                replies = [x for x in later if not x["author_is_manager"]]
+            item = dict(
+                _task_ref(t),
+                is_open=t["is_open"],
+                comment_id=c["id"],
+                author=c["author"],
+                at=c["at"],
+                body=c["body"],
+                in_period=in_period,
+                replied=bool(replies),
+                first_reply_at=replies[0]["at"] if replies else None,
+                # 返信までの営業日数 / 返信が無いときは今までの経過営業日数
+                response_days=business_days_ago(c["at"], replies[0]["at"]) if replies else None,
+                elapsed_days=None if replies else business_days_ago(c["at"], now),
+                later_comment_ids=[x["id"] for x in later],
+                later_changes=[ch for ch in t["changes"] if ch["at"] and c["at"] and ch["at"] > c["at"]],
+                judgement=MC_REPLIED if replies else MC_NO_REPLY,
+                # AI の判定(指示・質問・依頼の内容 / 対応済み・一部対応・未対応 / 残っている対応 / 根拠)
+                ai=None,
+            )
+            if is_acknowledgement(c["body"]):
+                item["judgement"] = MC_ACK
+                acks.append(item)
+            else:
+                items.append(item)
+    items.sort(key=lambda i: (i["at"] or datetime.min, i["comment_id"]))
+    follow = sorted((i for i in items if not i["replied"]),
+                    key=lambda i: (-(i["elapsed_days"] or 0), i["at"] or datetime.min))
+    return {
+        "items": items,
+        "follow": follow,
+        "acks": acks,
+        "total": len(items),
+        "no_reply": len(follow),
+        "replied": len(items) - len(follow),
+        "ack_count": len(acks),
+    }
+
+
+def _progress_section(tasks, members, period, now, settings):
+    """① タスクの進捗。"""
+    today = now.date()
+    due_soon_days = settings["due_soon_days"]
+    stale_days = settings["stale_days"]
+    done, started, overdue, due_soon, stale, hold = [], [], [], [], [], []
+
+    for t in tasks.values():
+        if t["completed_in"]:
+            done.append(dict(_task_ref(t), completed_at=t["completed_at"],
+                             completed_estimated=t["completed_estimated"]))
+        if t["started_in"]:
+            started.append(dict(_task_ref(t), started_at=max(
+                ch["at"] for ch in t["changes"]
+                if ch["status"] == STATUS_DOING and _in_period(ch["at"], period))))
+        if not t["is_open"]:
+            continue
+        last = _last_comment_view(t["last_progress"])
+        due = t["due_date"]
+        if due is not None and due < today:
+            overdue.append(dict(_task_ref(t), overdue_days=business_days_ago(due, today),
+                                calendar_days=(today - due).days, last_comment=last))
+        if t["status"] == STATUS_TODO and due is not None and due >= today:
+            left = business_days_ago(today, due)
+            if left <= due_soon_days:
+                due_soon.append(dict(_task_ref(t), days_left=left, last_comment=last))
+        if t["status"] == STATUS_DOING:
+            if t["last_progress"] is not None:
+                since, basis = t["last_progress"]["at"], "最後の進捗記載"
+            elif t["status_since"] is not None:
+                since, basis = t["status_since"], "進行中にした日（記載なし）"
+            else:
+                since, basis = t["created_at"], "登録日（記載なし・推定）"
+            elapsed = business_days_ago(since, now) if since else None
+            if elapsed is not None and elapsed >= stale_days:
+                stale.append(dict(_task_ref(t), since=since, basis=basis, elapsed_days=elapsed,
+                                  last_comment=last))
+        if t["status"] == STATUS_HOLD:
+            since = t["status_since"] or t["updated_at"]
+            hold.append(dict(_task_ref(t), since=since, since_estimated=t["status_since"] is None,
+                             hold_days=business_days_ago(since, now) if since else None,
+                             last_comment=_last_comment_view(t["comments"][-1] if t["comments"] else None),
+                             # AI が全コメントから抜き出す課題・相談事項
+                             ai=None))
+
+    done.sort(key=lambda r: r["completed_at"] or datetime.min, reverse=True)
+    started.sort(key=lambda r: r["started_at"], reverse=True)
+    overdue.sort(key=lambda r: (-r["overdue_days"], r["due_date"], r["task_id"]))
+    due_soon.sort(key=lambda r: (r["days_left"], r["due_date"], r["task_id"]))
+    stale.sort(key=lambda r: (-r["elapsed_days"], r["task_id"]))
+    hold.sort(key=lambda r: (-(r["hold_days"] or 0), r["task_id"]))
+
+    mc = _manager_comments(tasks, period, now)
+    lists = {"done": done, "started": started, "overdue": overdue, "due_soon": due_soon,
+             "stale": stale, "hold": hold, "mc_total": mc["items"], "mc_no_reply": mc["follow"]}
+    rows = _count_rows(members, lists)
+    team = {key: len(items) for key, items in lists.items()}
+    return {
+        "done": done, "started": started, "overdue": overdue, "due_soon": due_soon,
+        "stale": stale, "hold": hold, "manager_comments": mc,
+        "rows": rows, "team": team,
+        "due_soon_days": due_soon_days, "stale_days": stale_days,
+        # AI が未完了のタスクの全コメントから抜き出す課題・相談事項
+        "issues_ai": None,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# ② スキル状況
+# --------------------------------------------------------------------------- #
+def _attempt_view(a, now):
+    """スキルテストの受験1回分(表示・AI の材料)。"""
+    if a.status == ATTEMPT_IN_PROGRESS and a.deadline_at is not None and a.deadline_at < now:
+        state = "abandoned"     # 受験中のまま期限を過ぎた(途中でやめた)
+    elif a.status == ATTEMPT_EXPIRED:
+        state = "expired"
+    elif a.status == ATTEMPT_IN_PROGRESS:
+        state = "in_progress"
+    else:
+        state = "finished"
+    level_up = (a.status == ATTEMPT_FINISHED and a.new_level is not None
+                and a.prev_level is not None and a.new_level > a.prev_level)
+    return {
+        "attempt_id": a.id,
+        "user_id": a.user_id,
+        "skill_id": a.skill_id,
+        "skill_name": a.skill.name if a.skill else "",
+        "started_at": a.started_at,
+        "finished_at": a.finished_at,
+        "state": state,
+        "status_label": {"abandoned": "途中で終了（期限切れ）"}.get(state, a.status_label),
+        "total": a.total,
+        "correct": a.correct,
+        "rate": a.rate,
+        "result_level": a.result_level,
+        "prev_level": a.prev_level,
+        "new_level": a.new_level,
+        "level_up": level_up,
+        "applied": bool(a.applied),
+        "blur_count": a.blur_count or 0,
+        "level_results": a.level_result_list,
+    }
+
+
+def _skilltest_status(members, period, now):
+    """スキルテストの状況(期間内の受験)と未受験。"""
+    member_ids = [u.id for u in members]
+    attempts = []
+    if member_ids:
+        attempts = (
+            SkillTestAttempt.query.filter(SkillTestAttempt.user_id.in_(member_ids))
+            .options(selectinload(SkillTestAttempt.skill))
+            .order_by(SkillTestAttempt.started_at, SkillTestAttempt.id)
+            .all()
+        )
+    views = [_attempt_view(a, now) for a in attempts]
+    in_period = [v for v in views if _in_period(v["started_at"], period)]
+    rows = []
+    for u in members:
+        mine_all = [v for v in views if v["user_id"] == u.id]
+        mine = [v for v in in_period if v["user_id"] == u.id]
+        rows.append({
+            "user_id": u.id,
+            "name": u.display_name,
+            "attempts": len(mine),
+            "finished": sum(1 for v in mine if v["state"] == "finished"),
+            "expired": sum(1 for v in mine if v["state"] in ("expired", "abandoned")),
+            "in_progress": sum(1 for v in mine if v["state"] == "in_progress"),
+            "level_ups": sum(1 for v in mine if v["level_up"]),
+            "many_blur": sum(1 for v in mine if v["blur_count"] >= BLUR_MANY),
+            "max_blur": max([v["blur_count"] for v in mine] or [0]),
+            "ever": len(mine_all),
+            "last_at": mine_all[-1]["started_at"] if mine_all else None,
+        })
+    team = {key: sum(r[key] for r in rows)
+            for key in ("attempts", "finished", "expired", "in_progress", "level_ups", "many_blur")}
+    return {
+        "attempts": in_period,
+        "rows": rows,
+        "team": team,
+        "never": [r for r in rows if not r["ever"]],
+        "none_in_period": [r for r in rows if r["ever"] and not r["attempts"]],
+        "testable_count": len(testable_skills()),
+        "blur_many": BLUR_MANY,
+    }
+
+
+def _skills_section(members, period, now):
+    """② スキル状況(テストは期間内、分布・偏りは現時点)。"""
+    member_ids = [u.id for u in members]
+    type_order = {t: i for i, t in enumerate(SKILL_TYPE_CHOICES)}
+    skills = sorted(Skill.query.filter_by(is_active=True).all(),
+                    key=lambda s: (type_order.get(s.skill_type, 99), s.sort_order, s.name))
+    level = {}
+    if member_ids:
+        for r in SkillRating.query.filter(SkillRating.user_id.in_(member_ids)).all():
+            level[(r.user_id, r.skill_id)] = r.level
+
+    # メンバーのスキル分布(区分ごとの Lv2以上の数・平均到達度・得意なスキル)
+    distribution = []
+    for u in members:
+        types = {}
+        for stype in SKILL_TYPE_CHOICES:
+            levels = [level.get((u.id, s.id), 0) for s in skills if s.skill_type == stype]
+            types[stype] = {
+                "total": len(levels),
+                "proficient": sum(1 for lv in levels if lv >= SKILL_PROFICIENT_LEVEL),
+                "avg": round(sum(levels) / len(levels), 1) if levels else None,
+            }
+        held = sorted(((level.get((u.id, s.id), 0), s) for s in skills
+                       if level.get((u.id, s.id), 0) >= SKILL_PROFICIENT_LEVEL),
+                      key=lambda x: (-x[0], type_order.get(x[1].skill_type, 99), x[1].sort_order))
+        distribution.append({
+            "user_id": u.id,
+            "name": u.display_name,
+            "types": types,
+            "proficient_total": sum(t["proficient"] for t in types.values()),
+            "strengths": [{"skill_id": s.id, "name": s.name, "level": lv,
+                           "level_label": level_label(s.skill_type, lv)} for lv, s in held[:5]],
+        })
+
+    # 業務の必要スキル(有効な業務・有効なスキルだけ)
+    operations = (Operation.query.filter_by(is_active=True)
+                  .order_by(Operation.sort_order, Operation.name).all())
+    active_ids = {s.id for s in skills}
+    required_by = {}
+    for op in operations:
+        for req in op.skill_reqs:
+            if req.skill_id in active_ids:
+                required_by.setdefault(req.skill_id, []).append(op.name)
+
+    # スキルごとの保有者(Lv2以上)。1名以下は「偏り」
+    skill_rows = []
+    for s in skills:
+        holders = [{"user_id": u.id, "name": u.display_name, "level": level.get((u.id, s.id), 0)}
+                   for u in members if level.get((u.id, s.id), 0) >= SKILL_PROFICIENT_LEVEL]
+        holders.sort(key=lambda h: -h["level"])
+        skill_rows.append({
+            "skill_id": s.id,
+            "name": s.name,
+            "skill_type": s.skill_type,
+            "type_label": s.type_label,
+            "type_color": s.type_color,
+            "category": s.category or "",
+            "holders": holders,
+            "holder_count": len(holders),
+            "thin": bool(members) and len(holders) <= 1,
+            "required_by": required_by.get(s.id, []),
+        })
+    thin = sorted((r for r in skill_rows if r["thin"]),
+                  key=lambda r: (-len(r["required_by"]), r["holder_count"]))
+
+    # 業務ごとに、必要スキルをすべて満たすメンバー。1名以下は「偏り」
+    op_rows = []
+    no_reqs = 0
+    for op in operations:
+        reqs = [r for r in op.skill_reqs if r.skill_id in active_ids]
+        if not reqs:
+            no_reqs += 1
+            continue
+        capable = [u for u in members
+                   if all(level.get((u.id, r.skill_id), 0) >= r.level for r in reqs)]
+        op_rows.append({
+            "operation_id": op.id,
+            "name": op.name,
+            "req_count": len(reqs),
+            "capable": [u.display_name for u in capable],
+            "capable_ids": [u.id for u in capable],
+            "capable_count": len(capable),
+            "single": bool(members) and len(capable) <= 1,
+        })
+    single_ops = sorted((r for r in op_rows if r["single"]), key=lambda r: r["capable_count"])
+
+    # 少数の人への集中(Lv2以上の保有の合計のうち、1名が持つ割合)
+    holdings = sorted(({"user_id": d["user_id"], "name": d["name"], "count": d["proficient_total"]}
+                       for d in distribution), key=lambda h: -h["count"])
+    total = sum(h["count"] for h in holdings)
+    for h in holdings:
+        h["share"] = _rate(h["count"], total)
+    top_share = (holdings[0]["count"] / total) if (holdings and total) else 0.0
+    concentration = {
+        "total": total,
+        "holdings": holdings,
+        "top": holdings[0] if holdings and total else None,
+        "top_share": round(top_share * 100) if total else None,
+        "flag": len(members) >= 3 and total > 0 and top_share >= CONCENTRATION_SHARE,
+        "threshold": round(CONCENTRATION_SHARE * 100),
+    }
+
+    return {
+        "tests": _skilltest_status(members, period, now),
+        "distribution": distribution,
+        "skills": skill_rows,
+        "thin_skills": thin,
+        "operations": op_rows,
+        "single_operations": single_ops,
+        "operations_without_reqs": no_reqs,
+        "concentration": concentration,
+        "proficient": SKILL_PROFICIENT_LEVEL,
+        "type_labels": SKILL_TYPE_LABELS,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# ③ 成果物の状況
+# --------------------------------------------------------------------------- #
+def outcome_problems(o):
+    """完了したタスクの成果の記載をルールで確認する。指摘の一覧 [{code, label, field, detail}]。
+
+    o はタスクの材料の outcome(_analysis_task)。あいまいさは AI が判定する(ここでは見ない)。
+    """
+    problems = []
+
+    def add(code, field, detail):
+        problems.append({"code": code, "label": OUTCOME_PROBLEM_LABELS[code],
+                         "field": field, "detail": detail})
+
+    est, act = o["quant_estimate"], o["quant_actual"]
+    qual_est, qual_act = o["qual_estimate"].strip(), o["qual_actual"].strip()
+    note = o["quant_note"].strip()
+
+    if act is None and not qual_act:
+        add("empty_actual", "成果（実績）", "定量・定性のどちらの実績も書かれていない")
+    else:
+        if est is not None and act is None:
+            add("empty_actual", "成果（定量）の実績",
+                "見込み（{}）はあるが実績が空".format(o["quant_estimate_label"]))
+        if qual_est and not qual_act:
+            add("empty_actual", "成果（定性）の実績", "見込みはあるが実績が空")
+    if est is not None and not o["quant_estimate_unit"]:
+        add("no_unit", "成果（定量）の見込み", "数値（{}）に単位がない".format(_fmt_amount(est)))
+    if act is not None and not o["quant_actual_unit"]:
+        add("no_unit", "成果（定量）の実績", "数値（{}）に単位がない".format(_fmt_amount(act)))
+    if act is not None and not note:
+        add("no_basis", "成果（定量）の補足",
+            "実績の数値（{}）の根拠・計算方法が書かれていない".format(o["quant_actual_label"]))
+    est_kind, est_year = _annualize(est, o["quant_estimate_unit"])
+    act_kind, act_year = _annualize(act, o["quant_actual_unit"])
+    if est_kind is not None and est_kind == act_kind and est_year > 0:
+        ratio = act_year / est_year
+        if ratio < OUTCOME_GAP_LOW or ratio > OUTCOME_GAP_HIGH:
+            add("big_gap", "成果（定量）",
+                "実績が見込みの{}%（見込み {} ／ 実績 {}）。差の理由が書かれているか確認".format(
+                    round(ratio * 100), o["quant_estimate_label"], o["quant_actual_label"]))
+    if qual_act and _text_length(qual_act) < OUTCOME_SHORT_CHARS:
+        add("too_short", "成果（定性）の実績", "{}文字だけ".format(_text_length(qual_act)))
+    if note and _text_length(note) < NOTE_SHORT_CHARS:
+        add("too_short", "成果（定量）の補足", "{}文字だけ".format(_text_length(note)))
+    return problems
+
+
+def _lead_time(t):
+    """着手→完了のリードタイム(暦日)。着手は開始日(無ければ登録日)、完了は完了日時。"""
+    if t["completed_at"] is None:
+        return None
+    if t["start_date"] is not None:
+        start, start_estimated = t["start_date"], False
+    elif t["created_at"] is not None:
+        start, start_estimated = t["created_at"].date(), True
+    else:
+        return None
+    end = t["completed_at"].date()
+    days = max((end - start).days, 0)
+    target = t["scale_days"]
+    return {
+        "start": start,
+        "start_estimated": start_estimated,
+        "end": end,
+        "end_estimated": t["completed_estimated"],
+        "estimated": start_estimated or t["completed_estimated"],
+        "days": days,
+        "target_days": target,
+        "over": target is not None and days > target,
+    }
+
+
+def _lt_summary(entries):
+    """リードタイムのまとめ(中央値・目安との比較)。"""
+    with_target = [e for e in entries if e["target_days"] is not None]
+    return {
+        "count": len(entries),
+        "median": _median([e["days"] for e in entries]),
+        "target_median": _median([e["target_days"] for e in with_target]),
+        "with_target": len(with_target),
+        "over": sum(1 for e in with_target if e["over"]),
+        "estimated": sum(1 for e in entries if e["estimated"]),
+        "note": sample_note(len(entries)),
+    }
+
+
+def _outputs_section(tasks, members, period):
+    """③ 成果物の状況(期間内に完了したタスク。チーム全体とヒト別)。"""
+    rows = []
+    for t in tasks.values():
+        if not t["completed_in"]:
+            continue
+        o = t["outcome"]
+        est_kind, est_year = _annualize(o["quant_estimate"], o["quant_estimate_unit"])
+        act_kind, act_year = _annualize(o["quant_actual"], o["quant_actual_unit"])
+        rows.append(dict(
+            _task_ref(t),
+            completed_at=t["completed_at"],
+            completed_estimated=t["completed_estimated"],
+            outcome=o,
+            problems=outcome_problems(o),
+            money_est=est_year if est_kind == _OUTCOME_MONEY else 0.0,
+            hour_est=est_year if est_kind == _OUTCOME_HOUR else 0.0,
+            money_act=act_year if act_kind == _OUTCOME_MONEY else 0.0,
+            hour_act=act_year if act_kind == _OUTCOME_HOUR else 0.0,
+            lead_time=_lead_time(t),
+            # AI のあいまいさの判定・書き直し案(タスクとコメントにある事実だけ。不明な数値は ◯)
+            ai=None,
+            suggestion=None,
+        ))
+    rows.sort(key=lambda r: r["completed_at"] or datetime.min, reverse=True)
+    rewrite = [r for r in rows if r["problems"]]
+
+    def problem_counts(items):
+        counts = {code: 0 for code in OUTCOME_PROBLEM_LABELS}
+        for item in items:
+            for code in {p["code"] for p in item["problems"]}:
+                counts[code] += 1
+        return counts
+
+    def summary(items, share):
+        lts = [r["lead_time"] for r in items if r["lead_time"] is not None]
+        return {
+            "completed": len(items),
+            "rewrite": sum(1 for r in items if r["problems"]),
+            "problems": problem_counts(items),
+            "money_act": round(sum(r["money_act"] / share(r) for r in items), 1),
+            "hour_act": round(sum(r["hour_act"] / share(r) for r in items), 1),
+            "money_est": round(sum(r["money_est"] / share(r) for r in items), 1),
+            "hour_est": round(sum(r["hour_est"] / share(r) for r in items), 1),
+            "lead_time": _lt_summary(lts),
+        }
+
+    # ヒト別は担当者の数で均等割り(成果の集計(5-7)と同じ)。チームは1件ずつ
+    person_rows = []
+    for u in members:
+        mine = [r for r in rows if u.id in r["assignee_ids"]]
+        person_rows.append(dict(summary(mine, lambda r: len(r["assignee_ids"]) or 1),
+                                user_id=u.id, name=u.display_name))
+    return {
+        "tasks": rows,
+        "rewrite": rewrite,
+        "problem_labels": OUTCOME_PROBLEM_LABELS,
+        "rows": person_rows,
+        "team": summary(rows, lambda r: 1),
+        "gap_low": round(OUTCOME_GAP_LOW * 100),
+        "gap_high": round(OUTCOME_GAP_HIGH * 100),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# ④ 各人の能力(総合)
+# --------------------------------------------------------------------------- #
+def _was_open_during(t, period):
+    """期間中に未完了だった時がある(期間の最後までに登録され、期間の最初より後に完了または未完了)。"""
+    if t["created_at"] is not None and t["created_at"] > period["end_dt"]:
+        return False
+    return t["completed_at"] is None or t["completed_at"] >= period["start_dt"]
+
+
+def _abilities_section(tasks, members, period, now, progress, outputs):
+    """④ 各人の能力(総合)。指導の参考の表(順位・点数は付けない。表示名順)。"""
+    today = now.date()
+    workload_rows, _totals = _build_workload(today, members)
+    workload = {r["user"].id: r for r in workload_rows}
+    outputs_by_user = {r["user_id"]: r for r in outputs["rows"]}
+    weeks = period["days"] / 7.0
+    mc_items = [i for i in progress["manager_comments"]["items"] if i["in_period"]]
+
+    rows = []
+    progress_rewrite = []
+    for u in members:
+        mine = [t for t in tasks.values() if u.id in t["assignee_ids"]]
+        open_during = [t for t in mine if _was_open_during(t, period)]
+        comments = [dict(c, task_id=t["id"], title=t["title"], status=t["status"],
+                         status_color=STATUS_COLORS.get(t["status"], "secondary"))
+                    for t in mine for c in t["comments"]
+                    if c["user_id"] == u.id and _in_period(c["at"], period)]
+        comments.sort(key=lambda c: c["at"])
+        vague = []
+        for c in comments:
+            reason = progress_comment_issue(c["body"])
+            if reason:
+                item = {"task_id": c["task_id"], "title": c["title"], "status": c["status"],
+                        "status_color": c["status_color"],
+                        "comment_id": c["id"], "user_id": u.id, "name": u.display_name,
+                        "at": c["at"], "body": c["body"], "reason": reason,
+                        "ai": None, "suggestion": None}
+                vague.append(item)
+                progress_rewrite.append(item)
+        frequency = (round(len(comments) / (len(open_during) * weeks), 2)
+                     if open_during and weeks else None)
+        my_mc = [i for i in mc_items if u.id in i["assignee_ids"]]
+        replied = sum(1 for i in my_mc if i["replied"])
+        w = workload.get(u.id)
+        out = outputs_by_user.get(u.id) or {}
+        rows.append({
+            "user_id": u.id,
+            "name": u.display_name,
+            "doing": w["doing"] if w else 0,
+            "task_open": w["task_open"] if w else 0,
+            "load_h": w["total_h"] if w else 0.0,
+            "load_level": w["level"] if w else None,
+            "lead_time": out.get("lead_time"),
+            "completed": out.get("completed", 0),
+            "money_act": out.get("money_act", 0.0),
+            "hour_act": out.get("hour_act", 0.0),
+            "outcome_rewrite": out.get("rewrite", 0),
+            "progress_comments": len(comments),
+            "progress_tasks": len(open_during),
+            "progress_frequency": frequency,
+            "progress_vague": len(vague),
+            "mc_total": len(my_mc),
+            "mc_replied": replied,
+            "mc_rate": _rate(replied, len(my_mc)),
+            "mc_note": sample_note(len(my_mc)),
+            # AI の所見(強み / 気になる点 / 支援のポイント)
+            "ai": None,
+        })
+    progress_rewrite.sort(key=lambda i: i["at"], reverse=True)
+    return {"rows": rows, "progress_rewrite": progress_rewrite, "weeks": round(weeks, 1)}
+
+
+# --------------------------------------------------------------------------- #
+# 対象者ごとの関係するタスク(AI の材料の単位)
+# --------------------------------------------------------------------------- #
+def _is_relevant_to_period(t, period):
+    """未完了、または期間内に完了・コメント・状態の変更があったタスク。"""
+    return bool(
+        t["is_open"] or t["completed_in"]
+        or any(_in_period(c["at"], period) for c in t["comments"])
+        or any(_in_period(ch["at"], period) for ch in t["changes"])
+    )
+
+
+def collect_analysis(period, now, settings):
+    """AI分析の集計(コードで計算するものすべて)。DB は読み取りのみ。形は章の先頭の説明のとおり。"""
+    members = analysis_members()
+    tasks = load_analysis_tasks(period)
+    progress = _progress_section(tasks, members, period, now, settings)
+    skills = _skills_section(members, period, now)
+    outputs = _outputs_section(tasks, members, period)
+    abilities = _abilities_section(tasks, members, period, now, progress, outputs)
+    person_task_ids = {
+        u.id: [t["id"] for t in tasks.values()
+               if u.id in t["assignee_ids"] and _is_relevant_to_period(t, period)]
+        for u in members
+    }
+    data = {
+        "now": now,
+        "period": period,
+        "settings": settings,
+        "members": [{"id": u.id, "name": u.display_name} for u in members],
+        "tasks": tasks,
+        "person_task_ids": person_task_ids,
+        "progress": progress,
+        "skills": skills,
+        "outputs": outputs,
+        "abilities": abilities,
+    }
+    data["actions"] = rule_actions(data)
+    return data
+
+
+# =============================================================================
+# 9-4. AI分析: 推奨アクション(ルール)
+# =============================================================================
+# マネージャーが今やることを、集計結果から優先度の高い順に 5〜10件 選ぶ(AI を使わない)。
+# AI が未設定・失敗のときもこれを表示する(AI の推奨アクションは、この候補と集計結果をもとに作る)。
+#
+# 候補(種類ごとの点数の目安。同じ種類の中は状況が重いものほど高い):
+#   期限超過(90〜)・マネージャーのコメントに返信なし(80〜)・進行中なのに記載がない(70〜)・
+#   期限が近いのに未着手(65〜)・保留が長い(60〜)・負荷が高い(58〜)・対応できる人が1名以下の業務(55)・
+#   保有者が1名以下のスキル(48〜)・成果の書き直し推奨(45〜)・進捗記載の書き直し推奨(40)・
+#   スキルテストの未受験(35)・時間切れ／途中で終了・離脱が多い受験(33)
+# 同じ種類ばかりにならないよう種類ごとの上限(ACTION_CAPS)まで選び、5件に満たなければ上限を外して補う。
+# 各アクション: rank(順位)・category(種類)・title(やること)・target(対象: 種類・ID・表示名)・
+#               reason(理由)・numbers(根拠の数値)・score(並べ替えの点数)
+
+ACTION_MIN = 5
+ACTION_MAX = 10
+ACTION_CAPS = {
+    "overdue": 3,
+    "manager_comment": 3,
+    "stale": 2,
+    "due_soon": 2,
+    "hold": 1,
+    "load": 2,
+    "operation": 1,
+    "skill": 1,
+    "outcome": 2,
+    "progress_writing": 1,
+    "skilltest": 1,
+}
+ACTION_CATEGORY_LABELS = {
+    "overdue": "期限超過",
+    "manager_comment": "コメントへの対応",
+    "stale": "記載がない",
+    "due_soon": "期限が近いのに未着手",
+    "hold": "保留",
+    "load": "負荷",
+    "operation": "業務の偏り",
+    "skill": "スキルの偏り",
+    "outcome": "成果の書き方",
+    "progress_writing": "進捗の書き方",
+    "skilltest": "スキルテスト",
+}
+
+
+def _task_target(item):
+    return {"kind": "task", "id": item["task_id"], "label": item["title"]}
+
+
+def _san(names):
+    """担当者の呼び方(「山田 一郎さん・鈴木 二郎さん」)。担当者がいなければ空文字。"""
+    return "・".join("{}さん".format(name) for name in names)
+
+
+def _ask(item, with_assignee, without_assignee):
+    """担当者がいれば「○○さん＋with_assignee」、いなければ without_assignee。"""
+    who = _san(item["assignee_list"])
+    return who + with_assignee if who else without_assignee
+
+
+def _action_candidates(data):
+    progress = data["progress"]
+    skills = data["skills"]
+    out = []
+
+    def add(category, score, title, target, reason, numbers):
+        out.append({"category": category, "category_label": ACTION_CATEGORY_LABELS[category],
+                    "score": round(score, 2), "title": title, "target": target,
+                    "reason": reason, "numbers": numbers})
+
+    for item in progress["overdue"]:
+        bonus = 5 if item["priority"] == PRIORITY_HIGH else 0
+        last = item["last_comment"]
+        add("overdue", 90 + min(item["overdue_days"], 30) / 3.0 + bonus,
+            _ask(item, "と期限超過の見通し（新しい期限・残りの作業）を確認する",
+                 "担当者を決めて、期限超過の見通しを確認する"),
+            _task_target(item),
+            "期限（{}）を過ぎて未完了（{}）。".format(item["due_date"].strftime("%m/%d"), item["status"]),
+            ["期限超過 {}営業日".format(item["overdue_days"]),
+             "優先度 {}".format(item["priority"]),
+             "最後の進捗記載: {}".format(last["at"].strftime("%m/%d") if last else "なし")])
+    for item in progress["manager_comments"]["follow"]:
+        if not item["is_open"]:
+            continue
+        add("manager_comment", 80 + min(item["elapsed_days"] or 0, 20) / 2.0,
+            _ask(item, "に、コメントへの返信・対応を確認する", "担当者を決めて、コメントへの対応を依頼する"),
+            _task_target(item),
+            "{} {}さんのコメント「{}」に担当者の返信がない。".format(
+                item["at"].strftime("%m/%d"), item["author"], one_line(item["body"], 40)),
+            ["経過 {}営業日".format(item["elapsed_days"]), "状態 {}".format(item["status"])])
+    for item in progress["stale"]:
+        add("stale", 70 + min(item["elapsed_days"], 30) / 3.0,
+            _ask(item, "に進捗の記載を依頼する", "担当者を決めて、進捗を確認する"),
+            _task_target(item),
+            "進行中なのに{}から{}営業日、進捗の記載がない。".format(
+                item["basis"], item["elapsed_days"]),
+            ["経過 {}営業日（しきい値 {}営業日）".format(item["elapsed_days"], progress["stale_days"])])
+    for item in progress["due_soon"]:
+        add("due_soon", 65 + (progress["due_soon_days"] - item["days_left"]),
+            _ask(item, "と着手の予定を確認する", "担当者を決めて、着手の予定を立てる"),
+            _task_target(item),
+            "期限（{}）まで残り{}営業日なのに未着手。".format(
+                item["due_date"].strftime("%m/%d"), item["days_left"]),
+            ["残り {}営業日（しきい値 {}営業日）".format(item["days_left"], progress["due_soon_days"])])
+    for item in progress["hold"]:
+        days = item["hold_days"] or 0
+        if days < progress["stale_days"]:
+            continue
+        add("hold", 60 + min(days, 30) / 3.0,
+            _ask(item, "と保留の理由・再開の条件を確認する", "保留の理由・再開の条件を確認する（担当者なし）"),
+            _task_target(item),
+            "保留が{}営業日続いている。".format(days),
+            ["保留 {}営業日（しきい値 {}営業日）".format(days, progress["stale_days"])])
+    for row in data["abilities"]["rows"]:
+        if row["load_h"] < _LOAD_FULL:
+            continue
+        add("load", 58 + min((row["load_h"] - _LOAD_FULL) / 20.0, 5),
+            "{}さんの負荷を下げる（タスクの割り振り・期限の見直し）".format(row["name"]),
+            {"kind": "person", "id": row["user_id"], "label": row["name"]},
+            "月間の目安工数がフルタイム（{}h/月）以上。".format(_LOAD_FULL),
+            ["負荷 {}h/月".format(row["load_h"]), "未完了のタスク {}件".format(row["task_open"]),
+             "進行中 {}件".format(row["doing"])])
+    for op in skills["single_operations"]:
+        add("operation", 55 + (1 if op["capable_count"] == 0 else 0),
+            "業務「{}」を対応できる人を増やす（育成・引き継ぎの計画）".format(op["name"]),
+            {"kind": "operation", "id": op["operation_id"], "label": op["name"]},
+            "必要スキルをすべて満たすメンバーが{}。".format(
+                "いない" if op["capable_count"] == 0 else "{}さん1名だけ".format(op["capable"][0])),
+            ["対応できる人 {}名".format(op["capable_count"]), "必要スキル {}件".format(op["req_count"])])
+    # 保有者が1名以下のスキル: 業務に必要なものは1件ずつ、それ以外はまとめて1件
+    loose = []
+    for s in skills["thin_skills"]:
+        if not s["required_by"]:
+            loose.append(s)
+            continue
+        add("skill", 50 + min(len(s["required_by"]), 5) / 5.0,
+            "スキル「{}」の保有者を増やす（勉強会・OJT）".format(s["name"]),
+            {"kind": "skill", "id": s["skill_id"], "label": s["name"], "skill_type": s["skill_type"]},
+            "Lv{}以上の保有者が{}。必要な業務: {}。".format(
+                SKILL_PROFICIENT_LEVEL,
+                "いない" if not s["holders"] else "{}さん1名だけ".format(s["holders"][0]["name"]),
+                "、".join(s["required_by"])),
+            ["保有者 {}名".format(s["holder_count"]), "必要な業務 {}件".format(len(s["required_by"]))])
+    if loose:
+        nobody = [s for s in loose if not s["holders"]]
+        add("skill", 48,
+            "保有者が1名以下のスキル（{}件）の育成の優先順位を決める".format(len(loose)),
+            {"kind": "skill", "id": None, "label": "スキルマップ", "skill_type": SKILL_TYPE_ALL},
+            "Lv{}以上の保有者が1名以下のスキルがある（例: {}）。".format(
+                SKILL_PROFICIENT_LEVEL, "、".join(s["name"] for s in loose[:3])),
+            ["保有者が1名以下 {}件".format(len(loose)), "うち保有者なし {}件".format(len(nobody))])
+    for item in data["outputs"]["rewrite"]:
+        codes = [p["label"] for p in item["problems"]]
+        add("outcome", 45 + min(len(item["problems"]), 5) / 5.0,
+            _ask(item, "に成果の書き直しを依頼する", "成果の記載を書き直す（担当者なし）"),
+            _task_target(item),
+            "完了したタスクの成果: {}。".format("・".join(dict.fromkeys(codes))),
+            ["指摘 {}件".format(len(item["problems"]))])
+    by_person = {}
+    for item in data["abilities"]["progress_rewrite"]:
+        by_person.setdefault(item["user_id"], []).append(item)
+    for rows in by_person.values():
+        first = rows[0]
+        add("progress_writing", 40 + min(len(rows), 10) / 10.0,
+            "{}さんに進捗の書き方（何をどこまで進めたか・次にやること）を伝える".format(first["name"]),
+            {"kind": "person", "id": first["user_id"], "label": first["name"]},
+            "期間内の進捗記載に具体性の低いものがある（例: 「{}」）。".format(one_line(first["body"], 20)),
+            ["書き直し推奨 {}件".format(len(rows))])
+    tests = skills["tests"]
+    if tests["testable_count"] and tests["never"]:
+        names = [r["name"] for r in tests["never"]]
+        add("skilltest", 35,
+            "{}にスキルテストの受験を勧める".format(_san(names)),
+            {"kind": "skilltest", "id": None, "label": "スキルテスト管理"},
+            "一度もスキルテストを受けていないメンバーがいる。",
+            ["未受験 {}名".format(len(names)), "テストの対象スキル {}件".format(tests["testable_count"])])
+    for row in tests["rows"]:
+        if not (row["expired"] or row["many_blur"]):
+            continue
+        add("skilltest", 33,
+            "{}さんとスキルテストの受け方を確認する".format(row["name"]),
+            {"kind": "skilltest", "id": row["user_id"], "label": "{}さんの受験履歴".format(row["name"])},
+            "期間内の受験に{}がある。".format("・".join(
+                label for label, n in (("時間切れ・途中で終了", row["expired"]),
+                                       ("画面から{}回以上離れた受験".format(BLUR_MANY), row["many_blur"])) if n)),
+            ["受験 {}回".format(row["attempts"]), "時間切れ・途中で終了 {}回".format(row["expired"]),
+             "離脱が多い {}回（最大 {}回）".format(row["many_blur"], row["max_blur"])])
+    return out
+
+
+def rule_actions(data):
+    """ルールによる推奨アクション(優先度の高い順に最大 ACTION_MAX 件)。"""
+    candidates = sorted(_action_candidates(data), key=lambda a: -a["score"])
+    picked, rest, used = [], [], {}
+    for action in candidates:
+        if used.get(action["category"], 0) < ACTION_CAPS.get(action["category"], 1):
+            used[action["category"]] = used.get(action["category"], 0) + 1
+            picked.append(action)
+        else:
+            rest.append(action)
+    if len(picked) < ACTION_MIN:
+        picked.extend(rest[:ACTION_MIN - len(picked)])
+    picked.sort(key=lambda a: -a["score"])
+    picked = picked[:ACTION_MAX]
+    for rank, action in enumerate(picked, start=1):
+        action["rank"] = rank
+    return picked
+
+
+# =============================================================================
+# 9-5. AI分析: 画面
+# =============================================================================
+# GET /manager/analysis   コードの集計(①〜④)とルールによる推奨アクションをすぐに表示する。
+#                         期間は ?period=7|14|30|90(既定 30)または ?period=range&from=...&to=...
+# マネージャーのみ(メンバーは 403、未ログインはログイン画面)。
+
+
+@manager_bp.route("/analysis", endpoint="analysis")
+@login_required
+def analysis_dashboard():
+    if not current_user.is_manager:
+        abort(403)
+    now = _now()
+    period = analysis_period(request.args, now.date())
+    settings = load_ai_analysis_settings()
+    data = collect_analysis(period, now, settings)
+    return render_template(
+        "manager/analysis.html",
+        a=data,
+        period=period,
+        period_choices=ANALYSIS_PERIOD_DAYS,
+        period_range=ANALYSIS_PERIOD_RANGE,
+        settings=settings,
+        sample_note=sample_note,
+        action_max=ACTION_MAX,
+        status_colors=STATUS_COLORS,
+        type_choices=SKILL_TYPE_CHOICES,
+        type_labels=SKILL_TYPE_LABELS,
+        ai_status=ai_status_label(),
+        ai_configured=ai_is_configured(),
+    )
+
+
+# #############################################################################
+# 10. システム設定
 # #############################################################################
 # マネージャーのみ。アプリのすべての設定を1つの画面(タブ)で変更する。
 #
-#   9-1 項目の定義     基本設定の項目の定義(キー・グループ・表示名・説明・種類・再起動の要否・秘密か)。
+#   10-1 項目の定義    基本設定の項目の定義(キー・グループ・表示名・説明・種類・再起動の要否・秘密か)。
 #                      項目の定義はここの1か所だけにある
-#   9-2 入力チェック   基本設定の入力チェック・保存(instance/config.py の書き換え)・画面表示用の値
-#   9-3 画面           Blueprint: system_bp, /system/settings。タブ:
+#   10-2 入力チェック  基本設定の入力チェック・保存(instance/config.py の書き換え)・画面表示用の値
+#   10-3 画面          Blueprint: system_bp, /system/settings。タブ:
 #                        基本設定（config） : instance/config.py の環境ごとの設定
 #                        週報               : instance/weekly_settings.json
 #                        期限超過通知       : instance/overdue_settings.json
 #                        スキルテスト       : instance/skilltest_settings.json
+#                        AI分析             : instance/ai_analysis_settings.json
 #
-# 週報・期限超過通知・スキルテストの入力チェックと表示用の値は、各機能の設定フォーム
-# (6-3・7-3・8-5)にあり(保存先も各機能の設定の保存のまま)、この画面から使う。
+# 週報・期限超過通知・スキルテスト・AI分析の入力チェックと表示用の値は、各機能の設定フォーム
+# (6-3・7-3・8-5・9-1)にあり(保存先も各機能の設定の保存のまま)、この画面から使う。
 # 各機能の画面には、実行・状況の表示だけが残る(設定はこの画面へのリンク)。
 
 
 # =============================================================================
-# 9-1. システム設定: 基本設定の項目の定義
+# 10-1. システム設定: 基本設定の項目の定義
 # =============================================================================
 # 基本設定(instance/config.py)の項目の定義。項目の定義はここ(FIELDS)の1か所だけに置く。
 #
@@ -9889,11 +11228,11 @@ def documented_keys():
 
 
 # =============================================================================
-# 9-2. システム設定: 基本設定の入力チェック・保存
+# 10-2. システム設定: 基本設定の入力チェック・保存
 # =============================================================================
 # 基本設定(instance/config.py)の入力チェック・保存・画面表示用の値。
 #
-# 項目の定義は FIELDS(9-1。1か所)にあり、ここではそれに従って処理する。
+# 項目の定義は FIELDS(10-1。1か所)にあり、ここではそれに従って処理する。
 #
 # 保存の流れ(save_config_form):
 #   1. instance/config.py を読み、画面を開いたときから変わっていないか確かめる(版の比較)
@@ -10394,15 +11733,16 @@ def config_form_context(app, state=None, errors=None):
 
 
 # =============================================================================
-# 9-3. システム設定: 画面
+# 10-3. システム設定: 画面
 # =============================================================================
 # システム設定の画面。マネージャーのみ(未ログインはログイン画面へ、メンバーは403)。
 #
-# GET  /system/settings?tab=<タブ>     設定画面(タブ: config / weekly / overdue / skilltest)
+# GET  /system/settings?tab=<タブ>     設定画面(タブ: config / weekly / overdue / skilltest / analysis)
 # POST /system/settings/config         基本設定の保存(instance/config.py)
 # POST /system/settings/weekly         週報の設定の保存(instance/weekly_settings.json)
 # POST /system/settings/overdue        期限超過通知の設定の保存(instance/overdue_settings.json)
 # POST /system/settings/skilltest      スキルテストの設定の保存(instance/skilltest_settings.json)
+# POST /system/settings/analysis       AI分析の設定の保存(instance/ai_analysis_settings.json)
 # POST /system/settings/config/remove-unused
 #                                      基本設定の「未使用の設定を削除」(instance/config.py から
 #                                      今は使わない項目の行を削除する。RETIRED_KEYS)
@@ -10418,6 +11758,7 @@ TAB_CONFIG = "config"
 TAB_WEEKLY = "weekly"
 TAB_OVERDUE = "overdue"
 TAB_SKILLTEST = "skilltest"
+TAB_ANALYSIS = "analysis"
 
 # (キー, 表示名, アイコン)
 TABS = (
@@ -10425,6 +11766,7 @@ TABS = (
     (TAB_WEEKLY, "週報", "bi-file-earmark-text"),
     (TAB_OVERDUE, "期限超過通知", "bi-alarm"),
     (TAB_SKILLTEST, "スキルテスト", "bi-patch-check"),
+    (TAB_ANALYSIS, "AI分析", "bi-clipboard-data"),
 )
 TAB_KEYS = tuple(key for key, _label, _icon in TABS)
 
@@ -10450,6 +11792,10 @@ FEATURES = {
         SKILLTEST_LABEL, SKILLTEST_SAVED_MESSAGE, load_skilltest_settings,
         save_skilltest_settings, parse_skilltest_form, skilltest_with_input,
         skilltest_form_context),
+    TAB_ANALYSIS: SettingsFeature(
+        AI_ANALYSIS_LABEL, AI_ANALYSIS_SAVED_MESSAGE, load_ai_analysis_settings,
+        save_ai_analysis_settings, parse_ai_analysis_form, settings_with_input,
+        ai_analysis_form_context),
 }
 
 # AI接続テストで送る問い合わせ(短く、応答も短くなるもの)
@@ -10495,6 +11841,7 @@ def _render_system_settings(tab, status=200, config_state=None, config_errors=No
         wk=contexts[TAB_WEEKLY],
         od=contexts[TAB_OVERDUE],
         st=contexts[TAB_SKILLTEST],
+        an=contexts[TAB_ANALYSIS],
     ), status
 
 
@@ -10609,7 +11956,7 @@ def test_ai():
 
 
 # --------------------------------------------------------------------------- #
-# 機能ごとの設定(週報・期限超過通知・スキルテスト)
+# 機能ごとの設定(週報・期限超過通知・スキルテスト・AI分析)
 # --------------------------------------------------------------------------- #
 def _save_feature(tab):
     """機能の設定を保存する(入力チェックと保存先は FEATURES の各機能の関数)。"""
@@ -10647,13 +11994,18 @@ def save_skilltest():
     return _save_feature(TAB_SKILLTEST)
 
 
+@system_bp.route("/settings/analysis", methods=["POST"])
+def save_analysis():
+    return _save_feature(TAB_ANALYSIS)
+
+
 # #############################################################################
-# 10. 定期メールの自動送信スケジューラ
+# 11. 定期メールの自動送信スケジューラ
 # #############################################################################
 
 
 # =============================================================================
-# 10-1. スケジューラ(週報・期限超過通知)
+# 11-1. スケジューラ(週報・期限超過通知)
 # =============================================================================
 # 定期メールの自動送信スケジューラ(バックグラウンドのスレッド1本で、2つの仕事を確認する)。
 #
@@ -10665,7 +12017,7 @@ def save_skilltest():
 # - 起動するのは「flask --app app run」でサーバーとして動かしたときだけ(create_app() の最後で
 #   start_scheduler_once() を呼ぶ。seed / migrate コマンド・テスト・import では起動しない)。
 #   flask run --debug の自動再読み込みで2つのプロセスがアプリを作っても、instance/scheduler.lock の
-#   ロックを取れた1つのプロセスだけが動かす(10-2)
+#   ロックを取れた1つのプロセスだけが動かす(11-2)
 # - ジョブごとに、同じ (日付, 時刻) ではこのプロセスの中で1回しか実行しない(メモリ上の記録)
 # - サーバーが止まっていて実行時刻を過ぎた分は、後から実行しない(取りこぼしの再実行なし)
 # - 実行履歴はDBに残さない(結果は各機能の「前回の結果」に上書き)
@@ -10814,7 +12166,7 @@ def start_scheduler(app, interval=CHECK_INTERVAL):
 
 
 # =============================================================================
-# 10-2. サーバーとして起動したときの開始(プロセス間で1つだけ)
+# 11-2. サーバーとして起動したときの開始(プロセス間で1つだけ)
 # =============================================================================
 SCHEDULER_LOCK_FILENAME = "scheduler.lock"
 
@@ -10871,12 +12223,12 @@ def start_scheduler_once(app):
 
 
 # #############################################################################
-# 11. アプリの組み立て
+# 12. アプリの組み立て
 # #############################################################################
 
 
 # =============================================================================
-# 11-1. 画面テンプレート・静的ファイル(templates.html)
+# 12-1. 画面テンプレート・静的ファイル(templates.html)
 # =============================================================================
 # 画面テンプレート(Jinja2)・CSS・JavaScript は、プロジェクト直下の templates.html に
 # ファイルごとのセクションとしてまとめてある(TemplateSections で読む)。
@@ -10993,7 +12345,7 @@ def send_static_section(filename):
 
 
 # =============================================================================
-# 11-2. create_app(アプリの作成)
+# 12-2. create_app(アプリの作成)
 # =============================================================================
 # 設定の読み込み順:
 #   1. Config(このファイルの固定設定と、環境ごとの設定の既定値)
@@ -11011,6 +12363,7 @@ BLUEPRINTS = (
     skills_bp,
     # スキルテスト(メンバーが受験し到達度を自動登録。管理画面はマネージャーのみ)
     skilltest_bp,
+    # マネージャーダッシュボード(AI分析〔9 章〕の画面も同じ Blueprint)
     manager_bp,
     departments_bp,
     export_bp,
@@ -11018,7 +12371,7 @@ BLUEPRINTS = (
     # 「flask run」のときだけ起動する
     weekly_bp,
     overdue_bp,
-    # システム設定(マネージャーのみ。基本設定・週報・期限超過通知・スキルテストの設定を1画面で変更)
+    # システム設定(マネージャーのみ。基本設定・週報・期限超過通知・スキルテスト・AI分析の設定を1画面で変更)
     system_bp,
 )
 
@@ -11108,7 +12461,7 @@ def create_app():
 
 
 # #############################################################################
-# 12. flask コマンド(seed / migrate)
+# 13. flask コマンド(seed / migrate)
 # #############################################################################
 # 「flask --app app <コマンド>」で使えるコマンド(create_app() で登録する)。
 #   flask --app app seed                          初期データの投入
@@ -11117,7 +12470,7 @@ def create_app():
 
 
 # =============================================================================
-# 12-1. seed: 初期データの投入
+# 13-1. seed: 初期データの投入
 # =============================================================================
 @click.command("seed")
 @with_appcontext
@@ -11319,7 +12672,7 @@ def seed_command():
 
 
 # =============================================================================
-# 12-2. migrate: 既存DBを最新のモデル定義に合わせる
+# 13-2. migrate: 既存DBを最新のモデル定義に合わせる
 # =============================================================================
 # コードを新しいものに差し替えたあと、**実運用中のDBを消さずに** flask --app app migrate を
 # 1回実行すれば、不足しているテーブル・列が追加されて動くようになる。
