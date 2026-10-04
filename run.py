@@ -9,10 +9,15 @@
     python serve.py
     -> waitress で起動し、定期メールの自動送信も行う(serve.py を参照)
 """
+import os
+
 from app import create_app
 
 app = create_app()
 
 if __name__ == "__main__":
     # host=0.0.0.0 にすると同一ネットワーク(LAN)内の他PCからもアクセス可能
-    app.run(host="0.0.0.0", port=int(app.config.get("SERVER_PORT") or 8050), debug=True)
+    # instance/ (システム設定の画面から保存する instance/config.py など)の変更では
+    # 自動再起動しない(再起動が必要な項目は、本番と同じく手動の再起動で反映する)
+    app.run(host="0.0.0.0", port=int(app.config.get("SERVER_PORT") or 8050), debug=True,
+            exclude_patterns=[os.path.join(app.instance_path, "*")])

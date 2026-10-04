@@ -1,0 +1,45 @@
+{# システム設定「期限超過通知」タブ(instance/overdue_settings.json に保存)。入力チェックは app/overdue/settings_form.py #}
+<p class="small text-muted d-flex flex-wrap justify-content-between gap-2">
+  <span>
+    期限超過通知（営業日の毎朝のメール）の自動送信と、メールに載せるコメントの件数です。
+    設定は <code>instance/overdue_settings.json</code> に保存され、DB には保存しません。
+  </span>
+  <a href="{{ url_for('overdue.index') }}"><i class="bi bi-box-arrow-up-right"></i> 期限超過通知の画面（プレビュー・今すぐ送信・前回の結果）</a>
+</p>
+
+<form method="post" action="{{ url_for('system.save_overdue') }}">
+  <div class="card shadow-sm mb-4">
+    <div class="card-header bg-white fw-bold"><i class="bi bi-sliders"></i> 期限超過通知の設定</div>
+    <div class="card-body">
+      <div class="form-check form-switch mb-3">
+        <input class="form-check-input" type="checkbox" role="switch" id="overdue-enabled" name="enabled" value="1"
+               {% if od.settings.enabled %}checked{% endif %}>
+        <label class="form-check-label fw-bold" for="overdue-enabled">自動送信する</label>
+        <div class="form-text">オンにすると、営業日（土日・祝日以外）の指定時刻に、本番の宛先へそのまま送信します（承認の手順はありません）。期限超過が0件の日も「該当なし」として送信します。</div>
+      </div>
+      <div class="row g-3">
+        <div class="col-sm-6 col-md-3">
+          <label class="form-label small mb-1" for="overdue-time">送信時刻</label>
+          <input type="time" name="time" id="overdue-time" class="form-control form-control-sm" value="{{ od.settings.time }}" required>
+        </div>
+        <div class="col-sm-6 col-md-3">
+          <label class="form-label small mb-1" for="overdue-comment_count">表示するコメント件数</label>
+          <input type="number" name="comment_count" id="overdue-comment_count" class="form-control form-control-sm"
+                 value="{{ od.settings.comment_count }}" min="{{ od.comment_min }}" max="{{ od.comment_max }}" step="1" required>
+        </div>
+        <div class="col-md-6">
+          <div class="form-text mt-md-4">
+            各タスクに、直近の進捗記載（コメント）をこの件数まで古い順に載せます（{{ od.comment_min }}〜{{ od.comment_max }}件）。
+            経過日数は土日祝を除いた営業日で数えます（今日の記載は「本日」）。記載が無いタスクは「コメントなし」になります。
+          </div>
+        </div>
+      </div>
+      <div class="form-text mt-3">
+        宛先は「基本設定」タブの「期限超過通知の宛先」（空なら「宛先」）、タスクへのリンクは「リンク・サーバー」の「リンクの基準URL」で設定します。
+      </div>
+    </div>
+    <div class="card-footer bg-white d-flex justify-content-end">
+      <button class="btn btn-primary btn-sm"><i class="bi bi-save"></i> 期限超過通知の設定を保存</button>
+    </div>
+  </div>
+</form>

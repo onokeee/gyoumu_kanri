@@ -4,6 +4,8 @@ app/auth/ldap_client.py は本番環境ごとに差し替えるファイルな�
 authenticate() と _LOCAL_ACCOUNTS(表示名・役割)しか使わない(中身には依存しない)。
 固定ローカル管理者(admin)のパスワードは、instance/config.py の ADMIN_PASSWORD で
 先に確認する(設定が空のときだけ ldap_client.py の判定に任せる)。
+ADMIN_PASSWORD はシステム設定の「基本設定」タブからも変更でき、保存するとすぐに有効になる
+(ログインのたびに current_app.config から読む)。
 """
 import hmac
 

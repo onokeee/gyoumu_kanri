@@ -7,7 +7,8 @@
 だけを書き換える。呼び出し側は `chat()` の戻り値の形 (text, error) にしか
 依存していないので、他のコードは変更不要。
 
-接続設定は instance/config.py に記入する(このファイルには書かない):
+接続設定は instance/config.py に記入する(このファイルには書かない。
+システム設定の「基本設定」タブからも変更でき、保存するとすぐに反映される):
   AI_API_URL  : エンドポイント(空なら OpenAI公式 DEFAULT_API_URL)
   AI_API_KEY  : APIキー(キー不要の独自APIなら空でよい)
   AI_MODEL    : モデル名
@@ -66,8 +67,8 @@ def _endpoint_label(url):
 def status_label():
     """画面表示用の状態文言(APIキーや接続先URLの詳細は表示しない)。"""
     if not is_configured():
-        return ("未設定（instance/config.py の AI_API_KEY "
-                "または AI_API_URL に記入すると使えます）")
+        return ("未設定（システム設定の「基本設定」タブで AI_API_KEY "
+                "または AI_API_URL を設定すると使えます）")
     values = _settings()
     return "接続先: {} ／ モデル: {}".format(
         _endpoint_label(values["api_url"] or DEFAULT_API_URL), values["model"]
@@ -125,7 +126,7 @@ def chat(messages):
     戻り値: (応答の本文, None) / 失敗時は (None, エラーメッセージ)
     """
     if not is_configured():
-        return None, ("ChatGPT-APIが未設定です。instance/config.py の AI_API_KEY"
+        return None, ("ChatGPT-APIが未設定です。システム設定の「基本設定」タブで AI_API_KEY"
                       "（独自APIの場合は AI_API_URL）を設定してください。")
 
     values = _settings()
@@ -135,7 +136,8 @@ def chat(messages):
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
-            detail = exc.read().decode("utf-8", "ignore")[:200]
+            # 先にキーを伏せ字にしてから切り詰める(切り詰めでキーの一部だけが残らないように)
+            detail = _mask(exc.read().decode("utf-8", "ignore"), api_key)[:200]
         except Exception:
             pass
         return None, _mask("APIエラー({}): {}".format(exc.code, detail or exc.reason),

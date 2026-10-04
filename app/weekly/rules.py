@@ -135,6 +135,16 @@ def safe_filename(name, default_stem="週報"):
     return stem + DOCX_EXT
 
 
+def preview_names(settings, today):
+    """今日作成した場合の対象期間・ファイル名・件名(画面のプレビュー用)。"""
+    start, end = period_for(today, settings["period_rule"])
+    return {
+        "period": period_label(start, end),
+        "filename": build_filename(settings["filename_pattern"], start, end, today),
+        "subject": build_subject(settings["subject_pattern"], start, end, today),
+    }
+
+
 def build_filename(pattern, start, end, send_date):
     """ファイル名のパターンから、実際のファイル名を作る。"""
     return safe_filename(render_pattern(pattern, start, end, send_date, for_filename=True))

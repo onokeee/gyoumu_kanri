@@ -2,7 +2,8 @@
 
 送信サーバー・差出人・宛先・認証情報はすべて instance/config.py に記入する
 (MAIL_SMTP_SERVER / MAIL_SMTP_PORT / MAIL_USE_TLS / MAIL_USERNAME / MAIL_PASSWORD /
- MAIL_FROM / MAIL_TO / MAIL_CC / MAIL_TEST_TO)。画面からは変更できない。
+ MAIL_FROM / MAIL_TO / MAIL_CC / MAIL_TEST_TO)。システム設定の「基本設定」タブからも変更でき、
+保存するとすぐに反映される(値は送信のたびに current_app.config から読む)。
 
 send(subject, text, html=None, attachments=(), to=None, cc=None, test=False):
   text        : 本文(text/plain・UTF-8)
@@ -28,7 +29,7 @@ from email import encoders
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.utils import formatdate, make_msgid, parseaddr
+from email.utils import formataddr, formatdate, make_msgid, parseaddr
 
 from flask import current_app
 
@@ -48,6 +49,18 @@ def addresses(value):
         if item and not any(ch in item for ch in "\r\n\t"):
             result.append(item)
     return result
+
+
+def _header_address(item):
+    """ヘッダ(From/To/Cc)に書くアドレス。「表示名 <アドレス>」の表示名だけを符号化する
+    (日本語の表示名でもアドレスの部分が読める形になる)。"""
+    name, addr = parseaddr(item)
+    if not addr:
+        return item
+    try:
+        return formataddr((name, addr), charset="utf-8")
+    except UnicodeError:  # アドレスの部分が半角でない(そのまま渡す)
+        return item
 
 
 def settings():
@@ -100,7 +113,7 @@ def check(test=False, to=None, to_label="宛先（MAIL_TO）"):
     if not actual_to:
         missing.append("テスト送信の宛先（MAIL_TEST_TO または MAIL_FROM）" if test else to_label)
     if missing:
-        return "メールの設定が不足しています: {}。instance/config.py に記入してサーバーを再起動してください。".format(
+        return "メールの設定が不足しています: {}。システム設定の「基本設定」タブで設定してください。".format(
             "、".join(missing))
     return None
 
@@ -145,10 +158,10 @@ def send(subject, text, html=None, attachments=(), to=None, cc=None, test=False)
     to, cc = recipients(test, to=to, cc=cc)
 
     msg = _build_message(subject, text, html, attachments)
-    msg["From"] = mail_from
-    msg["To"] = ",".join(to)
+    msg["From"] = _header_address(mail_from)
+    msg["To"] = ", ".join(_header_address(item) for item in to)
     if cc:
-        msg["Cc"] = ",".join(cc)
+        msg["Cc"] = ", ".join(_header_address(item) for item in cc)
     msg["Subject"] = subject
     # Date・Message-ID が無いと受信側で拒否・迷惑メール扱いされることがある
     msg["Date"] = formatdate(localtime=True)

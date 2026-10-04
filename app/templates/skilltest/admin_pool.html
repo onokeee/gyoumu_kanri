@@ -99,7 +99,8 @@
     </table>
   </div>
   <div class="card-footer bg-white small text-muted">
-    1回の受験に必要な問題数: {% for lv in levels %}Lv{{ lv }} {{ settings.questions_per_level[lv|string] }}問{% if not loop.last %}・{% endif %}{% endfor %}。
+    1回の受験に必要な問題数: {% for lv in levels %}Lv{{ lv }} {{ settings.questions_per_level[lv|string] }}問{% if not loop.last %}・{% endif %}{% endfor %}
+    （問題数・目標数は<a href="{{ url_for('system.settings', tab='skilltest') }}">システム設定の「スキルテスト」タブ</a>で変更）。
     同じ人には見たことのない問題を優先して出すため、プールには必要数より多めに用意しておくと、再受験でも新しい問題になります。
   </div>
 </div>

@@ -78,7 +78,7 @@ def _topup(app, skill_id):
             elif not ai_client.is_configured():
                 name = skill.name
                 ok, message = False, ("AI（ChatGPT互換API）が未設定のため問題を作成できません。"
-                                      "instance/config.py の AI_API_KEY または AI_API_URL を設定してください。")
+                                      "システム設定の「基本設定」タブで AI_API_KEY または AI_API_URL を設定してください。")
             else:
                 name = skill.name
                 settings = settings_store.load()

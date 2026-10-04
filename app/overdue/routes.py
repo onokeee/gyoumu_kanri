@@ -1,12 +1,14 @@
-"""期限超過通知(毎朝のメール)の設定画面と手動送信。マネージャーのみ。
+"""期限超過通知(毎朝のメール)の画面と手動送信。マネージャーのみ。
 
-GET  /overdue/          設定画面(次回の自動送信・前回の結果・メール/リンクの設定状況・
-                        各設定・今この時点のメールのプレビュー)
-POST /overdue/settings  設定の保存(instance/overdue_settings.json。DBは使わない)
+GET  /overdue/          期限超過通知の画面(次回の自動送信・前回の結果・メール/リンクの設定状況・
+                        現在の設定の概要・今この時点のメールのプレビュー)
 POST /overdue/run       今すぐ送信: test=テスト送信 / send=本番の宛先に送信(バックグラウンド)
+POST /overdue/settings  旧URL。システム設定の保存(POST /system/settings/overdue)へ転送する
 
-メールの送信サーバー・宛先・リンクの基準URL(APP_BASE_URL)は instance/config.py で設定する
-(この画面では読み取り専用で状況だけを表示する)。
+期限超過通知の設定(自動送信・時刻・コメント件数)は、システム設定の「期限超過通知」タブで変更する
+(入力チェックは settings_form.py、保存先は instance/overdue_settings.json)。
+メールの送信サーバー・宛先・リンクの基準URL(APP_BASE_URL)はシステム設定の「基本設定」タブ
+(instance/config.py)で変更する(この画面では状況だけを表示する)。
 """
 from datetime import date, datetime
 
@@ -25,7 +27,6 @@ from flask_login import current_user
 from app import mailer
 from app.overdue import content, service, settings_store
 from app.overdue.rules import next_run
-from app.utils import parse_hhmm
 
 overdue_bp = Blueprint("overdue", __name__, url_prefix="/overdue")
 
@@ -36,7 +37,7 @@ ACTION_SEND = "send"
 
 @overdue_bp.before_request
 def _managers_only():
-    """期限超過通知の設定・送信はマネージャーのみ(未ログインはログイン画面へ)。
+    """期限超過通知の画面・送信はマネージャーのみ(未ログインはログイン画面へ)。
 
     login_required は OPTIONS を素通しするため使わず、ここで直接確認する。
     """
@@ -51,20 +52,17 @@ def _preview_document(html):
     return html.replace("<head>", '<head>\n<base target="_blank">', 1)
 
 
-def _render(settings, status=200):
-    """設定画面を表示する(保存エラー時は入力中の値で再表示する)。"""
+def _render(settings):
+    """期限超過通知の画面を表示する(実行と状況だけ。設定はシステム設定の「期限超過通知」タブ)。"""
     mail = mailer.settings()
     to, cc, source = service.production_recipients()
     test_to, _cc = mailer.recipients(test=True)
     base_url, link_problem = content.link_base()
     # 今この時点のメールの内容。「今すぐ送信」と同じく保存済みの設定で作る
-    # (入力エラーで再表示する場合も、未保存の入力値は使わない)
-    preview = content.build(date.today(), settings_store.load()["comment_count"])
+    preview = content.build(date.today(), settings["comment_count"])
     return render_template(
-        "overdue/settings.html",
+        "overdue/index.html",
         settings=settings,
-        comment_min=settings_store.COMMENT_COUNT_MIN,
-        comment_max=settings_store.COMMENT_COUNT_MAX,
         upcoming=next_run(settings, datetime.now()),
         weekday_labels=WEEKDAY_LABELS,
         last=settings["last_result"],
@@ -82,52 +80,21 @@ def _render(settings, status=200):
         preview=preview,
         preview_document=_preview_document(preview["html"]),
         sending=service.is_sending(),
-    ), status
+    )
 
 
 @overdue_bp.route("/")
-def settings_view():
+def index():
     return _render(settings_store.load())
 
 
 @overdue_bp.route("/settings", methods=["POST"])
 def save_settings():
-    errors = []
-    values = {"enabled": request.form.get("enabled") == "1"}
+    """旧URL(設定の保存)。設定はシステム設定に移したため、そちらの保存へ転送する。
 
-    at = parse_hhmm(request.form.get("time"))
-    if at is not None:
-        values["time"] = at.strftime("%H:%M")
-    else:
-        errors.append("送信する時刻を「時:分」（例: 05:00）で入力してください。")
-
-    raw_count = (request.form.get("comment_count") or "").strip()
-    count = int(raw_count) if raw_count.isdecimal() else None
-    if settings_store.valid_comment_count(count):
-        values["comment_count"] = count
-    else:
-        errors.append("表示するコメント件数は{}〜{}の数字で入力してください。".format(
-            settings_store.COMMENT_COUNT_MIN, settings_store.COMMENT_COUNT_MAX))
-
-    if errors:
-        for message in errors:
-            flash(message, "danger")
-        # 入力中の内容を残したまま再表示する(保存はしない)
-        current = settings_store.load()
-        current.update(values)
-        return _render(current, status=400)
-
-    try:
-        settings_store.save(values)
-    except OSError as exc:
-        current_app.logger.exception("期限超過通知の設定を保存できませんでした")
-        flash("設定を保存できませんでした: {}".format(exc), "danger")
-        current = settings_store.load()
-        current.update(values)
-        return _render(current, status=500)
-
-    flash("期限超過通知の設定を保存しました。", "success")
-    return redirect(url_for("overdue.settings_view"))
+    307 で転送するのでフォームの内容はそのまま届き、保存後はシステム設定の「期限超過通知」タブに戻る。
+    """
+    return redirect(url_for("system.save_overdue"), code=307)
 
 
 @overdue_bp.route("/run", methods=["POST"])
@@ -143,8 +110,8 @@ def run_now():
     app = current_app._get_current_object()
     if not service.start_background(app, trigger, test=test):
         flash("別の送信を処理中です。完了してから、もう一度実行してください。", "warning")
-        return redirect(url_for("overdue.settings_view"))
+        return redirect(url_for("overdue.index"))
 
     flash("{}を開始しました。結果は「前回の結果」に表示されます"
           "（画面を再読み込みして確認してください）。".format(label), "info")
-    return redirect(url_for("overdue.settings_view"))
+    return redirect(url_for("overdue.index"))

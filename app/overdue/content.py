@@ -14,7 +14,7 @@
 経過日数は営業日で数え「M日前（土日祝除く）」と書く(今日のものは「本日」)。
 本文は1行にまとめ(改行は空白に)、長いものは COMMENT_TEXT_MAX 文字で切る。
 
-リンクは APP_BASE_URL(instance/config.py)＋タスク詳細画面のパス。
+リンクは APP_BASE_URL(instance/config.py。システム設定の「基本設定」タブで変更)＋タスク詳細画面のパス。
 APP_BASE_URL が空・不正ならリンクは付けない(タスク名だけ)。
 テキスト版は「タスク名（URL）」、HTML版はタスク名をリンクにする。HTML版は
 テンプレート(templates/overdue/mail.html)で作り、すべての値をエスケープする。
@@ -57,7 +57,7 @@ def link_base():
     raw = str(current_app.config.get("APP_BASE_URL") or "").strip()
     if not raw:
         return "", ("APP_BASE_URL が未設定のため、メールのタスク名にリンクを付けられません"
-                    "（タスク名だけを載せます）。instance/config.py に記入してサーバーを再起動してください。")
+                    "（タスク名だけを載せます）。システム設定の「基本設定」タブで設定してください。")
     try:
         parts = urlsplit(raw)
         valid = (parts.scheme.lower() in ("http", "https") and bool(parts.hostname)
@@ -67,7 +67,7 @@ def link_base():
         valid = False
     if not valid:
         return "", ("APP_BASE_URL の形式が正しくないため、メールのタスク名にリンクを付けられません"
-                    "（http:// または https:// で始まるURLを instance/config.py に記入してください）。")
+                    "（システム設定の「基本設定」タブで、http:// または https:// で始まるURLを設定してください）。")
     return raw.rstrip("/"), None
 
 

@@ -15,7 +15,8 @@
   GET  /skilltest/admin/pool/<skill_id>    スキルごとの問題の一覧(有効/無効の切り替え)
   POST /skilltest/admin/pool/<skill_id>/topup        問題の補充(バックグラウンド)
   POST /skilltest/admin/questions/<id>/toggle        問題の有効/無効の切り替え
-  GET  /skilltest/admin/settings, POST 同じURL       設定(instance/skilltest_settings.json)
+  GET  /skilltest/admin/settings, POST 同じURL       旧URL。設定はシステム設定の「スキルテスト」タブへ移した
+                                                     (GET はそのタブへ、POST はその保存へ転送する)
 
 受験の操作はすべて本人の受験だけが対象(他人の受験は404)。
 """
@@ -427,86 +428,15 @@ def admin_toggle_question(question_id):
 
 
 # --------------------------------------------------------------------------- #
-# マネージャー: 設定
+# マネージャー: 設定(旧URL)
 # --------------------------------------------------------------------------- #
-def _render_settings(settings, status=200):
-    levels = settings_store.LEVELS
-    rows, total, seconds = settings_store.plan(
-        settings, settings_store.tested_levels(settings, len(_tech_scale()) - 1))
-    return render_template(
-        "skilltest/admin_settings.html",
-        settings=settings,
-        levels=levels,
-        plan_total=total,
-        plan_minutes=int(round(seconds / 60.0)),
-        scale=_tech_scale(),
-        limits=settings_store,
-        grace_sec=service.GRACE_SEC,
-        margin_min=service.DEADLINE_MARGIN_MIN,
-    ), status
-
-
 @skilltest_bp.route("/admin/settings", methods=["GET", "POST"])
 def admin_settings():
-    if request.method == "GET":
-        return _render_settings(settings_store.load())
+    """旧URL。設定はシステム設定の「スキルテスト」タブに移した。
 
-    errors = []
-    values = {"questions_per_level": {}, "time_limits": {}}
-
-    def number(name):
-        raw = (request.form.get(name) or "").strip()
-        return int(raw) if raw.isdecimal() else None
-
-    for level in settings_store.LEVELS:
-        count = number("questions_{}".format(level))
-        if settings_store.valid_int(count, settings_store.QUESTIONS_MIN, settings_store.QUESTIONS_MAX):
-            values["questions_per_level"][str(level)] = count
-        else:
-            errors.append("Lv{}の問題数は{}〜{}の数字で入力してください。".format(
-                level, settings_store.QUESTIONS_MIN, settings_store.QUESTIONS_MAX))
-        limit = number("limit_{}".format(level))
-        if settings_store.valid_int(limit, settings_store.TIME_LIMIT_MIN, settings_store.TIME_LIMIT_MAX):
-            values["time_limits"][str(level)] = limit
-        else:
-            errors.append("Lv{}の制限時間は{}〜{}秒の数字で入力してください。".format(
-                level, settings_store.TIME_LIMIT_MIN, settings_store.TIME_LIMIT_MAX))
-
-    for key, label, low, high, unit in (
-        ("pass_rate", "合格ライン", settings_store.PASS_RATE_MIN, settings_store.PASS_RATE_MAX, "%"),
-        ("retake_days", "再受験までの日数", settings_store.RETAKE_DAYS_MIN,
-         settings_store.RETAKE_DAYS_MAX, "日"),
-        ("max_auto_level", "判定・自動登録するレベルの上限", settings_store.AUTO_LEVEL_MIN,
-         settings_store.AUTO_LEVEL_MAX, ""),
-        ("pool_target_per_level", "問題プールの目標数", settings_store.POOL_TARGET_MIN,
-         settings_store.POOL_TARGET_MAX, "問"),
-    ):
-        value = number(key)
-        if settings_store.valid_int(value, low, high):
-            values[key] = value
-        else:
-            errors.append("{}は{}〜{}{}の数字で入力してください。".format(label, low, high, unit))
-
-    if errors:
-        for message in errors:
-            flash(message, "danger")
-        current = settings_store.load()
-        # 入力中の内容を残したまま再表示する(保存はしない)
-        current["questions_per_level"].update(values["questions_per_level"])
-        current["time_limits"].update(values["time_limits"])
-        for key in ("pass_rate", "retake_days", "max_auto_level", "pool_target_per_level"):
-            if key in values:
-                current[key] = values[key]
-        return _render_settings(current, status=400)
-
-    try:
-        settings_store.save(values)
-    except OSError as exc:
-        current_app.logger.exception("スキルテストの設定を保存できませんでした")
-        flash("設定を保存できませんでした: {}".format(exc), "danger")
-        current = settings_store.load()
-        current.update(values)
-        return _render_settings(current, status=500)
-
-    flash("スキルテストの設定を保存しました（受験中・受験済みのテストには影響しません）。", "success")
-    return redirect(url_for("skilltest.admin_settings"))
+    GET はそのタブへ移動し、POST は 307 でそのタブの保存へ転送する(フォームの内容はそのまま届く)。
+    入力チェックは settings_form.py、保存先は instance/skilltest_settings.json のまま。
+    """
+    if request.method == "POST":
+        return redirect(url_for("system.save_skilltest"), code=307)
+    return redirect(url_for("system.settings", tab="skilltest"))

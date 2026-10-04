@@ -10,6 +10,8 @@ config.example.py をもとに自動作成される(app/instance_config.py)。
 
 create_app() はこのクラスの値を読み込んだあと、instance/config.py の値で上書きする。
 instance/config.py に書かれていない項目は、ここの既定値が使われる。
+環境ごとの設定の項目は、システム設定の画面の項目の定義(app/system/config_fields.py)にも
+追加すること(定義の無い項目は画面の「その他」に読み取り専用で表示される)。
 """
 
 

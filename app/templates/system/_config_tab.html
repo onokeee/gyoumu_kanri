@@ -1,0 +1,156 @@
+{# システム設定「基本設定（config）」タブ。項目の定義は app/system/config_fields.py #}
+{% macro field_input(row) %}
+{% set f = row.field %}
+{% set invalid = 'is-invalid' if row.error else '' %}
+{% if f.type == 'bool' %}
+  <input type="hidden" name="{{ f.key }}" value="0">
+  <div class="form-check form-switch">
+    <input class="form-check-input {{ invalid }}" type="checkbox" role="switch" id="cfg-{{ f.key }}" name="{{ f.key }}" value="1"
+           {% if row.value %}checked{% endif %}>
+    <label class="form-check-label small" for="cfg-{{ f.key }}">オン</label>
+  </div>
+{% elif f.type == 'int' %}
+  <input type="number" class="form-control form-control-sm {{ invalid }}" id="cfg-{{ f.key }}" name="{{ f.key }}"
+         value="{{ row.value }}" min="{{ f.min }}" max="{{ f.max }}" step="1" style="max-width: 12rem;">
+  <div class="form-text mt-0">{{ f.min }}〜{{ f.max }}</div>
+{% elif f.type == 'addresses' %}
+  <textarea class="form-control form-control-sm {{ invalid }}" id="cfg-{{ f.key }}" name="{{ f.key }}" rows="3"
+            autocomplete="off" spellcheck="false" placeholder="name@example.com（1行に1件）">{{ row.value }}</textarea>
+{% elif f.type == 'secret_key' %}
+  <div class="mb-1">
+    {% if row.is_set %}<span class="badge bg-success">設定あり</span>{% else %}<span class="badge bg-secondary">未設定</span>
+    <span class="small text-muted">（起動のたびに一時的な鍵を使用）</span>{% endif %}
+  </div>
+  <div class="form-check">
+    <input class="form-check-input" type="checkbox" id="cfg-generate-{{ f.key }}" name="generate_{{ f.key }}" value="1"
+           {% if row.generate_checked %}checked{% endif %}>
+    <label class="form-check-label small" for="cfg-generate-{{ f.key }}">新しいキーを生成する（保存時にランダムな値を作成）</label>
+  </div>
+  <div class="small text-warning-emphasis mt-1"><i class="bi bi-exclamation-triangle"></i> 新しいキーはサーバーの再起動後に有効になります。再起動すると全員がログアウトされます。</div>
+{% elif f.type == 'secret' %}
+  <div class="mb-1">
+    {% if row.is_set %}<span class="badge bg-success">設定あり</span>{% else %}<span class="badge bg-secondary">未設定</span>{% endif %}
+    <span class="small text-muted">値は表示しません。空欄のまま保存すると変更しません。</span>
+  </div>
+  <input type="password" class="form-control form-control-sm {{ invalid }}" id="cfg-{{ f.key }}" name="{{ f.key }}"
+         autocomplete="new-password" placeholder="{% if f.confirm %}新しいパスワード{% else %}変更する場合だけ入力{% endif %}">
+  {% if f.confirm %}
+  <input type="password" class="form-control form-control-sm mt-1 {{ invalid }}" id="cfg-{{ f.key }}-confirm" name="{{ f.key }}_confirm"
+         autocomplete="new-password" placeholder="新しいパスワード（確認のためもう一度）" aria-label="{{ f.label }}（確認）">
+  {% endif %}
+  <div class="form-check mt-1">
+    <input class="form-check-input" type="checkbox" id="cfg-clear-{{ f.key }}" name="clear_{{ f.key }}" value="1"
+           {% if row.clear_checked %}checked{% endif %}>
+    <label class="form-check-label small" for="cfg-clear-{{ f.key }}">空にする</label>
+  </div>
+  {% if f.clear_warning %}
+  <div class="small text-warning-emphasis"><i class="bi bi-exclamation-triangle"></i> {{ f.clear_warning }}</div>
+  {% endif %}
+{% else %}
+  <input type="text" class="form-control form-control-sm {{ invalid }}" id="cfg-{{ f.key }}" name="{{ f.key }}"
+         value="{{ row.value }}" autocomplete="off" spellcheck="false"
+         {% if f.type == 'url' %}inputmode="url" placeholder="https://..."{% elif f.type == 'address' %}inputmode="email" placeholder="name@example.com"{% endif %}>
+{% endif %}
+{% if row.error %}<div class="invalid-feedback d-block">{{ row.error }}</div>{% endif %}
+<div class="form-text">{{ f.help }}</div>
+{% endmacro %}
+
+<p class="small text-muted">
+  環境ごとの設定（接続先・宛先・パスワードなど）です。保存すると設定ファイル <code>instance/config.py</code> の、変更した項目の行だけを書き換えます
+  （コメントやほかの項目はそのまま。変更前の内容は <code>instance/config.py.bak</code> に残します）。
+  <span class="badge bg-warning text-dark">再起動が必要</span> の項目以外は、保存するとすぐに反映されます。
+  <code>instance/config.py</code> はこれまでどおり直接編集することもできます（その場合はサーバーの再起動で反映）。
+</p>
+
+<form method="post" action="{{ url_for('system.save_config') }}" id="config-form" autocomplete="off" novalidate>
+  <input type="hidden" name="version" value="{{ cfg.version }}">
+  {% for group in cfg.groups %}
+  <div class="card shadow-sm mb-3">
+    <div class="card-header bg-white fw-bold">{{ group.label }}</div>
+    <div class="card-body pb-1">
+      {% for row in group.rows %}
+      {% set f = row.field %}
+      <div class="row g-2 mb-3">
+        <div class="col-md-4">
+          <label class="form-label small fw-bold mb-0" for="cfg-{{ f.key }}">{{ f.label }}</label>
+          <div class="small">
+            <code>{{ f.key }}</code>
+            {% if f.restart_required %}<span class="badge bg-warning text-dark">再起動が必要</span>{% endif %}
+            {% if row.pending %}<span class="badge bg-info text-dark" title="ファイルの値と実行中の値が異なります">再起動待ち</span>{% endif %}
+          </div>
+          {% if not row.in_file and cfg.can_save %}
+          <div class="small text-muted">ファイルに記載なし（既定値を使用）</div>
+          {% endif %}
+        </div>
+        <div class="col-md-8">
+          {{ field_input(row) }}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endfor %}
+
+  {% if cfg.other %}
+  <div class="card shadow-sm mb-3">
+    <div class="card-header bg-white fw-bold">その他（読み取り専用）</div>
+    <div class="card-body small">
+      <p class="text-muted mb-2">
+        次の項目はこの画面の項目の定義（<code>app/system/config_fields.py</code>）に無いため、画面からは変更できません。
+        変更する場合は <code>instance/config.py</code> を直接編集し、サーバーを再起動してください。
+      </p>
+      <div class="table-responsive">
+        <table class="table table-sm align-middle mb-0">
+          <thead class="table-light"><tr><th>項目</th><th>記載場所</th><th>状態</th><th>値</th></tr></thead>
+          <tbody>
+            {% for row in cfg.other %}
+            <tr>
+              <td><code>{{ row.key }}</code></td>
+              <td class="text-muted">{{ row.source }}</td>
+              <td>{% if row.is_set %}設定あり{% else %}未設定{% endif %}{% if not row.in_file %}<span class="text-muted">（ファイルに記載なし）</span>{% endif %}</td>
+              <td class="text-break">{% if row.hidden %}<span class="text-muted">（表示しません）</span>{% elif row.value %}<code>{{ row.value }}</code>{% else %}<span class="text-muted">―</span>{% endif %}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="d-flex justify-content-end align-items-center gap-2 mb-4">
+    {% if not cfg.can_save %}<span class="small text-danger">設定ファイルを読み込めないため保存できません。</span>{% endif %}
+    <button class="btn btn-primary" {% if not cfg.can_save %}disabled{% endif %}><i class="bi bi-save"></i> 基本設定を保存</button>
+  </div>
+</form>
+
+{# 接続テスト(保存済みの設定を使う。入力中の値は使わない) #}
+<div class="card shadow-sm mb-4">
+  <div class="card-header bg-white fw-bold"><i class="bi bi-plug"></i> 接続テスト</div>
+  <div class="card-body">
+    <p class="small text-muted">保存済みの設定（実行中の値）で接続を確かめます。入力中の値は使わないため、変更した場合は先に保存してください。</p>
+    <div class="row g-3">
+      <div class="col-md-6">
+        <form method="post" action="{{ url_for('system.test_mail') }}">
+          <button class="btn btn-sm btn-outline-primary" {% if cfg.mail_test_problem %}disabled{% endif %}>
+            <i class="bi bi-envelope-check"></i> メール接続テスト
+          </button>
+        </form>
+        <div class="small text-muted mt-1">
+          テスト送信の宛先（{% if cfg.mail_test_to_is_from %}差出人宛て{% else %}{{ cfg.mail_test_to_count }}件{% endif %}）に短いテキストのメールを1通送ります。
+        </div>
+        {% if cfg.mail_test_problem %}
+        <div class="small text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> {{ cfg.mail_test_problem }}</div>
+        {% endif %}
+      </div>
+      <div class="col-md-6">
+        <form method="post" action="{{ url_for('system.test_ai') }}">
+          <button class="btn btn-sm btn-outline-primary" {% if not cfg.ai_enabled %}disabled{% endif %}>
+            <i class="bi bi-robot"></i> AI接続テスト
+          </button>
+        </form>
+        <div class="small text-muted mt-1">AIに短い問い合わせを1回送ります（{{ cfg.ai_status }}）。</div>
+      </div>
+    </div>
+  </div>
+</div>

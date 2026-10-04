@@ -5,7 +5,8 @@ DBは使わず、instance/weekly_settings.json(Git管理外)に保存する。
 記録したとき)に作成される。
 
 ここに保存するのは「いつ・誰を・どう書くか」だけ。メールの送信サーバー・宛先や
-AIのキーは保存しない(instance/config.py に記入し、画面では読み取り専用で表示する)。
+AIのキーは保存しない(instance/config.py。システム設定の「基本設定」タブで変更する)。
+画面の入力チェックは settings_form.py(システム設定の「週報」タブで使う)。
 
 保存項目:
   enabled          : 自動送信する/しない

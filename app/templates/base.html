@@ -39,9 +39,9 @@
                href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false"><i class="bi bi-envelope-paper"></i> 定期メール</a>
             <ul class="dropdown-menu">
               <li><a class="dropdown-item {% if request.blueprint == 'weekly' %}active{% endif %}"
-                     href="{{ url_for('weekly.settings_view') }}"><i class="bi bi-file-earmark-text"></i> 週報</a></li>
+                     href="{{ url_for('weekly.index') }}"><i class="bi bi-file-earmark-text"></i> 週報</a></li>
               <li><a class="dropdown-item {% if request.blueprint == 'overdue' %}active{% endif %}"
-                     href="{{ url_for('overdue.settings_view') }}"><i class="bi bi-alarm"></i> 期限超過通知</a></li>
+                     href="{{ url_for('overdue.index') }}"><i class="bi bi-alarm"></i> 期限超過通知</a></li>
             </ul>
           </li>
           {% endif %}
@@ -55,7 +55,7 @@
             <a class="nav-link {% if request.blueprint == 'skills' %}active{% endif %}"
                href="{{ url_for('skills.list_skills') }}"><i class="bi bi-mortarboard"></i> スキル</a>
           </li>
-          {# スキルテストの管理(受験履歴・問題プール・設定)。マネージャーは受験しない #}
+          {# スキルテストの管理(受験履歴・問題プール。設定はシステム設定)。マネージャーは受験しない #}
           <li class="nav-item">
             <a class="nav-link {% if request.blueprint == 'skilltest' %}active{% endif %}"
                href="{{ url_for('skilltest.admin_attempts') }}"><i class="bi bi-patch-check"></i> スキルテスト管理</a>
@@ -77,6 +77,13 @@
           <li class="nav-item">
             <a class="nav-link {% if request.blueprint == 'departments' %}active{% endif %}"
                href="{{ url_for('departments.manage') }}"><i class="bi bi-diagram-3"></i> チーム管理</a>
+          </li>
+          {% endif %}
+          {% if current_user.is_manager %}
+          {# システム設定(基本設定・週報・期限超過通知・スキルテストの設定)はマネージャーのみ #}
+          <li class="nav-item">
+            <a class="nav-link {% if request.blueprint == 'system' %}active{% endif %}"
+               href="{{ url_for('system.settings') }}"><i class="bi bi-gear"></i> システム設定</a>
           </li>
           {% endif %}
         </ul>
