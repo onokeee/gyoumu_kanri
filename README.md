@@ -79,7 +79,8 @@ LDAPとは独立に常に有効な管理者アカウントを1つ用意してい
 
 - ID: `admin` / パスワード: `instance/config.py` の `ADMIN_PASSWORD`
 - パスワードは初回起動時に導入先ごとのランダムな値が自動で入ります。`instance/config.py` を開いて確認し、必要に応じて変更してください（変更後はサーバーを再起動）。
-- `ADMIN_PASSWORD` を空にすると、`admin` でのログインは無効になります。
+- この確認はログイン画面の処理（`app/auth/routes.py`）で、`ldap_client.py` より先に行います。`ADMIN_PASSWORD` が設定されている間は、`admin` はこの値でだけログインできます。
+- `ADMIN_PASSWORD` を空にすると、`admin` の確認も `ldap_client.py` の `authenticate()` に任せます。
 
 ### 動作確認用ダミーアカウント（開発用。本番LDAP導入で不要）
 `kacho`（マネージャー）/ `leader`・`yamada`・`suzuki`・`tanaka`（メンバー）。パスワードはすべて `password`。
@@ -387,3 +388,4 @@ OpenAI互換のエンドポイント（自前のAPIなど）なら `AI_API_URL` 
 
 **本番LDAPへの移行**
 `app/auth/ldap_client.py` の `authenticate()` 内「LDAP-API」ブロックのみを実 API 呼び出しに置き換えます。戻り値の形（`username / display_name / role / source`）は変更しないでください。固定ローカル管理者（`_LOCAL_ACCOUNTS`）とアプリ登録チェックはそのまま残します。
+アプリ側が `ldap_client.py` から使うのは `authenticate()` と `_LOCAL_ACCOUNTS`（`admin` の表示名・役割。初期データ作成では `_DUMMY_USERS` も使用）だけです。本番用に作った `ldap_client.py` はそのまま置き換えて使えます。
