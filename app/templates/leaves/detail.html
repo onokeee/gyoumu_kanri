@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% from "_macros.html" import fmt_date_jp, fmt_datetime %}
+{% block title %}年休詳細 &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('leaves.calendar_view') }}">年休</a></li>
+    <li class="breadcrumb-item active">詳細</li>
+  </ol>
+</nav>
+
+<div class="card shadow-sm">
+  <div class="card-body">
+    <div class="d-flex justify-content-between align-items-start">
+      <h1 class="h4 mb-3">{{ leave.user.display_name }} さんの年休</h1>
+      <span class="badge bg-{{ leave.type_color }}">{{ leave.leave_type }}</span>
+    </div>
+
+    <dl class="row mb-0">
+      <dt class="col-sm-3 text-muted">取得日</dt>
+      <dd class="col-sm-9">{{ fmt_date_jp(leave.leave_date) }}</dd>
+
+      <dt class="col-sm-3 text-muted">種別</dt>
+      <dd class="col-sm-9">{{ leave.leave_type }}（換算 {{ leave.day_count }} 日）</dd>
+
+      <dt class="col-sm-3 text-muted">所属チーム</dt>
+      <dd class="col-sm-9">{{ leave.user.department_names or '―' }}</dd>
+
+      <dt class="col-sm-3 text-muted">登録日時</dt>
+      <dd class="col-sm-9">{{ fmt_datetime(leave.created_at) }}</dd>
+    </dl>
+  </div>
+
+  {% if can_modify %}
+  <div class="card-footer bg-white d-flex flex-wrap gap-2">
+    <a href="{{ url_for('leaves.edit_leave', leave_id=leave.id) }}" class="btn btn-sm btn-secondary"><i class="bi bi-pencil"></i> 編集</a>
+    <form method="post" action="{{ url_for('leaves.cancel_leave', leave_id=leave.id) }}"
+          onsubmit="return confirm('この年休を取消しますか?');">
+      <button class="btn btn-sm btn-outline-danger"><i class="bi bi-x-lg"></i> 取消</button>
+    </form>
+  </div>
+  {% else %}
+  <div class="card-footer bg-white text-muted small">
+    <i class="bi bi-info-circle"></i> 取消・編集ができるのは本人のみです。
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

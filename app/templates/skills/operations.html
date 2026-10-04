@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}業務項目の管理 &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('skills.list_skills', show=['operation']) }}">スキルマップ(業務)</a></li>
+    <li class="breadcrumb-item active">業務項目の管理</li>
+  </ol>
+</nav>
+
+<h1 class="h3 mb-1">業務項目の管理</h1>
+<p class="text-muted small">スキルマップの横軸「業務」に表示する業務項目を管理します。各業務に必要なスキルは、スキルマップ(業務)のチェックで設定します。</p>
+
+<div class="card shadow-sm">
+  <div class="card-header bg-white fw-bold">業務の一覧</div>
+  <div class="card-body">
+    {% for o in operations %}
+    <div class="border rounded p-2 mb-2">
+      <form method="post" action="{{ url_for('skills.rename_operation', op_id=o.id) }}" class="row g-2 align-items-end">
+        <div class="col-md-4">
+          <label class="form-label small mb-1">業務名</label>
+          <input type="text" name="name" class="form-control form-control-sm {% if not o.is_active %}text-muted{% endif %}" value="{{ o.name }}">
+        </div>
+        <div class="col-md-5">
+          <label class="form-label small mb-1">説明（スキルマップでマウスオーバー表示）</label>
+          <input type="text" name="description" class="form-control form-control-sm" value="{{ o.description or '' }}" placeholder="業務内容の詳細">
+        </div>
+        <div class="col-md-1">
+          <label class="form-label small mb-1">並び</label>
+          <input type="number" name="sort_order" class="form-control form-control-sm" value="{{ o.sort_order }}" title="並び順">
+        </div>
+        <div class="col-md-2">
+          <button class="btn btn-sm btn-outline-primary w-100">保存</button>
+        </div>
+      </form>
+      <div class="d-flex align-items-center gap-2 mt-1">
+        {% if o.is_active %}<span class="badge bg-success">有効</span>{% else %}<span class="badge bg-secondary">無効</span>{% endif %}
+        <span class="text-muted small">必要スキル {{ o.skill_reqs|length }}件</span>
+        <form method="post" action="{{ url_for('skills.toggle_operation', op_id=o.id) }}" class="ms-auto">
+          <button class="btn btn-sm btn-outline-{{ 'danger' if o.is_active else 'success' }}">
+            {{ '無効化' if o.is_active else '有効化' }}
+          </button>
+        </form>
+      </div>
+    </div>
+    {% else %}
+    <p class="text-muted small">業務項目がまだありません。下から追加してください。</p>
+    {% endfor %}
+
+    <hr>
+    <form method="post" action="{{ url_for('skills.new_operation') }}" class="row g-2 align-items-end">
+      <div class="col-md-4">
+        <label class="form-label small mb-1">新しい業務を追加</label>
+        <input type="text" name="name" class="form-control form-control-sm" placeholder="例: アプリ開発 / 要件定義" required>
+      </div>
+      <div class="col-md-5">
+        <label class="form-label small mb-1">説明（任意）</label>
+        <input type="text" name="description" class="form-control form-control-sm" placeholder="業務内容の詳細">
+      </div>
+      <div class="col-md-1">
+        <label class="form-label small mb-1">並び</label>
+        <input type="number" name="sort_order" class="form-control form-control-sm" value="0">
+      </div>
+      <div class="col-md-2">
+        <button class="btn btn-sm btn-primary w-100"><i class="bi bi-plus-lg"></i> 追加</button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

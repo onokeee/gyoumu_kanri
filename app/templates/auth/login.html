@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}ログイン &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+  <div class="col-md-5 col-lg-4">
+    <div class="card shadow-sm mt-5">
+      <div class="card-body p-4">
+        <h1 class="h4 text-center mb-1"><i class="bi bi-clipboard-check text-primary"></i> {{ app_name }}</h1>
+        <p class="text-center text-muted small mb-4">アカウントでログイン</p>
+
+        {# ログイン前に開こうとしたページ(next)を送信後も引き継ぐ #}
+        <form method="post" action="{{ url_for('auth.login', next=request.args.get('next')) }}">
+          <div class="mb-3">
+            <label class="form-label">ID</label>
+            <input type="text" name="username" class="form-control" autofocus required
+                   value="{{ username or '' }}" placeholder="ログインID">
+          </div>
+          <div class="mb-3">
+            <label class="form-label">パスワード</label>
+            <input type="password" name="password" class="form-control" required placeholder="パスワード">
+          </div>
+          <button type="submit" class="btn btn-primary w-100">
+            <i class="bi bi-box-arrow-in-right"></i> ログイン
+          </button>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

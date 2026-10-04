@@ -1,0 +1,22 @@
+{# スキルテスト管理(マネージャー)の見出しとタブ。active に 'attempts' / 'pool' / 'settings' を渡す #}
+<div class="d-flex justify-content-between align-items-center mb-1 flex-wrap gap-2">
+  <h1 class="h3 mb-0"><i class="bi bi-patch-check"></i> スキルテスト管理</h1>
+  <div class="d-flex gap-2">
+    <a href="{{ url_for('export.skilltest_xlsx') }}" class="btn btn-sm btn-outline-success"><i class="bi bi-file-earmark-excel"></i> Excel出力</a>
+    <a href="{{ url_for('skills.list_skills') }}" class="btn btn-sm btn-outline-secondary"><i class="bi bi-mortarboard"></i> スキルマップ</a>
+  </div>
+</div>
+<p class="text-muted small">
+  メンバーがAIの作った4択問題でテクニカルスキル（Lv1〜4）を受験し、結果が今の到達度より高ければ到達度に自動で登録されます（マネージャーは受験しません）。
+</p>
+<ul class="nav nav-tabs mb-3">
+  <li class="nav-item">
+    <a class="nav-link {% if active == 'attempts' %}active{% endif %}" href="{{ url_for('skilltest.admin_attempts') }}"><i class="bi bi-clock-history"></i> 受験履歴</a>
+  </li>
+  <li class="nav-item">
+    <a class="nav-link {% if active == 'pool' %}active{% endif %}" href="{{ url_for('skilltest.admin_pool') }}"><i class="bi bi-collection"></i> 問題プール</a>
+  </li>
+  <li class="nav-item">
+    <a class="nav-link {% if active == 'settings' %}active{% endif %}" href="{{ url_for('skilltest.admin_settings') }}"><i class="bi bi-sliders"></i> 設定</a>
+  </li>
+</ul>

@@ -1,0 +1,164 @@
+{% extends "base.html" %}
+{% block title %}スキルマップ &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+  <h1 class="h3 mb-0"><i class="bi bi-mortarboard"></i> スキルマップ</h1>
+  <div class="d-flex gap-2">
+    <a href="{{ url_for('export.skills_xlsx') }}" class="btn btn-sm btn-outline-success"><i class="bi bi-file-earmark-excel"></i> Excel出力</a>
+    {% if can_edit and show_op %}
+    <a href="{{ url_for('skills.operations') }}" class="btn btn-sm btn-outline-secondary"><i class="bi bi-gear"></i> 業務項目の管理</a>
+    {% endif %}
+    {% if can_edit and show_person %}
+    <a href="{{ url_for('skills.items') }}" class="btn btn-sm btn-outline-secondary"><i class="bi bi-gear"></i> スキル項目の管理</a>
+    {% endif %}
+  </div>
+</div>
+
+{# 見方の切り替え(スキル基準 / 業務基準の対応表) #}
+<div class="btn-group btn-group-sm mb-3" role="group">
+  <a href="{{ url_for('skills.list_skills') }}" class="btn btn-outline-primary active">縦=スキル項目</a>
+  <a href="{{ url_for('skills.coverage') }}" class="btn btn-outline-primary">縦=業務（対応可否）</a>
+</div>
+
+{# 横軸に表示する列(ヒト・業務。両方チェックで同時表示) #}
+<form method="get" class="card card-body shadow-sm mb-3 py-2" id="axisForm">
+  <input type="hidden" name="type" value="{{ skill_type }}">
+  <div class="d-flex align-items-center flex-wrap gap-3">
+    <span class="small text-muted">横軸に表示:</span>
+    <div class="form-check form-check-inline mb-0">
+      <input class="form-check-input" type="checkbox" name="show" value="person" id="showPerson"
+             {% if show_person %}checked{% endif %} onchange="document.getElementById('axisForm').submit()">
+      <label class="form-check-label" for="showPerson"><i class="bi bi-people"></i> ヒト</label>
+    </div>
+    <div class="form-check form-check-inline mb-0">
+      <input class="form-check-input" type="checkbox" name="show" value="operation" id="showOp"
+             {% if show_op %}checked{% endif %} onchange="document.getElementById('axisForm').submit()">
+      <label class="form-check-label" for="showOp"><i class="bi bi-briefcase"></i> 業務</label>
+    </div>
+    <span class="text-muted small">両方チェックで同時表示。業務列＝その業務に必要な到達レベル（ヒトと同じ尺度）。</span>
+  </div>
+</form>
+
+{# 区分タブ(「全スキル」を先頭に。横軸の選択を保持) #}
+<ul class="nav nav-pills mb-3">
+  <li class="nav-item">
+    <a class="nav-link {% if is_all %}active{% endif %}"
+       href="{{ url_for('skills.list_skills', type=all_type, show=show) }}"><i class="bi bi-grid-3x3-gap"></i> 全スキル</a>
+  </li>
+  {% for t in type_choices %}
+  <li class="nav-item">
+    <a class="nav-link {% if skill_type == t %}active{% endif %}"
+       href="{{ url_for('skills.list_skills', type=t, show=show) }}">{{ type_labels[t] }}</a>
+  </li>
+  {% endfor %}
+</ul>
+
+{% set ncols = 1 + operations|length + users|length + (1 if show_person else 0) %}
+<div class="card shadow-sm">
+  <div class="table-responsive">
+    <table class="table table-bordered table-hover align-middle mb-0 text-center" style="min-width:600px;">
+      <thead class="table-light">
+        <tr>
+          <th class="text-start" style="position:sticky; left:0;">スキル項目</th>
+          {# 業務列(ヒトの左側) #}
+          {% for o in operations %}
+          <th class="small text-nowrap bg-body-secondary" title="{{ o.description or o.name }}">
+            {% if can_edit %}<a href="{{ url_for('skills.edit_operation', op_id=o.id) }}">{{ o.name }}</a>
+            {% else %}{{ o.name }}{% endif %}
+          </th>
+          {% endfor %}
+          {# ヒト列 #}
+          {% for u in users %}
+          <th class="small text-nowrap"><a href="{{ url_for('skills.member', user_id=u.id) }}">{{ u.display_name }}</a></th>
+          {% endfor %}
+          {% if show_person %}<th class="text-nowrap small">単独可<br>(Lv{{ proficient }}+)</th>{% endif %}
+        </tr>
+        {% if show_op and operations|length %}
+        <tr class="small text-muted">
+          <th class="text-start fw-normal" style="position:sticky; left:0;"></th>
+          {% for o in operations %}<th class="fw-normal bg-body-secondary">業務</th>{% endfor %}
+          {% for u in users %}<th class="fw-normal">ヒト</th>{% endfor %}
+          {% if show_person %}<th></th>{% endif %}
+        </tr>
+        {% endif %}
+      </thead>
+      <tbody>
+        {% set ns = namespace(rows=0) %}
+        {% for grp in groups %}
+        {% if is_all %}
+        {# 全スキル表示時は区分ごとに小見出し行(到達尺度が区分で異なるため) #}
+        <tr class="table-{{ grp.color }}">
+          <td class="text-start fw-bold" colspan="{{ ncols }}">
+            {{ grp.label }}（0〜{{ grp.scale|length - 1 }}）
+          </td>
+        </tr>
+        {% endif %}
+        {% for s in grp.skills %}
+        {% set ns.rows = ns.rows + 1 %}
+        <tr>
+          <td class="text-start">
+            {{ s.name }}
+            {% if s.category %}<br><span class="text-muted small">{{ s.category }}</span>{% endif %}
+          </td>
+          {# 業務セル: 必要到達レベル(0=不要は空) #}
+          {% for o in operations %}
+          {% set lv = req_by_skill[s.id].get(o.id, 0) %}
+          <td class="p-1 bg-body-secondary">
+            {% if lv %}
+            <span class="badge bg-{{ level_colors.get(lv, 'secondary') }}"
+                  title="{{ o.name }} に必要: Lv{{ lv }} {{ grp.scale[lv] if lv < grp.scale|length else lv }}">{{ lv }}</span>
+            {% else %}<span class="text-muted">·</span>{% endif %}
+          </td>
+          {% endfor %}
+          {# ヒトセル: 到達度 #}
+          {% for u in users %}
+          {% set r = level_by_skill[s.id].get(u.id) %}
+          {% set plv = r.level if r else 0 %}
+          <td class="p-1">
+            <span class="badge bg-{{ r.level_color if r else 'light' }} {% if not r %}text-muted border{% endif %}"
+                  title="{{ u.display_name }} / {{ grp.scale[plv] if plv < grp.scale|length else plv }}{% if r and r.note %} / {{ r.note }}{% endif %}">
+              {{ plv }}
+            </span>
+          </td>
+          {% endfor %}
+          {% if show_person %}
+          {% set holders = holder_counts.get(s.id, 0) %}
+          <td class="fw-bold {% if holders == 0 %}text-danger{% endif %}">
+            {{ holders }}/{{ users|length }}
+          </td>
+          {% endif %}
+        </tr>
+        {% endfor %}
+        {% endfor %}
+        {% if ns.rows == 0 %}
+        <tr><td colspan="{{ ncols }}" class="text-muted py-4">{% if is_all %}スキル項目はまだありません。{% else %}この区分のスキル項目はまだありません。{% endif %}{% if can_edit %}「スキル項目の管理」から追加してください。{% endif %}</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+  {% if show_op and operations|length == 0 %}
+  <div class="card-footer bg-white small text-muted">
+    <i class="bi bi-info-circle"></i> 業務項目がありません。{% if can_edit %}「業務項目の管理」から追加してください。{% endif %}
+  </div>
+  {% endif %}
+</div>
+
+{# 凡例(表示中の区分ごとの到達尺度) #}
+<div class="card card-body shadow-sm mt-3">
+  {% for grp in groups %}
+  <div class="small {% if not loop.first %}mt-2 pt-2 border-top{% endif %}">
+    <span class="fw-bold">
+      {% if is_all %}<span class="badge bg-{{ grp.color }}">{{ grp.label }}</span>{% else %}{{ grp.label }}{% endif %}の到達尺度:
+    </span>
+    {% for label in grp.scale %}
+    <span class="ms-2"><span class="badge bg-secondary">{{ loop.index0 }}</span> {{ label }}</span>
+    {% endfor %}
+  </div>
+  {% endfor %}
+</div>
+<p class="text-muted small mt-2">
+  {% if show_person %}<span class="me-3"><i class="bi bi-people"></i> ヒト列＝各メンバーの到達度（名前クリックで編集）。</span>{% endif %}
+  {% if show_op %}<span><i class="bi bi-briefcase"></i> 業務列＝その業務に必要な到達レベル（業務名クリックで編集）。</span>{% endif %}
+</p>
+{% endblock %}

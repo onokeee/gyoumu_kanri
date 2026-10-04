@@ -1,0 +1,175 @@
+{% extends "base.html" %}
+{% from "_macros.html" import fmt_datetime %}
+{% block title %}スキルテスト &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-1 flex-wrap gap-2">
+  <h1 class="h3 mb-0"><i class="bi bi-patch-question"></i> スキルテスト</h1>
+</div>
+<p class="text-muted small">
+  テクニカルスキルの理解度を4択問題で確認します。結果のレベルが今の到達度より高ければ、スキルの到達度に自動で登録されます（下がることはありません）。
+</p>
+
+{% if running %}
+<div class="alert alert-primary d-flex justify-content-between align-items-center flex-wrap gap-2">
+  <div>
+    <i class="bi bi-hourglass-split"></i> 受験中のテストがあります:
+    <span class="fw-bold">{{ running.skill.name }}</span>
+    <span class="small">（{{ running.answered_count }}/{{ running.total }} 問回答済み・期限 {{ fmt_datetime(running.deadline_at) }}）</span>
+  </div>
+  <a href="{{ url_for('skilltest.question', attempt_id=running.id) }}" class="btn btn-primary btn-sm"><i class="bi bi-play-fill"></i> 続きから再開</a>
+</div>
+{% endif %}
+
+<div class="card shadow-sm mb-4">
+  <div class="card-header bg-white fw-bold"><i class="bi bi-list-check"></i> 受験できるスキル（有効なテクニカルスキル）</div>
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead class="table-light">
+        <tr>
+          <th style="min-width: 12rem;">スキル</th>
+          <th style="min-width: 9rem;">今の到達度</th>
+          <th class="text-nowrap">前回の受験</th>
+          <th class="text-nowrap">次に受験できる日時</th>
+          <th class="text-end"></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          <td>
+            <div class="fw-bold">{{ row.skill.name }}</div>
+            {% if row.skill.category %}<div class="small text-muted">{{ row.skill.category }}</div>{% endif %}
+            {% if row.capped %}
+            <div class="small text-muted"><i class="bi bi-info-circle"></i> 今の到達度がテストで登録できる上限（Lv{{ row.top_level }}）以上のため、受験しても到達度は変わりません。</div>
+            {% endif %}
+          </td>
+          <td>
+            <span class="badge bg-{{ level_colors.get(row.level, 'secondary') }} {% if row.level == 0 %}text-dark border{% endif %}">Lv{{ row.level }}</span>
+            <span class="small">{{ scale[row.level] if row.level < scale|length else '' }}</span>
+          </td>
+          <td class="small text-nowrap">
+            {% if row.last %}
+            {{ fmt_datetime(row.last.started_at) }}<br>
+            <span class="badge bg-{{ row.last.status_color }}">{{ row.last.status_label }}</span>
+            {% if row.last.result_level is not none %}
+            結果 Lv{{ row.last.result_level }}{% if row.last.applied %} <span class="badge bg-success">登録</span>{% endif %}
+            {% endif %}
+            {% else %}<span class="text-muted">未受験</span>{% endif %}
+          </td>
+          <td class="small text-nowrap">
+            {% if row.state == 'wait' %}{{ fmt_datetime(row.available) }}
+            {% else %}<span class="text-muted">いつでも</span>{% endif %}
+          </td>
+          <td class="text-end text-nowrap">
+            {% if row.state == 'resume' %}
+            <a href="{{ url_for('skilltest.question', attempt_id=running.id) }}" class="btn btn-primary btn-sm"><i class="bi bi-play-fill"></i> 再開する</a>
+            {% elif row.state == 'busy' %}
+            <button class="btn btn-outline-secondary btn-sm" disabled title="受験中のテストを先に終えてください">受験中のテストがあります</button>
+            {% elif row.state == 'wait' %}
+            <button class="btn btn-outline-secondary btn-sm" disabled>再受験の間隔中</button>
+            {% else %}
+            <form method="post" action="{{ url_for('skilltest.start', skill_id=row.skill.id) }}" class="d-inline skilltest-start"
+                  data-confirm="「{{ row.skill.name }}」のテストを始めます。全{{ rules.total }}問・約{{ rules.minutes }}分です。始めると時間は進み続けます（画面を閉じても止まりません）。よろしいですか？">
+              <button class="btn btn-success btn-sm"><i class="bi bi-pencil-square"></i> 受験する</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="text-muted text-center py-4">受験できるスキルがありません（有効なテクニカルスキルが登録されていません）。</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{# ルール #}
+<div class="card shadow-sm mb-4">
+  <div class="card-header bg-white fw-bold"><i class="bi bi-journal-text"></i> テストのルール</div>
+  <div class="card-body small">
+    <ul class="mb-3">
+      <li>1回のテストで1つのスキルを確認します。問題は4択で全{{ rules.total }}問
+        （{% for r in rules.rows %}Lv{{ r.level }} {{ r.count }}問{% if not loop.last %}・{% endif %}{% endfor %}）。
+        やさしい問題（Lv1）から順に出題します。</li>
+      <li>1問ずつの制限時間があります（{% for r in rules.rows %}Lv{{ r.level }} {{ r.limit }}秒{% if not loop.last %}・{% endif %}{% endfor %}。合計 約{{ rules.minutes }}分）。
+        0秒になると自動で次の問題へ進み、時間内に回答しなかった問題は不正解になります。ページを再読み込みしても残り時間は戻りません。</li>
+      <li>1問ずつ回答し、<span class="fw-bold">前の問題には戻れません</span>。選択肢の並びは受験ごとに変わります。</li>
+      <li>途中で画面を閉じた場合は、開き直すと続きから再開します。ただし開始から 約{{ rules.deadline_minutes }}分を過ぎると自動で終了し、未回答の問題は不正解として採点します。</li>
+      <li>判定: あるレベルの正答率が{{ rules.pass_rate }}%以上で、それより下のレベルもすべて合格していれば、そのレベルに合格です。合格した最も高いレベルがテストの結果です（Lv1が不合格なら Lv0）。</li>
+      <li>結果のレベルが今の到達度より高いときだけ、到達度に自動で登録します。今の到達度が下がることはありません。</li>
+      <li>同じスキルの再受験は、前回の受験開始から{{ rules.retake_days }}日後からできます{% if rules.retake_days == 0 %}（現在は制限なし）{% endif %}。受験中のテストは1つだけです。</li>
+      <li>受験中は、ほかのタブやアプリに切り替えないでください。<span class="fw-bold">画面から離れた回数は記録され、マネージャーが確認します。</span>問題文のコピーはできません。</li>
+      <li>結果の画面には、レベルごとの正解数と結果のレベルだけを表示します（各問題の正解は表示しません）。</li>
+    </ul>
+    <div class="alert alert-light border mb-0 py-2">
+      <i class="bi bi-info-circle"></i>
+      テストで判定できるのは Lv{{ rules.top_level }}（{{ scale[rules.top_level] if rules.top_level < scale|length else '' }}）までです。
+      Lv5（{{ scale[5] }}）・Lv6（{{ scale[6] }}）と、コンセプチュアルスキル・ヒューマンスキルは、これまでどおりマネージャーが評価します。
+      4択問題で確かめられるのは知識と判断の一部で、実際に作れること・教えられることまでは測れません。
+    </div>
+  </div>
+</div>
+
+{# 自分の受験履歴 #}
+<div class="card shadow-sm mb-4">
+  <div class="card-header bg-white fw-bold"><i class="bi bi-clock-history"></i> 自分の受験履歴</div>
+  <div class="table-responsive">
+    <table class="table table-sm table-hover align-middle mb-0 sortable">
+      <thead class="table-light">
+        <tr>
+          <th>開始日時</th>
+          <th style="min-width: 10rem;">スキル</th>
+          <th>状態</th>
+          <th data-type="num">正解数</th>
+          <th data-type="num">結果</th>
+          <th>到達度</th>
+          <th data-nosort></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for a in history %}
+        <tr>
+          <td class="text-nowrap" data-sort="{{ a.started_at.strftime('%Y%m%d%H%M%S') }}">{{ fmt_datetime(a.started_at) }}</td>
+          <td>{{ a.skill.name }}</td>
+          <td><span class="badge bg-{{ a.status_color }}">{{ a.status_label }}</span></td>
+          <td class="text-nowrap" data-sort="{{ a.correct if not a.is_in_progress else '' }}">
+            {% if a.is_in_progress %}―{% else %}{{ a.correct }}/{{ a.total }}{% endif %}
+          </td>
+          <td class="text-nowrap" data-sort="{{ a.result_level if a.result_level is not none else '' }}">
+            {% if a.result_level is not none %}Lv{{ a.result_level }}{% else %}―{% endif %}
+          </td>
+          <td class="small text-nowrap">
+            {% if a.is_in_progress %}―
+            {% elif a.applied %}<span class="badge bg-success">登録</span> Lv{{ a.prev_level }} → Lv{{ a.new_level }}
+            {% else %}<span class="text-muted">変更なし（Lv{{ a.prev_level }}）</span>{% endif %}
+          </td>
+          <td class="text-end">
+            {% if a.is_in_progress %}
+            <a href="{{ url_for('skilltest.question', attempt_id=a.id) }}" class="btn btn-sm btn-primary">再開</a>
+            {% else %}
+            <a href="{{ url_for('skilltest.result', attempt_id=a.id) }}" class="btn btn-sm btn-outline-secondary">結果</a>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="text-muted text-center py-3">まだ受験していません。</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{# 受験開始時の表示(不足している問題をAIで作る間、待ってもらう) #}
+<div id="skilltestOverlay" class="skilltest-overlay d-none" role="status" aria-live="polite">
+  <div class="skilltest-overlay-box">
+    <div class="spinner-border text-primary mb-3" role="status"></div>
+    <div class="fw-bold">問題を準備しています（1〜2分かかることがあります）</div>
+    <div class="small text-muted mt-1">この画面のままお待ちください。準備ができると1問目が表示されます。</div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/skilltest.js') }}"></script>
+{% endblock %}

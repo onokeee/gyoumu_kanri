@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block title %}設定 &middot; スキルテスト管理 &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+{% set active = 'settings' %}
+{% include "skilltest/_admin_nav.html" %}
+
+<form method="post" action="{{ url_for('skilltest.admin_settings') }}">
+  <div class="card shadow-sm mb-3">
+    <div class="card-header bg-white fw-bold d-flex justify-content-between flex-wrap gap-2">
+      <span><i class="bi bi-list-ol"></i> 出題（レベルごと）</span>
+      <span class="small fw-normal text-muted">保存済みの設定: 全{{ plan_total }}問・合計 約{{ plan_minutes }}分</span>
+    </div>
+    <div class="table-responsive">
+      <table class="table align-middle mb-0">
+        <thead class="table-light">
+          <tr>
+            <th>レベル</th>
+            <th>到達度の目安</th>
+            <th style="width: 160px;">問題数（{{ limits.QUESTIONS_MIN }}〜{{ limits.QUESTIONS_MAX }}）</th>
+            <th style="width: 200px;">1問の制限時間（秒・{{ limits.TIME_LIMIT_MIN }}〜{{ limits.TIME_LIMIT_MAX }}）</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for lv in levels %}
+          <tr>
+            <td class="fw-bold">Lv{{ lv }}</td>
+            <td class="small">{{ scale[lv] }}</td>
+            <td>
+              <input type="number" class="form-control form-control-sm" name="questions_{{ lv }}"
+                     value="{{ settings.questions_per_level[lv|string] }}" min="{{ limits.QUESTIONS_MIN }}" max="{{ limits.QUESTIONS_MAX }}" step="1" required>
+            </td>
+            <td>
+              <input type="number" class="form-control form-control-sm" name="limit_{{ lv }}"
+                     value="{{ settings.time_limits[lv|string] }}" min="{{ limits.TIME_LIMIT_MIN }}" max="{{ limits.TIME_LIMIT_MAX }}" step="1" required>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="card-footer bg-white small text-muted">
+      問題はやさしい順（Lv1から）に出題し、同じレベルの中はランダムな順です。
+      制限時間を{{ grace_sec }}秒（通信の遅れの分）過ぎた回答は時間切れ（不正解）になります。
+      全体の期限は「各問の制限時間の合計＋{{ margin_min }}分」で、過ぎた受験は自動で終了します。
+    </div>
+  </div>
+
+  <div class="card shadow-sm mb-3">
+    <div class="card-header bg-white fw-bold"><i class="bi bi-sliders"></i> 判定・受験・問題プール</div>
+    <div class="card-body">
+      <div class="row g-3">
+        <div class="col-sm-6 col-lg-3">
+          <label class="form-label small mb-1 fw-bold" for="pass_rate">合格ライン（正答率 %）</label>
+          <input type="number" class="form-control form-control-sm" id="pass_rate" name="pass_rate"
+                 value="{{ settings.pass_rate }}" min="{{ limits.PASS_RATE_MIN }}" max="{{ limits.PASS_RATE_MAX }}" step="1" required>
+          <div class="form-text">各レベルの正答率がこの値以上で、下のレベルもすべて合格ならそのレベルに合格。</div>
+        </div>
+        <div class="col-sm-6 col-lg-3">
+          <label class="form-label small mb-1 fw-bold" for="retake_days">再受験までの日数</label>
+          <input type="number" class="form-control form-control-sm" id="retake_days" name="retake_days"
+                 value="{{ settings.retake_days }}" min="{{ limits.RETAKE_DAYS_MIN }}" max="{{ limits.RETAKE_DAYS_MAX }}" step="1" required>
+          <div class="form-text">同じスキルは、前回の受験開始からこの日数が過ぎると再受験できます（0 なら制限なし）。</div>
+        </div>
+        <div class="col-sm-6 col-lg-3">
+          <label class="form-label small mb-1 fw-bold" for="max_auto_level">判定・自動登録するレベルの上限</label>
+          <select class="form-select form-select-sm" id="max_auto_level" name="max_auto_level">
+            {% for lv in range(limits.AUTO_LEVEL_MIN, limits.AUTO_LEVEL_MAX + 1) %}
+            <option value="{{ lv }}" {% if settings.max_auto_level == lv %}selected{% endif %}>Lv{{ lv }}（{{ scale[lv] }}）</option>
+            {% endfor %}
+          </select>
+          <div class="form-text">テストはLv1からこのレベルまでを出題・判定します。Lv5・6はマネージャーが評価します。</div>
+        </div>
+        <div class="col-sm-6 col-lg-3">
+          <label class="form-label small mb-1 fw-bold" for="pool_target_per_level">問題プールの目標数（レベルごと）</label>
+          <input type="number" class="form-control form-control-sm" id="pool_target_per_level" name="pool_target_per_level"
+                 value="{{ settings.pool_target_per_level }}" min="{{ limits.POOL_TARGET_MIN }}" max="{{ limits.POOL_TARGET_MAX }}" step="1" required>
+          <div class="form-text">問題プールの「補充」で、各レベルの有効な問題がこの数になるまでAIで作成します。</div>
+        </div>
+      </div>
+    </div>
+    <div class="card-footer bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
+      <span class="small text-muted">
+        設定は <code>instance/skilltest_settings.json</code> に保存します（DB には保存しません）。受験中・受験済みのテストは、開始時の設定のまま採点します。
+      </span>
+      <button class="btn btn-primary btn-sm"><i class="bi bi-save"></i> 設定を保存</button>
+    </div>
+  </div>
+</form>
+{% endblock %}

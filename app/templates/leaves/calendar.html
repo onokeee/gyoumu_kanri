@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block title %}年休カレンダー &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+  <h1 class="h3 mb-0"><i class="bi bi-calendar-check"></i> 年休カレンダー</h1>
+  <div class="d-flex gap-2">
+    {% if current_user.is_manager %}
+    <a href="{{ url_for('export.leaves_xlsx') }}" class="btn btn-outline-success"><i class="bi bi-file-earmark-excel"></i> Excel出力</a>
+    {% endif %}
+    <a href="{{ url_for('leaves.list_leaves') }}" class="btn btn-outline-secondary"><i class="bi bi-list-ul"></i> 一覧</a>
+    <a href="{{ url_for('leaves.new_leave') }}" class="btn btn-primary"><i class="bi bi-plus-lg"></i> 年休を登録</a>
+  </div>
+</div>
+
+{# 月ナビ + チームフィルタ #}
+<div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+  <div class="btn-group">
+    <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('leaves.calendar_view', year=prev[0], month=prev[1], dept=dept_id) }}">&laquo; 前月</a>
+    <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('leaves.calendar_view', dept=dept_id) }}">今月</a>
+    <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('leaves.calendar_view', year=next[0], month=next[1], dept=dept_id) }}">次月 &raquo;</a>
+  </div>
+  <h2 class="h4 mb-0">{{ year }}年 {{ month }}月</h2>
+  <form method="get" class="d-flex align-items-center gap-1">
+    <input type="hidden" name="year" value="{{ year }}">
+    <input type="hidden" name="month" value="{{ month }}">
+    <label class="small text-muted mb-0">チーム:</label>
+    <select name="dept" class="form-select form-select-sm" onchange="this.form.submit()" style="width:auto;">
+      <option value="">全体</option>
+      {% for d in departments %}
+      <option value="{{ d.id }}" {% if dept_id == d.id %}selected{% endif %}>{{ d.name }}</option>
+      {% endfor %}
+    </select>
+  </form>
+</div>
+
+<div class="card shadow-sm">
+  <div class="table-responsive">
+    <table class="table table-bordered text-center mb-0 align-top" style="table-layout:fixed;">
+      <thead>
+        <tr>
+          {% for label in weekday_labels %}
+          <th class="{% if loop.index0 == 0 %}text-danger{% elif loop.index0 == 6 %}text-primary{% endif %}">{{ label }}</th>
+          {% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for week in weeks %}
+        <tr>
+          {% for cell in week %}
+          <td class="p-1 {% if cell.is_weekend %}leave-weekend{% endif %} {% if not cell.in_month %}leave-outside text-muted{% endif %} {% if cell.warn %}table-danger{% endif %}"
+              style="height:90px; vertical-align:top;">
+            <div class="d-flex justify-content-between align-items-center">
+              <span class="small fw-bold
+                {% if cell.weekday == 6 %}text-danger{% elif cell.weekday == 5 %}text-primary{% endif %}
+                {% if cell.is_today %}badge bg-warning text-dark{% endif %}">{{ cell.date.day }}</span>
+              <span class="text-nowrap">
+                {% if cell.warn %}<i class="bi bi-people-fill text-danger small" title="同日に休む人数が多いチームがあります"></i>{% endif %}
+                {% if cell.leaves %}<span class="badge rounded-pill bg-light text-muted" style="font-size:0.62rem;">{{ cell.leaves|length }}名</span>{% endif %}
+              </span>
+            </div>
+            <div class="d-grid gap-1 mt-1">
+              {% for lv in cell.leaves %}
+              <a href="{{ url_for('leaves.detail', leave_id=lv.id) }}"
+                 class="badge bg-{{ lv.type_color }} text-truncate text-decoration-none d-block text-start"
+                 title="{{ lv.user.display_name }} / {{ lv.leave_type }}">
+                {{ lv.user.display_name }}{% if lv.leave_type != '全休' %}<small>({{ lv.leave_type[:2] }})</small>{% endif %}
+              </a>
+              {% endfor %}
+            </div>
+          </td>
+          {% endfor %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+<div class="small text-muted mt-2">
+  <span class="badge bg-primary">全休</span>
+  <span class="badge bg-info">半休</span>
+  <span class="ms-2"><span class="leave-weekend-swatch"></span> 土日(休日)</span>
+  <span class="ms-2 text-danger"><i class="bi bi-people-fill"></i> 同じチームで同日{{ daily_limit }}名超</span>
+</div>
+{% endblock %}

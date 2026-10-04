@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+{% block title %}定型・定期業務 &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h1 class="h3 mb-0"><i class="bi bi-arrow-repeat"></i> 定型・定期業務</h1>
+  <div class="d-flex gap-2">
+    {% if current_user.is_manager %}
+    <a href="{{ url_for('export.routine_xlsx') }}" class="btn btn-outline-success"><i class="bi bi-file-earmark-excel"></i> Excel出力</a>
+    {% endif %}
+    <a href="{{ url_for('routine.new_routine') }}" class="btn btn-primary"><i class="bi bi-plus-lg"></i> 業務を登録</a>
+  </div>
+</div>
+
+{# ヒト別サマリー(全データ対象。下の絞り込みには連動しない) #}
+<div class="card shadow-sm mb-3">
+  <div class="card-header bg-white fw-bold">
+    <i class="bi bi-people"></i> ヒト別サマリー
+    <span class="text-muted small fw-normal">（全データ対象）</span>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-sm table-hover align-middle mb-0 text-end sortable">
+      <thead class="table-light">
+        <tr>
+          <th class="text-start">担当者</th>
+          <th class="text-nowrap" data-type="num">総件数</th>
+          <th class="text-nowrap" data-type="num">総合計時間(月)</th>
+          <th class="text-nowrap" data-type="num">手順書<br>作成済</th>
+          <th class="text-nowrap" data-type="num">手順書<br>未作成</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in summary_rows %}
+        <tr>
+          <td class="text-start text-nowrap">{{ s.assignee.display_name if s.assignee else '(不明)' }}</td>
+          <td data-sort="{{ s.count }}">{{ s.count }}</td>
+          <td class="text-nowrap" data-sort="{{ s.minutes }}">{{ "{:,}".format(s.minutes) }}分
+            <span class="text-muted small">({{ "%.1f"|format(s.minutes / 60) }}時間)</span></td>
+          <td class="text-success fw-medium" data-sort="{{ s.done }}">{{ s.done }}</td>
+          <td class="{% if s.undone %}text-danger fw-bold{% endif %}" data-sort="{{ s.undone }}">{{ s.undone }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="text-center text-muted py-3">まだ登録がありません。</td></tr>
+        {% endfor %}
+      </tbody>
+      {% if summary_rows %}
+      <tfoot class="table-light fw-bold">
+        <tr>
+          <td class="text-start">合計</td>
+          <td>{{ summary_totals.count }}</td>
+          <td class="text-nowrap">{{ "{:,}".format(summary_totals.minutes) }}分
+            <span class="fw-normal text-muted small">({{ "%.1f"|format(summary_totals.minutes / 60) }}時間)</span></td>
+          <td>{{ summary_totals.done }}</td>
+          <td>{{ summary_totals.undone }}</td>
+        </tr>
+      </tfoot>
+      {% endif %}
+    </table>
+  </div>
+</div>
+
+<form method="get" class="card card-body shadow-sm mb-3">
+  <div class="row g-2 align-items-end">
+    <div class="col-6 col-md-3">
+      <label class="form-label small mb-1">キーワード</label>
+      <input type="text" name="q" value="{{ filters.q }}" class="form-control form-control-sm" placeholder="業務名・内容">
+    </div>
+    <div class="col-6 col-md-3">
+      <label class="form-label small mb-1">担当者</label>
+      <select name="assignee" class="form-select form-select-sm">
+        <option value="">すべて</option>
+        {% for u in users %}
+        <option value="{{ u.id }}" {% if filters.assignee == u.id|string %}selected{% endif %}>{{ u.display_name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col-6 col-md-2">
+      <label class="form-label small mb-1">手順書</label>
+      <select name="manual" class="form-select form-select-sm">
+        <option value="">すべて</option>
+        {% for m in manual_choices %}
+        <option value="{{ m }}" {% if filters.manual == m %}selected{% endif %}>{{ m }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col-6 col-md-2 form-check ms-2 mb-2">
+      <input class="form-check-input" type="checkbox" name="scope" value="mine" id="mine" {% if filters.scope == 'mine' %}checked{% endif %}>
+      <label class="form-check-label small" for="mine">自分の担当のみ</label>
+    </div>
+    <div class="col-12 col-md-2 d-grid">
+      <button class="btn btn-sm btn-outline-primary"><i class="bi bi-funnel"></i> 絞り込み</button>
+    </div>
+  </div>
+</form>
+
+<div class="card shadow-sm">
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0 sortable">
+      <thead class="table-light">
+        <tr>
+          <th>担当者</th><th>業務名</th><th>目的</th>
+          <th class="text-nowrap">頻度</th>
+          <th class="text-nowrap text-end" data-type="num">所要時間(月)</th>
+          <th class="text-nowrap">手順書</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in routines %}
+        <tr>
+          <td class="text-nowrap">{{ r.assignee.display_name }}</td>
+          <td><a href="{{ url_for('routine.detail', routine_id=r.id) }}" class="fw-medium">{{ r.name }}</a></td>
+          <td><small class="text-muted">{{ r.purpose or '―' }}</small></td>
+          <td class="text-nowrap">{{ r.frequency_label }}</td>
+          <td class="text-nowrap text-end" data-sort="{{ r.monthly_minutes if r.monthly_minutes is not none else '' }}">
+            {{ r.monthly_minutes_label }}
+          </td>
+          <td><span class="badge bg-{{ r.manual_color }}">{{ r.manual_status }}</span></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="text-center text-muted py-4">該当する定型・定期業務はありません。</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+<p class="text-muted small mt-2">
+  {{ routines|length }} 件
+  <span class="ms-2"><i class="bi bi-info-circle"></i> 所要時間(月)＝「回数 × 1回の所要時間」を月換算した目安(4週/月・30日/月で換算)。</span>
+</p>
+{% endblock %}

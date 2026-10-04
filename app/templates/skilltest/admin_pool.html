@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block title %}問題プール &middot; スキルテスト管理 &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+{% set active = 'pool' %}
+{% include "skilltest/_admin_nav.html" %}
+
+<div class="row g-3 mb-3">
+  <div class="col-lg-6">
+    <div class="card shadow-sm h-100">
+      <div class="card-header bg-white fw-bold"><i class="bi bi-robot"></i> 問題の作成（AI）</div>
+      <div class="card-body small">
+        <div class="mb-2">
+          {% if ai_enabled %}<span class="badge bg-success">設定あり</span>{% else %}<span class="badge bg-danger">未設定</span>{% endif %}
+          {{ ai_status }}
+        </div>
+        <ul class="mb-0">
+          <li>「補充」を押すと、そのスキルの各レベルの有効な問題が {{ target }} 問になるまで、AIが問題を作ってプールに追加します（バックグラウンド。数分かかることがあります）。</li>
+          <li>受験の開始時に、その人が見たことのない問題が足りなければ、その場でAIが作ります（受験者を1〜2分待たせるため、事前の補充をおすすめします）。</li>
+          <li>AIが使えず問題が足りないときは、その人が以前に解いた問題を再出題します（受験履歴の「再出題」に件数を表示）。それでも足りなければ受験を開始できません。</li>
+          <li>AIの作った問題は誤りを含むことがあります。問題の一覧で内容を確認し、不適切な問題は「無効にする」で出題から外してください。</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="col-lg-6">
+    <div class="card shadow-sm h-100">
+      <div class="card-header bg-white d-flex justify-content-between align-items-center">
+        <span class="fw-bold"><i class="bi bi-clipboard-check"></i> 前回の補充の結果</span>
+        <a href="{{ url_for('skilltest.admin_pool') }}" class="btn btn-sm btn-outline-secondary"><i class="bi bi-arrow-clockwise"></i> 更新</a>
+      </div>
+      <div class="card-body">
+        {% if running %}
+        <div class="alert alert-info py-1 px-2 small mb-2">
+          <span class="spinner-border spinner-border-sm" role="status"></span>
+          「{{ running_name }}」の問題を補充中です。しばらくしてから「更新」を押してください。
+        </div>
+        {% endif %}
+        {% if last %}
+        <div class="mb-1">
+          {% if last.ok %}<span class="badge bg-success">成功</span>{% else %}<span class="badge bg-danger">失敗</span>{% endif %}
+          <span class="small text-muted">{{ last.at }}</span>
+        </div>
+        <div class="small pre-wrap">{{ last.message }}</div>
+        {% else %}
+        <div class="text-muted small">まだ補充していません。</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card shadow-sm mb-4">
+  <div class="card-header bg-white fw-bold d-flex justify-content-between flex-wrap gap-2">
+    <span><i class="bi bi-collection"></i> スキル・レベルごとの問題数（有効）</span>
+    <span class="small fw-normal text-muted">赤 = 1回の受験に必要な数より少ない ／ 黄 = 目標（{{ target }}問）より少ない ／（ ）内は無効にした問題</span>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead class="table-light">
+        <tr>
+          <th>スキル</th>
+          {% for lv in levels %}
+          <th class="text-center text-nowrap" title="{{ scale[lv] }}">Lv{{ lv }}</th>
+          {% endfor %}
+          <th class="text-end text-nowrap">合計</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr class="{% if not row.testable %}text-muted{% endif %}">
+          <td>
+            <a href="{{ url_for('skilltest.admin_pool_skill', skill_id=row.skill.id) }}" class="fw-bold">{{ row.skill.name }}</a>
+            {% if row.skill.category %}<span class="small text-muted">{{ row.skill.category }}</span>{% endif %}
+            {% if not row.testable %}<span class="badge bg-light text-dark border">無効（受験の対象外）</span>{% endif %}
+          </td>
+          {% for c in row.cells %}
+          <td class="text-center text-nowrap">
+            <span class="fw-bold {% if row.testable and c.active < c.need %}text-danger{% elif row.testable and c.active < target %}text-warning-emphasis{% endif %}">{{ c.active }}</span>
+            {% if c.inactive %}<span class="small text-muted">（{{ c.inactive }}）</span>{% endif %}
+          </td>
+          {% endfor %}
+          <td class="text-end">{{ row.total }}</td>
+          <td class="text-end text-nowrap">
+            <a href="{{ url_for('skilltest.admin_pool_skill', skill_id=row.skill.id) }}" class="btn btn-sm btn-outline-secondary">問題の一覧</a>
+            {% if row.testable %}
+            <form method="post" action="{{ url_for('skilltest.admin_topup', skill_id=row.skill.id) }}" class="d-inline">
+              <button class="btn btn-sm btn-outline-primary" {% if running or not ai_enabled %}disabled{% endif %}
+                      title="各レベルの有効な問題が{{ target }}問になるまでAIで作成します"><i class="bi bi-plus-circle"></i> 補充</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="{{ levels|length + 3 }}" class="text-muted text-center py-4">テクニカルスキルが登録されていません（スキルマップの「スキル項目の管理」で追加します）。</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="card-footer bg-white small text-muted">
+    1回の受験に必要な問題数: {% for lv in levels %}Lv{{ lv }} {{ settings.questions_per_level[lv|string] }}問{% if not loop.last %}・{% endif %}{% endfor %}。
+    同じ人には見たことのない問題を優先して出すため、プールには必要数より多めに用意しておくと、再受験でも新しい問題になります。
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,154 @@
+{% extends "base.html" %}
+{% from "_macros.html" import fmt_datetime %}
+{% block title %}スキルテストの詳細 &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('skilltest.admin_attempts') }}">スキルテスト管理</a></li>
+    <li class="breadcrumb-item active">受験の詳細 #{{ attempt.id }}</li>
+  </ol>
+</nav>
+
+<div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
+  <h1 class="h4 mb-0">
+    {{ attempt.user.display_name if attempt.user else '（削除済み）' }} ／ {{ attempt.skill.name if attempt.skill else '' }}
+  </h1>
+  <span class="badge bg-{{ attempt.status_color }} fs-6">{{ attempt.status_label }}</span>
+</div>
+
+<div class="row g-3 mb-3">
+  <div class="col-lg-6">
+    <div class="card shadow-sm h-100">
+      <div class="card-header bg-white fw-bold"><i class="bi bi-info-circle"></i> 概要</div>
+      <div class="card-body small">
+        <dl class="row mb-0">
+          <dt class="col-5 text-muted">開始</dt><dd class="col-7">{{ fmt_datetime(attempt.started_at) }}</dd>
+          <dt class="col-5 text-muted">終了</dt><dd class="col-7">{{ fmt_datetime(attempt.finished_at) }}</dd>
+          <dt class="col-5 text-muted">全体の期限</dt><dd class="col-7">{{ fmt_datetime(attempt.deadline_at) }}</dd>
+          <dt class="col-5 text-muted">正解数</dt>
+          <dd class="col-7">
+            {% if attempt.is_in_progress %}受験中（{{ attempt.answered_count }}/{{ attempt.total }}問 回答済み）
+            {% else %}{{ attempt.correct }} / {{ attempt.total }}（{{ attempt.rate if attempt.rate is not none else 0 }}%）{% endif %}
+          </dd>
+          <dt class="col-5 text-muted">結果のレベル</dt>
+          <dd class="col-7">
+            {% if attempt.result_level is not none %}Lv{{ attempt.result_level }}
+            <span class="text-muted">{{ scale[attempt.result_level] if attempt.result_level < scale|length else '' }}</span>{% else %}―{% endif %}
+          </dd>
+          <dt class="col-5 text-muted">到達度</dt>
+          <dd class="col-7">
+            {% if attempt.is_in_progress %}―
+            {% elif attempt.applied %}<span class="badge bg-success">自動登録</span> Lv{{ attempt.prev_level }} → Lv{{ attempt.new_level }}
+            {% else %}変更なし（Lv{{ attempt.prev_level }}）{% endif %}
+          </dd>
+          <dt class="col-5 text-muted">画面から離れた回数</dt>
+          <dd class="col-7 {% if attempt.blur_count %}text-danger fw-bold{% endif %}">{{ attempt.blur_count }} 回</dd>
+          <dt class="col-5 text-muted">再出題した問題</dt>
+          <dd class="col-7">{{ attempt.reused_count }} 問{% if attempt.reused_count %} <span class="text-muted">（問題プールの不足のため、受験済みの問題を出題）</span>{% endif %}</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+  <div class="col-lg-6">
+    <div class="card shadow-sm h-100">
+      <div class="card-header bg-white fw-bold"><i class="bi bi-bar-chart-steps"></i> レベルごとの結果</div>
+      <div class="table-responsive">
+        <table class="table table-sm align-middle mb-0">
+          <thead class="table-light">
+            <tr><th>レベル</th><th class="text-end">正解</th><th class="text-end">正答率</th><th>判定</th></tr>
+          </thead>
+          <tbody>
+            {% for r in level_results %}
+            <tr>
+              <td>Lv{{ r.level }}</td>
+              <td class="text-end">{{ r.correct }} / {{ r.total }}</td>
+              <td class="text-end">{{ r.rate }}%</td>
+              <td>
+                {% if r.passed %}<span class="badge bg-success">合格</span>
+                {% elif r.rate_ok %}<span class="badge bg-secondary">基準以上（下位が不合格）</span>
+                {% else %}<span class="badge bg-light text-dark border">不合格</span>{% endif %}
+              </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="4" class="text-muted text-center py-3">終了後に表示します。</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="card-footer bg-white small text-muted">
+        受験開始時の設定: 合格ライン {{ snapshot.get('pass_rate', '―') }}%
+        ／ 判定レベル Lv1〜{{ (snapshot.get('levels') or ['―'])|last }}
+        ／ 制限時間 {% for lv, sec in (snapshot.get('time_limits') or {}).items() %}Lv{{ lv }} {{ sec }}秒{% if not loop.last %}・{% endif %}{% endfor %}
+        ／ 猶予 {{ snapshot.get('grace_sec', '―') }}秒
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card shadow-sm mb-4">
+  <div class="card-header bg-white fw-bold d-flex justify-content-between flex-wrap gap-2">
+    <span><i class="bi bi-list-ol"></i> 出題と回答（全{{ attempt.answers|length }}問）</span>
+    <span class="small fw-normal">
+      <span class="badge bg-success-subtle text-success-emphasis border border-success-subtle">正解の選択肢</span>
+      <span class="badge bg-primary">選んだ選択肢</span>
+    </span>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-sm align-top mb-0">
+      <thead class="table-light">
+        <tr>
+          <th class="text-nowrap">#</th>
+          <th class="text-nowrap">Lv</th>
+          <th>問題と選択肢（表示した順）</th>
+          <th class="text-nowrap">結果</th>
+          <th class="text-nowrap text-end">所要/制限</th>
+          <th class="text-nowrap text-end">離脱</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for a in attempt.answers %}
+        <tr>
+          <td class="text-nowrap">{{ a.seq }}</td>
+          <td class="text-nowrap">Lv{{ a.level }}</td>
+          <td style="min-width: 320px;">
+            <div class="pre-wrap mb-1">{{ a.question }}</div>
+            <ol class="list-unstyled small mb-1">
+              {% for c in a.choice_list %}
+              <li class="px-2 py-1 rounded mb-1 {% if loop.index0 == a.correct_index %}bg-success-subtle border border-success-subtle{% endif %}">
+                <span class="fw-bold">{{ letters[loop.index0] }}.</span> <span class="pre-wrap">{{ c }}</span>
+                {% if loop.index0 == a.correct_index %}<i class="bi bi-check-lg text-success" title="正解"></i>{% endif %}
+                {% if a.selected_index == loop.index0 %}<span class="badge bg-primary">選択</span>{% endif %}
+              </li>
+              {% endfor %}
+            </ol>
+            {% if a.source_question and a.source_question.explanation %}
+            <details class="small text-muted">
+              <summary>解説</summary>
+              <div class="pre-wrap">{{ a.source_question.explanation }}</div>
+            </details>
+            {% endif %}
+            <div class="small text-muted">
+              問題 #{{ a.question_id }}{% if a.source_question and not a.source_question.is_active %} <span class="badge bg-light text-dark border">無効化済み</span>{% endif %}
+              ／ 表示 {{ fmt_datetime(a.served_at) }}{% if a.answered_at %} ／ 確定 {{ a.answered_at.strftime('%H:%M:%S') }}{% endif %}
+            </div>
+          </td>
+          <td class="text-nowrap">
+            {% if a.timed_out %}
+            <span class="badge bg-warning text-dark">{% if a.served_at %}時間切れ{% else %}未表示（時間切れ）{% endif %}</span>
+            {% if a.selected_index is not none %}<div class="small text-muted">選択 {{ a.selected_letter }}（期限後）</div>{% endif %}
+            {% elif a.answered_at is none %}<span class="badge bg-light text-dark border">{% if a.served_at %}回答中{% else %}未表示{% endif %}</span>
+            {% elif a.is_correct %}<span class="badge bg-success">正解</span> <span class="small">{{ a.selected_letter }}</span>
+            {% else %}<span class="badge bg-danger">不正解</span> <span class="small">{{ a.selected_letter }}（正解 {{ a.correct_letter }}）</span>{% endif %}
+          </td>
+          <td class="text-nowrap text-end small">
+            {% if a.elapsed_sec is not none %}{{ '%.1f' % a.elapsed_sec }}秒{% else %}―{% endif %} / {{ a.time_limit_sec }}秒
+          </td>
+          <td class="text-end {% if a.blur_count %}text-danger fw-bold{% endif %}">{{ a.blur_count }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

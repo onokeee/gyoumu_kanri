@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Flask instance (SQLiteデータベース・設定ファイル config.py・週報の設定などを格納)
+instance/
+
+# 旧バージョンのローカル設定ファイル(現在は使わない。残っていても誤ってコミットしないよう除外)
+.env
+
+# OS / エディタ
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Claude Code のローカル設定(権限など。共有不要)
+.claude/

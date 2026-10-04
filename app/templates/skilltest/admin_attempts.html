@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% from "_macros.html" import fmt_datetime %}
+{% block title %}スキルテスト管理 &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+{% set active = 'attempts' %}
+{% include "skilltest/_admin_nav.html" %}
+
+{# 絞り込み(選択した時点で自動反映) #}
+<form method="get" class="card card-body shadow-sm mb-3 py-2 auto-filter">
+  <div class="row g-2 align-items-end">
+    <div class="col-sm-4 col-md-3">
+      <label class="form-label small mb-1 fw-bold" for="fUser">メンバー</label>
+      <select name="user_id" id="fUser" class="form-select form-select-sm">
+        <option value="">すべて</option>
+        {% for u in users %}
+        <option value="{{ u.id }}" {% if filters.user_id == u.id %}selected{% endif %}>{{ u.display_name }}{% if not u.is_active %}（無効）{% endif %}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col-sm-4 col-md-3">
+      <label class="form-label small mb-1 fw-bold" for="fSkill">スキル</label>
+      <select name="skill_id" id="fSkill" class="form-select form-select-sm">
+        <option value="">すべて</option>
+        {% for s in skills %}
+        <option value="{{ s.id }}" {% if filters.skill_id == s.id %}selected{% endif %}>{{ s.name }}{% if not s.is_active %}（無効）{% endif %}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col-sm-4 col-md-2">
+      <label class="form-label small mb-1 fw-bold" for="fStatus">状態</label>
+      <select name="status" id="fStatus" class="form-select form-select-sm">
+        <option value="">すべて</option>
+        {% for key, label in status_labels.items() %}
+        <option value="{{ key }}" {% if filters.status == key %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col-md-4 small text-muted">
+      {{ attempts|length }} 件。見出しをクリックすると並び替えます。
+      <noscript><button class="btn btn-sm btn-primary ms-2">絞り込み</button></noscript>
+    </div>
+  </div>
+</form>
+
+<div class="card shadow-sm mb-4">
+  <div class="table-responsive">
+    <table class="table table-sm table-hover align-middle mb-0 sortable">
+      <thead class="table-light">
+        <tr>
+          <th>開始日時</th>
+          <th>メンバー</th>
+          <th style="min-width: 10rem;">スキル</th>
+          <th>状態</th>
+          <th data-type="num" class="text-end">正解数</th>
+          <th data-type="num" class="text-end">正答率</th>
+          <th data-type="num">結果</th>
+          <th>到達度</th>
+          <th data-type="num" class="text-end" title="タブ・ウィンドウの切り替えなどで画面から離れた回数">離脱</th>
+          <th data-type="num" class="text-end" title="受験済みの問題を再出題した数（問題プールの不足時）">再出題</th>
+          <th data-nosort></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for a in attempts %}
+        <tr>
+          <td class="text-nowrap small" data-sort="{{ a.started_at.strftime('%Y%m%d%H%M%S') }}">{{ fmt_datetime(a.started_at) }}</td>
+          <td class="text-nowrap">{{ a.user.display_name if a.user else '（削除済み）' }}</td>
+          <td>{{ a.skill.name if a.skill else '' }}</td>
+          <td><span class="badge bg-{{ a.status_color }}">{{ a.status_label }}</span></td>
+          <td class="text-end text-nowrap" data-sort="{{ a.correct if not a.is_in_progress else '' }}">
+            {% if a.is_in_progress %}{{ a.answered_count }}/{{ a.total }}問 回答中{% else %}{{ a.correct }}/{{ a.total }}{% endif %}
+          </td>
+          <td class="text-end text-nowrap" data-sort="{{ a.rate if (a.rate is not none and not a.is_in_progress) else '' }}">
+            {% if a.is_in_progress or a.rate is none %}―{% else %}{{ a.rate }}%{% endif %}
+          </td>
+          <td class="text-nowrap" data-sort="{{ a.result_level if a.result_level is not none else '' }}">
+            {% if a.result_level is not none %}Lv{{ a.result_level }}{% else %}―{% endif %}
+          </td>
+          <td class="small text-nowrap">
+            {% if a.is_in_progress %}―
+            {% elif a.applied %}<span class="badge bg-success">自動登録</span> Lv{{ a.prev_level }} → Lv{{ a.new_level }}
+            {% else %}<span class="text-muted">変更なし（Lv{{ a.prev_level }}）</span>{% endif %}
+          </td>
+          <td class="text-end {% if a.blur_count %}text-danger fw-bold{% endif %}" data-sort="{{ a.blur_count }}">{{ a.blur_count }}</td>
+          <td class="text-end" data-sort="{{ a.reused_count }}">{{ a.reused_count }}</td>
+          <td class="text-end"><a href="{{ url_for('skilltest.admin_attempt', attempt_id=a.id) }}" class="btn btn-sm btn-outline-secondary">詳細</a></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="11" class="text-muted text-center py-4">受験履歴はありません。</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

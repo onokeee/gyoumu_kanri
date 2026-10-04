@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block title %}業務×ヒト 対応表 &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+  <h1 class="h3 mb-0"><i class="bi bi-mortarboard"></i> スキルマップ</h1>
+  {% if can_edit %}
+  <a href="{{ url_for('skills.operations') }}" class="btn btn-sm btn-outline-secondary"><i class="bi bi-gear"></i> 業務項目の管理</a>
+  {% endif %}
+</div>
+
+{# 見方の切り替え #}
+<div class="btn-group btn-group-sm mb-3" role="group">
+  <a href="{{ url_for('skills.list_skills') }}" class="btn btn-outline-primary">縦=スキル項目</a>
+  <a href="{{ url_for('skills.coverage') }}" class="btn btn-outline-primary active">縦=業務（対応可否）</a>
+</div>
+
+<p class="text-muted small">
+  縦=業務、横=ヒト。各業務に必要なスキル（必要到達レベル）を各メンバーが満たしているかを表します。<br>
+  <span class="badge bg-success">○</span> 対応可（必要スキルをすべて充足） ／
+  <span class="badge bg-warning text-dark">n/m</span> 一部充足（充足数/必要数） ／
+  <span class="text-muted">—</span> 必要スキル未設定。
+  必要スキルは業務名クリック（または「業務項目の管理」）から設定します。
+</p>
+
+<div class="card shadow-sm">
+  <div class="table-responsive">
+    <table class="table table-bordered table-hover align-middle text-center mb-0" style="min-width:600px;">
+      <thead class="table-light">
+        <tr>
+          <th class="text-start" style="position:sticky; left:0;">業務</th>
+          <th class="small text-nowrap">必要<br>スキル数</th>
+          {% for u in users %}
+          <th class="small text-nowrap"><a href="{{ url_for('skills.member', user_id=u.id) }}">{{ u.display_name }}</a></th>
+          {% endfor %}
+          <th class="small text-nowrap">対応可<br>人数</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          <td class="text-start" title="{{ row.op.description or row.op.name }}">
+            {% if can_edit %}<a href="{{ url_for('skills.edit_operation', op_id=row.op.id) }}">{{ row.op.name }}</a>
+            {% else %}{{ row.op.name }}{% endif %}
+          </td>
+          <td class="small text-muted">{{ row.req_count }}</td>
+          {% for cell in row.cells %}
+          <td class="p-1">
+            {% if cell.state == 'full' %}
+            <span class="badge bg-success" title="対応可（{{ cell.met }}/{{ cell.total }} 充足）">○</span>
+            {% elif cell.state == 'partial' %}
+            <span class="badge bg-{{ 'warning text-dark' if cell.met else 'light text-muted border' }}"
+                  title="一部充足（{{ cell.met }}/{{ cell.total }}）">{{ cell.met }}/{{ cell.total }}</span>
+            {% else %}
+            <span class="text-muted" title="必要スキル未設定">—</span>
+            {% endif %}
+          </td>
+          {% endfor %}
+          <td class="fw-bold {% if row.req_count and row.doable == 0 %}text-danger{% endif %}">
+            {% if row.req_count %}{{ row.doable }}/{{ users|length }}{% else %}―{% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="{{ users|length + 3 }}" class="text-muted py-4">業務項目がありません。{% if can_edit %}「業務項目の管理」から追加してください。{% endif %}</td></tr>
+        {% endfor %}
+      </tbody>
+      {% if rows %}
+      <tfoot class="table-light fw-bold">
+        <tr>
+          <td class="text-start">対応可能な業務数</td>
+          <td></td>
+          {% for c in per_user_doable %}<td>{{ c }}</td>{% endfor %}
+          <td></td>
+        </tr>
+      </tfoot>
+      {% endif %}
+    </table>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}{{ member.display_name }} のスキル編集 &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('skills.list_skills') }}">スキルマップ</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('skills.member', user_id=member.id) }}">{{ member.display_name }}</a></li>
+    <li class="breadcrumb-item active">編集</li>
+  </ol>
+</nav>
+
+<h1 class="h3 mb-3">{{ member.display_name }} さんの到達度を編集</h1>
+
+<form method="post">
+  {% for stype in type_choices %}
+  <div class="card shadow-sm mb-3">
+    <div class="card-header bg-white fw-bold">{{ type_labels[stype] }}</div>
+    <div class="card-body">
+      {% for s, r in by_type[stype] %}
+      <div class="row align-items-center mb-2">
+        <div class="col-md-4">
+          <label class="form-label mb-0">{{ s.name }}
+            {% if s.category %}<span class="text-muted small">({{ s.category }})</span>{% endif %}
+          </label>
+        </div>
+        <div class="col-md-5">
+          <select name="level_{{ s.id }}" class="form-select form-select-sm">
+            {% for label in s.level_labels %}
+            <option value="{{ loop.index0 }}" {% if (r.level if r else 0) == loop.index0 %}selected{% endif %}>
+              {{ loop.index0 }}：{{ label }}
+            </option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-md-3">
+          <input type="text" name="note_{{ s.id }}" class="form-control form-control-sm"
+                 placeholder="メモ(任意)" value="{{ r.note if r and r.note else '' }}">
+        </div>
+      </div>
+      {% else %}
+      <p class="text-muted small mb-0">この区分のスキル項目はありません。</p>
+      {% endfor %}
+    </div>
+  </div>
+  {% endfor %}
+
+  <div class="d-flex gap-2">
+    <button type="submit" class="btn btn-primary"><i class="bi bi-check-lg"></i> 保存</button>
+    <a href="{{ url_for('skills.member', user_id=member.id) }}" class="btn btn-outline-secondary">キャンセル</a>
+  </div>
+</form>
+{% endblock %}

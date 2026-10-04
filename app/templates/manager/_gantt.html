@@ -1,0 +1,116 @@
+{# 全タスクのガントチャート(ダッシュボード内蔵・全画面ページで共用) #}
+{# 必要な変数: gantt, gfrom, gto, gsort, gdir, ghide, gassignee, gticks, gtoday_left,
+   status_colors, gusers, gantt_endpoint, gantt_extra #}
+<div class="d-flex justify-content-between align-items-center mt-4 mb-1 flex-wrap gap-2">
+  <h2 class="h4 mb-0">
+    <i class="bi bi-bar-chart-steps"></i>
+    {% if gpersonal %}自分のタスクのガントチャート{% else %}全タスクのガントチャート{% endif %}
+  </h2>
+  {% if gantt_endpoint == 'manager.dashboard' %}
+  <a class="btn btn-sm btn-outline-primary"
+     href="{{ url_for('manager.gantt_full', gfrom=gfrom.strftime('%Y-%m-%d'), gto=gto.strftime('%Y-%m-%d'), gsort=gsort, gdir=gdir, ghide=('1' if ghide else ''), gassignee=gassignee) }}">
+    <i class="bi bi-arrows-fullscreen"></i> 全画面表示
+  </a>
+  {% elif gantt_endpoint == 'manager.gantt_full' %}
+  <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('manager.dashboard') }}">← マネージャーダッシュボード</a>
+  {% endif %}
+</div>
+
+<form method="get" action="{{ url_for(gantt_endpoint) }}" class="card card-body shadow-sm mb-2">
+  {% for k, v in gantt_extra.items() %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+  <input type="hidden" name="gsort" value="{{ gsort }}">
+  <input type="hidden" name="gdir" value="{{ gdir }}">
+  <div class="row g-2 align-items-end">
+    <div class="col-6 col-md-2">
+      <label class="form-label small mb-1">開始日</label>
+      <input type="date" name="gfrom" value="{{ gfrom.strftime('%Y-%m-%d') }}" class="form-control form-control-sm">
+    </div>
+    <div class="col-6 col-md-2">
+      <label class="form-label small mb-1">終了日</label>
+      <input type="date" name="gto" value="{{ gto.strftime('%Y-%m-%d') }}" class="form-control form-control-sm">
+    </div>
+    {% if not gpersonal %}
+    <div class="col-6 col-md-3">
+      <label class="form-label small mb-1">担当者</label>
+      <select name="gassignee" class="form-select form-select-sm">
+        <option value="">すべて</option>
+        {% for u in gusers %}
+        <option value="{{ u.id }}" {% if gassignee == u.id|string %}selected{% endif %}>{{ u.display_name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    {% endif %}
+    <div class="col-6 col-md-3 form-check ms-2 mb-2">
+      <input class="form-check-input" type="checkbox" name="ghide" value="1" id="ghide" {% if ghide %}checked{% endif %}>
+      <label class="form-check-label small" for="ghide">「完了」を非表示</label>
+    </div>
+    <div class="col-6 col-md-2 d-grid">
+      <button class="btn btn-sm btn-primary"><i class="bi bi-funnel"></i> 表示</button>
+    </div>
+  </div>
+</form>
+
+<div class="small text-muted mb-2">
+  棒=ステータス(切替日で色が変わる):
+  <span class="badge bg-{{ status_colors['進行中'] }}">進行中</span>
+  <span class="badge bg-{{ status_colors['未着手'] }}">未着手(待ち)</span>
+  <span class="badge bg-{{ status_colors['保留'] }} text-dark">保留</span>
+  {% if not ghide %}<span class="badge bg-{{ status_colors['完了'] }}">完了</span>{% endif %}
+  <span class="ms-2 text-danger"><i class="bi bi-lightning-charge-fill"></i> 期限超過(未完了)</span>
+  <span class="ms-2"><span class="gantt-mark d-inline-block position-static"></span> 進捗記載(マウスオーバーで内容)</span>
+</div>
+
+<div class="card shadow-sm mb-4">
+  <div class="gantt">
+    <div class="gantt-inner">
+      {# ヘッダ(ソート＋日付軸) #}
+      <div class="gantt-row gantt-head">
+        <div class="gantt-c-task">
+          <a class="text-decoration-none" href="{{ url_for(gantt_endpoint, gsort='task', gdir=('desc' if gsort=='task' and gdir=='asc' else 'asc'), gfrom=gfrom.strftime('%Y-%m-%d'), gto=gto.strftime('%Y-%m-%d'), ghide=('1' if ghide else ''), gassignee=gassignee, **gantt_extra) }}">
+            タスク{% if gsort=='task' %} <i class="bi bi-caret-{{ 'up' if gdir=='asc' else 'down' }}-fill"></i>{% endif %}
+          </a>
+        </div>
+        <div class="gantt-c-assignee">
+          <a class="text-decoration-none" href="{{ url_for(gantt_endpoint, gsort='assignee', gdir=('desc' if gsort=='assignee' and gdir=='asc' else 'asc'), gfrom=gfrom.strftime('%Y-%m-%d'), gto=gto.strftime('%Y-%m-%d'), ghide=('1' if ghide else ''), gassignee=gassignee, **gantt_extra) }}">
+            担当者{% if gsort=='assignee' %} <i class="bi bi-caret-{{ 'up' if gdir=='asc' else 'down' }}-fill"></i>{% endif %}
+          </a>
+        </div>
+        <div class="gantt-timeline">
+          {% for tick in gticks %}
+          <div class="gantt-tick" style="left:{{ tick.left }}%;"></div>
+          <div class="gantt-tick-label" style="left:{{ tick.left }}%;">{{ tick.date.strftime('%m/%d') }}</div>
+          {% endfor %}
+          {% if gtoday_left is not none %}<div class="gantt-today" style="left:{{ gtoday_left }}%;"></div>{% endif %}
+        </div>
+      </div>
+      {# タスク行 #}
+      {% for g in gantt %}
+      <div class="gantt-row">
+        <div class="gantt-c-task"><a href="{{ url_for('tasks.detail', task_id=g.task.id) }}" title="{{ g.task.title }}">{{ g.task.title }}</a></div>
+        <div class="gantt-c-assignee" title="{{ g.task.assignee_names }}">{{ g.task.assignee_names or '未割当' }}</div>
+        <div class="gantt-timeline">
+          {% for tick in gticks %}<div class="gantt-tick" style="left:{{ tick.left }}%;"></div>{% endfor %}
+          {% if gtoday_left is not none %}<div class="gantt-today" style="left:{{ gtoday_left }}%;"></div>{% endif %}
+          {% for seg in g.segments %}
+          <div class="gantt-seg bg-{{ status_colors[seg.status] }}"
+               style="left:{{ seg.left }}%; width:{{ seg.width }}%;{% if seg.status == '保留' %} color:#212529;{% endif %}"
+               title="{{ g.task.title }} ／ {{ seg.status }}">{% if loop.last %}{{ seg.status }}{% endif %}</div>
+          {% endfor %}
+          {% for m in g.marks %}
+          <div class="gantt-mark" style="left:{{ m.left }}%;" title="{{ m.tip }}"></div>
+          {% endfor %}
+          {% if g.overdue_left is not none %}
+          <div class="gantt-lightning" style="left:{{ g.overdue_left }}%;" title="期限超過(未完了)">
+            <svg width="12" height="26" viewBox="0 0 12 26" preserveAspectRatio="none">
+              <path d="M4,0 L8,7 L4,13 L8,19 L4,26" stroke="#dc3545" stroke-width="2" fill="none"/>
+            </svg>
+          </div>
+          {% endif %}
+        </div>
+      </div>
+      {% else %}
+      <div class="gantt-row"><div class="p-3 text-muted small">表示するタスクがありません。</div></div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
