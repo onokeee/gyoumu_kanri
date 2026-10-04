@@ -107,7 +107,6 @@ import shutil
 import smtplib
 import socket
 import sqlite3
-import ssl
 import sys
 import tempfile
 import threading
@@ -220,20 +219,13 @@ class Config(FixedConfig):
     AI_MODEL = "gpt-4o-mini"   # 使用するモデル名
     AI_TIMEOUT = 60            # タイムアウト(秒)
 
-    # メール送信(SMTP)。送信サーバーが空ならメール送信は行えない。
+    # メール送信(SMTP。暗号化・認証なしで送る)。送信サーバーが空ならメール送信は行えない。
+    # 週報・期限超過通知は MAIL_TO / MAIL_CC 宛て、テスト送信は差出人 MAIL_FROM 宛てに送る。
     MAIL_SMTP_SERVER = ""      # 送信サーバー(ホスト名またはIPアドレス)
     MAIL_SMTP_PORT = 25        # ポート番号
-    MAIL_USE_TLS = False       # True なら STARTTLS で暗号化する
-    MAIL_USERNAME = ""         # 認証ユーザー名(空なら認証しない)
-    MAIL_PASSWORD = ""         # 認証パスワード
-    MAIL_FROM = ""             # 差出人アドレス
+    MAIL_FROM = ""             # 差出人アドレス(テスト送信の宛先にも使う)
     MAIL_TO = []               # 宛先(To)のアドレス一覧
     MAIL_CC = []               # 宛先(Cc)のアドレス一覧
-    MAIL_TEST_TO = []          # テスト送信の宛先一覧(空なら差出人 MAIL_FROM 宛て)
-
-    # 期限超過通知(毎朝のメール)の宛先。OVERDUE_MAIL_TO が空なら MAIL_TO / MAIL_CC を使う。
-    OVERDUE_MAIL_TO = []       # 宛先(To)のアドレス一覧
-    OVERDUE_MAIL_CC = []       # 宛先(Cc)のアドレス一覧(OVERDUE_MAIL_TO が空のときは使わない)
 
     # メールに載せるリンクの基準URL(他のPCからこのアプリを開くときのURL。末尾の / は不要)。
     # 空ならメールにリンクを付けない(タスク名だけ)。
@@ -301,38 +293,24 @@ AI_TIMEOUT = 60
 # -----------------------------------------------------------------------------
 # メール送信(SMTP)  ※週報・期限超過通知の送信に使用
 # -----------------------------------------------------------------------------
+# 送信は暗号化(STARTTLS)・認証(ログイン)なしで行います。
+# 認証なしで送信できる送信サーバー(中継サーバーなど)を指定してください。
 # 送信サーバー(ホスト名またはIPアドレス)。空ならメール送信は行えません。
 # 例: MAIL_SMTP_SERVER = "smtp.example.com"
 MAIL_SMTP_SERVER = ""
-# ポート番号(一般的には 25 / 587 など。送信サーバーの指定に合わせる)
+# ポート番号(一般的には 25。送信サーバーの指定に合わせる)
 MAIL_SMTP_PORT = 25
-# True にすると STARTTLS で暗号化して送信します
-# (サーバー証明書とホスト名を検証します。MAIL_SMTP_SERVER は証明書のホスト名と合わせてください)
-MAIL_USE_TLS = False
-# 送信サーバーの認証ユーザー名とパスワード(認証不要なら空のまま)
-MAIL_USERNAME = ""
-MAIL_PASSWORD = ""
-# 差出人アドレス
+# 差出人アドレス(テスト送信・メール接続テストは、このアドレス宛てに送ります)
 # 例: MAIL_FROM = "noreply@example.com"
 MAIL_FROM = ""
-# 宛先(To)・同報(Cc)のアドレス一覧
+# 宛先(To)・同報(Cc)のアドレス一覧(週報・期限超過通知の両方に使います)
 # 例: MAIL_TO = ["manager@example.com", "team@example.com"]
 MAIL_TO = []
 MAIL_CC = []
-# テスト送信の宛先一覧(空なら差出人 MAIL_FROM 宛てに送ります)
-# 例: MAIL_TEST_TO = ["you@example.com"]
-MAIL_TEST_TO = []
 
 # -----------------------------------------------------------------------------
-# 期限超過通知(毎朝のメール)
+# メールのリンク  ※期限超過通知に使用
 # -----------------------------------------------------------------------------
-# 期限超過通知の宛先(To)・同報(Cc)のアドレス一覧。
-# OVERDUE_MAIL_TO が空なら、週報と同じ MAIL_TO / MAIL_CC に送ります
-# (そのとき OVERDUE_MAIL_CC は使いません)。テスト送信は MAIL_TEST_TO 宛てです。
-# 例: OVERDUE_MAIL_TO = ["team@example.com"]
-OVERDUE_MAIL_TO = []
-OVERDUE_MAIL_CC = []
-
 # メールに載せるタスクへのリンクの基準URL
 # (メンバーのPCからこのアプリを開くときのURL。末尾の / は不要)。
 # 空ならメールにはリンクを付けず、タスク名だけを載せます。
@@ -374,6 +352,11 @@ APP_BASE_URL = ""
 #      一時ファイルに書いて置き換える(os.replace。書き込み途中で壊れたファイルを残さない)
 #   同時に保存されても壊れないよう、共通のロック(config_file_lock)で直列化する。
 #   エラーメッセージには設定値(パスワード・キーなど)を含めない。
+#
+# ■ 項目の行の削除(remove_config_keys。基本設定タブの「未使用の設定を削除」で使う)
+#   指定した項目の `KEY = ...` の行を削除する。行のすぐ上に続くコメント(その項目の説明)は、
+#   説明している項目(コメントの下に続けて書かれた行)がすべて削除されるときだけ一緒に削除する。
+#   確認・バックアップ(config.py.bak)・置き換え・ロックは画面からの更新と同じ。
 
 CONFIG_FILENAME = "config.py"
 BACKUP_SUFFIX = ".bak"
@@ -697,6 +680,175 @@ def update_config(instance_path, changes, username, expected_version=None, now=N
             raise ConfigFileError("instance/{} を保存できませんでした（{}）。".format(
                 CONFIG_FILENAME, exc.__class__.__name__)) from exc
         return values
+
+
+# --------------------------------------------------------------------------- #
+# 項目の行の削除
+# --------------------------------------------------------------------------- #
+def _single_target(stmt):
+    """単純な `KEY = 値`(注釈付きを含む)なら KEY、それ以外の形なら None。"""
+    if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 \
+            and isinstance(stmt.targets[0], ast.Name):
+        return stmt.targets[0].id
+    if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+        return stmt.target.id
+    return None
+
+
+def _owns_lines(stmt, lines):
+    """文 stmt の行に、ほかの文が無いか(行ごと削除してよいか)。行末のコメントはかまわない。"""
+    first = lines[stmt.lineno - 1]
+    before = first.encode("utf-8")[:stmt.col_offset].decode("utf-8", "ignore")
+    last = lines[stmt.end_lineno - 1]
+    after = last.encode("utf-8")[stmt.end_col_offset:].decode("utf-8", "ignore").strip()
+    return not before.strip() and (not after or after.startswith("#"))
+
+
+def _lines_to_remove(lines, tree, keys):
+    """削除する行(0始まりの行番号の集合)と、行ごと削除できない項目の一覧を返す。"""
+    statements = tree.body
+    covered = set()
+    for stmt in statements:
+        covered.update(range(stmt.lineno - 1, stmt.end_lineno))
+    targets, blocked = set(), []
+    for index, stmt in enumerate(statements):
+        bound = [key for key in keys if _binds(stmt, key)]
+        if not bound:
+            continue
+        if _single_target(stmt) in keys and _owns_lines(stmt, lines):
+            targets.add(index)
+        else:
+            blocked.extend(bound)
+    if blocked or not targets:
+        return set(), blocked
+
+    # 空行・コメントを挟まずに続けて書かれた文のまとまりごとに処理する
+    runs, run = [], []
+    for index, stmt in enumerate(statements):
+        if run and stmt.lineno != statements[run[-1]].end_lineno + 1:
+            runs.append(run)
+            run = []
+        run.append(index)
+    if run:
+        runs.append(run)
+
+    remove = set()
+    for run in runs:
+        hit = [index for index in run if index in targets]
+        if not hit:
+            continue
+        for index in hit:
+            stmt = statements[index]
+            remove.update(range(stmt.lineno - 1, stmt.end_lineno))
+        if len(hit) != len(run):
+            continue  # ほかの項目と一緒に書かれている(上のコメントはそちらの説明でもあるので残す)
+        # まとまりのすぐ上に続くコメントの行(その項目の説明)も削除する
+        line_no = statements[run[0]].lineno - 2
+        while line_no >= 0 and line_no not in covered:
+            current = lines[line_no]
+            stripped = current.strip()
+            if not stripped.startswith("#") or current.startswith(HEADER_PREFIX):
+                break
+            if line_no < 2 and (current.startswith("#!") or _CODING_RE.match(current)):
+                break
+            remove.add(line_no)
+            line_no -= 1
+
+    # 削除した部分の前後がどちらも空行(またはファイルの末尾)になる場合は、空行を1つにまとめる
+    def blank(i):
+        return not lines[i].strip()
+
+    for start in sorted(remove):
+        if start - 1 in remove or start == 0 or not blank(start - 1):
+            continue
+        end = start
+        while end + 1 in remove:
+            end += 1
+        if end + 1 >= len(lines) or blank(end + 1):
+            remove.add(start - 1)
+    return remove, []
+
+
+def remove_config_keys(instance_path, keys, username, expected_version=None, now=None):
+    """instance/config.py から項目 keys の行(`KEY = 値`)を削除する。
+
+    expected_version を渡すと、ファイルの版がそれと違う場合は ConfigConflictError。
+    戻り値: (削除した項目(ファイルに出てくる順), 削除後のファイルの値)。
+    削除する行が無ければ ([], 今の値) を返す(ファイルは変更しない)。
+    単純な `KEY = 値` 以外の形で書かれた項目がある場合や、削除後の内容を確認できない場合は
+    ConfigFileError(ファイルは変更しない)。
+    """
+    keys = set(keys)
+    with config_file_lock:
+        current = read_config(instance_path)
+        path = current["path"]
+        if expected_version is not None and current["version"] != expected_version:
+            raise ConfigConflictError(
+                "画面を開いた後に instance/{} が更新されています。".format(CONFIG_FILENAME))
+        if not current["exists"]:
+            return [], {}
+
+        text = current["text"]
+        declared = _declared_encoding(text)
+        if declared is not None and not _is_utf8(declared):
+            raise ConfigFileError(
+                "instance/{} の文字コードの指定（coding）が UTF-8 ではないため、画面から更新できません。"
+                "ファイルは変更していません。ファイルを直接編集してください。".format(CONFIG_FILENAME))
+        try:
+            tree = ast.parse(text)
+        except SyntaxError as exc:
+            raise ConfigFileError("instance/{} の {} 行目に書式の誤りがあります。".format(
+                CONFIG_FILENAME, exc.lineno)) from exc
+        lines = _split_lines(text)
+        remove, blocked = _lines_to_remove(lines, tree, keys)
+        if blocked:
+            raise ConfigFileError(
+                "instance/{} の書き方のため、画面から安全に削除できませんでした（{}）。"
+                "ファイルは変更していません。ファイルを直接編集してください。".format(
+                    CONFIG_FILENAME, "、".join(sorted(set(blocked)))))
+        if not remove:
+            return [], current["values"]
+
+        removed = [key for key in current["values"] if key in keys]
+        newline = _newline_of(text)
+        text = "".join(line for index, line in enumerate(lines) if index not in remove)
+        stamp = (now or datetime.now()).strftime("%Y-%m-%d %H:%M")
+        text = _refresh_header(
+            text, "{} {}（画面から未使用の設定を削除: {}）".format(
+                HEADER_PREFIX, stamp, _clean_label(username)),
+            newline)
+
+        data = text.encode("utf-8")
+        if current["bom"]:
+            data = _UTF8_BOM.encode("utf-8") + data
+
+        # 削除後の内容が正しく、削除した項目だけが無くなっていることを確かめてから置き換える
+        try:
+            ast.parse(data)
+            values = evaluate(data, path)
+        except Exception as exc:
+            raise ConfigFileError("削除後の instance/{} を確認できませんでした（{}）。"
+                                  "ファイルは変更していません。".format(
+                                      CONFIG_FILENAME, exc.__class__.__name__)) from exc
+        wrong = [key for key in keys if key in values]
+        for key, old in current["values"].items():
+            if key in keys or not isinstance(old, _PLAIN_TYPES):
+                continue
+            if key not in values or not same_value(values[key], old):
+                wrong.append(key)
+        if wrong:
+            raise ConfigFileError(
+                "instance/{} の書き方のため、画面から安全に削除できませんでした（{}）。"
+                "ファイルは変更していません。ファイルを直接編集してください。".format(
+                    CONFIG_FILENAME, "、".join(sorted(set(wrong)))))
+
+        try:
+            shutil.copy2(path, path + BACKUP_SUFFIX)
+            _write_atomic(path, data)
+        except OSError as exc:
+            raise ConfigFileError("instance/{} を保存できませんでした（{}）。".format(
+                CONFIG_FILENAME, exc.__class__.__name__)) from exc
+        return removed, values
 
 
 # --------------------------------------------------------------------------- #
@@ -1731,6 +1883,34 @@ SKILL_LEVEL_COLORS = {
 # 「単独で実務可能」とみなす到達度の下限(スキル保有状況の指標で使用)
 SKILL_PROFICIENT_LEVEL = 2
 
+# --- スキルの説明(skills.description)の見出し ---
+# 説明は、スキルテストの問題をAIが作るときの出題範囲・難易度の基準になる(8-2 の build_messages)。
+# スキル項目の編集画面の「AIで下書き」(5-6)は、この4つの見出しで下書きを作る。
+DESC_SCOPE = "対象範囲"
+DESC_TOOLS = "使う道具・言語・ソフト"
+DESC_LEVELS = "レベルごとの目安（Lv1〜Lv4）"
+DESC_EXCLUDE = "出題しない範囲"
+SKILL_DESCRIPTION_HEADINGS = (DESC_SCOPE, DESC_TOOLS, DESC_LEVELS, DESC_EXCLUDE)
+# 「レベルごとの目安」に書くレベル(スキルテストで判定するレベルと同じ 1〜4)
+SKILL_DESCRIPTION_LEVELS = (1, 2, 3, 4)
+# 説明の中の見出しの行(行頭の「■」「#」「【」などは省略可。「レベルごとの目安」は後ろの（Lv1〜Lv4）も省略可)
+_DESCRIPTION_HEADING_RE = re.compile(
+    r"^[ \t\u3000]*(?:[■□◆◇●○#＃]+|【|\[)?[ \t\u3000]*"
+    r"(対象範囲|使う道具・言語・ソフト|レベルごとの目安|出題しない範囲)", re.MULTILINE)
+_DESCRIPTION_HEADING_KEYS = {
+    "対象範囲": DESC_SCOPE,
+    "使う道具・言語・ソフト": DESC_TOOLS,
+    "レベルごとの目安": DESC_LEVELS,
+    "出題しない範囲": DESC_EXCLUDE,
+}
+
+
+def description_headings(text):
+    """スキルの説明に含まれる見出し(SKILL_DESCRIPTION_HEADINGS のうち、書かれているもの)。"""
+    found = {_DESCRIPTION_HEADING_KEYS[m.group(1)]
+             for m in _DESCRIPTION_HEADING_RE.finditer(str(text or ""))}
+    return [heading for heading in SKILL_DESCRIPTION_HEADINGS if heading in found]
+
 
 def scale_for(skill_type):
     return SKILL_SCALES.get(skill_type, SKILL_SCALES[SKILL_TECHNICAL])
@@ -2340,10 +2520,10 @@ def ai_chat(messages):
 # =============================================================================
 # メール送信(SMTP)の共通部品。週報・期限超過通知など、どの機能からも使う。
 #
-# 送信サーバー・差出人・宛先・認証情報はすべて instance/config.py に記入する
-# (MAIL_SMTP_SERVER / MAIL_SMTP_PORT / MAIL_USE_TLS / MAIL_USERNAME / MAIL_PASSWORD /
-#  MAIL_FROM / MAIL_TO / MAIL_CC / MAIL_TEST_TO)。システム設定の「基本設定」タブからも変更でき、
-# 保存するとすぐに反映される(値は送信のたびに current_app.config から読む)。
+# 送信サーバー・差出人・宛先はすべて instance/config.py に記入する
+# (MAIL_SMTP_SERVER / MAIL_SMTP_PORT / MAIL_FROM / MAIL_TO / MAIL_CC)。
+# システム設定の「基本設定」タブからも変更でき、保存するとすぐに反映される
+# (値は送信のたびに current_app.config から読む)。
 #
 # send_mail(subject, text, html=None, attachments=(), to=None, cc=None, test=False):
 #   text        : 本文(text/plain・UTF-8)
@@ -2353,14 +2533,13 @@ def ai_chat(messages):
 #                 指定すると multipart/mixed にして本文の後ろに添付する。
 #                 日本語のファイル名は RFC 2231 の形式(filename*=utf-8''...)で付ける
 #   to / cc     : 本番の宛先の一覧。None なら MAIL_TO / MAIL_CC
-#   test        : True ならテスト送信。MAIL_TEST_TO(空なら差出人 MAIL_FROM)だけに送り、
-#                 to / cc は使わない(Cc なし)
+#   test        : True ならテスト送信。差出人 MAIL_FROM だけに送り、to / cc は使わない(Cc なし)
 #   戻り値      : (成功したか, メッセージ)
 #
-# 送信方法は一般的な smtplib の手順どおり:
-#   Date・Message-ID を付け、SMTP(必要なら STARTTLS・認証)で To＋Cc に送る。
-#   STARTTLS ではサーバー証明書とホスト名を検証する(検証できなければ送信しない)。
-# パスワードは画面・ログ・メッセージのどこにも表示しない。
+# 送信方法は smtplib の基本の手順どおり(暗号化〔STARTTLS〕・認証〔ログイン〕は行わない):
+#   smtplib.SMTP(送信サーバー, ポート, timeout=20) に接続し、
+#   sendmail(差出人, To＋Cc, msg.as_string()) で送る。
+#   メッセージには Date・Message-ID を付ける。
 
 SMTP_TIMEOUT = 20
 
@@ -2393,7 +2572,7 @@ def _header_address(item):
 
 
 def mail_settings():
-    """現在のメール設定(画面の読み取り専用表示にも使う。パスワードは含めない)。"""
+    """現在のメール設定(画面の読み取り専用表示にも使う)。"""
     config = current_app.config
     try:
         port = int(config.get("MAIL_SMTP_PORT") or 25)
@@ -2402,25 +2581,21 @@ def mail_settings():
     return {
         "server": str(config.get("MAIL_SMTP_SERVER") or "").strip(),
         "port": port,
-        "use_tls": bool(config.get("MAIL_USE_TLS")),
-        "username": str(config.get("MAIL_USERNAME") or "").strip(),
         "mail_from": str(config.get("MAIL_FROM") or "").strip(),
         "to": mail_addresses(config.get("MAIL_TO")),
         "cc": mail_addresses(config.get("MAIL_CC")),
-        "test_to": mail_addresses(config.get("MAIL_TEST_TO")),
     }
 
 
 def mail_recipients(test=False, to=None, cc=None):
     """宛先 (To, Cc)。
 
-    テスト送信は MAIL_TEST_TO(空なら差出人)宛てで Cc なし(to / cc は使わない)。
+    テスト送信は差出人(MAIL_FROM)宛てで Cc なし(to / cc は使わない)。
     本番送信は to / cc(None なら MAIL_TO / MAIL_CC)。
     """
     values = mail_settings()
     if test:
-        test_to = values["test_to"] or ([values["mail_from"]] if values["mail_from"] else [])
-        return test_to, []
+        return ([values["mail_from"]] if values["mail_from"] else []), []
     to = values["to"] if to is None else mail_addresses(to)
     cc = values["cc"] if cc is None else mail_addresses(cc)
     return to, cc
@@ -2431,6 +2606,7 @@ def check_mail_settings(test=False, to=None, to_label="宛先（MAIL_TO）"):
 
     to       : 本番送信の宛先(None なら MAIL_TO)。テスト送信では使わない
     to_label : 本番の宛先が空のときに示す設定項目の名前
+    テスト送信の宛先は差出人なので、差出人が空なら「差出人」だけを示す。
     """
     values = mail_settings()
     actual_to, _cc = mail_recipients(test, to=to)
@@ -2439,8 +2615,8 @@ def check_mail_settings(test=False, to=None, to_label="宛先（MAIL_TO）"):
         missing.append("送信サーバー（MAIL_SMTP_SERVER）")
     if not values["mail_from"]:
         missing.append("差出人（MAIL_FROM）")
-    if not actual_to:
-        missing.append("テスト送信の宛先（MAIL_TEST_TO または MAIL_FROM）" if test else to_label)
+    if not actual_to and not test:
+        missing.append(to_label)
     if missing:
         return "メールの設定が不足しています: {}。システム設定の「基本設定」タブで設定してください。".format(
             "、".join(missing))
@@ -2482,7 +2658,6 @@ def send_mail(subject, text, html=None, attachments=(), to=None, cc=None, test=F
         return False, problem
 
     values = mail_settings()
-    password = str(current_app.config.get("MAIL_PASSWORD") or "")
     mail_from = values["mail_from"]
     to, cc = mail_recipients(test, to=to, cc=cc)
 
@@ -2501,27 +2676,17 @@ def send_mail(subject, text, html=None, attachments=(), to=None, cc=None, test=F
     envelope = list(dict.fromkeys(to + cc))
 
     try:
+        # 暗号化(STARTTLS)・認証(ログイン)はしない。接続して送るだけ(終わると QUIT で切断する)
         with smtplib.SMTP(values["server"], values["port"], timeout=SMTP_TIMEOUT) as smtp:
-            if values["use_tls"]:
-                smtp.starttls(context=ssl.create_default_context())
-            if values["username"]:
-                smtp.login(values["username"], password)
             refused = smtp.sendmail(mail_from, envelope, msg.as_string())
-    except smtplib.SMTPAuthenticationError:
-        return False, "送信サーバーの認証に失敗しました（MAIL_USERNAME / MAIL_PASSWORD を確認してください）。"
     except smtplib.SMTPRecipientsRefused as exc:
         return False, "すべての宛先が拒否されました: {}".format("、".join(exc.recipients))
     except smtplib.SMTPSenderRefused:
         return False, "差出人（{}）が送信サーバーに拒否されました。".format(mail_from)
-    except smtplib.SMTPNotSupportedError:
-        return False, "送信サーバーが STARTTLS または認証に対応していません（MAIL_USE_TLS / MAIL_USERNAME を確認してください）。"
     except smtplib.SMTPException as exc:
         return False, "メール送信に失敗しました: {}".format(exc)
     except (socket.timeout, TimeoutError):
         return False, "送信サーバーの応答がタイムアウトしました（{}秒）。".format(SMTP_TIMEOUT)
-    except ssl.SSLCertVerificationError as exc:
-        return False, "送信サーバーの証明書を検証できませんでした（MAIL_SMTP_SERVER のホスト名と証明書を確認してください）: {}".format(
-            exc.verify_message or exc)
     except OSError as exc:
         return False, "送信サーバー（{}:{}）に接続できませんでした: {}".format(
             values["server"], values["port"], exc)
@@ -3632,6 +3797,11 @@ def cancel_leave(leave_id):
 #
 # スキルの閲覧・編集はいずれもマネージャーのみ(メンバーは before_request で403)。
 # スキルマップ(マトリクス)、個人スキル、項目定義、到達度の設定を扱う。
+#
+# スキル項目の説明(skills.description)は、スキルテストの問題をAIが作るときの出題範囲の基準になる。
+# 項目の追加・編集の画面の「AIで下書き」(POST /skills/items/description-draft)は、スキル名・区分・
+# カテゴリと到達尺度から、4つの見出し(SKILL_DESCRIPTION_HEADINGS)で説明の下書きをAIに作らせ、
+# 入力欄に入れるだけ(保存はしない。マネージャーが確認して「更新」「追加」を押したときに保存される)。
 
 skills_bp = Blueprint("skills", __name__, url_prefix="/skills")
 
@@ -4036,6 +4206,141 @@ def items():
     )
 
 
+# スキル項目の編集画面から戻る先(?back=pool: スキルテストの問題プールのそのスキルの画面)
+ITEM_BACK_POOL = "pool"
+
+# AIの下書きの最大文字数(これより長い部分は切り捨てる)
+DESCRIPTION_DRAFT_MAX = 2000
+# 下書きから除く制御文字(改行・タブ以外)
+_DRAFT_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# 見出しだけの行の、見出しの語の後ろ(（Lv1〜Lv4）・閉じ括弧・コロンだけなら見出しの行とみなす)
+_HEADING_TAIL = re.compile(r"[ \t　]*(?:（[^）]*）|\([^)]*\))?[ \t　]*[】\]:：]?[ \t　]*$")
+
+
+def _item_back():
+    """編集画面から戻る先(問題プールから開いた場合だけ "pool")。"""
+    return ITEM_BACK_POOL if request.values.get("back") == ITEM_BACK_POOL else ""
+
+
+def _item_scales():
+    """区分ごとの到達尺度のうち、説明の「レベルごとの目安」に書くレベル(Lv1〜Lv4)の文言。"""
+    return {
+        stype: [(level, scale_for(stype)[level]) for level in SKILL_DESCRIPTION_LEVELS
+                if level < len(scale_for(stype))]
+        for stype in SKILL_TYPE_CHOICES
+    }
+
+
+def _render_item_form(skill, form=None, status=200):
+    """スキル項目の追加・編集の画面を表示する(form は再表示する入力)。"""
+    return render_template(
+        "skills/item_form.html", skill=skill,
+        type_choices=SKILL_TYPE_CHOICES, type_labels=SKILL_TYPE_LABELS, form=form,
+        scales=_item_scales(),
+        headings=SKILL_DESCRIPTION_HEADINGS,
+        ai_enabled=ai_is_configured(),
+        ai_status=ai_status_label(),
+        back=_item_back(),
+    ), status
+
+
+def build_description_messages(name, skill_type, category, current=""):
+    """スキルの説明の下書きをAIに作らせるメッセージ(OpenAI形式)。"""
+    lines = [
+        "次のスキルの「説明」の下書きを作成してください。",
+        "この説明は、スキルテストの4択問題を作るときの出題範囲と難易度の基準として使います。",
+        "",
+        "■スキル",
+        "名称: {}".format(name),
+        "区分: {}".format(SKILL_TYPE_LABELS.get(skill_type, skill_type)),
+        "カテゴリ: {}".format(category or "（なし）"),
+        "到達尺度（レベルの意味）:",
+    ]
+    for level, label in _item_scales().get(skill_type, []):
+        lines.append("  Lv{}: {}".format(level, label))
+    current = (current or "").strip()
+    if current:
+        lines += [
+            "",
+            "■今の説明（参考。正しい内容は活かして、下の形式に整理し直す）",
+            current,
+        ]
+    lines += [
+        "",
+        "■出力の形式",
+        "次の4つの見出しを、この順に書く。見出しの行は「■見出し」の形にし、"
+        "見出しの下は「・」で始まる箇条書きにする。",
+        "■{}".format(DESC_SCOPE),
+        "  このスキルで扱う知識・作業の範囲（テストで問う範囲）",
+        "■{}".format(DESC_TOOLS),
+        "  使う道具・プログラミング言語・ソフトウェア（分かればバージョンや機能の範囲も）",
+        "■{}".format(DESC_LEVELS),
+        "  「・Lv1: 」〜「・Lv4: 」の4行。上の到達尺度の文言を、このスキルで具体的に"
+        "できること・分かっていることで書く",
+        "■{}".format(DESC_EXCLUDE),
+        "  テストで問わない内容（ほかのスキルで扱う内容、使わない機能、特定の組織だけの事情など）",
+        "",
+        "■守ること",
+        "・特定の組織の事情に依存しない、一般的な表現で書く",
+        "・スキル名・カテゴリから判断できない道具・ソフトは決めつけず、「（例）」を付けて候補として書く",
+        "・全体で600文字程度までにまとめる",
+        "・4つの見出しと箇条書きだけを出力する（前置き・まとめの文・コードブロックは付けない）",
+    ]
+    return [
+        {"role": "system",
+         "content": ("あなたは、チームのスキル項目の定義を整理する担当者です。"
+                     "指示された形式を守り、日本語で説明の下書きだけを出力してください。")},
+        {"role": "user", "content": "\n".join(lines)},
+    ]
+
+
+def clean_description_draft(text):
+    """AIの応答を説明の下書きに整える(コードブロック・Markdown の記号を除き、見出しを「■」にそろえる)。"""
+    body = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    fence = re.match(r"^```[A-Za-z0-9_-]*\s*\n?(.*?)\n?```\s*$", body, re.DOTALL)
+    if fence:
+        body = fence.group(1).strip()
+    lines = []
+    for line in body.split("\n"):
+        line = _DRAFT_CONTROL.sub("", line).rstrip().replace("**", "")
+        stripped = line.strip()
+        known = _DESCRIPTION_HEADING_RE.match(stripped)
+        heading = re.match(r"^#{1,6}\s*(.+)$", stripped)
+        if known and _HEADING_TAIL.match(stripped, known.end()):
+            # 4つの見出しだけの行(「## 対象範囲」「【出題しない範囲】」など)は「■見出し」にそろえる
+            line = "■" + _DESCRIPTION_HEADING_KEYS[known.group(1)]
+        elif heading:
+            line = "■" + heading.group(1).strip().lstrip("■").strip()
+        elif re.match(r"^[-*]\s+", stripped):
+            line = re.sub(r"^\s*[-*]\s+", "・", line)
+        lines.append(line)
+    body = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    if len(body) > DESCRIPTION_DRAFT_MAX:
+        body = body[:DESCRIPTION_DRAFT_MAX].rstrip()
+    return body
+
+
+def draft_skill_description(name, skill_type, category, current=""):
+    """AIでスキルの説明の下書きを作る(保存はしない)。
+
+    戻り値: (下書き または None, メッセージ)。メッセージは画面にそのまま表示する。
+    """
+    if not ai_is_configured():
+        return None, ("AI（ChatGPT互換API）が未設定のため、下書きを作成できません。"
+                      "システム設定の「基本設定」タブで AI_API_KEY または AI_API_URL を設定してください。")
+    text, error = ai_chat(build_description_messages(name, skill_type, category, current))
+    if error:
+        return None, "AIで下書きを作成できませんでした: {}".format(error)
+    draft = clean_description_draft(text)
+    if not draft:
+        return None, "AIの応答が空でした。もう一度お試しください。"
+    message = "AIの下書きを説明の欄に入れました（まだ保存していません）。内容を確認・修正してから保存してください。"
+    missing = [h for h in SKILL_DESCRIPTION_HEADINGS if h not in description_headings(draft)]
+    if missing:
+        message += "下書きに見出し（{}）がありません。必要なら書き足してください。".format("、".join(missing))
+    return draft, message
+
+
 @skills_bp.route("/items/new", methods=["GET", "POST"])
 @login_required
 def new_item():
@@ -4047,11 +4352,7 @@ def new_item():
         name = request.form.get("name", "").strip()
         if not name:
             flash("スキル名は必須です。", "danger")
-            return render_template(
-                "skills/item_form.html", skill=None,
-                type_choices=SKILL_TYPE_CHOICES, type_labels=SKILL_TYPE_LABELS,
-                form=request.form,
-            )
+            return _render_item_form(None, request.form)
         stype = request.form.get("skill_type")
         if stype not in SKILL_TYPE_CHOICES:
             stype = SKILL_TECHNICAL
@@ -4068,10 +4369,7 @@ def new_item():
         flash("スキル項目を追加しました。", "success")
         return redirect(url_for("skills.items"))
 
-    return render_template(
-        "skills/item_form.html", skill=None,
-        type_choices=SKILL_TYPE_CHOICES, type_labels=SKILL_TYPE_LABELS, form=None,
-    )
+    return _render_item_form(None)
 
 
 @skills_bp.route("/items/<int:skill_id>/edit", methods=["GET", "POST"])
@@ -4088,11 +4386,7 @@ def edit_item(skill_id):
         name = request.form.get("name", "").strip()
         if not name:
             flash("スキル名は必須です。", "danger")
-            return render_template(
-                "skills/item_form.html", skill=skill,
-                type_choices=SKILL_TYPE_CHOICES, type_labels=SKILL_TYPE_LABELS,
-                form=request.form,
-            )
+            return _render_item_form(skill, request.form)
         # skill_type は到達度との整合のため変更不可(表示のみ)
         skill.name = name
         skill.category = request.form.get("category", "").strip()
@@ -4101,12 +4395,56 @@ def edit_item(skill_id):
         skill.sort_order = int(order_raw) if order_raw.lstrip("-").isdigit() else 0
         db.session.commit()
         flash("スキル項目を更新しました。", "success")
+        if _item_back() == ITEM_BACK_POOL:
+            return redirect(url_for("skilltest.admin_pool_skill", skill_id=skill.id))
         return redirect(url_for("skills.items"))
 
-    return render_template(
-        "skills/item_form.html", skill=skill,
-        type_choices=SKILL_TYPE_CHOICES, type_labels=SKILL_TYPE_LABELS, form=None,
-    )
+    return _render_item_form(skill)
+
+
+@skills_bp.route("/items/description-draft", methods=["POST"])
+@login_required
+def description_draft():
+    """スキルの説明の下書きをAIで作る(保存はしない)。
+
+    フォームの入力(スキル名・区分・カテゴリ・今の説明)と、編集中なら URL の skill_id から下書きを作る。
+    画面の JavaScript からは Accept: application/json で呼び、{ok, draft, message} を受け取って
+    説明の欄に入れる。JavaScript が無効なときは、入力を残したまま下書きを入れた画面を表示する。
+    どちらも DB には書き込まない。
+    """
+    wants_json = request.accept_mimetypes.best_match(
+        ["application/json", "text/html"]) == "application/json"
+    if not _can_edit_skill():
+        if wants_json:
+            return jsonify(ok=False, message="権限がありません(マネージャー)。"), 403
+        abort(403)
+
+    skill = None
+    raw_id = request.values.get("skill_id", "").strip()
+    if raw_id:
+        skill = db.session.get(Skill, int(raw_id)) if raw_id.isdecimal() else None
+        if skill is None:
+            abort(404)
+    # 区分は、編集中のスキルならそのスキルの区分(変更できないため)、追加中なら選択中の区分
+    skill_type = skill.skill_type if skill is not None else request.form.get("skill_type")
+    if skill_type not in SKILL_TYPE_CHOICES:
+        skill_type = SKILL_TECHNICAL
+    name = request.form.get("name", "").strip()
+    category = request.form.get("category", "").strip()
+    current = request.form.get("description", "")
+
+    if not name:
+        draft, message = None, "スキル名を入力してから「AIで下書き」を押してください。"
+    else:
+        draft, message = draft_skill_description(name, skill_type, category, current)
+    if wants_json:
+        return jsonify(ok=draft is not None, draft=draft or "", message=message)
+
+    # JavaScript が無効なとき: 入力を残し、説明の欄に下書きを入れて表示する(保存はしない)
+    form = {key: request.form.get(key, "") for key in ("name", "skill_type", "category", "sort_order")}
+    form["description"] = draft if draft is not None else current
+    flash(message, "info" if draft is not None else "danger")
+    return _render_item_form(skill, form)
 
 
 @skills_bp.route("/items/<int:skill_id>/toggle", methods=["POST"])
@@ -6464,7 +6802,7 @@ def build_docx(material, written, created_at, app_name):
 #   2. 材料を集める(collect_weekly_material) → 文章を作る(write_report) → Wordにする(build_docx)
 #   3. deliver に応じて:
 #        "download" : ファイルを返すだけ(送信しない・前回の結果も変えない)
-#        "test"     : テスト宛先(MAIL_TEST_TO、空なら差出人)に送る。Cc なし
+#        "test"     : テスト送信。差出人(MAIL_FROM)だけに送る。Cc なし
 #        "send"     : 本番の宛先(MAIL_TO・MAIL_CC)に送る
 #      test / send は成否にかかわらず「前回の結果」を上書きする。
 #
@@ -6692,7 +7030,6 @@ def _render_weekly(settings):
         upcoming_period = period_label(*period_for(upcoming.date(), settings["period_rule"]))
 
     mail = mail_settings()
-    test_to, _cc = mail_recipients(test=True)
     return render_template(
         "weekly/index.html",
         settings=settings,
@@ -6709,8 +7046,6 @@ def _render_weekly(settings):
         mail=mail,
         mail_problem=check_mail_settings(test=False),
         test_problem=check_mail_settings(test=True),
-        test_to_count=len(test_to),
-        test_to_is_from=not mail["test_to"],
         ai_enabled=ai_is_configured(),
         ai_status=ai_status_label(),
         sending=weekly_is_sending(),
@@ -7304,9 +7639,8 @@ def build_overdue_content(today, comment_count):
 # run_overdue(app, trigger, test):
 #   1. 設定(instance/overdue_settings.json)を読み込む
 #   2. 期限超過タスクを集めてメール(件名・テキスト版・HTML版)を作る(build_overdue_content)
-#   3. test=True  : テスト宛先(MAIL_TEST_TO、空なら差出人)に送る。Cc なし
-#      test=False : 本番の宛先に送る。OVERDUE_MAIL_TO が記入されていれば
-#                   OVERDUE_MAIL_TO・OVERDUE_MAIL_CC、空なら MAIL_TO・MAIL_CC
+#   3. test=True  : テスト送信。差出人(MAIL_FROM)だけに送る。Cc なし
+#      test=False : 本番の宛先(週報と同じ MAIL_TO・MAIL_CC)に送る
 #   成否にかかわらず「前回の結果」を上書きする。期限超過が0件でも送る(「該当なし」)。
 #
 # start_overdue_background(...) は送信を別スレッドで実行する(画面からの送信用。
@@ -7315,9 +7649,6 @@ def build_overdue_content(today, comment_count):
 #
 # DBは読み取りのみ(書き込みは一切しない)。必ず app.app_context() の中で動く。
 
-# 本番の宛先が空のときに示す設定項目の名前
-OVERDUE_TO_LABEL = "宛先（OVERDUE_MAIL_TO または MAIL_TO）"
-
 # メール送信(テスト・本番)は同時に1つだけ(二重送信を防ぐ)
 _overdue_send_lock = threading.Lock()
 
@@ -7325,26 +7656,6 @@ _overdue_send_lock = threading.Lock()
 def overdue_is_sending():
     """メール送信(テスト・本番)の処理中か。"""
     return _overdue_send_lock.locked()
-
-
-def overdue_recipients():
-    """本番の宛先 (To, Cc, 使う設定の名前)。
-
-    OVERDUE_MAIL_TO が記入されていれば OVERDUE_MAIL_TO・OVERDUE_MAIL_CC を、
-    空なら週報と同じ MAIL_TO・MAIL_CC を使う。
-    """
-    config = current_app.config
-    to = mail_addresses(config.get("OVERDUE_MAIL_TO"))
-    if to:
-        return to, mail_addresses(config.get("OVERDUE_MAIL_CC")), "OVERDUE_MAIL_TO / OVERDUE_MAIL_CC"
-    values = mail_settings()
-    return values["to"], values["cc"], "MAIL_TO / MAIL_CC"
-
-
-def check_overdue_mail_settings(test=False):
-    """送信に必要な設定が揃っているか。問題があればその説明、無ければ None。"""
-    to, _cc, _source = overdue_recipients()
-    return check_mail_settings(test, to=to, to_label=OVERDUE_TO_LABEL)
 
 
 def build_overdue_mail(today=None):
@@ -7366,14 +7677,14 @@ def _deliver_overdue(app, trigger, test, today):
     """送信の本体(_send_lock を持った状態で呼ぶ)。成否にかかわらず「前回の結果」を上書きする。"""
     with app.app_context():
         try:
-            problem = check_overdue_mail_settings(test)
+            problem = check_mail_settings(test)
             if problem:
                 ok, message = False, problem
             else:
                 mail = build_overdue_mail(today)
-                to, cc, _source = overdue_recipients()
+                # 宛先は週報と同じ MAIL_TO・MAIL_CC(テスト送信は差出人だけ)
                 ok, send_message = send_mail(
-                    mail["subject"], mail["text"], html=mail["html"], to=to, cc=cc, test=test)
+                    mail["subject"], mail["text"], html=mail["html"], test=test)
                 message = _overdue_summary(mail, send_message)
         except Exception as exc:
             app.logger.exception("期限超過通知の作成・送信に失敗しました")
@@ -7465,8 +7776,6 @@ def _preview_document(html):
 def _render_overdue(settings):
     """期限超過通知の画面を表示する(実行と状況だけ。設定はシステム設定の「期限超過通知」タブ)。"""
     mail = mail_settings()
-    to, cc, source = overdue_recipients()
-    test_to, _cc = mail_recipients(test=True)
     base_url, link_problem = link_base()
     # 今この時点のメールの内容。「今すぐ送信」と同じく保存済みの設定で作る
     preview = build_overdue_content(date.today(), settings["comment_count"])
@@ -7477,13 +7786,10 @@ def _render_overdue(settings):
         weekday_labels=WEEKDAY_LABELS,
         last=settings["last_result"],
         mail=mail,
-        to_count=len(to),
-        cc_count=len(cc),
-        recipient_source=source,
-        mail_problem=check_overdue_mail_settings(test=False),
-        test_problem=check_overdue_mail_settings(test=True),
-        test_to_count=len(test_to),
-        test_to_is_from=not mail["test_to"],
+        to_count=len(mail["to"]),
+        cc_count=len(mail["cc"]),
+        mail_problem=check_mail_settings(test=False),
+        test_problem=check_mail_settings(test=True),
         base_url=base_url,
         link_configured=bool(str(current_app.config.get("APP_BASE_URL") or "").strip()),
         link_problem=link_problem,
@@ -7739,6 +8045,10 @@ def skilltest_plan(settings, levels):
 #   ・同じスキルの既存の問題(有効・無効とも)や、同じ応答の中の問題と内容が重複しない
 #     (全角/半角・大文字/小文字・空白・句読点の違いは同じとみなす)
 # 応答の前後にコードブロック(```json … ```)や説明文が付いていても、JSONの配列を取り出して読む。
+#
+# AIには、スキル名・カテゴリ・説明(skills.description)・レベルの意味(到達尺度の文言)を伝える。
+# 説明に見出し(3-5 の SKILL_DESCRIPTION_HEADINGS)があれば、「対象範囲」の中から出題し、
+# 「出題しない範囲」からは出題しないこと、難易度は「レベルごとの目安」に合わせることを指示する。
 
 # 1回のAI呼び出しで作る問題数の上限
 CHUNK_SIZE = 10
@@ -7784,22 +8094,53 @@ def model_label():
     return name[:64]
 
 
+def _scope_rules(description, level):
+    """説明(skills.description)に合わせた出題範囲の指示(「■守ること」に加える行)。"""
+    if not description:
+        return ["・説明が無いため、スキル名とカテゴリから一般に想定される範囲で出題する"]
+    headings = description_headings(description)
+    rules = []
+    if DESC_SCOPE in headings:
+        rules.append("・説明の「{}」に書かれた内容の中から出題し、その範囲の外からは出題しない".format(
+            DESC_SCOPE))
+    else:
+        rules.append("・説明に書かれた範囲の中から出題する")
+    if DESC_TOOLS in headings:
+        rules.append("・道具・言語・ソフトに関する問題は、説明の「{}」に書かれたものだけを扱う".format(
+            DESC_TOOLS))
+    if DESC_LEVELS in headings:
+        rules.append("・難易度は、説明の「{}」の Lv{} の内容に合わせる".format(DESC_LEVELS, level))
+    if DESC_EXCLUDE in headings:
+        rules.append("・説明の「{}」に書かれた内容は出題しない（選択肢の題材にもしない）".format(
+            DESC_EXCLUDE))
+    return rules
+
+
 def build_messages(skill, level, count, avoid=()):
     """AIに送るメッセージ(OpenAI形式)を作る。"""
     label = level_label(skill.skill_type or SKILL_TECHNICAL, level)
+    description = (skill.description or "").strip()
     lines = [
         "次の条件で、4択の問題を{}問作成してください。".format(count),
         "",
         "■スキル",
         "名称: {}".format(skill.name),
         "カテゴリ: {}".format(skill.category or "（なし）"),
-        "説明: {}".format((skill.description or "（なし）").strip()),
+    ]
+    if description:
+        lines += ["説明（出題範囲の定義。次の「---」の行の間）:", "---", description, "---"]
+    else:
+        lines.append("説明: （なし）")
+    lines += [
         "",
         "■難易度: レベル{}（1〜4の4段階）".format(level),
         "このレベルの目安: 「{}」人なら正解できる水準".format(label),
         "出題の方針: {}".format(DIFFICULTY.get(level, DIFFICULTY[4])),
         "",
         "■守ること",
+    ]
+    lines += _scope_rules(description, level)
+    lines += [
         "・特定の組織の事情に依存しない、一般に通用する知識・技能を問う",
         "・正解はちょうど1つ。ほかの3つは、もっともらしいが明確に誤りの選択肢にする",
         "・「すべて正しい」「どれでもない」のような選択肢は使わない",
@@ -8869,6 +9210,8 @@ def skilltest_form_context(settings):
 #   GET  /skilltest/admin/pool               問題プール(スキル・レベルごとの問題数、補充)
 #   GET  /skilltest/admin/pool/<skill_id>    スキルごとの問題の一覧(有効/無効の切り替え)
 #   POST /skilltest/admin/pool/<skill_id>/topup        問題の補充(バックグラウンド)
+#   POST /skilltest/admin/pool/<skill_id>/deactivate   そのスキルの有効な問題をすべて停止(無効)にする
+#                                                      (説明を変えた後、古い説明で作った問題を入れ替えるため)
 #   POST /skilltest/admin/questions/<id>/toggle        問題の有効/無効の切り替え
 #   GET  /skilltest/admin/settings, POST 同じURL       旧URL。設定はシステム設定の「スキルテスト」タブへ移した
 #                                                      (GET はそのタブへ、POST はその保存へ転送する)
@@ -9147,6 +9490,7 @@ def admin_pool():
         rows.append({
             "skill": skill,
             "testable": is_testable(skill),
+            "no_description": not (skill.description or "").strip(),
             "cells": [
                 {
                     "level": lv,
@@ -9203,6 +9547,9 @@ def admin_pool_skill(skill_id):
         running=is_topup_running(),
         ai_enabled=ai_is_configured(),
         target=settings["pool_target_per_level"],
+        active_total=SkillTestQuestion.query.filter_by(skill_id=skill.id, is_active=True).count(),
+        headings=SKILL_DESCRIPTION_HEADINGS,
+        found_headings=description_headings(skill.description),
     )
 
 
@@ -9227,6 +9574,32 @@ def admin_topup(skill_id):
           "「前回の補充の結果」に表示されます（画面を再読み込みして確認してください）。".format(skill.name),
           "info")
     return redirect(back)
+
+
+@skilltest_bp.route("/admin/pool/<int:skill_id>/deactivate", methods=["POST"])
+def admin_deactivate_all(skill_id):
+    """そのスキルの有効な問題をすべて停止(無効)にする(受験履歴・問題は残す)。
+
+    スキルの説明を変えた後、古い説明で作った問題を出題から外し、補充で入れ替えるために使う。
+    """
+    skill = db.session.get(Skill, skill_id)
+    if skill is None:
+        abort(404)
+    count = (SkillTestQuestion.query
+             .filter_by(skill_id=skill.id, is_active=True)
+             .update({SkillTestQuestion.is_active: False}, synchronize_session=False))
+    db.session.commit()
+    if count:
+        current_app.logger.info("スキルテスト: 「%s」の問題 %d 問をすべて停止しました（%s）",
+                                skill.name, count, current_user.username)
+        message = "「{}」の有効な問題 {}問をすべて停止しました（今後は出題しません。受験履歴には残ります）。".format(
+            skill.name, count)
+        if is_testable(skill):
+            message += "「AIで補充」で、今の説明から新しい問題を作れます。"
+        flash(message, "info")
+    else:
+        flash("「{}」に有効な問題はありません。".format(skill.name), "info")
+    return redirect(url_for("skilltest.admin_pool_skill", skill_id=skill.id))
 
 
 @skilltest_bp.route("/admin/questions/<int:question_id>/toggle", methods=["POST"])
@@ -9319,7 +9692,6 @@ GROUP_LDAP = "ldap"
 GROUP_AI = "ai"
 GROUP_MAIL = "mail"
 GROUP_RECIPIENTS = "recipients"
-GROUP_OVERDUE = "overdue"
 GROUP_SERVER = "server"
 
 GROUPS = (
@@ -9328,8 +9700,7 @@ GROUPS = (
     (GROUP_AI, "AI"),
     (GROUP_MAIL, "メール送信"),
     (GROUP_RECIPIENTS, "宛先"),
-    (GROUP_OVERDUE, "期限超過通知の宛先"),
-    (GROUP_SERVER, "リンク・サーバー"),
+    (GROUP_SERVER, "リンク"),
 )
 # ホスト名・IPアドレスに使える文字
 _HOST_PATTERN = r"[A-Za-z0-9._:\-\[\]]+"
@@ -9410,64 +9781,32 @@ FIELDS = (
     # ---- メール送信 ----
     Field(
         "MAIL_SMTP_SERVER", GROUP_MAIL, "送信サーバー",
-        "ホスト名またはIPアドレスです（例: smtp.example.com）。空ならメールは送信できません。",
+        "ホスト名またはIPアドレスです（例: smtp.example.com）。空ならメールは送信できません。"
+        "送信は暗号化（STARTTLS）・認証（ログイン）なしで行うため、認証なしで送信できるサーバーを指定します。",
         pattern=_HOST_PATTERN, pattern_help=_HOST_HELP,
     ),
     Field(
         "MAIL_SMTP_PORT", GROUP_MAIL, "ポート番号",
-        "一般的には 25 / 587 などです。送信サーバーの指定に合わせます。",
+        "一般的には 25 です。送信サーバーの指定に合わせます。",
         type=TYPE_INT, min=1, max=65535,
     ),
     Field(
-        "MAIL_USE_TLS", GROUP_MAIL, "STARTTLS で暗号化する",
-        "オンにすると STARTTLS で暗号化して送信します（サーバー証明書とホスト名を検証します。"
-        "送信サーバーは証明書のホスト名と合わせてください）。",
-        type=TYPE_BOOL,
-    ),
-    Field(
-        "MAIL_USERNAME", GROUP_MAIL, "認証ユーザー名",
-        "送信サーバーの認証ユーザー名です。認証が不要なら空のままにします。",
-    ),
-    Field(
-        "MAIL_PASSWORD", GROUP_MAIL, "認証パスワード",
-        "送信サーバーの認証パスワードです。値は表示しません。"
-        "送信サーバー・ポート番号・認証ユーザー名を変えるときは、パスワードを入力し直すか「空にする」を指定してください。",
-        type=TYPE_SECRET, secret=True,
-        bound_to=("MAIL_SMTP_SERVER", "MAIL_SMTP_PORT", "MAIL_USERNAME"),
-    ),
-    Field(
         "MAIL_FROM", GROUP_MAIL, "差出人アドレス",
-        "例: noreply@example.com",
+        "例: noreply@example.com。テスト送信・メール接続テストは、このアドレス宛てに送ります。",
         type=TYPE_ADDRESS,
     ),
     # ---- 宛先 ----
     Field(
         "MAIL_TO", GROUP_RECIPIENTS, "宛先（To）",
-        "週報の宛先です（期限超過通知の宛先が空のときは期限超過通知にも使います）。",
+        "週報と期限超過通知の宛先です。",
         type=TYPE_ADDRESSES,
     ),
     Field(
         "MAIL_CC", GROUP_RECIPIENTS, "同報（Cc）",
-        "週報の同報（Cc）です。",
+        "週報と期限超過通知の同報（Cc）です。",
         type=TYPE_ADDRESSES,
     ),
-    Field(
-        "MAIL_TEST_TO", GROUP_RECIPIENTS, "テスト送信の宛先",
-        "テスト送信・メール接続テストの宛先です。空なら差出人アドレス宛てに送ります。",
-        type=TYPE_ADDRESSES,
-    ),
-    # ---- 期限超過通知の宛先 ----
-    Field(
-        "OVERDUE_MAIL_TO", GROUP_OVERDUE, "宛先（To）",
-        "期限超過通知の宛先です。空なら週報と同じ宛先（MAIL_TO / MAIL_CC）に送ります。",
-        type=TYPE_ADDRESSES,
-    ),
-    Field(
-        "OVERDUE_MAIL_CC", GROUP_OVERDUE, "同報（Cc）",
-        "期限超過通知の同報（Cc）です。OVERDUE_MAIL_TO が空のときは使いません。",
-        type=TYPE_ADDRESSES,
-    ),
-    # ---- リンク・サーバー ----
+    # ---- リンク ----
     Field(
         "APP_BASE_URL", GROUP_SERVER, "リンクの基準URL",
         "メールに載せるタスクへのリンクの基準URLです（メンバーのPCからこのアプリを開くときのURL。"
@@ -9479,13 +9818,18 @@ FIELDS = (
 FIELD_MAP = {field.key: field for field in FIELDS}
 SECRET_KEYS = tuple(field.key for field in FIELDS if field.secret)
 
-# 以前の版で使っていて、今は使わない項目。instance/config.py に残っていれば、画面の「その他」に
-# この説明を付けて表示する(ファイルからは消さない)
+# 以前の版で使っていて、今は使わない項目 {キー: 使わない理由}。instance/config.py に残っていれば、
+# 画面の「その他」に「未使用」としてこの理由を付けて表示する。ファイルからは自動では消さず、
+# マネージャーが「未使用の設定を削除」を押したときだけ、その行を削除する(remove_unused_config)
 RETIRED_KEYS = {
-    "SERVER_HOST": "instance/config.py だけに記載（使われていません。待ち受けのアドレスは起動のコマンド"
-                   "「flask --app app run」の --host で指定します）",
-    "SERVER_PORT": "instance/config.py だけに記載（使われていません。待ち受けのポートは起動のコマンド"
-                   "「flask --app app run」の --port で指定します）",
+    "SERVER_HOST": "待ち受けのアドレスは起動のコマンド「flask --app app run」の --host で指定します",
+    "SERVER_PORT": "待ち受けのポートは起動のコマンド「flask --app app run」の --port で指定します",
+    "MAIL_USE_TLS": "メールは暗号化（STARTTLS）なしで送信します",
+    "MAIL_USERNAME": "メールは認証（ログイン）なしで送信します",
+    "MAIL_PASSWORD": "メールは認証（ログイン）なしで送信します",
+    "MAIL_TEST_TO": "テスト送信・メール接続テストは差出人（MAIL_FROM）宛てに送ります",
+    "OVERDUE_MAIL_TO": "期限超過通知は週報と同じ宛先（MAIL_TO）に送ります",
+    "OVERDUE_MAIL_CC": "期限超過通知は週報と同じ同報（MAIL_CC）に送ります",
 }
 
 
@@ -9531,7 +9875,7 @@ def documented_keys():
 #   4. 再起動が不要な項目は、実行中のアプリの設定(current_app.config)にもすぐ反映する。
 #      SECRET_KEY はファイルにだけ書き、再起動後に反映される
 #
-# 秘密の値(SECRET_KEY / ADMIN_PASSWORD / AI_API_KEY / MAIL_PASSWORD)は、画面・ログ・
+# 秘密の値(SECRET_KEY / ADMIN_PASSWORD / AI_API_KEY)は、画面・ログ・
 # メッセージのどこにも出さない(画面には「設定あり／未設定」だけを表示する)。
 
 CONFIG_TEXT_MAX = 500           # 1行の文字列・URLの最大文字数
@@ -9737,13 +10081,6 @@ def _destination(key, value):
             return parts.scheme.lower(), (parts.hostname or "").lower(), port
         except ValueError:
             return url
-    if key == "MAIL_SMTP_PORT":
-        try:
-            return int(value or 25)
-        except (TypeError, ValueError):
-            return value
-    if key == "MAIL_SMTP_SERVER":
-        return str(value or "").strip().lower()
     return str(value or "").strip()
 
 
@@ -9877,6 +10214,39 @@ def save_config_form(app, form, username):
                       applied=applied)
 
 
+def remove_unused_config(app, form, username):
+    """instance/config.py に残っている、今は使わない項目(RETIRED_KEYS)の行を削除する。
+
+    form の version(画面を開いたときのファイルの版)が今の版と違えば削除しない(競合)。
+    削除の仕組みは remove_config_keys()(1-3。変更前の内容は instance/config.py.bak に残す)。
+    戻り値: (結果 CONFIG_SAVE_〜, 削除した項目の一覧, メッセージ)。
+    """
+    with config_file_lock:
+        try:
+            info = read_config(app.instance_path)
+        except ConfigFileError as exc:
+            return CONFIG_SAVE_ERROR, [], str(exc)
+        if form.get("version", "") != info["version"]:
+            return CONFIG_SAVE_CONFLICT, [], MSG_CONFLICT
+        keys = unused_keys_in_file(info["values"])
+        if not keys:
+            return CONFIG_SAVE_UNCHANGED, [], ""
+        try:
+            removed, _values = remove_config_keys(
+                app.instance_path, keys, username, expected_version=info["version"])
+        except ConfigConflictError:
+            return CONFIG_SAVE_CONFLICT, [], MSG_CONFLICT
+        except ConfigFileError as exc:
+            app.logger.warning("システム設定（基本設定）: 未使用の設定を削除できませんでした: %s", exc)
+            return CONFIG_SAVE_ERROR, [], str(exc)
+        # 実行中の設定からも外す(どこからも使われていないが、ファイルと揃える)
+        for key in removed:
+            app.config.pop(key, None)
+        app.logger.info("システム設定（基本設定）: 未使用の設定を削除しました: %s（%s）",
+                        ", ".join(removed), username)
+        return CONFIG_SAVE_OK, removed, ""
+
+
 # --------------------------------------------------------------------------- #
 # 画面表示用の値
 # --------------------------------------------------------------------------- #
@@ -9901,12 +10271,17 @@ def _is_set(value):
     return value not in (None, "", [], ())
 
 
+def unused_keys_in_file(file_values):
+    """instance/config.py に残っている、今は使わない項目(RETIRED_KEYS。ファイルに出てくる順)。"""
+    return [key for key in file_values if key in RETIRED_KEYS]
+
+
 def _other_rows(app, file_values):
-    """定義の無いキー(読み取り専用で「その他」に表示)。"""
+    """定義の無いキー(読み取り専用で「その他」に表示)。今は使わない項目には retired を付ける。"""
     documented, fixed = documented_keys()
     base = defaults(app)
     keys = [(key, "app.py の見本・既定値") for key in documented if key not in FIELD_MAP]
-    keys += [(key, RETIRED_KEYS.get(key, "instance/config.py だけに記載")) for key in file_values
+    keys += [(key, "instance/config.py だけに記載") for key in file_values
              if key not in FIELD_MAP and key not in fixed and key not in documented]
     rows = []
     for key, source in keys:
@@ -9921,6 +10296,8 @@ def _other_rows(app, file_values):
             "is_set": _is_set(value),
             "hidden": hidden,
             "value": "" if hidden else (text if len(text) <= 120 else text[:117] + "..."),
+            "retired": key in RETIRED_KEYS,
+            "retired_note": RETIRED_KEYS.get(key, ""),
         })
     return rows
 
@@ -9970,7 +10347,6 @@ def config_form_context(app, state=None, errors=None):
             rows.append(row)
         groups.append({"key": group_key, "label": group_label, "rows": rows})
 
-    test_to, _cc = mail_recipients(test=True)
     return {
         "file_error": file_error,
         "can_save": info is not None,
@@ -9978,12 +10354,12 @@ def config_form_context(app, state=None, errors=None):
         "version": info["version"] if info else "",
         "groups": groups,
         "other": _other_rows(app, file_values),
+        "unused": unused_keys_in_file(file_values),
         "pending": pending,
         "pending_secret_key": "SECRET_KEY" in pending_keys,
         "error_count": len(errors),
         "mail_test_problem": check_mail_settings(test=True),
-        "mail_test_to_count": len(test_to),
-        "mail_test_to_is_from": not mail_settings()["test_to"],
+        "mail_from": mail_settings()["mail_from"],
         "ai_enabled": ai_is_configured(),
         "ai_status": ai_status_label(),
     }
@@ -9999,7 +10375,10 @@ def config_form_context(app, state=None, errors=None):
 # POST /system/settings/weekly         週報の設定の保存(instance/weekly_settings.json)
 # POST /system/settings/overdue        期限超過通知の設定の保存(instance/overdue_settings.json)
 # POST /system/settings/skilltest      スキルテストの設定の保存(instance/skilltest_settings.json)
-# POST /system/settings/test-mail      メール接続テスト(保存済みの設定で、テスト送信の宛先へ短いメール)
+# POST /system/settings/config/remove-unused
+#                                      基本設定の「未使用の設定を削除」(instance/config.py から
+#                                      今は使わない項目の行を削除する。RETIRED_KEYS)
+# POST /system/settings/test-mail      メール接続テスト(保存済みの設定で、差出人宛てに短いメール)
 # POST /system/settings/test-ai        AI接続テスト(保存済みの設定で、短い問い合わせを1回)
 #
 # タブごとに別のフォーム・保存ボタンを持ち、保存後は同じタブに戻る(?tab= で開くタブを指定)。
@@ -10147,9 +10526,26 @@ def save_config():
     return redirect(_tab_url(TAB_CONFIG))
 
 
+@system_bp.route("/settings/config/remove-unused", methods=["POST"])
+def remove_unused():
+    """instance/config.py から、今は使わない項目(「その他」の「未使用」)の行を削除する。"""
+    app = current_app._get_current_object()
+    status, removed, message = remove_unused_config(app, request.form, current_user.username)
+    if status == CONFIG_SAVE_OK:
+        flash("未使用の設定を削除しました（{}）。変更前の内容は instance/config.py.bak に残しています。".format(
+            "、".join(removed)), "success")
+    elif status == CONFIG_SAVE_UNCHANGED:
+        flash("削除する未使用の設定はありません（設定ファイルは更新していません）。", "info")
+    elif status == CONFIG_SAVE_CONFLICT:
+        flash(message, "warning")
+    else:
+        flash("未使用の設定を削除できませんでした: {}".format(message), "danger")
+    return redirect(_tab_url(TAB_CONFIG))
+
+
 @system_bp.route("/settings/test-mail", methods=["POST"])
 def test_mail():
-    """保存済みの設定で、テスト送信の宛先(MAIL_TEST_TO。空なら差出人)へ短いメールを送る。"""
+    """保存済みの設定で、差出人(MAIL_FROM)宛てに短いメールを送る。"""
     app = current_app._get_current_object()
     subject = "【接続テスト】{}".format(app.config.get("APP_NAME") or "業務管理システム")
     text = (

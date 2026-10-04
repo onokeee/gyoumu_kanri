@@ -1831,23 +1831,27 @@
 {% endmacro %}
 
 {% block content %}
+{% set current_type = skill.skill_type if editing else val('skill_type', 'テクニカル') %}
 <div class="row justify-content-center">
-  <div class="col-lg-7">
+  <div class="col-lg-8">
     <h1 class="h3 mb-3">{{ 'スキル項目の編集' if editing else 'スキル項目の追加' }}</h1>
 
-    <form method="post" class="card card-body shadow-sm">
+    {# action を明示する(「AIで下書き」を JavaScript なしで使ったときの再表示でも、保存はこの URL に送る) #}
+    <form method="post" class="card card-body shadow-sm" id="skill-item-form"
+          action="{{ url_for('skills.edit_item', skill_id=skill.id) if editing else url_for('skills.new_item') }}">
+      {% if back %}<input type="hidden" name="back" value="{{ back }}">{% endif %}
       <div class="mb-3">
-        <label class="form-label">スキル名 <span class="text-danger">*</span></label>
-        <input type="text" name="name" class="form-control" required value="{{ val('name') }}">
+        <label class="form-label" for="item-name">スキル名 <span class="text-danger">*</span></label>
+        <input type="text" name="name" id="item-name" class="form-control" required value="{{ val('name') }}">
       </div>
 
       <div class="mb-3">
-        <label class="form-label">区分</label>
+        <label class="form-label" for="item-type">区分</label>
         {% if editing %}
-        <input type="text" class="form-control" value="{{ skill.type_label }}" disabled>
+        <input type="text" id="item-type" class="form-control" value="{{ skill.type_label }}" disabled>
         <div class="form-text">区分は到達度との整合のため変更できません。</div>
         {% else %}
-        <select name="skill_type" class="form-select">
+        <select name="skill_type" id="item-type" class="form-select">
           {% for t in type_choices %}
           <option value="{{ t }}" {% if val('skill_type','テクニカル') == t %}selected{% endif %}>{{ type_labels[t] }}</option>
           {% endfor %}
@@ -1857,28 +1861,77 @@
 
       <div class="row">
         <div class="col-md-8 mb-3">
-          <label class="form-label">カテゴリ(任意)</label>
-          <input type="text" name="category" class="form-control" value="{{ val('category') }}"
+          <label class="form-label" for="item-category">カテゴリ(任意)</label>
+          <input type="text" name="category" id="item-category" class="form-control" value="{{ val('category') }}"
                  placeholder="例:開発 / 分析 / 運用">
         </div>
         <div class="col-md-4 mb-3">
-          <label class="form-label">並び順</label>
-          <input type="number" name="sort_order" class="form-control" value="{{ val('sort_order','0') }}">
+          <label class="form-label" for="item-sort">並び順</label>
+          <input type="number" name="sort_order" id="item-sort" class="form-control" value="{{ val('sort_order','0') }}">
         </div>
       </div>
 
       <div class="mb-3">
-        <label class="form-label">説明・到達度の判断基準(任意)</label>
-        <textarea name="description" class="form-control" rows="3">{{ val('description') }}</textarea>
+        <div class="d-flex justify-content-between align-items-end flex-wrap gap-2 mb-1">
+          <label class="form-label mb-0" for="item-description">説明・到達度の判断基準(任意)</label>
+          {# JavaScript が有効なら、画面を移動せずに下書きを入れる(skill-item-form.js)。
+             無効なら、このボタンで入力を残したまま下書きを入れた画面を表示する(どちらも保存はしない) #}
+          <button type="submit" class="btn btn-sm btn-outline-primary" id="description-draft-button" formnovalidate
+                  formaction="{{ url_for('skills.description_draft', skill_id=skill.id) if editing else url_for('skills.description_draft') }}"
+                  {% if not ai_enabled %}disabled title="AIが未設定のため使えません"{% endif %}>
+            <i class="bi bi-robot"></i> AIで下書き
+          </button>
+        </div>
+        <textarea name="description" id="item-description" class="form-control" rows="12">{{ val('description') }}</textarea>
+        <div id="description-draft-status" class="small mt-1" role="status" aria-live="polite"></div>
+        <div class="form-text">
+          <p class="mb-1">
+            <strong>スキルテストの問題は、AIがこの説明を読んで作ります</strong>（スキル名・カテゴリ・到達尺度とあわせて使います）。
+            説明が具体的なほど、範囲外の問題や的外れな問題が減ります。次の見出しで書くことをおすすめします。
+          </p>
+          <ul class="mb-1 ps-3">
+            <li><strong>■{{ headings[0] }}</strong> … このスキルで扱う知識・作業の範囲（テストで問う範囲）</li>
+            <li><strong>■{{ headings[1] }}</strong> … 例: 表計算ソフト（関数・ピボットテーブル）、Python 3 など</li>
+            <li><strong>■{{ headings[2] }}</strong> … 各レベルで具体的にできること（下の到達尺度を、このスキルの言葉で書く）</li>
+            <li><strong>■{{ headings[3] }}</strong> … テストで問わない内容（ほかのスキルで扱う内容・使わない機能など）</li>
+          </ul>
+          <p class="mb-1">
+            「AIで下書き」を押すと、スキル名・区分・カテゴリと到達尺度（今の説明があればそれも参考）から、AIがこの形の下書きを説明の欄に入れます。
+            <strong>保存はされません</strong>。内容を確認・修正してから「{{ '更新' if editing else '追加' }}」を押してください。
+            {% if not ai_enabled %}<span class="text-danger">AIが未設定のため使えません（{{ ai_status }}）。</span>{% endif %}
+          </p>
+          <p class="mb-1">
+            説明を変えたときは、古い説明で作られた問題を
+            {% if editing %}<a href="{{ url_for('skilltest.admin_pool_skill', skill_id=skill.id) }}">問題プール</a>{% else %}問題プール{% endif %}
+            の「このスキルの問題をすべて停止」で止めてから、「AIで補充」で作り直してください。
+          </p>
+          <div class="mb-0">
+            到達尺度（Lv1〜Lv4）:
+            {% for t, levels in scales.items() %}
+            <span class="skill-scale {% if t != current_type %}d-none{% endif %}" data-skill-type="{{ t }}">
+              {% if not editing %}<span class="text-muted">{{ type_labels[t] }}</span>{% endif %}
+              {% for lv, label in levels %}Lv{{ lv }}「{{ label }}」{% if not loop.last %}・{% endif %}{% endfor %}
+            </span>
+            {% endfor %}
+          </div>
+        </div>
       </div>
 
       <div class="d-flex gap-2">
         <button type="submit" class="btn btn-primary"><i class="bi bi-check-lg"></i> {{ '更新' if editing else '追加' }}</button>
+        {% if back == 'pool' and editing %}
+        <a href="{{ url_for('skilltest.admin_pool_skill', skill_id=skill.id) }}" class="btn btn-outline-secondary">キャンセル</a>
+        {% else %}
         <a href="{{ url_for('skills.items') }}" class="btn btn-outline-secondary">キャンセル</a>
+        {% endif %}
       </div>
     </form>
   </div>
 </div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/skill-item-form.js') }}"></script>
 {% endblock %}
 {#=== skills/coverage.html ===#}
 {% extends "base.html" %}
@@ -2728,6 +2781,7 @@
           <li>受験の開始時に、その人が見たことのない問題が足りなければ、その場でAIが作ります（受験者を1〜2分待たせるため、事前の補充をおすすめします）。</li>
           <li>AIが使えず問題が足りないときは、その人が以前に解いた問題を再出題します（受験履歴の「再出題」に件数を表示）。それでも足りなければ受験を開始できません。</li>
           <li>AIの作った問題は誤りを含むことがあります。問題の一覧で内容を確認し、不適切な問題は「無効にする」で出題から外してください。</li>
+          <li>AIは、スキル名・カテゴリ・<strong>説明</strong>・到達尺度をもとに問題を作ります。説明（対象範囲・使う道具・レベルごとの目安・出題しない範囲）を書いておくと、範囲外の問題が減ります（スキル項目の編集の「AIで下書き」で下書きを作れます）。説明を変えたときは、問題の一覧の「このスキルの問題をすべて停止」で古い問題を止めてから補充してください。</li>
         </ul>
       </div>
     </div>
@@ -2783,6 +2837,12 @@
             <a href="{{ url_for('skilltest.admin_pool_skill', skill_id=row.skill.id) }}" class="fw-bold">{{ row.skill.name }}</a>
             {% if row.skill.category %}<span class="small text-muted">{{ row.skill.category }}</span>{% endif %}
             {% if not row.testable %}<span class="badge bg-light text-dark border">無効（受験の対象外）</span>{% endif %}
+            {% if row.no_description %}
+            <div class="small text-warning-emphasis">
+              <i class="bi bi-exclamation-triangle"></i> 説明なし（問題の精度が下がります）
+              <a href="{{ url_for('skills.edit_item', skill_id=row.skill.id, back='pool') }}">説明を書く</a>
+            </div>
+            {% endif %}
           </td>
           {% for c in row.cells %}
           <td class="text-center text-nowrap">
@@ -2832,15 +2892,43 @@
   <h1 class="h4 mb-0"><i class="bi bi-collection"></i> {{ skill.name }} の問題
     {% if not testable %}<span class="badge bg-light text-dark border fs-6">受験の対象外</span>{% endif %}
   </h1>
-  {% if testable %}
-  <form method="post" action="{{ url_for('skilltest.admin_topup', skill_id=skill.id) }}">
-    <input type="hidden" name="back" value="skill">
-    <button class="btn btn-sm btn-outline-primary" {% if running or not ai_enabled %}disabled{% endif %}>
-      <i class="bi bi-plus-circle"></i> AIで補充（各レベル {{ target }}問まで）
-    </button>
-  </form>
-  {% endif %}
+  <div class="d-flex flex-wrap gap-2">
+    <form method="post" action="{{ url_for('skilltest.admin_deactivate_all', skill_id=skill.id) }}">
+      <button class="btn btn-sm btn-outline-danger" {% if not active_total %}disabled{% endif %}
+              title="説明を変えた後、古い説明で作った問題を入れ替えるときに使います"
+              onclick="return confirm('「{{ skill.name }}」の有効な問題 {{ active_total }}問をすべて停止（無効）にします。今後は出題しません（受験履歴には残り、1問ずつ有効に戻せます）。よろしいですか？');">
+        <i class="bi bi-slash-circle"></i> このスキルの問題をすべて停止
+      </button>
+    </form>
+    {% if testable %}
+    <form method="post" action="{{ url_for('skilltest.admin_topup', skill_id=skill.id) }}">
+      <input type="hidden" name="back" value="skill">
+      <button class="btn btn-sm btn-outline-primary" {% if running or not ai_enabled %}disabled{% endif %}>
+        <i class="bi bi-plus-circle"></i> AIで補充（各レベル {{ target }}問まで）
+      </button>
+    </form>
+    {% endif %}
+  </div>
 </div>
+
+{# スキルの説明(AIが問題を作るときの出題範囲の基準) #}
+{% if not (skill.description or '').strip() %}
+<div class="alert alert-warning small py-2">
+  <i class="bi bi-exclamation-triangle"></i> <strong>説明なし（問題の精度が下がります）</strong>
+  AIはスキル名とカテゴリだけから問題を作るため、範囲外の問題が出やすくなります。
+  <a href="{{ url_for('skills.edit_item', skill_id=skill.id, back='pool') }}">説明を書く</a>（「AIで下書き」で下書きを作れます）。
+</div>
+{% else %}
+{% set missing = headings|reject('in', found_headings)|list %}
+<details class="card shadow-sm mb-2 small">
+  <summary class="card-header bg-white py-1">
+    スキルの説明（AIが問題を作るときの出題範囲の基準）
+    {% if missing %}<span class="text-warning-emphasis ms-1"><i class="bi bi-exclamation-triangle"></i> 見出しなし: {{ missing|join('・') }}</span>{% endif %}
+    <a href="{{ url_for('skills.edit_item', skill_id=skill.id, back='pool') }}" class="ms-2">説明を編集</a>
+  </summary>
+  <div class="card-body py-2 pre-wrap">{{ skill.description }}</div>
+</details>
+{% endif %}
 <p class="small text-muted mb-2">
   {% for lv in levels %}
   {% set c = counts.get(lv, {}) %}
@@ -3795,7 +3883,7 @@
           <dt class="col-5">送信サーバー</dt>
           <dd class="col-7">
             {% if mail.server %}設定あり
-            <span class="text-muted">（ポート {{ mail.port }}{% if mail.use_tls %}・STARTTLS{% endif %}{% if mail.username %}・認証あり{% endif %}）</span>
+            <span class="text-muted">（ポート {{ mail.port }}）</span>
             {% else %}<span class="text-danger">未設定</span>{% endif %}
           </dd>
           <dt class="col-5">差出人（From）</dt>
@@ -3803,7 +3891,7 @@
           <dt class="col-5">本番の宛先</dt>
           <dd class="col-7">To {{ mail.to|length }}件・Cc {{ mail.cc|length }}件</dd>
           <dt class="col-5">テスト送信先</dt>
-          <dd class="col-7">{% if test_to_is_from %}差出人宛て{% else %}{{ test_to_count }}件{% endif %}（Cc なし）</dd>
+          <dd class="col-7">差出人宛て（Cc なし）</dd>
           <dt class="col-5">AI整形</dt>
           <dd class="col-7">
             {% if ai_enabled %}<span class="text-success">設定あり</span>
@@ -3981,7 +4069,7 @@
           <dt class="col-5">送信サーバー</dt>
           <dd class="col-7">
             {% if mail.server %}設定あり
-            <span class="text-muted">（ポート {{ mail.port }}{% if mail.use_tls %}・STARTTLS{% endif %}{% if mail.username %}・認証あり{% endif %}）</span>
+            <span class="text-muted">（ポート {{ mail.port }}）</span>
             {% else %}<span class="text-danger">未設定</span>{% endif %}
           </dd>
           <dt class="col-5">差出人（From）</dt>
@@ -3989,10 +4077,10 @@
           <dt class="col-5">本番の宛先</dt>
           <dd class="col-7">
             {% if to_count %}To {{ to_count }}件・Cc {{ cc_count }}件{% else %}<span class="text-danger">未設定</span>{% endif %}
-            <div class="text-muted"><code>{{ recipient_source }}</code> を使用</div>
+            <div class="text-muted">週報と同じ <code>MAIL_TO / MAIL_CC</code> を使用</div>
           </dd>
           <dt class="col-5">テスト送信先</dt>
-          <dd class="col-7">{% if test_to_is_from %}差出人宛て{% else %}{{ test_to_count }}件{% endif %}（Cc なし）</dd>
+          <dd class="col-7">差出人宛て（Cc なし）</dd>
           <dt class="col-5">リンクの基準URL</dt>
           <dd class="col-7 text-break">
             {% if base_url %}<span class="text-success">設定あり</span> <span class="text-muted">{{ base_url }}</span>
@@ -4002,7 +4090,7 @@
         <hr>
         <div class="text-muted">
           これらは <a href="{{ url_for('system.settings', tab='config') }}">システム設定の「基本設定」タブ</a>で変更します
-          （送信サーバー等は「メール送信」、宛先は「期限超過通知の宛先」〔空なら週報と同じ「宛先」〕、リンクは「リンク・サーバー」の「リンクの基準URL」）。
+          （送信サーバー・差出人は「メール送信」、宛先は「宛先」〔週報と同じ〕、リンクは「リンク」の「リンクの基準URL」）。
         </div>
       </div>
     </div>
@@ -4026,7 +4114,7 @@
     </form>
     <div class="small text-muted mt-2">
       保存済みの設定（表示するコメント件数）で、今この時点の内容（下のプレビューと同じ）を送信します。
-      テスト送信は <code>MAIL_TEST_TO</code>（空なら差出人）宛てに送ります。送信はバックグラウンドで行い、結果は「前回の結果」に表示されます。
+      テスト送信は差出人（<code>MAIL_FROM</code>）宛てに送ります（Cc なし）。送信はバックグラウンドで行い、結果は「前回の結果」に表示されます。
     </div>
     {% if mail_problem %}
     <div class="small text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> {{ mail_problem }}</div>
@@ -4294,6 +4382,7 @@
       <p class="text-muted mb-2">
         次の項目はこの画面の項目の定義（<code>app.py</code> の FIELDS）に無いため、画面からは変更できません。
         変更する場合は <code>instance/config.py</code> を直接編集し、サーバーを再起動してください。
+        {% if cfg.other|selectattr('retired')|list %}<span class="badge bg-secondary">未使用</span> の項目は以前の版の設定で、今は使われていません（残っていても動作には影響しません）。{% endif %}
       </p>
       <div class="table-responsive">
         <table class="table table-sm align-middle mb-0">
@@ -4301,8 +4390,8 @@
           <tbody>
             {% for row in cfg.other %}
             <tr>
-              <td><code>{{ row.key }}</code></td>
-              <td class="text-muted">{{ row.source }}</td>
+              <td><code>{{ row.key }}</code>{% if row.retired %} <span class="badge bg-secondary">未使用</span>{% endif %}</td>
+              <td class="text-muted">{{ row.source }}{% if row.retired %}<div class="small">使われていません（{{ row.retired_note }}）</div>{% endif %}</td>
               <td>{% if row.is_set %}設定あり{% else %}未設定{% endif %}{% if not row.in_file %}<span class="text-muted">（ファイルに記載なし）</span>{% endif %}</td>
               <td class="text-break">{% if row.hidden %}<span class="text-muted">（表示しません）</span>{% elif row.value %}<code>{{ row.value }}</code>{% else %}<span class="text-muted">―</span>{% endif %}</td>
             </tr>
@@ -4310,6 +4399,16 @@
           </tbody>
         </table>
       </div>
+      {% if cfg.unused and cfg.can_save %}
+      <div class="d-flex flex-wrap justify-content-end align-items-center gap-2 mt-2">
+        <span class="text-muted">未使用の項目の行（すぐ上の説明のコメントを含む）を <code>instance/config.py</code> から削除します。変更前の内容は <code>instance/config.py.bak</code> に残します。</span>
+        {# 削除は別のフォーム(下の unused-config-form)で送る(基本設定の入力は保存しない) #}
+        <button type="submit" form="unused-config-form" class="btn btn-sm btn-outline-danger"
+                onclick="return confirm('未使用の設定（{{ cfg.unused|join('、') }}）の行を instance/config.py から削除します。\n変更前の内容は instance/config.py.bak に残します。よろしいですか？');">
+          <i class="bi bi-trash"></i> 未使用の設定を削除
+        </button>
+      </div>
+      {% endif %}
     </div>
   </div>
   {% endif %}
@@ -4319,6 +4418,11 @@
     <button class="btn btn-primary" {% if not cfg.can_save %}disabled{% endif %}><i class="bi bi-save"></i> 基本設定を保存</button>
   </div>
 </form>
+{% if cfg.unused and cfg.can_save %}
+<form method="post" action="{{ url_for('system.remove_unused') }}" id="unused-config-form">
+  <input type="hidden" name="version" value="{{ cfg.version }}">
+</form>
+{% endif %}
 
 {# 接続テスト(保存済みの設定を使う。入力中の値は使わない) #}
 <div class="card shadow-sm mb-4">
@@ -4333,7 +4437,7 @@
           </button>
         </form>
         <div class="small text-muted mt-1">
-          テスト送信の宛先（{% if cfg.mail_test_to_is_from %}差出人宛て{% else %}{{ cfg.mail_test_to_count }}件{% endif %}）に短いテキストのメールを1通送ります。
+          差出人（<code>MAIL_FROM</code>）宛てに短いテキストのメールを1通送ります。
         </div>
         {% if cfg.mail_test_problem %}
         <div class="small text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> {{ cfg.mail_test_problem }}</div>
@@ -4552,7 +4656,7 @@
         </div>
       </div>
       <div class="form-text mt-3">
-        宛先は「基本設定」タブの「期限超過通知の宛先」（空なら「宛先」）、タスクへのリンクは「リンク・サーバー」の「リンクの基準URL」で設定します。
+        宛先は「基本設定」タブの「宛先」（週報と同じ <code>MAIL_TO</code> / <code>MAIL_CC</code>）、タスクへのリンクは「リンク」の「リンクの基準URL」で設定します。
       </div>
     </div>
     <div class="card-footer bg-white d-flex justify-content-end">
@@ -5003,6 +5107,97 @@ a:hover {
 
   function init() {
     document.querySelectorAll("form.auto-filter").forEach(setup);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();
+{#=== static/js/skill-item-form.js ===#}
+/* スキル項目の追加・編集の画面(skills/item_form.html)用。
+ *
+ * ・「AIで下書き」: 入力中のスキル名・区分・カテゴリ・説明をサーバー(/skills/items/description-draft)に
+ *   送り、AIの下書きを説明の欄に入れる(保存はしない。保存は「更新」「追加」のボタンで行う)。
+ *   説明の欄に入力がある場合は、置き換える前に確認する。
+ * ・区分を選び直したときに、その区分の到達尺度(Lv1〜Lv4)を表示する。
+ *
+ * JavaScript が無効でも、「AIで下書き」は入力を残したまま下書きを入れた画面を表示する(サーバー側)。
+ */
+(function () {
+  "use strict";
+
+  function setStatus(box, text, kind) {
+    if (!box) return;
+    box.textContent = text;
+    box.className = "small mt-1" + (kind ? " text-" + kind : "");
+  }
+
+  function setupDraft() {
+    var form = document.getElementById("skill-item-form");
+    var button = document.getElementById("description-draft-button");
+    var textarea = document.getElementById("item-description");
+    var status = document.getElementById("description-draft-status");
+    if (!form || !button || !textarea || !window.fetch || !window.FormData) return;
+
+    button.addEventListener("click", function (event) {
+      event.preventDefault();
+      if (button.disabled) return;
+      var name = form.elements["name"];
+      if (name && !name.value.trim()) {
+        setStatus(status, "スキル名を入力してから「AIで下書き」を押してください。", "danger");
+        name.focus();
+        return;
+      }
+      if (textarea.value.trim() &&
+          !window.confirm("今の説明を、AIの下書きで置き換えます（保存するまでは元の説明のままです。画面の「キャンセル」で破棄できます）。よろしいですか？")) {
+        return;
+      }
+      var original = button.innerHTML;
+      button.disabled = true;
+      button.innerHTML = '<span class="spinner-border spinner-border-sm" role="status"></span> 作成中…';
+      setStatus(status, "AIで下書きを作成しています（数十秒かかることがあります）…", "muted");
+
+      fetch(button.getAttribute("formaction"), {
+        method: "POST",
+        body: new FormData(form),
+        headers: { "Accept": "application/json" },
+        credentials: "same-origin"
+      }).then(function (response) {
+        return response.json().catch(function () {
+          throw new Error("サーバーの応答を読み取れませんでした（" + response.status + "）");
+        });
+      }).then(function (data) {
+        if (data.ok) {
+          textarea.value = data.draft;
+          setStatus(status, data.message, "success");
+        } else {
+          setStatus(status, data.message || "下書きを作成できませんでした。", "danger");
+        }
+      }).catch(function (error) {
+        setStatus(status, "下書きを作成できませんでした: " + error.message, "danger");
+      }).then(function () {
+        button.disabled = false;
+        button.innerHTML = original;
+      });
+    });
+  }
+
+  function setupScales() {
+    var select = document.getElementById("item-type");
+    if (!select || select.tagName !== "SELECT") return;
+    var scales = document.querySelectorAll(".skill-scale[data-skill-type]");
+    select.addEventListener("change", function () {
+      scales.forEach(function (el) {
+        el.classList.toggle("d-none", el.getAttribute("data-skill-type") !== select.value);
+      });
+    });
+  }
+
+  function init() {
+    setupDraft();
+    setupScales();
   }
 
   if (document.readyState === "loading") {
