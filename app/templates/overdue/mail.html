@@ -22,10 +22,12 @@
 {%- for task in group.tasks %}
 <li style="margin:0 0 4px 0;">
 {%- if task.url %}<a href="{{ task.url }}" style="color:#0d6efd;">{{ task.title }}</a>{% else %}{{ task.title }}{% endif %}
-<span style="color:#dc3545;">{{ task.meta }}</span>：
+<span style="color:#dc3545;">{{ task.meta }}</span>
+{#- コメントはタスク名の次の行から1件ずつ表示する #}
 {%- for c in task.comments %}
-{%- if not loop.first %}<br>{% endif %}<span style="color:#6c757d;">{{ c.head }}</span>{{ c.text }}
-{%- else %}<span style="color:#6c757d;">{{ no_comment }}</span>
+<br><span style="color:#6c757d;">{{ c.head }}</span>{{ c.text }}
+{%- else %}
+<br><span style="color:#6c757d;">{{ no_comment }}</span>
 {%- endfor %}</li>
 {%- endfor %}
 </ul>

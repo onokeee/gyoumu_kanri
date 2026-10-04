@@ -9,7 +9,8 @@
 担当者は件数の多い順(同数なら表示名順。「担当者なし」は同数の中で最後)、
 タスクは期限の古い順(超過の長い順)に並べる。
 
-各タスクには直近の進捗記載(コメント)を comment_count 件まで、古い順に載せる。
+各タスクには直近の進捗記載(コメント)を comment_count 件まで、古い順に載せる
+(タスク名の次の行から1件ずつ。記載が無ければ「コメントなし」)。
 経過日数は営業日で数え「M日前（土日祝除く）」と書く(今日のものは「本日」)。
 本文は1行にまとめ(改行は空白に)、長いものは COMMENT_TEXT_MAX 文字で切る。
 
@@ -233,9 +234,9 @@ def build_text(data):
                 if task["url"]:
                     name += "（{}）".format(task["url"])
                 comments = ["{}{}".format(c["head"], c["text"]) for c in task["comments"]]
-                first = comments[0] if comments else NO_COMMENT
-                lines.append("　{}{}：{}".format(name, task["meta"], first))
-                lines.extend("　　" + c for c in comments[1:])
+                # 見やすさのため、コメントはタスク名の次の行から1件ずつ書く
+                lines.append("　{}{}".format(name, task["meta"]))
+                lines.extend("　　" + c for c in (comments or [NO_COMMENT]))
         lines.append("")
     lines.append(_footer())
     return "\n".join(lines)
