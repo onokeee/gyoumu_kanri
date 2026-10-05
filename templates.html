@@ -11,7 +11,7 @@
   ・最初の区切りより前(このコメント)は読み込まない。
 
   目次(区切りの名前。この順に並ぶ):
-    共通　　　　　　　  base.html  _macros.html  errors/too_large.html
+    共通　　　　　　　  base.html  _macros.html  errors/too_large.html  errors/http_error.html
     ログイン　　　　　  auth/login.html
     個人ダッシュボード  main/dashboard.html
     タスク　　　　　　  tasks/list.html  tasks/detail.html  tasks/form.html
@@ -199,6 +199,22 @@
       <h1 class="h5"><i class="bi bi-exclamation-octagon"></i> 入力が大きすぎるため、受け付けられませんでした</h1>
       <p class="mb-2">1回の送信は約{{ limit_bytes // 10000 }}万バイト（日本語でおよそ{{ limit_bytes // 9 // 10000 }}万字）までです。入力した内容は保存されていません。</p>
       <p class="mb-0">ブラウザの「戻る」で入力した画面に戻ると、入力した内容が残っている場合があります。長い内容は分けて登録してください（進捗の記載を何回かに分けるなど）。</p>
+    </div>
+    <a href="{{ url_for('main.dashboard') }}" class="btn btn-outline-secondary">トップへ</a>
+  </div>
+</div>
+{% endblock %}
+{#=== errors/http_error.html ===#}
+{# 権限が無い(403)・ページが見つからない(404)・画面として開けない URL(405)の画面。heading / message は app.py の HTTP_ERROR_PAGES #}
+{% extends "base.html" %}
+{% block title %}{{ heading }} &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+  <div class="col-lg-8">
+    <div class="alert alert-warning mt-4">
+      <h1 class="h5"><i class="bi bi-exclamation-triangle"></i> {{ heading }}</h1>
+      <p class="mb-0">{{ message }}</p>
     </div>
     <a href="{{ url_for('main.dashboard') }}" class="btn btn-outline-secondary">トップへ</a>
   </div>
@@ -798,7 +814,7 @@
           {% for u in users %}
           <div class="col">
             <div class="form-check">
-              <input class="form-check-input" type="checkbox" name="assignee_ids" value="{{ u.id }}"
+              <input class="form-check-input" type="checkbox" name="assignee_ids" value="{{ u.form_key }}"
                      id="asg{{ u.id }}" {% if u.id in selected_assignees %}checked{% endif %}
                      {% if not can_plan %}disabled{% endif %}>
               <label class="form-check-label small" for="asg{{ u.id }}">{{ u.display_name }}{% if not u.is_active %} <span class="text-muted">［無効］</span>{% endif %}</label>
@@ -1141,8 +1157,8 @@
           <select name="assignee_id" class="form-select" required>
             <option value="">選択してください</option>
             {% for u in users %}
-            <option value="{{ u.id }}"
-              {% if (form and form.get('assignee_id')|string == u.id|string) or (not form and routine and routine.assignee_id == u.id) %}selected{% endif %}>
+            <option value="{{ u.form_key }}"
+              {% if (form and form.get('assignee_id') == u.form_key) or (not form and routine and routine.assignee_id == u.id) %}selected{% endif %}>
               {{ u.display_name }}{% if not u.is_active %}［無効］{% endif %}
             </option>
             {% endfor %}
@@ -1575,7 +1591,7 @@
           {% set r = level_by_skill[s.id].get(u.id) %}
           {% set plv = r.level if r else 0 %}
           <td class="p-1">
-            <span class="badge bg-{{ r.level_color if r else 'light' }} {% if not r %}text-muted border{% endif %}"
+            <span class="badge bg-{{ r.level_color if r else 'light' }} {% if not r or r.level == 0 %}text-muted border{% endif %}"
                   title="{{ u.display_name }} / {{ grp.scale[plv] if plv < grp.scale|length else plv }}{% if r and r.note %} / {{ r.note }}{% endif %}">
               {{ plv }}
             </span>
@@ -1617,7 +1633,7 @@
   {% endfor %}
 </div>
 <p class="text-muted small mt-2">
-  {% if show_person %}<span class="me-3"><i class="bi bi-people"></i> ヒト列＝各メンバーの到達度（名前クリックで編集）。</span>{% endif %}
+  {% if show_person %}<span class="me-3"><i class="bi bi-people"></i> ヒト列＝各メンバーの到達度（名前クリックで個人のスキルの画面。到達度の編集はその画面の「到達度を編集」から）。</span>{% endif %}
   {% if show_op %}<span><i class="bi bi-briefcase"></i> 業務列＝その業務に必要な到達レベル（業務名クリックで編集）。</span>{% endif %}
 </p>
 {% endblock %}
@@ -1735,7 +1751,7 @@
           <span class="fw-medium">{{ s.name }}</span>
           {% if s.category %}<span class="text-muted small">({{ s.category }})</span>{% endif %}
         </div>
-        <span class="badge bg-{{ r.level_color if r else 'light' }} {% if not r %}text-muted border{% endif %}">
+        <span class="badge bg-{{ r.level_color if r else 'light' }} {% if not r or r.level == 0 %}text-muted border{% endif %}">
           Lv{{ lv }}：{{ s.level_labels[lv] if lv < s.level_labels|length else lv }}
         </span>
       </div>
@@ -1768,6 +1784,8 @@
 <h1 class="h3 mb-3">{{ member.display_name }} さんの到達度を編集</h1>
 
 <form method="post">
+  {# 画面を開いたときの本人(IDが別の人に再利用された後の古い画面から保存しないように照合する) #}
+  <input type="hidden" name="member_username" value="{{ member.username }}">
   {% for stype in type_choices %}
   <div class="card shadow-sm mb-3">
     <div class="card-header bg-white fw-bold">{{ type_labels[stype] }}</div>
@@ -1830,7 +1848,7 @@
   <div class="table-responsive">
     <table class="table table-hover align-middle mb-0">
       <thead class="table-light">
-        <tr><th>区分</th><th>スキル名</th><th>カテゴリ</th><th class="text-center">並び順</th><th>状態</th><th>評価済</th><th></th></tr>
+        <tr><th>区分</th><th>スキル名</th><th>カテゴリ</th><th class="text-center">並び順</th><th>状態</th><th title="有効なメンバーのうち、到達度（Lv1以上）が登録されている人数">評価済</th><th></th></tr>
       </thead>
       <tbody>
         {% for s in skills %}
@@ -1843,7 +1861,7 @@
             {% if s.is_active %}<span class="badge bg-success">有効</span>
             {% else %}<span class="badge bg-secondary">無効</span>{% endif %}
           </td>
-          <td class="small">{{ s.ratings|length }}名</td>
+          <td class="small">{{ rated_counts.get(s.id, 0) }}名</td>
           <td class="text-nowrap">
             <a href="{{ url_for('skills.edit_item', skill_id=s.id) }}" class="btn btn-sm btn-outline-secondary"><i class="bi bi-pencil"></i></a>
             <form method="post" action="{{ url_for('skills.toggle_item', skill_id=s.id) }}" class="d-inline">
@@ -2964,7 +2982,8 @@
     {% if testable %}
     <form method="post" action="{{ url_for('skilltest.admin_topup', skill_id=skill.id) }}">
       <input type="hidden" name="back" value="skill">
-      <button class="btn btn-sm btn-outline-primary" {% if running or not ai_enabled %}disabled{% endif %}>
+      <button class="btn btn-sm btn-outline-primary" {% if running or not ai_enabled %}disabled{% endif %}
+              {%- if running and not running_this %} title="別のスキル（{{ running_name }}）を補充中のため、終わってから補充できます"{% endif %}>
         <i class="bi bi-plus-circle"></i> AIで補充（各レベル {{ target }}問まで）
       </button>
     </form>
@@ -2995,7 +3014,8 @@
   {% set c = counts.get(lv, {}) %}
   Lv{{ lv }}: 有効 {{ c.get('active', 0) }}問{% if c.get('inactive', 0) %}（無効 {{ c.get('inactive', 0) }}問）{% endif %}{% if not loop.last %} ／ {% endif %}
   {% endfor %}
-  {% if running %}<span class="ms-2 text-info"><span class="spinner-border spinner-border-sm"></span> 補充中（問題プールの画面で結果を確認できます）</span>{% endif %}
+  {% if running_this %}<span class="ms-2 text-info"><span class="spinner-border spinner-border-sm"></span> 補充中（問題プールの画面で結果を確認できます）</span>
+  {%- elif running %}<span class="ms-2 text-muted"><i class="bi bi-hourglass-split"></i> 別のスキル（{{ running_name }}）を補充中のため、終わってから補充できます</span>{% endif %}
 </p>
 
 <form method="get" class="card card-body shadow-sm mb-3 py-2 auto-filter">
@@ -3255,7 +3275,7 @@
 <h2 class="h4 mt-4 mb-1"><i class="bi bi-trophy"></i> 成果（見込み・実績）</h2>
 <p class="text-muted small mb-2">
   タスクに登録された成果を集計。<strong>金額(￥)と時間(ｈ)は合算できないため分けて、いずれも年換算</strong>で表示します（1年=12ヶ月=360日で換算）。
-  期間は<strong>期限日（未設定なら開始日）</strong>を基準に絞り込み、複数担当のタスクは担当者で均等割りしています。
+  期間は<strong>期限日（未設定なら開始日）</strong>を基準に絞り込み、複数担当のタスクは担当者で均等割りしています（無効化した担当者の分は、その人の「［無効］」の行に計上）。
 </p>
 
 {# 期間の変更(他セクションの条件は保持) #}
@@ -3665,10 +3685,11 @@
         <div class="gantt-timeline">
           {% for tick in gticks %}<div class="gantt-tick" style="left:{{ tick.left }}%;"></div>{% endfor %}
           {% if gtoday_left is not none %}<div class="gantt-today" style="left:{{ gtoday_left }}%;"></div>{% endif %}
-          {% for seg in g.segments %}
+          {#- 棒は日ごとの状態の色。最後の区間の文字は今の状態(期限の後に完了した・表示期間の後に変わったタスクは「→ 現在 …」) #}
+          {% for seg in g.segments %}{% set now_differs = loop.last and seg.status != g.task.status %}
           <div class="gantt-seg bg-{{ status_colors[seg.status] }}"
                style="left:{{ seg.left }}%; width:{{ seg.width }}%;{% if seg.status == '保留' %} color:#212529;{% endif %}"
-               title="{{ g.task.title }} ／ {{ seg.status }}">{% if loop.last %}{{ seg.status }}{% endif %}</div>
+               title="{{ g.task.title }} ／ {{ seg.status }}{% if now_differs %}（現在: {{ g.task.status }}）{% endif %}">{% if loop.last %}{{ seg.status }}{% if now_differs %} → 現在 {{ g.task.status }}{% endif %}{% endif %}</div>
           {% endfor %}
           {% for m in g.marks %}
           <div class="gantt-mark" style="left:{{ m.left }}%;" title="{{ m.tip }}"></div>
@@ -4280,7 +4301,7 @@
           <th class="text-nowrap">受験中</th>
           <th class="text-nowrap">レベル<br>アップ</th>
           <th class="text-nowrap">離脱が多い<br>（{{ ts.blur_many }}回以上）</th>
-          <th class="text-nowrap">最後の受験<br>（全期間）</th>
+          <th class="text-nowrap">最後の受験<br>（期間の終わりまで）</th>
         </tr>
       </thead>
       <tbody>
@@ -4317,7 +4338,7 @@
     {% if not ts.testable_count %}
     <span class="text-muted">テストの対象スキル（有効なテクニカルスキル）がありません。</span>
     {% else %}
-    <div><span class="fw-bold">一度も受験していない:</span>
+    <div><span class="fw-bold">一度も受験していない（期間の終わりの時点）:</span>
       {% for r in ts.never %}{{ r.name }}{% if not loop.last %}、{% endif %}{% else %}<span class="text-muted">なし</span>{% endfor %}</div>
     <div><span class="fw-bold">期間内に受験していない（以前は受験）:</span>
       {% for r in ts.none_in_period %}{{ r.name }}（最後 {{ fmt_date(r.last_at) }}）{% if not loop.last %}、{% endif %}{% else %}<span class="text-muted">なし</span>{% endfor %}</div>
@@ -4561,6 +4582,8 @@
             <ul class="mb-0 ps-3">{% for line in r.ai[key] %}<li class="pre-wrap">{{ line }}</li>{% endfor %}</ul></div>
           {% endif %}
           {% endfor %}
+          {% elif r.ai_state %}
+          <div class="text-muted">{{ ai_state_badge(r.ai_state) }} 分析した後にメンバーが変わった（削除・追加で同じIDの別の人になった）ため、所見を出していません。</div>
           {% else %}
           <div class="text-muted">所見はありません（{% if ai.result.unread.count %}材料の一部を読み込めなかったか、{% endif %}AIの応答に所見がありませんでした）。</div>
           {% endif %}
@@ -4693,6 +4716,7 @@
               <form method="post" action="{{ url_for('departments.delete_member', user_id=u.id) }}"
                     class="d-inline" data-confirm="メンバー「{{ u.display_name }}」を削除します。よろしいですか？&#10;※タスク等の業務データがある場合は無効化されます。"
                     onsubmit="return confirm(this.dataset.confirm);">
+                <input type="hidden" name="username" value="{{ u.username }}">
                 <button class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i> 削除</button>
               </form>
               {% endif %}
@@ -4735,6 +4759,7 @@
       <span class="text-muted">{{ u.display_name }} <code>{{ u.username }}</code>
         <span class="badge bg-secondary">{{ u.role_label }}</span></span>
       <form method="post" action="{{ url_for('departments.reactivate_member', user_id=u.id) }}" class="d-inline">
+        <input type="hidden" name="username" value="{{ u.username }}">
         <button class="btn btn-sm btn-outline-success"><i class="bi bi-arrow-counterclockwise"></i> 復帰</button>
       </form>
     </div>
@@ -4747,6 +4772,9 @@
 <div class="card shadow-sm">
   <div class="card-header bg-white fw-bold">メンバーの紐づけ(兼務可)</div>
   <form method="post" action="{{ url_for('departments.save_memberships') }}">
+    {# 保存で変えるのは、この表に出している人・チームの組み合わせだけ(画面を開いた後の追加・削除を消さない) #}
+    {% for u in users %}<input type="hidden" name="member_keys" value="{{ u.form_key }}">{% endfor %}
+    {% for d in departments %}<input type="hidden" name="dept_ids" value="{{ d.id }}">{% endfor %}
     <div class="table-responsive">
       <table class="table table-hover align-middle mb-0 text-center">
         <thead class="table-light">
@@ -4765,7 +4793,7 @@
             <td class="text-start"><span class="badge bg-light text-dark">{{ u.role_label }}</span></td>
             {% for d in departments %}
             <td>
-              <input type="checkbox" class="form-check-input" name="dept_{{ d.id }}" value="{{ u.id }}"
+              <input type="checkbox" class="form-check-input" name="dept_{{ d.id }}" value="{{ u.form_key }}"
                      {% if u.id in membership[d.id] %}checked{% endif %}>
             </td>
             {% endfor %}

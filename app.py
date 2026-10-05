@@ -131,6 +131,7 @@ import urllib.request
 from collections import namedtuple
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal
 from email import encoders
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
@@ -140,7 +141,7 @@ from functools import lru_cache, wraps
 from io import BytesIO
 from time import monotonic
 from typing import Optional
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import click
 from docx import Document
@@ -160,6 +161,7 @@ from flask import (
     render_template,
     request,
     send_file,
+    session,
     url_for,
 )
 from flask.cli import with_appcontext
@@ -168,6 +170,7 @@ from flask_login import (
     UserMixin,
     current_user,
     login_required,
+    login_url,
     login_user,
     logout_user,
 )
@@ -178,6 +181,7 @@ from openpyxl.styles import Font
 from sqlalchemy import case, func, inspect, text
 from sqlalchemy.exc import DatabaseError, IntegrityError
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.exc import StaleDataError
 from werkzeug.exceptions import HTTPException, MethodNotAllowed
 from werkzeug.routing import IntegerConverter, RequestRedirect
 
@@ -1006,6 +1010,24 @@ login_manager.login_view = "auth.login"
 login_manager.login_message = "ログインしてください。"
 login_manager.login_message_category = "warning"
 
+# ログインが切れた状態で送られた保存・変更など(GET 以外。行われていない)の送り先のパスを残すセッションのキー
+# (ログインの後に「直前の操作は行われていません」と知らせるため。auth.login で取り出す)
+DROPPED_REQUEST_KEY = "dropped_request_path"
+
+
+@login_manager.unauthorized_handler
+def _unauthorized():
+    """未ログインのとき: Flask-Login の既定と同じく案内を出してログイン画面へ(next に今の URL)。
+
+    GET 以外(保存・変更などの送信)は行われないため、送り先のパスをセッションに残す。GET と POST の
+    両方を受け付ける URL(タスク・定型業務・年休の登録・編集など)は、ログインの後の戻る先(_page_for_next)
+    だけでは送信だったことが分からないため。
+    """
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        session[DROPPED_REQUEST_KEY] = request.path
+    flash(login_manager.login_message, login_manager.login_message_category)
+    return redirect(login_url(login_manager.login_view, next_url=request.url))
+
 
 # =============================================================================
 # 2-2. 小さなヘルパー関数
@@ -1074,6 +1096,18 @@ def to_ints(values):
     return [n for n in (to_int(v) for v in values) if n is not None]
 
 
+def users_from_form_keys(values, users):
+    """フォームの「ユーザーID:ログインID」の値(User.form_key)を、選択肢 users の中の人にする。
+
+    戻り値: (選ばれた人のリスト〔users の順〕, 選択肢に無い値があったか)。
+    ID だけの値・ログインIDが違う値(画面を開いた後に削除され、IDが別の人に再利用された)・
+    選択肢に無い人(削除・無効化された)の値は選ばない。
+    """
+    wanted = {str(v) for v in values}
+    chosen = [u for u in users if u.form_key in wanted]
+    return chosen, len(chosen) < len(wanted)
+
+
 def form_int(values, name):
     """フォーム・URL の値(values は request.form / request.args など)を 0 以上の整数にする。
 
@@ -1121,6 +1155,26 @@ def set_active_from_form(obj):
         return False
     obj.is_active = target
     return True
+
+
+# 同時に送られた保存(ボタンの二度押し・2人が同時に保存)で、後から処理した側を保存しなかったときの案内
+_CONCURRENT_EDIT = ("ほかの操作で同時に変更されたため、保存できませんでした。"
+                    "今の内容を確認して、必要ならもう一度保存してください。")
+
+
+def commit_or_conflict():
+    """行の追加・削除をまとめて保存する。同時に送られた保存と重なったら取り消して案内を出し False。
+
+    重なり: 同じ行の追加(UNIQUE 制約・主キー。IntegrityError)、ほかの保存で既に削除された行の削除
+    (StaleDataError)。先に保存した側の内容は残り、後から処理した側を内部エラーにしない。
+    """
+    try:
+        db.session.commit()
+        return True
+    except (IntegrityError, StaleDataError):
+        db.session.rollback()
+        flash(_CONCURRENT_EDIT, "warning")
+        return False
 
 
 def commit_unique(message):
@@ -1222,6 +1276,18 @@ def new_last_result(trigger, ok, message):
     }
 
 
+# 自動送信(スケジューラ)で最後に実行した日付・時刻の印を記録する項目(週報・期限超過通知の設定ファイル)
+AUTO_RUN_KEY = "last_auto_key"
+
+
+def keep_auto_run_key(result, data):
+    """設定を整えるときに、自動送信の実行の印(AUTO_RUN_KEY)を残す(無い・文字列でなければ付けない)。"""
+    value = data.get(AUTO_RUN_KEY)
+    if isinstance(value, str) and value and len(value) <= 32:
+        result[AUTO_RUN_KEY] = value
+    return result
+
+
 class JsonSettings:
     """画面で編集する設定(instance/ の JSON ファイル1つ)の読み込み・保存。
 
@@ -1282,6 +1348,22 @@ class JsonSettings:
             data = self.normalize(current)
             write_json(self.path(), data)
             return data
+
+    def claim_auto_run(self, key):
+        """自動送信の実行の印 key(「YYYY-MM-DD HH:MM」)をファイルに記録する(確認と記録をロックの中で行う)。
+
+        戻り値: 記録した(実行してよい)なら True、既に同じ印が記録されている(実行済み)なら False。
+        実行済みの記録がメモリ(スケジューラの fired)だけだと、実行時刻の分の中でサーバーを再起動した
+        ときに、新しいプロセスがもう一度送ってしまうため。設定ファイルが読み込めない場合は
+        SettingsFileError を送出する(書き込まない)。
+        """
+        with self.lock:
+            current = self._load_for_update()
+            if current.get(AUTO_RUN_KEY) == key:
+                return False
+            current[AUTO_RUN_KEY] = key
+            write_json(self.path(), current)
+            return True
 
     def set_last_result(self, trigger, ok, message):
         """前回の結果を上書きする(他の設定項目は変更しない)。戻り値: 記録した前回の結果。
@@ -1689,6 +1771,15 @@ class User(UserMixin, db.Model):
         """
         return f"{self.id}:{self.username}"
 
+    @property
+    def form_key(self):
+        """フォームで人を指す値(「ユーザーID:ログインID」。users_from_form_keys で両方を照合する)。
+
+        画面を開いた後にその人が削除され、同じIDが次に追加した別の人に再利用されても、開いたままの
+        画面からの送信が別の人に対して行われないように、ログインIDも含める(get_id と同じ考え方)。
+        """
+        return f"{self.id}:{self.username}"
+
     def __repr__(self):
         return f"<User {self.username} ({self.display_name})>"
 
@@ -1751,12 +1842,31 @@ PRIORITY_COLORS = {
 OUTCOME_UNITS = ["￥/年", "￥/月", "￥/日", "ｈ/年", "ｈ/月", "ｈ/日"]
 
 
+def _exact_num(v):
+    """float を入力欄用の文字列に(丸めない。保存されている値と同じ数になる最短の表記。指数表記にしない)。
+
+    編集画面の入力欄に丸めた値を入れると、ほかの欄だけを直して保存したときに、成果の値が丸めた値で
+    上書きされてしまうため(例: 0.12345 → 0.1235)。
+    """
+    if v is None:
+        return ""
+    s = format(Decimal(repr(float(v))), "f")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return "0" if s in ("", "-0") else s
+
+
 def _fmt_num(v):
-    """float を入力/表示用の文字列に(整数は小数点なし・末尾ゼロ除去)。"""
+    """float を表示用の文字列に(小数第4位までに丸める・整数は小数点なし・末尾ゼロ除去)。
+
+    丸めると 0 になる 0 以外の小さな値は、丸めずに表示する(0 と表示しない)。
+    """
     if v is None:
         return ""
     s = ("%.4f" % float(v)).rstrip("0").rstrip(".")
-    return s or "0"
+    if s in ("", "0", "-0") and float(v) != 0:
+        return _exact_num(v)
+    return "0" if s in ("", "-0") else s
 
 
 def _fmt_amount(v):
@@ -1914,11 +2024,11 @@ class Task(db.Model):
     # --- 成果(定量)の表示・入力用ヘルパ ---
     @property
     def outcome_quant_estimate_input(self):
-        return _fmt_num(self.outcome_quant_estimate)
+        return _exact_num(self.outcome_quant_estimate)
 
     @property
     def outcome_quant_actual_input(self):
-        return _fmt_num(self.outcome_quant_actual)
+        return _exact_num(self.outcome_quant_actual)
 
     @property
     def outcome_quant_estimate_label(self):
@@ -2632,11 +2742,14 @@ class SkillTestAnswer(db.Model):
 
     @property
     def result_label(self):
-        """マネージャー向けの結果表示。"""
+        """マネージャー向けの結果表示(管理画面の受験の詳細と同じ。時間切れを先に見る)。
+
+        全体の期限で終了した受験の未回答の問題は、確定日時が無いまま時間切れ(timed_out)になる。
+        """
+        if self.timed_out:
+            return "時間切れ" if self.served_at is not None else "未表示（時間切れ）"
         if self.answered_at is None:
             return "未回答"
-        if self.timed_out:
-            return "時間切れ"
         return "正解" if self.is_correct else "不正解"
 
     def __repr__(self):
@@ -2698,6 +2811,15 @@ def ai_is_configured():
     return bool(values["api_key"] or values["api_url"])
 
 
+def url_has_userinfo(url):
+    """URL のホストの前に ID・パスワード(user:pass@)があるか(解釈できない URL は False)。"""
+    try:
+        parts = urlsplit(str(url or ""))
+        return parts.username is not None or parts.password is not None
+    except ValueError:
+        return False
+
+
 def _endpoint_label(url):
     """接続先の表示用(スキームとホスト名だけ。URL内の認証情報・パス・クエリは表示しない)。"""
     try:
@@ -2716,9 +2838,12 @@ def ai_status_label():
         return ("未設定（システム設定の「基本設定」タブで AI_API_KEY "
                 "または AI_API_URL を設定すると使えます）")
     values = _ai_settings()
-    return "接続先: {} ／ モデル: {}".format(
+    label = "接続先: {} ／ モデル: {}".format(
         _endpoint_label(values["api_url"] or AI_DEFAULT_API_URL), values["model"]
     )
+    if url_has_userinfo(values["api_url"]):
+        label += "（AI_API_URL に ID・パスワードが含まれているため使えません）"
+    return label
 
 
 def _mask_api_key(text, api_key):
@@ -2790,6 +2915,10 @@ def ai_chat(messages):
 
     values = _ai_settings()
     api_key = values["api_key"]
+    if url_has_userinfo(values["api_url"]):
+        # urllib は「ID:パスワード@ホスト」をホスト名として扱い、エラーの文にパスワードが出るため送らない
+        return None, ("AI_API_URL に ID・パスワード（user:pass@ の形）が含まれているため、送信しません。"
+                      "システム設定の「基本設定」タブで AI_API_URL を直してください。")
     try:
         text = _call_chat_api(messages)
     except urllib.error.HTTPError as exc:
@@ -3082,8 +3211,12 @@ def send_mail(subject, text, html=None, attachments=(), to=None, cc=None, test=F
     except OSError as exc:
         return False, "送信サーバー（{}:{}）に接続できませんでした: {}".format(
             values["server"], values["port"], exc)
-    except UnicodeError:
-        return False, NON_ASCII_ADDRESS_MESSAGE.format(mail_from)
+    except UnicodeError as exc:
+        # 差出人・宛先のアドレスは上で確認済み(半角英数字だけ)。ほかの原因(このPCのコンピューター名に
+        # 半角英数字以外の文字があり、送信サーバーへのあいさつ〔EHLO〕に使えないなど)をアドレスのせいにしない
+        return False, ("メール送信に失敗しました（半角英数字以外の文字を送信できませんでした。差出人・宛先のアドレスは"
+                       "問題ありません。このPCのコンピューター名〔送信サーバーへのあいさつに使う名前〕に"
+                       "半角英数字以外の文字が含まれていないかを確認してください）: {}".format(exc))
 
     if refused:
         return False, "一部の宛先に送信できませんでした（拒否: {}）。他の {} 件には送信済みです。".format(
@@ -3152,16 +3285,25 @@ def is_local_account(username):
 
 
 def _ensure_local_user(info):
-    """固定ローカルアカウント(admin 等)は、アプリ未登録でも用意する(初期・緊急用)。"""
-    user = User.query.filter_by(username=info["username"]).first()
-    if user is None:
-        user = User(username=info["username"])
-        db.session.add(user)
-    user.display_name = info["display_name"]
-    user.role = info["role"]
-    user.is_active = True
-    db.session.commit()
-    return user
+    """固定ローカルアカウント(admin 等)は、アプリ未登録でも用意する(初期・緊急用)。
+
+    新しい DB で同時に初回ログインした(行の追加が重なった)ときは、後から追加しようとした側を取り消し、
+    先に追加された行を使う(ログインIDの UNIQUE 制約。内部エラーにしない)。
+    """
+    for _attempt in range(2):
+        user = User.query.filter_by(username=info["username"]).first()
+        if user is None:
+            user = User(username=info["username"])
+            db.session.add(user)
+        user.display_name = info["display_name"]
+        user.role = info["role"]
+        user.is_active = True
+        try:
+            db.session.commit()
+            return user
+        except IntegrityError:
+            db.session.rollback()
+    raise RuntimeError("固定ローカル管理者のユーザーを用意できませんでした。")
 
 
 def _match_registered_user(info):
@@ -3236,12 +3378,14 @@ def login():
 
         login_user(user)
         flash(f"ようこそ、{user.display_name} さん。", "success")
+        # ログインが切れた状態で送った保存・変更など(_unauthorized が残した送り先のパス)
+        dropped = session.pop(DROPPED_REQUEST_KEY, None)
 
         # ログイン前にアクセスしようとしていたページがあればそこへ戻す(このアプリの中のパスだけ)
         next_page = _safe_next(request.args.get("next"))
         if next_page:
             page, post_only = _page_for_next(next_page)
-            if post_only:
+            if post_only or (dropped and unquote(urlsplit(next_page).path) == dropped):
                 # ログインが切れた状態で保存・変更などを送った: その操作は行われていない
                 flash("ログインの有効期限が切れていたため、直前の操作（保存・変更など）は行われていません。"
                       "必要ならもう一度操作してください。", "warning")
@@ -3469,10 +3613,20 @@ def _can_edit(task):
     )
 
 
+# 担当者の選択に、画面を開いた後に削除・無効化された人(またはIDが別の人に再利用された人)があったときの案内
+_STALE_ASSIGNEE = ("担当者の選択に、画面を開いた後に削除・無効化されたメンバーが含まれています。"
+                   "画面を開き直して、担当者を選び直してください。")
+# 開始日が期限より後の日付のときの案内
+_START_AFTER_DUE = "開始日は期限と同じ日か、それより前の日付にしてください。"
+
+
 def _selected_assignees(users):
-    """フォームの assignee_ids(複数)から担当ユーザーのリストを返す。"""
-    ids = set(to_ints(request.form.getlist("assignee_ids")))
-    return [u for u in users if u.id in ids]
+    """フォームの assignee_ids(複数。値は「ユーザーID:ログインID」)から担当ユーザーを選ぶ。
+
+    戻り値: (担当ユーザーのリスト, 選択肢に無い値があったか)。選択肢に無い値(削除・無効化された人、
+    IDが別の人に再利用された人、IDだけの値)は担当にしない(users_from_form_keys)。
+    """
+    return users_from_form_keys(request.form.getlist("assignee_ids"), users)
 
 
 def _assignee_choices(task):
@@ -3491,6 +3645,20 @@ def _assignee_choices(task):
 
 # キーワード検索の LIKE で、文字そのものとして探す記号の前に付ける文字(escape に渡す)
 _LIKE_ESCAPE = "\\"
+
+
+# キーワード検索のキーワードの最大文字数(長すぎるパターンは SQLite の LIKE の上限〔50,000バイト〕を超えて
+# エラーになるため。これを超えた分は使わずに、先頭だけで検索する)
+KEYWORD_MAX = 200
+
+
+def search_keyword():
+    """一覧のキーワード(?q=)。KEYWORD_MAX 文字を超えたら先頭だけにして、その旨を表示する。"""
+    keyword = request.args.get("q", "").strip()
+    if len(keyword) > KEYWORD_MAX:
+        flash("キーワードは{}文字までです（先頭の{}文字で検索しました）。".format(KEYWORD_MAX, KEYWORD_MAX), "warning")
+        keyword = keyword[:KEYWORD_MAX].strip()
+    return keyword
 
 
 def _like_pattern(keyword):
@@ -3514,7 +3682,7 @@ def list_tasks():
     assignee_ids = to_ints(request.args.getlist("assignee"))
     scope = request.args.get("scope", "")  # "mine" なら自分の担当のみ
     hide_done = request.args.get("hide_done") == "1"  # 「完了」を除く
-    keyword = request.args.get("q", "").strip()
+    keyword = search_keyword()
 
     query = Task.query
 
@@ -3567,9 +3735,13 @@ def new_task():
 
     if request.method == "POST":
         title = request.form.get("title", "").strip()
-        sel = [u.id for u in _selected_assignees(users)]
+        assignees, stale = _selected_assignees(users)
+        sel = [u.id for u in assignees]
         if not title:
             flash("タイトルは必須です。", "danger")
+            return _render_task_form(None, users, request.form, sel)
+        if stale:
+            flash(_STALE_ASSIGNEE, "danger")
             return _render_task_form(None, users, request.form, sel)
 
         data, err = _read_outcomes()
@@ -3586,19 +3758,24 @@ def new_task():
         if status == STATUS_DONE and not _outcomes_have_actual(data):
             flash(_COMPLETE_NEEDS_OUTCOME, "danger")
             return _render_task_form(None, users, request.form, sel)
+        start_date = parse_date(request.form.get("start_date"))
+        due_date = parse_date(request.form.get("due_date"))
+        if start_date and due_date and start_date > due_date:
+            flash(_START_AFTER_DUE, "danger")
+            return _render_task_form(None, users, request.form, sel)
 
         task = Task(
             title=title,
             description=request.form.get("description", "").strip(),
             status=status,
             priority=priority,
-            start_date=parse_date(request.form.get("start_date")),
-            due_date=parse_date(request.form.get("due_date")),
+            start_date=start_date,
+            due_date=due_date,
             scale=_read_scale(),
             creator_id=current_user.id,
         )
         _apply_outcomes(task, data)
-        task.assignees = _selected_assignees(users)
+        task.assignees = assignees
         db.session.add(task)
         _log_status(task, task.status)  # 初期ステータスを履歴に記録
         db.session.commit()
@@ -3629,12 +3806,17 @@ def edit_task(task_id):
     if request.method == "POST":
         title = request.form.get("title", "").strip()
         # 担当者を変えられるのはマネージャーだけ。メンバーの画面の担当者は今の担当のまま表示する
+        stale = False
         if current_user.is_manager:
-            sel = [u.id for u in _selected_assignees(users)]
+            assignees, stale = _selected_assignees(users)
         else:
-            sel = [u.id for u in task.assignees]
+            assignees = list(task.assignees)
+        sel = [u.id for u in assignees]
         if not title:
             flash("タイトルは必須です。", "danger")
+            return _render_task_form(task, users, request.form, sel)
+        if stale:
+            flash(_STALE_ASSIGNEE, "danger")
             return _render_task_form(task, users, request.form, sel)
 
         data, err = _read_outcomes()
@@ -3657,6 +3839,12 @@ def edit_task(task_id):
                 (task.status != STATUS_DONE or task.has_outcome_actual):
             flash(_COMPLETE_NEEDS_OUTCOME, "danger")
             return _render_task_form(task, users, request.form, sel)
+        if current_user.is_manager:
+            start_date = parse_date(request.form.get("start_date"))
+            due_date = parse_date(request.form.get("due_date"))
+            if start_date and due_date and start_date > due_date:
+                flash(_START_AFTER_DUE, "danger")
+                return _render_task_form(task, users, request.form, sel)
 
         task.title = title
         task.description = request.form.get("description", "").strip()
@@ -3666,10 +3854,10 @@ def edit_task(task_id):
         # メンバーは担当タスクの状況・内容・成果のみ更新でき、既存値を保持する。
         if current_user.is_manager:
             task.priority = priority
-            task.start_date = parse_date(request.form.get("start_date"))
-            task.due_date = parse_date(request.form.get("due_date"))
+            task.start_date = start_date
+            task.due_date = due_date
             task.scale = _read_scale()
-            task.assignees = _selected_assignees(users)
+            task.assignees = assignees
         _apply_outcomes(task, data)
         db.session.commit()
         flash("タスクを更新しました。", "success")
@@ -3854,8 +4042,9 @@ def _render_routine_form(routine, users, form=None):
 def _fill_from_form(rw, form, users, forced_assignee_id=None):
     """フォーム値を rw に反映。エラーメッセージのリストを返す。
 
-    users は担当者の選択肢(_assignee_users)。担当者はこの中の人だけを受け付ける(画面を開いた後に
-    削除・無効化された人や、存在しないIDは保存しない。削除した人のIDは次に追加した人に再利用されるため)。
+    users は担当者の選択肢(_assignee_users)。担当者の値は「ユーザーID:ログインID」(User.form_key)で、
+    この中の人だけを受け付ける(画面を開いた後に削除・無効化された人や、存在しないIDは保存しない。
+    削除した人のIDは次に追加した人に再利用されるため、ログインIDも照合する)。
     forced_assignee_id を渡すと担当者はそれに固定(メンバーの自分固定に使う)。
     """
     errors = []
@@ -3866,10 +4055,12 @@ def _fill_from_form(rw, form, users, forced_assignee_id=None):
     if forced_assignee_id is not None:
         assignee_id = forced_assignee_id
     else:
-        assignee_id = to_int(form.get("assignee_id"))
-        if assignee_id is None:
+        raw = form.get("assignee_id") or ""
+        chosen, _stale = users_from_form_keys([raw], users) if raw else ([], False)
+        assignee_id = chosen[0].id if chosen else None
+        if not raw:
             errors.append("担当者を選択してください。")
-        elif assignee_id not in {u.id for u in users}:
+        elif assignee_id is None:
             errors.append("選んだ担当者は、削除・無効化されたか登録されていません。担当者を選択し直してください。")
 
     frequency_count = _routine_number(form, "frequency_count", "回数", errors)
@@ -3905,7 +4096,7 @@ def list_routines():
     assignee_id = request.args.get("assignee", "")
     manual = request.args.get("manual", "")
     scope = request.args.get("scope", "")
-    keyword = request.args.get("q", "").strip()
+    keyword = search_keyword()
 
     query = RoutineWork.query
     if to_int(assignee_id) is not None:
@@ -4507,36 +4698,40 @@ def edit_operation(op_id):
     if request.method == "POST":
         form = request.form
         conflicts = []
-        for s in all_skills:
-            level = to_int(form.get(f"level_{s.id}"))
-            if level is None:
-                # フォームに無い(画面を開いた後に追加・有効化されたスキル)・不正な値の行は変えない
-                continue
-            level = max(0, min(level, s.max_level))
-            req = op.req_for(s)
-            stored = req.level if req is not None else 0
-            # 画面を開いたときの値(hidden。無い古いフォームは保存されている値とみなす)
-            if f"orig_level_{s.id}" in form:
-                shown = to_int(form.get(f"orig_level_{s.id}")) or 0
-            else:
-                shown = stored
-            if level in (shown, stored):
-                # 変えていない行・変えても今の値と同じ行は触らない
-                continue
-            if stored != shown:
-                # 画面を開いた後に、ほかの人の保存などで変わっていた: 上書きしない(後から保存した側で消さない)
-                conflicts.append(s.name)
-                continue
-            if level == 0:
-                # 不要(レベル0)は行を作らない(既存があれば削除=スパース維持)
-                if req is not None:
-                    db.session.delete(req)
-                continue
-            if req is None:
-                req = OperationSkill(operation_id=op.id, skill_id=s.id)
-                db.session.add(req)
-            req.level = level
-        db.session.commit()
+        # 行の追加は保存(commit)のときにまとめて行う(同時に送られた保存と重なっても commit_or_conflict で受け止める)
+        with db.session.no_autoflush:
+            for s in all_skills:
+                level = to_int(form.get(f"level_{s.id}"))
+                if level is None:
+                    # フォームに無い(画面を開いた後に追加・有効化されたスキル)・不正な値の行は変えない
+                    continue
+                level = max(0, min(level, s.max_level))
+                req = op.req_for(s)
+                stored = req.level if req is not None else 0
+                # 画面を開いたときの値(hidden。無い古いフォームは保存されている値とみなす)
+                if f"orig_level_{s.id}" in form:
+                    shown = to_int(form.get(f"orig_level_{s.id}")) or 0
+                else:
+                    shown = stored
+                if level in (shown, stored):
+                    # 変えていない行・変えても今の値と同じ行は触らない
+                    continue
+                if stored != shown:
+                    # 画面を開いた後に、ほかの人の保存などで変わっていた: 上書きしない(後から保存した側で消さない)
+                    conflicts.append(s.name)
+                    continue
+                if level == 0:
+                    # 不要(レベル0)は行を作らない(既存があれば削除=スパース維持)
+                    if req is not None:
+                        db.session.delete(req)
+                    continue
+                if req is None:
+                    req = OperationSkill(operation_id=op.id, skill_id=s.id)
+                    db.session.add(req)
+                req.level = level
+        # 同じ内容が同時に送られた(二度押し・2人が同時に保存)ときは、後から処理した側を保存しない
+        if not commit_or_conflict():
+            return redirect(url_for("skills.edit_operation", op_id=op.id))
         flash(f"業務「{op.name}」の必要スキルを更新しました。", "success")
         if conflicts:
             flash("次のスキルは、画面を開いた後にほかの操作で必要なレベルが変わっていたため、変更していません。"
@@ -4703,42 +4898,51 @@ def edit_member(user_id):
 
     if request.method == "POST":
         form = request.form
+        if form.get("member_username") != member.username:
+            # 画面を開いた後にその人が削除され、IDが別の人に再利用された(または古い画面): 保存しない
+            flash(_STALE_MEMBERS, "warning")
+            return redirect(url_for("skills.list_skills"))
         conflicts = []
-        for s in all_skills:
-            level = to_int(form.get(f"level_{s.id}"))
-            if level is None:
-                # フォームに無い(画面を開いた後に追加・有効化されたスキル)・不正な値の行は変えない
-                continue
-            level = max(0, min(level, s.max_level))
-            note = (form.get(f"note_{s.id}", "") or "").strip()
+        # 行の追加・削除は保存(commit)のときにまとめて行う(途中の読み込みで追加すると、同時に送られた保存と
+        # 重なったときに commit_or_conflict で受け止められない)
+        with db.session.no_autoflush:
+            for s in all_skills:
+                level = to_int(form.get(f"level_{s.id}"))
+                if level is None:
+                    # フォームに無い(画面を開いた後に追加・有効化されたスキル)・不正な値の行は変えない
+                    continue
+                level = max(0, min(level, s.max_level))
+                note = (form.get(f"note_{s.id}", "") or "").strip()
 
-            rating = s.rating_for(member)
-            stored = ((rating.level if rating else 0), (rating.note or "").strip() if rating else "")
-            # 画面を開いたときの値(hidden。無い古いフォームは保存されている値とみなす)
-            if f"orig_level_{s.id}" in form:
-                shown = (to_int(form.get(f"orig_level_{s.id}")) or 0,
-                         (form.get(f"orig_note_{s.id}", "") or "").strip())
-            else:
-                shown = stored
-            if (level, note) == shown or (level, note) == stored:
-                # 変えていない行・変えても今の値と同じ行は触らない(評価者・評価日時を書き換えない)
-                continue
-            if stored != shown:
-                # 画面を開いた後に、ほかの操作(スキルテストの自動登録など)で変わっていた: 上書きしない
-                conflicts.append(s.name)
-                continue
-            if level == 0 and not note:
-                # 未習得かつメモ無し → スパース維持(既存があれば削除)
-                if rating is not None:
-                    db.session.delete(rating)
-                continue
-            if rating is None:
-                rating = SkillRating(skill_id=s.id, user_id=member.id)
-                db.session.add(rating)
-            rating.level = level
-            rating.note = note
-            rating.rated_by_id = current_user.id
-        db.session.commit()
+                rating = s.rating_for(member)
+                stored = ((rating.level if rating else 0), (rating.note or "").strip() if rating else "")
+                # 画面を開いたときの値(hidden。無い古いフォームは保存されている値とみなす)
+                if f"orig_level_{s.id}" in form:
+                    shown = (to_int(form.get(f"orig_level_{s.id}")) or 0,
+                             (form.get(f"orig_note_{s.id}", "") or "").strip())
+                else:
+                    shown = stored
+                if (level, note) == shown or (level, note) == stored:
+                    # 変えていない行・変えても今の値と同じ行は触らない(評価者・評価日時を書き換えない)
+                    continue
+                if stored != shown:
+                    # 画面を開いた後に、ほかの操作(スキルテストの自動登録など)で変わっていた: 上書きしない
+                    conflicts.append(s.name)
+                    continue
+                if level == 0 and not note:
+                    # 未習得かつメモ無し → スパース維持(既存があれば削除)
+                    if rating is not None:
+                        db.session.delete(rating)
+                    continue
+                if rating is None:
+                    rating = SkillRating(skill_id=s.id, user_id=member.id)
+                    db.session.add(rating)
+                rating.level = level
+                rating.note = note
+                rating.rated_by_id = current_user.id
+        # 同じ内容が同時に送られた(二度押し・2人が同時に保存)ときは、後から処理した側を保存しない
+        if not commit_or_conflict():
+            return redirect(url_for("skills.edit_member", user_id=member.id))
         flash(f"{member.display_name} さんのスキル到達度を更新しました。", "success")
         if conflicts:
             flash("次のスキルは、画面を開いた後にほかの操作（スキルテストの自動登録など）で到達度が変わっていたため、"
@@ -4767,7 +4971,16 @@ def items():
     skills = Skill.query.order_by(
         Skill.skill_type, Skill.sort_order, Skill.name
     ).all()
-    return render_template("skills/items.html", skills=skills)
+    # 評価済の人数: スキル管理の対象者(有効なメンバー)のうち、到達度(Lv1以上)が登録されている人
+    # (スキルマップ・対応表と同じ対象。無効化した人・マネージャー・Lv0 のメモだけの行は数えない)
+    rated_counts = dict(
+        db.session.query(SkillRating.skill_id, func.count(SkillRating.id))
+        .join(User, SkillRating.user_id == User.id)
+        .filter(User.is_active.is_(True), User.role == ROLE_MEMBER, SkillRating.level >= 1)
+        .group_by(SkillRating.skill_id)
+        .all()
+    )
+    return render_template("skills/items.html", skills=skills, rated_counts=rated_counts)
 
 
 # スキル項目の編集画面から戻る先(?back=pool: スキルテストの問題プールのそのスキルの画面)
@@ -5248,7 +5461,10 @@ def _build_outcomes(today, users, only_user_id=None):
 
     - 金額(￥)と時間(ｈ)は足せないので分けて集計し、いずれも年換算で揃える
     - 期間は「期限日(未設定なら開始日)」を基準に絞り込む(既定=今年)
-    - 複数担当のタスクは負荷集計と同じく担当者で均等割り
+    - 複数担当のタスクは担当者の数(無効化した人を含む)で均等割り。成果は既に上がった結果のため、
+      これからの負荷(_build_workload。有効な担当者で割る)と違い、共同担当の誰かを無効化しても
+      ほかの人の値が変わらないようにする。無効化した人(と users に無い人)の分はその人の行
+      (「［無効］」付き)に計上する
     """
     ofrom = parse_date(request.args.get("ofrom")) or date(today.year, 1, 1)
     oto = parse_date(request.args.get("oto")) or date(today.year, 12, 31)
@@ -5263,7 +5479,7 @@ def _build_outcomes(today, users, only_user_id=None):
 
     acc = {u.id: blank(u, u.display_name) for u in users}
     unassigned = blank(None, "未割当")
-    # 担当者が全員 users に含まれない(無効化された)タスクは「未割当」ではなく、その人(［無効］)の行に計上する
+    # users に含まれない(無効化された)担当者の分は「未割当」ではなく、その人(［無効］)の行に計上する
     others = {}
 
     def other_row(user):
@@ -5301,16 +5517,15 @@ def _build_outcomes(today, users, only_user_id=None):
         if e_kind is None and a_kind is None and not has_qual:
             continue  # 成果の記載が無いタスクは対象外
 
-        assigned = [acc[u.id] for u in t.assignees if u.id in acc]
+        # 按分の分母は担当者の数(無効化した人を含む。個人ダッシュボードもマネージャー画面と同じ値)
+        n = len(t.assignees) or 1
         if only_user_id is not None:
-            # 按分の分母は全担当者数のまま(マネージャー画面と同じ値)、計上先は本人のみ
+            # 計上先は本人のみ
             targets = [acc[only_user_id]] if only_user_id in acc else []
-            n = len(assigned) or 1
+        elif t.assignees:
+            targets = [acc[u.id] if u.id in acc else other_row(u) for u in t.assignees]
         else:
-            if not assigned and t.assignees:
-                assigned = [other_row(u) for u in t.assignees]
-            targets = assigned or [unassigned]
-            n = len(targets)
+            targets = [unassigned]
         if not targets:
             continue
 
@@ -5727,6 +5942,22 @@ def new_member():
     return redirect(url_for("departments.manage"))
 
 
+# 画面を開いた後にメンバーが変わった(削除・追加でIDが別の人に再利用された)ときの案内
+_STALE_MEMBERS = "画面を開いた後にメンバーが変更されています（削除・追加など）。画面を開き直してから操作してください。"
+
+
+def _same_member(user):
+    """削除・復帰のボタンのフォームの username(画面を開いたときのログインID)が、URL のIDの人と同じか。
+
+    業務データの無いメンバーを削除するとIDは次に追加した人に再利用されるため、開いたままの画面の
+    ボタンで別の人を削除・復帰しないように照合する。違えば案内を出して False。
+    """
+    if request.form.get("username") == user.username:
+        return True
+    flash(_STALE_MEMBERS, "warning")
+    return False
+
+
 @departments_bp.route("/members/<int:user_id>/delete", methods=["POST"])
 @manager_required
 def delete_member(user_id):
@@ -5736,6 +5967,8 @@ def delete_member(user_id):
     よう物理削除せず「無効化」する(一覧・割り当てから外れる)。データが無ければ物理削除。
     """
     user = get_or_404(User, user_id)
+    if not _same_member(user):
+        return redirect(url_for("departments.manage"))
     if user.id == current_user.id:
         flash("自分自身は削除できません。", "warning")
         return redirect(url_for("departments.manage"))
@@ -5768,6 +6001,8 @@ def delete_member(user_id):
 def reactivate_member(user_id):
     """無効化したメンバーを復帰させる。マネージャーのみ。"""
     user = get_or_404(User, user_id)
+    if not _same_member(user):
+        return redirect(url_for("departments.manage"))
     user.is_active = True
     db.session.commit()
     flash(f"メンバー「{user.display_name}」を復帰しました。", "success")
@@ -5825,14 +6060,36 @@ def toggle_department(dept_id):
 @departments_bp.route("/memberships", methods=["POST"])
 @manager_required
 def save_memberships():
-    """人とチームの紐づけ(兼務対応)を一括保存する。"""
-    users = User.query.filter_by(is_active=True).all()
-    user_by_id = {u.id: u for u in users}
-    for dept in Department.query.all():
-        checked_ids = set(to_ints(request.form.getlist(f"dept_{dept.id}")))
-        dept.users = [user_by_id[uid] for uid in checked_ids if uid in user_by_id]
-    db.session.commit()
+    """人とチームの紐づけ(兼務対応)を一括保存する。
+
+    変えるのは、画面を開いたときに表に出ていた人(member_keys。「ユーザーID:ログインID」)と
+    チーム(dept_ids)の組み合わせだけ。画面を開いた後に追加・復帰した人や追加したチームの紐づけは
+    そのまま残す(別のタブ・別のマネージャーの保存を古い画面の内容で消さないように)。
+    画面を開いた後に削除・無効化された人、IDが別の人に再利用された人は変えない(users_from_form_keys)。
+    """
+    shown_keys = request.form.getlist("member_keys")
+    shown_dept_ids = set(to_ints(request.form.getlist("dept_ids")))
+    if not shown_keys or not shown_dept_ids:
+        flash("紐づけの表の内容を読み取れませんでした（保存していません）。画面を開き直してから保存してください。",
+              "warning")
+        return redirect(url_for("departments.manage"))
+    members, stale = users_from_form_keys(shown_keys, get_active_users())
+    departments = Department.query.filter(Department.id.in_(shown_dept_ids)).all()
+    # 紐づけの追加は保存(commit)のときにまとめて行う(同時に送られた保存と重なっても commit_or_conflict で受け止める)
+    with db.session.no_autoflush:
+        for dept in departments:
+            checked = set(request.form.getlist(f"dept_{dept.id}"))
+            current = list(dept.users)
+            for user in members:
+                if user.form_key in checked and user not in current:
+                    dept.users.append(user)
+                elif user.form_key not in checked and user in current:
+                    dept.users.remove(user)
+    if not commit_or_conflict():
+        return redirect(url_for("departments.manage"))
     flash("チームの紐づけを保存しました。", "success")
+    if stale:
+        flash("画面を開いた後に削除・無効化されたメンバーの紐づけは変更していません。", "info")
     return redirect(url_for("departments.manage"))
 
 
@@ -6000,7 +6257,12 @@ def _leaves_sheets():
 
 
 def _skilltest_sheets():
-    """スキルテストの受験履歴・回答(全問)・問題プール。"""
+    """スキルテストの受験履歴・回答(全問)・問題プール。
+
+    全体の期限を過ぎた受験中のテストは、管理画面を開いたときと同じく先に終了してから出力する
+    (「受験中」のまま正解数・結果の無い行にしない)。
+    """
+    expire_due()
     attempts = SkillTestAttempt.query.order_by(SkillTestAttempt.started_at, SkillTestAttempt.id).all()
     a_headers = [
         "受験ID", "メンバー", "スキル", "状態", "開始日時", "終了日時", "全体の期限",
@@ -6429,7 +6691,7 @@ def _normalize_weekly_settings(data):
         if isinstance(data.get(key), str):
             result[key] = data[key][:WEEKLY_TEXT_MAX]
     result["last_result"] = normalize_last_result(data.get("last_result"))
-    return result
+    return keep_auto_run_key(result, data)
 
 
 WEEKLY_SETTINGS = JsonSettings(WEEKLY_SETTINGS_FILENAME, WEEKLY_SETTINGS_LABEL,
@@ -6645,6 +6907,10 @@ def _task_facts(task, start, end, today=None):
         "priority": task.priority,
         "start_date": task.start_date,
         "due_date": due,
+        # 開始日・期限の表記(期間の終わりと同じ年は mm/dd、違う年は yyyy/mm/dd。前の年からの期限超過が
+        # 数日の遅れに見えないように。期限超過通知と同じ書き方)
+        "start_label": _year_aware_label(task.start_date, end),
+        "due_label": _year_aware_label(due, end),
         "scale_label": task.scale_label or "",
         "assignees": task.assignee_names,
         "assignee_ids": {u.id for u in task.assignees},
@@ -6847,8 +7113,15 @@ WEEKLY_NONE_TEXT = "特になし"
 # 表記の小道具
 # --------------------------------------------------------------------------- #
 def _mmdd(d):
-    """日付(または日時)を mm/dd に。None は ―。"""
+    """日付(または日時)を mm/dd に。None は ―(期間の中の日付〔記載・完了・状態の変更〕に使う)。"""
     return d.strftime("%m/%d") if d else "―"
+
+
+def _year_aware_label(d, ref):
+    """開始日・期限の表記: ref(期間の終わり)と同じ年は mm/dd、違う年は yyyy/mm/dd。None は ―。"""
+    if not d:
+        return "―"
+    return d.strftime("%m/%d") if d.year == ref.year else d.strftime("%Y/%m/%d")
 
 
 def _money(value):
@@ -6868,8 +7141,8 @@ def _outcome(f):
 def _task_line(f):
     """タスク1件の1行表記(タイトル【状態】(優先度・開始・期限・規模))。"""
     info = ["優先度 {}".format(f["priority"] or "―"),
-            "開始 {}".format(_mmdd(f["start_date"])),
-            "期限 {}".format(_mmdd(f["due_date"]))]
+            "開始 {}".format(f["start_label"]),
+            "期限 {}".format(f["due_label"])]
     if f["scale_label"]:
         info.append("規模 {}".format(f["scale_label"]))
     return "{}【{}】（{}）".format(f["title"], f["status"], "・".join(info))
@@ -6920,11 +7193,11 @@ def person_material_text(p, period):
     ])
     _section(lines, "担当している未完了のタスク", [_task_line(f) for f in p["open_tasks"]])
     _section(lines, "期限超過の未完了タスク", [
-        "{}（期限 {}・{}）".format(f["title"], _mmdd(f["due_date"]), f["status"])
+        "{}（期限 {}・{}）".format(f["title"], f["due_label"], f["status"])
         for f in p["overdue"]
     ])
     _section(lines, "今後7日以内に期限を迎えるタスク", [
-        "{}（期限 {}・{}）".format(f["title"], _mmdd(f["due_date"]), f["status"])
+        "{}（期限 {}・{}）".format(f["title"], f["due_label"], f["status"])
         for f in p["due_soon"]
     ])
     _section(lines, "期間内に進捗記載の無い未完了タスク", [f["title"] for f in p["silent"]])
@@ -6966,7 +7239,7 @@ def team_material_text(material, person_texts, period):
     ])
     _section(lines, "期限超過の未完了タスク", [
         "{}（担当 {}・期限 {}・{}）".format(
-            f["title"], f["assignees"] or "未割当", _mmdd(f["due_date"]), f["status"])
+            f["title"], f["assignees"] or "未割当", f["due_label"], f["status"])
         for f in team["overdue_tasks"]
     ])
     lines.append("[各メンバーの週報（個人分）]")
@@ -7005,12 +7278,12 @@ def person_rule_text(p):
     changes = ["{} {} → {}".format(_mmdd(c["at"]), c["task"], c["status"]) for c in p["changes"]]
     changes.extend("新規登録: {}（{}）".format(f["title"], f["initial_status"]) for f in p["created"])
 
-    issues = ["期限超過: {}（期限 {}・{}）".format(f["title"], _mmdd(f["due_date"]), f["status"])
+    issues = ["期限超過: {}（期限 {}・{}）".format(f["title"], f["due_label"], f["status"])
               for f in p["overdue"]]
     if p["silent"]:
         issues.append("今週の進捗記載なし: {}".format("、".join(f["title"] for f in p["silent"])))
 
-    plans = ["期限が近い: {}（期限 {}）".format(f["title"], _mmdd(f["due_date"])) for f in p["due_soon"]]
+    plans = ["期限が近い: {}（期限 {}）".format(f["title"], f["due_label"]) for f in p["due_soon"]]
 
     lines = []
     _block(lines, "今週の実績", results)
@@ -7025,7 +7298,7 @@ def no_activity_text(p):
     """動きの無かった対象者の文章(「今週の記載なし」＋未完了の担当タスク)。"""
     lines = [NO_ACTIVITY]
     _block(lines, "未完了の担当タスク", [
-        "{}【{}】（期限 {}）".format(f["title"], f["status"], _mmdd(f["due_date"]))
+        "{}【{}】（期限 {}）".format(f["title"], f["status"], f["due_label"])
         for f in p["open_tasks"]
     ])
     return "\n".join(lines)
@@ -7052,7 +7325,7 @@ def team_rule_text(material, period):
     _block(lines, "今週完了したタスクと成果", results)
     _block(lines, "課題・遅れ", [
         "期限超過: {}（担当 {}・期限 {}）".format(
-            f["title"], f["assignees"] or "未割当", _mmdd(f["due_date"]))
+            f["title"], f["assignees"] or "未割当", f["due_label"])
         for f in team["overdue_tasks"]
     ])
     return "\n".join(lines)
@@ -7805,7 +8078,7 @@ def _normalize_overdue_settings(data):
     if valid_comment_count(data.get("comment_count")):
         result["comment_count"] = data["comment_count"]
     result["last_result"] = normalize_last_result(data.get("last_result"))
-    return result
+    return keep_auto_run_key(result, data)
 
 
 OVERDUE_SETTINGS = JsonSettings(OVERDUE_SETTINGS_FILENAME, OVERDUE_SETTINGS_LABEL,
@@ -7917,8 +8190,10 @@ def link_base():
                     "（タスク名だけを載せます）。システム設定の「基本設定」タブで設定してください。")
     try:
         parts = urlsplit(raw)
+        parts.port  # ポート番号が不正なら ValueError(設定画面の確認と同じ)
+        # 「?」「#」は空のクエリ・フラグメント(「…/?」「…/#」)も不可。ID・パスワード(user:pass@)も不可
         valid = (parts.scheme.lower() in ("http", "https") and bool(parts.hostname)
-                 and not parts.query and not parts.fragment
+                 and "?" not in raw and "#" not in raw and not url_has_userinfo(raw)
                  and not any(ch.isspace() or ord(ch) < 0x20 for ch in raw))
     except ValueError:
         valid = False
@@ -8790,13 +9065,15 @@ def generate_questions(skill, level, count, max_calls=None, stop_at=None):
     戻り値: (保存した SkillTestQuestion のリスト, エラーメッセージ または None)
     AIに接続できない・応答が無いなどのエラーが起きたら、その時点で止める
     (それまでに保存した問題は残る)。応答の形式が不正なだけなら、回数の上限まで続ける。
+    呼び出し側は、そのスキルの作成のロック(generation_lock)を持った状態で呼ぶ(受験の開始時の作成と
+    補充が同時に同じ問題を保存しないように)。念のため、既存の問題文は AI の応答を受け取った後に
+    毎回読み直して重複を除く。
     """
     created = []
     if count <= 0:
         return created, None
     if max_calls is None:
         max_calls = int(math.ceil(count / float(CHUNK_SIZE))) + 1
-    keys = existing_keys(skill.id)
     model = model_label()
     last_error = None
     calls = 0
@@ -8812,6 +9089,8 @@ def generate_questions(skill, level, count, max_calls=None, stop_at=None):
         if parse_error:
             last_error = parse_error
             continue
+        # 保存の直前に読み直す(AI の応答を待っている間に、ほかの作成で保存された問題と重ねない)
+        keys = existing_keys(skill.id)
         added = 0
         for item in items:
             if len(created) >= count:
@@ -9140,6 +9419,16 @@ def is_generating_at_start(skill_id):
         return _start_generating.get(skill_id, 0) > 0
 
 
+# 同じスキルの問題の作成(受験の開始時の作成・補充)を1つずつにするロック {skill_id: Lock}。
+# 同時に作ると、どちらも相手の新しい問題を知らないまま同じ問題を保存してしまうため
+_generation_locks = {}
+
+
+def generation_lock(skill_id):
+    """そのスキルの問題の作成を直列化するロック(受験の開始時の作成と補充で共用)。"""
+    return _lock_for(_generation_locks, skill_id, threading.Lock)
+
+
 def _generate_at_start(skill, level, count, stop_at):
     """受験の開始時の問題の作成(作成中であることを _start_generating に記録する)。"""
     with _start_generating_lock:
@@ -9159,23 +9448,56 @@ def _pick_for_level(skill, level, count, served, state):
     """1つのレベルの問題を選ぶ: (問題のリスト, 再出題した数)。
 
     1. その人に表示したことのない有効な問題(ランダム)
-    2. 足りなければ不足分をAIで作る(同期。1回で最大10問ずつ)
+    2. 足りなければ不足分をAIで作る(同期。1回で最大10問ずつ)。そのスキルの作成は1つずつ
+       (generation_lock)で、待っている間にほかの受験の開始・補充で作られた問題があれば先にそれを使う
     3. まだ足りなければ、その人に表示したのが最も古い問題から再出題する
+    同じ問題文(normalize_text が同じ)の問題は、1回の受験で1つだけ選ぶ(state["keys"])。
     """
+    keys = state["keys"]
+    picked = []
+
+    def take(questions):
+        for q in questions:
+            if len(picked) >= count:
+                break
+            key = normalize_text(q.question)
+            if key in keys:
+                continue
+            keys.add(key)
+            picked.append(q)
+
+    def unseen_of(questions):
+        picked_ids = {q.id for q in picked}
+        unseen = [q for q in questions if q.id not in served and q.id not in picked_ids]
+        _rng.shuffle(unseen)
+        return unseen
+
     active = _active_questions(skill.id, level)
-    unseen = [q for q in active if q.id not in served]
-    _rng.shuffle(unseen)
-    picked = unseen[:count]
+    take(unseen_of(active))
 
     if len(picked) < count and state["ai"]:
-        created, error = _generate_at_start(skill, level, count - len(picked), state["stop_at"])
-        picked += created[:count - len(picked)]
-        state["generated"] += len(created)
-        if error:
-            state["errors"].append("Lv{}: {}".format(level, error))
-            if not created:
-                # 1問も作れなかった(AIに接続できない等)。残りのレベルでは待たずに諦める
-                state["ai"] = False
+        lock = generation_lock(skill.id)
+        if lock.acquire(timeout=max(0.0, state["stop_at"] - monotonic())):
+            try:
+                # 待っている間に作られた問題(ほかの人の受験の開始・補充)があれば、それを先に使う
+                active = _active_questions(skill.id, level)
+                take(unseen_of(active))
+                if len(picked) < count:
+                    created, error = _generate_at_start(skill, level, count - len(picked), state["stop_at"])
+                    take(created)
+                    state["generated"] += len(created)
+                    if error:
+                        state["errors"].append("Lv{}: {}".format(level, error))
+                        if not created:
+                            # 1問も作れなかった(AIに接続できない等)。残りのレベルでは待たずに諦める
+                            state["ai"] = False
+            finally:
+                lock.release()
+        else:
+            # ほかの作成(補充など)が時間内に終わらなかった。残りのレベルでは待たずに諦める
+            state["errors"].append("Lv{}: ほかの問題の作成が時間内に終わりませんでした。".format(level))
+            state["ai"] = False
+            active = _active_questions(skill.id, level)
 
     reused = 0
     if len(picked) < count:
@@ -9184,9 +9506,9 @@ def _pick_for_level(skill, level, count, served, state):
             (q for q in active if q.id in served and q.id not in picked_ids),
             key=lambda q: (served[q.id], q.id),
         )
-        extra = seen[:count - len(picked)]
-        reused = len(extra)
-        picked += extra
+        before = len(picked)
+        take(seen)
+        reused = len(picked) - before
     return picked, reused
 
 
@@ -9232,7 +9554,7 @@ def start_attempt(user, skill):
         rows, _total, seconds = skilltest_plan(settings, levels)
 
         served = _served_history(user.id, skill.id)
-        state = {"ai": ai_is_configured(), "generated": 0, "errors": [],
+        state = {"ai": ai_is_configured(), "generated": 0, "errors": [], "keys": set(),
                  "stop_at": monotonic() + START_AI_BUDGET_SEC}
         picked_by_level = []
         reused_total = 0
@@ -9602,15 +9924,17 @@ def _topup(app, skill_id):
                 target = settings["pool_target_per_level"]
                 parts, added_total, error = [], 0, None
                 for level in tested_levels(settings, skill.max_level):
-                    active = SkillTestQuestion.query.filter_by(
-                        skill_id=skill.id, level=level, is_active=True).count()
-                    need = target - active
-                    if need <= 0:
-                        parts.append("Lv{} 追加なし（{}問）".format(level, active))
-                        continue
-                    created, error = generate_questions(
-                        skill, level, need,
-                        max_calls=int(math.ceil(need / float(CHUNK_SIZE))) + 2)
+                    # 受験の開始時の作成と重ねない(作成中なら終わるのを待ち、その後の問題数で数える)
+                    with generation_lock(skill.id):
+                        active = SkillTestQuestion.query.filter_by(
+                            skill_id=skill.id, level=level, is_active=True).count()
+                        need = target - active
+                        if need <= 0:
+                            parts.append("Lv{} 追加なし（{}問）".format(level, active))
+                            continue
+                        created, error = generate_questions(
+                            skill, level, need,
+                            max_calls=int(math.ceil(need / float(CHUNK_SIZE))) + 2)
                     added_total += len(created)
                     parts.append("Lv{} +{}（{}問）".format(level, len(created), active + len(created)))
                     if error:
@@ -9930,7 +10254,8 @@ def admin_pool():
         rows.append({
             "skill": skill,
             "testable": is_testable(skill),
-            "no_description": not (skill.description or "").strip(),
+            # 説明なしの警告は受験の対象のスキルだけ(スキルの問題の画面と同じ)
+            "no_description": is_testable(skill) and not (skill.description or "").strip(),
             "cells": [
                 {
                     "level": lv,
@@ -9994,6 +10319,7 @@ def admin_pool_skill(skill_id):
         scale=scale_for(skill.skill_type),
         running=is_topup_running(),
         running_this=running_skill_id() == skill.id,
+        running_name=running_skill_name(),
         ai_enabled=ai_is_configured(),
         target=settings["pool_target_per_level"],
         active_total=SkillTestQuestion.query.filter_by(skill_id=skill.id, is_active=True).count(),
@@ -10350,9 +10676,15 @@ def _completion_of(task):
 
 
 def _analysis_task(task, period):
-    """1件のタスクの材料(全コメント・全状態の変更を含む。表示・AI の材料に使う素の値)。"""
+    """1件のタスクの材料(全コメント・全状態の変更を含む。表示・AI の材料に使う素の値)。
+
+    担当者の名前(assignee_list・assignee_names)は、無効化した人に「［無効］」を付ける(一覧・AI の材料)。
+    推奨アクションで声をかける相手は有効な担当者だけ(active_assignee_list。全員が無効なら担当者のいない
+    タスクと同じく「担当者を決めて…」にする)。
+    """
     assignees = list(task.assignees)
     assignee_ids = [u.id for u in assignees]
+    assignee_labels = [u.display_name + ("" if u.is_active else INACTIVE_MARK) for u in assignees]
     id_set = set(assignee_ids)
     comments = [_analysis_comment(c, id_set) for c in task.comments]
     comments.sort(key=lambda c: (c["at"] or datetime.min, c["id"]))
@@ -10375,8 +10707,9 @@ def _analysis_task(task, period):
         "created_at": task.created_at,
         "updated_at": task.updated_at,
         "assignee_ids": assignee_ids,
-        "assignee_list": [u.display_name for u in assignees],
-        "assignee_names": "、".join(u.display_name for u in assignees),
+        "assignee_list": assignee_labels,
+        "assignee_names": "、".join(assignee_labels),
+        "active_assignee_list": [u.display_name for u in assignees if u.is_active],
         "comments": comments,
         "changes": changes,
         "last_progress": progress[-1] if progress else None,
@@ -10576,6 +10909,7 @@ def _task_ref(t):
         "assignee_ids": t["assignee_ids"],
         "assignee_list": t["assignee_list"],
         "assignee_names": t["assignee_names"],
+        "active_assignee_list": t["active_assignee_list"],
         "start_date": t["start_date"],
         "due_date": t["due_date"],
         "scale_label": t["scale_label"],
@@ -10805,6 +11139,8 @@ def _skilltest_status(members, period, now):
         rows.append({
             "user_id": u.id,
             "name": u.display_name,
+            # 今までに一度でも受験したか(期間に関係なく現時点。受験を勧める推奨アクションに使う)
+            "ever_now": sum(1 for v in views if v["user_id"] == u.id and v["started_at"] is not None),
             "attempts": len(mine),
             "finished": sum(1 for v in mine if v["state"] == "finished"),
             "expired": sum(1 for v in mine if v["state"] in ("expired", "abandoned")),
@@ -10821,7 +11157,8 @@ def _skilltest_status(members, period, now):
         "attempts": in_period,
         "rows": rows,
         "team": team,
-        "never": [r for r in rows if not r["ever"]],
+        "never": [r for r in rows if not r["ever"]],          # 期間の終わりの時点で一度も受験していない
+        "never_now": [r for r in rows if not r["ever_now"]],  # 現時点で一度も受験していない
         "none_in_period": [r for r in rows if r["ever"] and not r["attempts"]],
         "testable_count": len(testable_skills()),
         "blur_many": BLUR_MANY,
@@ -11099,7 +11436,8 @@ def outputs_summary(rows, members, labels):
             "lead_time": _lt_summary(lts),
         }
 
-    # ヒト別は担当者の数で均等割り(成果の集計(5-7)と同じ)。チームは1件ずつ
+    # ヒト別は担当者の数(無効化した人を含む)で均等割り(成果の集計(5-7)の _build_outcomes と同じ)。
+    # チームは1件ずつ(マネージャー・無効化した人の分もチームに含むため、ヒト別の合計とは一致しない)
     person_rows = []
     for m in members:
         mine = [r for r in rows if m["id"] in r["assignee_ids"]]
@@ -11220,7 +11558,7 @@ def collect_analysis(period, now, settings):
         "now": now,
         "period": period,
         "settings": settings,
-        "members": [{"id": u.id, "name": u.display_name} for u in members],
+        "members": [{"id": u.id, "name": u.display_name, "username": u.username} for u in members],
         "tasks": tasks,
         "person_task_ids": person_task_ids,
         "progress": progress,
@@ -11296,8 +11634,11 @@ def _san(names):
 
 
 def _ask(item, with_assignee, without_assignee):
-    """担当者がいれば「○○さん＋with_assignee」、いなければ without_assignee。"""
-    who = _san(item["assignee_list"])
+    """有効な担当者がいれば「○○さん＋with_assignee」、いなければ without_assignee。
+
+    担当者が全員無効化されたタスクは、担当者のいないタスクと同じ扱い(無効化した人には頼めないため)。
+    """
+    who = _san(item.get("active_assignee_list", item["assignee_list"]))
     return who + with_assignee if who else without_assignee
 
 
@@ -11322,6 +11663,9 @@ def _action_candidates(data):
             ["期限超過 {}営業日".format(item["overdue_days"]),
              "優先度 {}".format(item["priority"]),
              "最後の進捗記載: {}".format(last["at"].strftime("%m/%d") if last else "なし")])
+    # マネージャーのコメント: 1つのタスクに要フォローのコメントが複数あっても推奨アクションは1件にする
+    # (同じやること・同じ対象が並んで、ほかのタスクの枠を使わないように)。点数は最も高いコメントの点数
+    mc_by_task = {}
     for item in progress["manager_comments"]["follow"]:
         if not item["is_open"]:
             continue
@@ -11329,23 +11673,31 @@ def _action_candidates(data):
             # 返信はあるが、AI が「未対応」「一部対応」と判定したもの(9-8 で要フォローに入る)
             ai = item.get("ai") or {}
             rest = one_line(ai.get("remaining") or ai.get("request") or "", 40)
-            add("manager_comment", (78 if item["judgement"] == MC_NOT_DONE else 74)
-                + min(item["age_days"] or 0, 20) / 2.0,
+            candidate = (
+                (78 if item["judgement"] == MC_NOT_DONE else 74) + min(item["age_days"] or 0, 20) / 2.0,
                 _ask(item, "と、コメントで求めた対応{}の進め方を確認する".format(
                     "（{}）".format(rest) if rest else ""), "担当者を決めて、コメントへの対応を依頼する"),
-                _task_target(item),
                 "{} {}さんのコメント「{}」への対応が「{}」（AIの判定）。".format(
                     item["at"].strftime("%m/%d"), item["author"], one_line(item["body"], 40),
                     item["judgement"]),
                 ["コメントから {}営業日".format(item["age_days"]), "判定 {}".format(item["judgement"]),
                  "状態 {}".format(item["status"])])
-            continue
-        add("manager_comment", 80 + min(item["elapsed_days"] or 0, 20) / 2.0,
-            _ask(item, "に、コメントへの返信・対応を確認する", "担当者を決めて、コメントへの対応を依頼する"),
-            _task_target(item),
-            "{} {}さんのコメント「{}」に担当者の返信がない。".format(
-                item["at"].strftime("%m/%d"), item["author"], one_line(item["body"], 40)),
-            ["経過 {}営業日".format(item["elapsed_days"]), "状態 {}".format(item["status"])])
+        else:
+            candidate = (
+                80 + min(item["elapsed_days"] or 0, 20) / 2.0,
+                _ask(item, "に、コメントへの返信・対応を確認する", "担当者を決めて、コメントへの対応を依頼する"),
+                "{} {}さんのコメント「{}」に担当者の返信がない。".format(
+                    item["at"].strftime("%m/%d"), item["author"], one_line(item["body"], 40)),
+                ["経過 {}営業日".format(item["elapsed_days"]), "状態 {}".format(item["status"])])
+        mc_by_task.setdefault(item["task_id"], []).append((candidate, item))
+    for entries in mc_by_task.values():
+        (score, title, reason, numbers), item = max(entries, key=lambda e: e[0][0])
+        if len(entries) > 1:
+            others = [i for _c, i in entries if i is not item]
+            reason += "ほかにも要フォローのコメントが{}件ある（{}）。".format(len(others), "、".join(
+                "{}「{}」".format(i["at"].strftime("%m/%d"), one_line(i["body"], 20)) for i in others))
+            numbers = numbers + ["要フォローのコメント {}件".format(len(entries))]
+        add("manager_comment", score, title, _task_target(item), reason, numbers)
     for item in progress["stale"]:
         add("stale", 70 + min(item["elapsed_days"], 30) / 3.0,
             _ask(item, "に進捗の記載を依頼する", "担当者を決めて、進捗を確認する"),
@@ -11425,8 +11777,9 @@ def _action_candidates(data):
             "期間内の進捗記載に具体性の低いものがある（例: 「{}」）。".format(one_line(first["body"], 20)),
             ["書き直し推奨 {}件".format(len(rows))])
     tests = skills["tests"]
-    if tests["testable_count"] and tests["never"]:
-        names = [r["name"] for r in tests["never"]]
+    # 受験を勧めるのは、現時点で一度も受験していない人(過去の期間を表示しても、期間の後に受験した人には勧めない)
+    if tests["testable_count"] and tests["never_now"]:
+        names = [r["name"] for r in tests["never_now"]]
         add("skilltest", 35,
             "{}にスキルテストの受験を勧める".format(_san(names)),
             {"kind": "skilltest", "id": None, "label": "スキルテスト管理"},
@@ -11497,7 +11850,7 @@ def rule_actions(data):
 # (複数担当のタスクは表示名順で最初の担当者の呼び出し。進捗記載は書いた本人の呼び出し)。
 
 ANALYSIS_GROUP_OTHER = "other"
-ANALYSIS_OTHER_LABEL = "担当者のいないタスク（マネージャーだけが担当のものを含む）"
+ANALYSIS_OTHER_LABEL = "担当者のいないタスク（マネージャーだけ・無効化したメンバーだけが担当のものを含む）"
 # チームのまとめに渡す推奨アクションの候補の数の上限(点数の高い順。残りの件数は材料に書く)
 ACTION_CANDIDATES_FOR_AI = 40
 # 分けて送るタスクの経過メモ・成果の事実メモの最大文字数(1件)
@@ -11912,7 +12265,7 @@ def person_numbers_text(data, user_id):
                 "{} Lv{}".format(_inline(h["name"]), h["level"]) for h in held)))
     if test:
         lines.append("・スキルテスト（期間内）: 受験 {}回 ／ 終了 {}回 ／ 時間切れ・途中で終了 {}回 ／ レベルアップ {}回 ／ "
-                     "離脱が多い（画面から{}回以上離れた）{}回 ／ 最後の受験 {}".format(
+                     "離脱が多い（画面から{}回以上離れた）{}回 ／ 最後の受験（期間の終わりまで） {}".format(
                          test["attempts"], test["finished"], test["expired"], test["level_ups"], BLUR_MANY,
                          test["many_blur"], _fmt_d(test["last_at"]) if test["last_at"] else "未受験"))
     return "\n".join(lines)
@@ -12190,8 +12543,8 @@ def skills_units(data):
                 "{} {}件（{}%）".format(_inline(h["name"]), h["count"], h["share"]) for h in cc["holdings"]),
             " → {}さんに{}%が集中（{}%以上）".format(_inline(cc["top"]["name"]), cc["top_share"], cc["threshold"])
             if cc["flag"] else ""))
-    overview.append("スキルテストの対象スキル: {}件 ／ 一度も受験していない: {} ／ 期間内に受験していない（以前は受験）: {}".format(
-        tests["testable_count"], "、".join(_inline(r["name"]) for r in tests["never"]) or "なし",
+    overview.append("スキルテストの対象スキル: {}件 ／ 一度も受験していない（現時点）: {} ／ 期間内に受験していない（以前は受験）: {}".format(
+        tests["testable_count"], "、".join(_inline(r["name"]) for r in tests["never_now"]) or "なし",
         "、".join(_inline(r["name"]) for r in tests["none_in_period"]) or "なし"))
     # 1行ずつの部品にする(長いときは行の区切りで分けられるように。最初の行は見出し)
     units = [("overview", [_part(line) for line in overview])]
@@ -12310,8 +12663,8 @@ def team_material_sections(data, candidates, hidden_candidates):
         "・スキルテスト（期間内）: 受験 {}回 ／ 終了 {}回 ／ 時間切れ・途中で終了 {}回 ／ レベルアップ {}回 ／ 離脱が多い {}回".format(
             ts["team"]["attempts"], ts["team"]["finished"], ts["team"]["expired"], ts["team"]["level_ups"],
             ts["team"]["many_blur"]),
-        "・一度も受験していない: {} ／ 期間内に受験していない: {}".format(
-            "、".join(_inline(r["name"]) for r in ts["never"]) or "なし",
+        "・一度も受験していない（現時点）: {} ／ 期間内に受験していない: {}".format(
+            "、".join(_inline(r["name"]) for r in ts["never_now"]) or "なし",
             "、".join(_inline(r["name"]) for r in ts["none_in_period"]) or "なし"),
         "・保有者が1名以下のスキル {}件 ／ 対応できる人が1名以下の業務 {}件{}".format(
             len(sk["thin_skills"]), len(sk["single_operations"]),
@@ -12895,8 +13248,10 @@ class AnalysisRun:
             else:
                 findings, findings_masked = self.take_findings(parsed.get("findings"), AllowedNumbers(material))
         self.masks[("findings", group["key"])] = findings_masked if findings else 0
-        self.result["persons"][str(group["key"])] = {"notes": notes[:AI_LIST_MAX * 2], "findings": findings,
-                                                     "unread_parts": len(failed)}
+        member = next((m for m in self.data["members"] if m["id"] == group["key"]), {})
+        self.result["persons"][str(group["key"])] = dict(
+            {"notes": notes[:AI_LIST_MAX * 2], "findings": findings, "unread_parts": len(failed)},
+            **person_identity(member.get("username")))
 
     def judged_counts(self, group):
         """所見の材料にする、その人の項目の AI の判定の件数(アプリが数える)。"""
@@ -12977,7 +13332,7 @@ class AnalysisRun:
             remaining, n2 = ("", 0) if judgement == MC_DONE else self.masked(raw.get("remaining"), allowed)
             evidence, n3 = self.masked(raw.get("evidence"), allowed)
             self.masks[("mc", item["comment_id"])] = n1 + n2 + n3
-            result["manager_comments"][str(item["comment_id"])] = {
+            result["manager_comments"][str(item["comment_id"])] = dict({
                 "request": request_text,
                 "needs_response": raw.get("needs_response") is not False,
                 "judgement": judgement,
@@ -12985,7 +13340,7 @@ class AnalysisRun:
                 "evidence": evidence,
                 "fp_request": fp_request,
                 "fp": fp,
-            }
+            }, **comment_identity(tasks[item["task_id"]], item["comment_id"]))
 
         rows = {r["task_id"]: r for r in self.data["outputs"]["tasks"]}
         outcome_tasks = set(items["outcomes"])
@@ -12999,7 +13354,8 @@ class AnalysisRun:
             if vague or rows[task_id]["problems"]:
                 suggestion, n1 = self.outcome_suggestion(raw.get("suggestion"), allowed)
             reason, n2 = self.masked(raw.get("reason"), allowed)
-            self.masks[("outcome", task_id)] = n1 + n2
+            # 理由は「あいまい」と判定したときだけ画面に出る(出ない文の置き換えは数えない)
+            self.masks[("outcome", task_id)] = n1 + (n2 if vague else 0)
             result["outcomes"][str(task_id)] = {"vague": vague, "reason": reason,
                                                 "suggestion": suggestion, "fp": outcome_fingerprint(tasks[task_id])}
 
@@ -13014,12 +13370,12 @@ class AnalysisRun:
             reason, n1 = self.masked(raw.get("reason"), allowed)
             suggestion, n2 = self.masked(raw.get("suggestion"), allowed, AI_SUGGESTION_MAX)
             self.masks[("progress", cid)] = n1 + n2
-            result["progress_comments"][str(cid)] = {
+            result["progress_comments"][str(cid)] = dict({
                 "reason": reason,
                 "suggestion": suggestion,
                 "rule": cid in rule_progress,
                 "fp": comment_fingerprint(tasks[task_id], cid),
-            }
+            }, **comment_identity(tasks[task_id], cid))
 
     def take_memos(self, parsed, items, carry):
         """分けて送っているタスクの経過メモ・成果の事実メモを、次の回に渡すために残す(画面には出さない)。"""
@@ -13252,9 +13608,14 @@ class AnalysisRun:
 
 
 def _identified_target(target, data):
-    """推奨アクションの対象に、タスクを見分ける印(tid)を付ける(保存した後に同じIDの別のタスクと取り違えない。9-8)。"""
+    """推奨アクションの対象に、タスク・人を見分ける印(tid・username)を付ける(保存した後に同じIDの別のタスク・人と
+    取り違えない。9-8)。"""
     if target.get("kind") == "task" and target.get("id") in data["tasks"]:
         return dict(target, tid=task_identity(data["tasks"][target["id"]]))
+    if target.get("kind") == "person":
+        member = next((m for m in data["members"] if m["id"] == target.get("id")), None)
+        if member is not None:
+            return dict(target, username=member.get("username") or "")
     return target
 
 
@@ -13398,10 +13759,15 @@ def run_ai_analysis_job(app, args):
 def start_ai_analysis(app, args):
     """AI分析を別スレッドで始める(画面の「AIで分析」)。既に実行中なら何もせず False を返す。"""
     args = {key: str(args.get(key) or "") for key in ("period", "from", "to")}
+    # 期間の表示は始める前に決めておく(スレッドが期間を計算するまでの間も、実行中の表示に期間を出す)
+    try:
+        label = analysis_period(args, _now().date())["label"]
+    except Exception:
+        label = ""
 
     def reset_state():
         _analysis_state.update(step="準備しています", done=0, total=0, started_at=datetime.now(),
-                               period="", last_error=None)
+                               period=label, last_error=None)
 
     return start_in_thread(app, _analysis_lock, "ai-analysis", lambda: run_ai_analysis_job(app, args),
                            "AI分析でエラーが発生しました", prepare=reset_state)
@@ -13466,6 +13832,44 @@ def task_identity(t):
     return _fingerprint(t["id"], t["created_at"])
 
 
+def _at_text(dt):
+    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else ""
+
+
+def comment_identity(t, comment_id):
+    """コメントの判定と一緒に保存する、コメントを見分ける印 {"tid": タスクの印, "at": 書いた日時}。
+
+    タスクを削除するとそのコメントの ID は次に書かれたコメント(別のタスクのものでも)に再利用されるため、
+    ID と本文の指紋だけでは、同じ本文(「対応中」など)の別のコメントと取り違える。
+    """
+    c = next((c for c in t["comments"] if c["id"] == comment_id), None)
+    return {"tid": task_identity(t), "at": _at_text(c["at"]) if c else ""}
+
+
+def same_comment(stored, t, c, generated_at):
+    """保存したコメントの判定 stored が、今のコメント c(タスク t)のものか。
+
+    印(tid・at)が違う、または分析(generated_at)の後に書かれたコメントは別のコメント(IDの再利用)とみなす。
+    印の無い古い結果は、分析の後に書かれたコメントでなければ同じとみなす。
+    """
+    if stored.get("tid") and stored["tid"] != task_identity(t):
+        return False
+    if stored.get("at") and stored["at"] != _at_text(c["at"]):
+        return False
+    if generated_at is not None and c["at"] is not None and \
+            c["at"].replace(second=0, microsecond=0) > generated_at:
+        return False
+    return True
+
+
+def person_identity(username):
+    """各人の所見と一緒に保存する、人を見分ける印(ログインID)。
+
+    業務データの無いメンバーを削除すると、そのユーザーIDは次に追加した人に再利用されるため。
+    """
+    return {"username": username or ""}
+
+
 def issue_fingerprint(t):
     """課題・相談の材料(タイトル・説明・コメント・状態)の指紋。"""
     return _fingerprint(t["title"], t["description"], [(c["id"], c["body"]) for c in t["comments"]], t["status"])
@@ -13476,9 +13880,28 @@ def _changed(stored_fp, current_fp):
     return bool(stored_fp) and stored_fp != current_fp
 
 
+def _str_list(value):
+    """保存した結果の箇条書き(文字列のリスト)。リストでなければ空、文字列でない要素は除く。"""
+    return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+
+
+def _str_lists(value, keys):
+    """{キー: 箇条書き} の結果を整える(keys は (キー, 見出し) の組)。辞書でない・すべて空なら None。"""
+    if not isinstance(value, dict):
+        return None
+    out = {key: _str_list(value.get(key)) for key, _label in keys}
+    return out if any(out.values()) else None
+
+
+def _int_value(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
 def _result_ids(values):
     out = set()
-    for v in values or []:
+    if not isinstance(values, (list, tuple, set)):
+        return out  # 手で書き換えたファイルなど(リストでなければ空とみなす)
+    for v in values:
         if isinstance(v, int) and not isinstance(v, bool):
             out.add(v)
     return out
@@ -13587,6 +14010,11 @@ def apply_ai_result(data, stored):
     for item in mc["items"]:
         ai = stored_mc.get(str(item["comment_id"]))
         ai = ai if isinstance(ai, dict) else None
+        if ai is not None:
+            t = tasks[item["task_id"]]
+            c = next((c for c in t["comments"] if c["id"] == item["comment_id"]), None)
+            if c is None or not same_comment(ai, t, c, generated_at):
+                ai = None  # 同じIDの別のコメント(削除したタスクのコメントのIDが再利用された)
         changed = False
         if ai is not None:
             fp_request, fp = mc_fingerprints(tasks[item["task_id"]], item["comment_id"])
@@ -13641,6 +14069,9 @@ def apply_ai_result(data, stored):
         cid = int(key)
         item = by_id.get(cid)
         found = comment_index.get(cid)
+        if found is not None and not same_comment(ai, found[0], found[1], generated_at):
+            # 同じIDの別のコメント(削除したタスクのコメントのIDが再利用された): 判定・書き直し案は使わない
+            continue
         if found is not None and _changed(ai.get("fp"), comment_fingerprint(found[0], cid)):
             # 分析の後に書き換えられた記載: AI の判定・書き直し案は使わない(AI だけが指摘したものは出さない)
             changed_pc.add(cid)
@@ -13667,25 +14098,33 @@ def apply_ai_result(data, stored):
     ab["progress_rewrite"].sort(key=lambda i: i["at"] or datetime.min, reverse=True)
     persons = entries("persons")
     out_rows = {r["user_id"]: r for r in outputs["rows"]}
+    usernames = {m["id"]: m.get("username") for m in data["members"]}
     for row in ab["rows"]:
         row["progress_vague"] = sum(1 for i in ab["progress_rewrite"] if i["user_id"] == row["user_id"])
         row["outcome_rewrite"] = out_rows.get(row["user_id"], {}).get("rewrite", row["outcome_rewrite"])
         person = persons.get(str(row["user_id"]))
         person = person if isinstance(person, dict) else {}
-        row["ai"] = person.get("findings") if isinstance(person.get("findings"), dict) else None
+        row["ai_state"] = None
+        if person.get("username") and person["username"] != usernames.get(row["user_id"]):
+            # 分析した後にその人が削除され、同じIDで別の人が追加された: 前の人の所見は出さない
+            person = {}
+            row["ai_state"] = AI_STATE_CHANGED
+        row["ai"] = _str_lists(person.get("findings"), FINDING_KEYS)
         # 所見を作るときに読み込めなかった回の数(所見は読めた範囲だけに基づく)
         unread_parts = person.get("unread_parts")
         row["ai_unread_parts"] = unread_parts if isinstance(unread_parts, int) and not isinstance(unread_parts, bool) else 0
-        row["ai_notes"] = [n for n in person.get("notes") or [] if isinstance(n, str)]
+        row["ai_notes"] = _str_list(person.get("notes"))
 
     # 担当者のいないタスクを読んだ結果(チームのまとめの材料)
-    data["ai_other_notes"] = [n for n in stored.get("other_notes") or [] if isinstance(n, str)]
+    data["ai_other_notes"] = _str_list(stored.get("other_notes"))
 
-    # ② スキル・まとめ・推奨アクション
-    data["skills"]["ai"] = stored.get("skills") if isinstance(stored.get("skills"), dict) else None
+    # ② スキル・まとめ・推奨アクション(画面で箇条書きにする値は文字列のリストに整える)
+    data["skills"]["ai"] = _str_lists(stored.get("skills"), SKILLS_AI_KEYS)
     team = stored.get("team") if isinstance(stored.get("team"), dict) else {}
-    data["ai_summary"] = team.get("summary") if isinstance(team.get("summary"), dict) else None
-    data["ai_actions"] = ([_checked_action(a, data) for a in stored.get("actions") or [] if isinstance(a, dict)]
+    data["ai_summary"] = _str_lists(team.get("summary"), SUMMARY_KEYS)
+    actions = stored.get("actions") if isinstance(stored.get("actions"), list) else []
+    data["ai_actions"] = ([_checked_action(dict(a, numbers=_str_list(a.get("numbers"))), data)
+                           for a in actions if isinstance(a, dict)]
                           if stored.get("actions_source") == "ai" else None)
     # ルールの推奨アクションも AI の判定を反映した集計から選び直す
     data["actions"] = rule_actions(data)
@@ -13707,8 +14146,14 @@ def _checked_action(action, data):
             stale = "対象のタスクは削除されたか、期間の対象外です"
         elif target.get("tid") and target["tid"] != task_identity(t):
             stale = AI_STATE_CHANGED + "（同じIDの別のタスクです）"
-    elif kind == "person" and not any(m["id"] == target_id for m in data["members"]):
-        stale = "対象のメンバーは分析の対象外です"
+    elif kind == "person":
+        member = next((m for m in data["members"] if m["id"] == target_id), None)
+        if member is None:
+            stale = "対象のメンバーは分析の対象外です"
+        elif target.get("username") and target["username"] != member.get("username"):
+            stale = AI_STATE_CHANGED + "（同じIDの別のメンバーです）"
+    elif target_id is not None and not (isinstance(target_id, int) and not isinstance(target_id, bool)):
+        stale = "対象を読み取れません"
     if stale is None:
         return action
     return dict(action, target=dict(target, stale=stale))
@@ -13733,6 +14178,33 @@ def ai_result_matches(stored, period):
 _ANALYSIS_PERIOD_ARGS = ("period", "from", "to")
 
 
+def _ai_result_summary(stored):
+    """保存した結果の見出しの表示用の値(型の違う値は既定の値にする。手で書き換えたファイルなど)。"""
+    p = stored.get("period") or {}
+    unread = stored.get("unread") if isinstance(stored.get("unread"), dict) else {}
+    read = stored.get("read") if isinstance(stored.get("read"), dict) else {}
+    calls = stored.get("calls") if isinstance(stored.get("calls"), dict) else {}
+    errors = stored.get("errors") if isinstance(stored.get("errors"), list) else []
+    parts = unread.get("parts") if isinstance(unread.get("parts"), list) else []
+    dates = "{}〜{}".format(str(p.get("start") or "").replace("-", "/"), str(p.get("end") or "").replace("-", "/"))
+    return {
+        "generated_at": str(stored.get("generated_at") or "").replace("-", "/"),
+        "finished_at": str(stored.get("finished_at") or "").replace("-", "/"),
+        # 日付で指定した期間はラベルが日付なので、日付を重ねて書かない
+        "period_label": dates if p.get("kind") == ANALYSIS_PERIOD_RANGE else "{}（{}）".format(p.get("label") or "", dates),
+        "model": str(stored.get("model") or ""),
+        "status": stored.get("status"),
+        "calls": dict(calls, **{key: _int_value(calls.get(key)) for key in ("ok", "total", "failed")}),
+        "errors": [str(e) for e in errors],
+        "masked_numbers": _int_value(stored.get("masked_numbers")),
+        "read": dict(read, task_ids=sorted(_result_ids(read.get("task_ids"))),
+                     comments=_int_value(read.get("comments"))),
+        "unread": dict(unread, count=_int_value(unread.get("count"))),
+        "unread_parts": [u for u in parts if isinstance(u, dict)],
+        "actions_source": stored.get("actions_source"),
+    }
+
+
 def _analysis_ai_view(data, period):
     """保存した AI の結果を表示用にまとめる(期間が同じなら data に反映する)。"""
     stored, error = load_ai_analysis_result()
@@ -13740,23 +14212,13 @@ def _analysis_ai_view(data, period):
     if stored is None:
         return view
     p = stored.get("period") or {}
-    unread = stored.get("unread") if isinstance(stored.get("unread"), dict) else {}
-    dates = "{}〜{}".format(str(p.get("start") or "").replace("-", "/"), str(p.get("end") or "").replace("-", "/"))
-    view["result"] = {
-        "generated_at": str(stored.get("generated_at") or "").replace("-", "/"),
-        "finished_at": str(stored.get("finished_at") or "").replace("-", "/"),
-        # 日付で指定した期間はラベルが日付なので、日付を重ねて書かない
-        "period_label": dates if p.get("kind") == ANALYSIS_PERIOD_RANGE else "{}（{}）".format(p.get("label") or "", dates),
-        "model": str(stored.get("model") or ""),
-        "status": stored.get("status"),
-        "calls": stored.get("calls") if isinstance(stored.get("calls"), dict) else {},
-        "errors": [str(e) for e in stored.get("errors") or []],
-        "masked_numbers": stored.get("masked_numbers") or 0,
-        "read": stored.get("read") if isinstance(stored.get("read"), dict) else {},
-        "unread": unread,
-        "unread_parts": [u for u in unread.get("parts") or [] if isinstance(u, dict)],
-        "actions_source": stored.get("actions_source"),
-    }
+    try:
+        view["result"] = _ai_result_summary(stored)
+    except Exception as exc:  # 手で書き換えたファイルなど(コードの集計だけを表示する)
+        current_app.logger.exception("AI分析の結果を読み取れませんでした")
+        view["error"] = "保存されているAI分析の結果を表示できませんでした（{}）。もう一度「AIで分析」を実行してください。".format(
+            one_line(str(exc), 120))
+        return view
     if not ai_result_matches(stored, period):
         view["other_period"] = {"period": ANALYSIS_PERIOD_RANGE, "from": p.get("start"), "to": p.get("end")}
         return view
@@ -14226,7 +14688,11 @@ def _parse_url(field, raw):
         valid = False
     if not valid:
         return None, "http:// または https:// で始まるURLを入力してください。"
-    if field.no_query and (parts.query or parts.fragment):
+    if url_has_userinfo(value):
+        return None, "URL に ID・パスワード（user:pass@ の形）は含められません。"
+    # 「?」「#」だけで終わる URL(空のクエリ・フラグメント)も受け付けない(リンクの後ろに付けると
+    # 「…/?/tasks/3」のようにタスクではなくトップを開くリンクになるため)
+    if field.no_query and ("?" in value or "#" in value):
         return None, "「?」「#」以降を付けずに入力してください。"
     return value, None
 
@@ -14901,7 +15367,9 @@ def save_analysis():
 #   start_scheduler_once() を呼ぶ。seed / migrate コマンド・テスト・import では起動しない)。
 #   flask run --debug の自動再読み込みで2つのプロセスがアプリを作っても、instance/scheduler.lock の
 #   ロックを取れた1つのプロセスだけが動かす(11-2)
-# - ジョブごとに、同じ (日付, 時刻) ではこのプロセスの中で1回しか実行しない(メモリ上の記録)
+# - ジョブごとに、同じ (日付, 時刻) では1回しか実行しない。メモリ上の記録(fired)に加えて、各ジョブの
+#   設定ファイルに最後に実行した印(last_auto_key)を残す(実行時刻の分の中でサーバーを再起動しても、
+#   新しいプロセスがもう一度送らないように)
 # - サーバーが止まっていて実行時刻を過ぎた分は、後から実行しない(取りこぼしの再実行なし)
 # - 実行履歴はDBに残さない(結果は各機能の「前回の結果」に上書き)
 # - 実行はジョブごとに別のスレッドで行う(時間のかかる週報の作成中も、もう一方の
@@ -14916,7 +15384,9 @@ CHECK_INTERVAL = 30  # 秒
 # due_key        : (設定, 今) → 実行時刻なら (日付, "HH:MM")、そうでなければ None
 # run            : (app, 設定, 今) → 実行して成否を返す
 # record_failure : (メッセージ) → 前回の結果に失敗を書く(app_context の中で呼ぶ)
-Job = namedtuple("Job", "name label load_settings due_key run record_failure")
+# claim_run      : (印「YYYY-MM-DD HH:MM」) → 設定ファイルに記録して True。記録済みなら False
+#                  (app_context の中で呼ぶ。JsonSettings.claim_auto_run)
+Job = namedtuple("Job", "name label load_settings due_key run record_failure claim_run")
 
 
 # --------------------------------------------------------------------------- #
@@ -14958,9 +15428,10 @@ def _overdue_failure(message):
 
 
 JOBS = (
-    Job("weekly", "週報", load_weekly_settings, _weekly_due_key, _weekly_run, _weekly_failure),
+    Job("weekly", "週報", load_weekly_settings, _weekly_due_key, _weekly_run, _weekly_failure,
+        WEEKLY_SETTINGS.claim_auto_run),
     Job("overdue", "期限超過通知", load_overdue_settings, overdue_due_key,
-        _overdue_run, _overdue_failure),
+        _overdue_run, _overdue_failure, OVERDUE_SETTINGS.claim_auto_run),
 )
 
 _scheduler_start_lock = threading.Lock()
@@ -14992,6 +15463,11 @@ def _check_job(app, job, fired, now, start_thread=True):
     # 古い記録は不要(同じ日付・時刻が再び来ることはない)
     for old in [k for k in fired if k[0] < now.date()]:
         fired.discard(old)
+    # 別のプロセス(再起動する前のサーバー)が同じ日付・時刻に実行済みなら実行しない
+    with app.app_context():
+        if not job.claim_run("{} {}".format(key[0].isoformat(), key[1])):
+            app.logger.info("%sの自動送信: %s %s は実行済みのため、実行しません", job.label, key[0], key[1])
+            return None
 
     if not start_thread:
         _execute(app, job, settings, now)
@@ -15320,6 +15796,19 @@ class SqliteIntConverter(IntegerConverter):
 # Flask の MAX_FORM_MEMORY_SIZE の既定値(バイト。設定が無いときの案内に使う)
 FORM_MEMORY_DEFAULT = 500_000
 
+# 403・404・405 の画面の見出しと案内(英語の既定の画面の代わり。errors/http_error.html)
+HTTP_ERROR_PAGES = {
+    403: ("この画面を開く権限がありません",
+          "マネージャーだけが使える画面・操作などは、メンバーのアカウントでは開けません。"
+          "必要な場合はマネージャーに依頼してください。"),
+    404: ("指定されたページが見つかりません",
+          "指定されたページ（タスクなど）は見つかりません。削除された可能性があります。"
+          "リンクや URL が正しいかを確認してください。"),
+    405: ("この URL は画面として開けません",
+          "保存・変更などのボタンから送るための URL のため、ブラウザで直接開くことはできません。"
+          "画面のボタンから操作してください。"),
+}
+
 
 def create_app():
     """アプリを作る。「flask --app app <コマンド>」はこの関数でアプリを作る。
@@ -15358,6 +15847,19 @@ def create_app():
     def too_large(_error):
         limit = app.config.get("MAX_FORM_MEMORY_SIZE") or FORM_MEMORY_DEFAULT
         return render_template("errors/too_large.html", limit_bytes=int(limit)), 413
+
+    # 権限が無い(403)・ページが無い(404。削除されたタスクへのメールのリンクなど)・画面として開けない
+    # URL(405)も、英語の既定の画面ではなく日本語で案内する(状態コードはそのまま)
+    @app.errorhandler(403)
+    @app.errorhandler(404)
+    @app.errorhandler(405)
+    def http_error(error):
+        heading, message = HTTP_ERROR_PAGES[error.code]
+        response = make_response(render_template(
+            "errors/http_error.html", code=error.code, heading=heading, message=message), error.code)
+        if isinstance(error, MethodNotAllowed) and error.valid_methods:
+            response.headers["Allow"] = ", ".join(error.valid_methods)  # 既定の画面と同じく受け付ける方法
+        return response
 
     app.cli.add_command(seed_command)
     app.cli.add_command(migrate_command)
