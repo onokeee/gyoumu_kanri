@@ -1033,7 +1033,7 @@ def _unauthorized():
 # 2-2. 小さなヘルパー関数
 # =============================================================================
 # 複数の画面・機能から使う小さなヘルパー関数(現在の日時・フォームの値の読み取り・
-# 主キーでの取り出し・アプリの名前・よく使う問い合わせ)。
+# 主キーでの取り出し・アプリの名前・よく使う問い合わせ・同時の操作と古い画面からの送信の確認)。
 
 # 改行・タブ以外の制御文字と、XML 1.0 で使えない文字(サロゲート・U+FFFE/U+FFFF)。
 # AIの応答・AIが作った問題・Excel(.xlsx)・Word(.docx)の出力から除く(1文字でも残っていると、Excel・Word の
@@ -1190,6 +1190,89 @@ def commit_unique(message):
         db.session.rollback()
         flash(message, "warning")
         return False
+
+
+def lock_for_write():
+    """保存・削除の前に、DB の書き込みのロックを先に取る(SQLite のロックはDB全体で1つ)。
+
+    「行がまだあるか・何が変わったかを確かめる → 保存する」の間に、同時に送られたほかの保存・削除
+    (ボタンの二度押し・2人が同時に操作した)が入らないようにする。ほかの書き込みは、この操作の
+    commit / rollback(リクエストの終わり)まで待つ。そのため、時間のかかる処理(AI・メール)の前には使わない。
+    ロックを取った後は、ほかの操作の結果を見るように、読み込んだ値をすべて読み直す(expire_all)。
+    ログイン中の人がほかの操作で削除されていたときは、ログアウトしてログイン画面へ戻す。
+    """
+    user_id = current_user.id if current_user.is_authenticated else None
+    # 行を変えない UPDATE(条件に合う行が無い)。実行した時点で書き込みのロックを取る
+    db.session.execute(text("UPDATE users SET id = id WHERE 0"))
+    db.session.expire_all()
+    if user_id is not None and db.session.query(User.id).filter(User.id == user_id).first() is None:
+        db.session.rollback()
+        logout_user()
+        abort(current_app.login_manager.unauthorized())
+
+
+def make_row_key(obj):
+    """画面・リンクで行(タスク・定型業務)を指す印(テーブル名・ID・作成日時から作る12文字)。
+
+    削除した行のIDは、次に追加した行に再利用される(SQLite)。開いたままの画面のボタン・メールの
+    リンクからの操作が、同じIDの新しい別の行に対して行われないように、IDと一緒に送ってもらって照合する
+    (row_key_matches)。User.form_key と同じ考え方。
+    """
+    created = obj.created_at.isoformat() if obj.created_at else ""
+    raw = "{}:{}:{}".format(obj.__tablename__, obj.id, created)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def row_key_matches(obj, value):
+    """送られた印 value が行 obj のものか。印の無い送信(以前の画面・以前のメールのリンク)は確かめない。"""
+    return value is None or str(value) == make_row_key(obj)
+
+
+def _value_digest(value):
+    """項目の値の短い印(比べるため。前後の空白と改行の書き方の違いは同じとみなす)。"""
+    if value is None:
+        text_value = ""
+    elif isinstance(value, (date, datetime)):
+        text_value = value.isoformat()
+    elif isinstance(value, float):
+        text_value = repr(value)
+    elif isinstance(value, (list, tuple)):
+        text_value = ",".join(str(v) for v in value)
+    else:
+        text_value = str(value).replace("\r\n", "\n").replace("\r", "\n").strip()
+    return hashlib.sha256(text_value.encode("utf-8")).hexdigest()[:8]
+
+
+def field_versions(values, keys):
+    """画面を開いたときの各項目の値の控え(項目ごとの短い印を「.」でつないだもの。hidden の version)。"""
+    return ".".join(_value_digest(values.get(key)) for key in keys)
+
+
+def fields_changed_since(version, values, keys):
+    """控え version(画面を開いたとき)の後に変わった項目の一覧。控えの無い送信(以前の画面)は None。
+
+    控えの形が違う(項目の数が合わない)ときは、すべての項目が変わったものとみなす。
+    """
+    if version is None:
+        return None
+    shown = str(version).split(".")
+    if len(shown) != len(keys):
+        return list(keys)
+    return [key for key, digest in zip(keys, shown) if digest != _value_digest(values.get(key))]
+
+
+def conflicting_fields(changed, current, new):
+    """画面を開いた後にほかの操作で変わった項目(changed)のうち、今回の保存で別の値にしようとしているもの。
+
+    今回の保存の値が今の値と同じなら、上書きしても失われるものが無いので重なりとしない。
+    """
+    return [key for key in changed or () if _value_digest(new.get(key)) != _value_digest(current.get(key))]
+
+
+# 画面を開いた後に、ほかの操作で同じ内容が変更されていたため保存しなかったときの案内({} は項目の名前)
+_EDITED_ELSEWHERE = ("画面を開いた後に、ほかの操作でこの内容が変更されていたため、保存していません"
+                     "（同時に変更された項目: {}）。ほかの操作で変わった項目は今の内容にしてあります。"
+                     "確認して、必要ならもう一度変更して保存してください。")
 
 
 # =============================================================================
@@ -1986,6 +2069,11 @@ class Task(db.Model):
     def is_assigned_to(self, user):
         return user is not None and any(u.id == user.id for u in self.assignees)
 
+    @property
+    def row_key(self):
+        """画面のボタン・メールのリンクでこのタスクを指す印(IDの再利用の取り違え防止。make_row_key)。"""
+        return make_row_key(self)
+
     def last_changed_to(self, status):
         """最後に status へ変更した日時(状態の変更の記録が無ければ None)。"""
         for change in reversed(self.status_changes):
@@ -2192,6 +2280,11 @@ class RoutineWork(db.Model):
 
     assignee = db.relationship("User", foreign_keys=[assignee_id])
     creator = db.relationship("User", foreign_keys=[creator_id])
+
+    @property
+    def row_key(self):
+        """画面のボタンでこの業務を指す印(IDの再利用の取り違え防止。make_row_key)。"""
+        return make_row_key(self)
 
     @property
     def manual_color(self):
@@ -2939,6 +3032,14 @@ def ai_chat(messages):
         return None, _mask_api_key("APIに接続できませんでした: {}".format(exc.reason), api_key)
     except (socket.timeout, TimeoutError):
         return None, "APIの応答がタイムアウトしました（{}秒）。".format(values["timeout"])
+    except UnicodeError as exc:
+        if isinstance(exc, UnicodeDecodeError):  # 応答を文字列として読めなかった
+            return None, _mask_api_key("APIの応答を解釈できませんでした: {}".format(exc), api_key)
+        # 送る前の失敗(応答の読み取りの失敗ではない)。URL・ヘッダ(APIキー)に使えるのは半角英数字・記号だけ
+        if str(getattr(exc, "encoding", "") or "").lower().replace("-", "") == "utf8":
+            return None, "送る文章に送信できない文字が含まれていたため、送信しませんでした。"
+        return None, ("AI_API_URL または AI_API_KEY に送信できない文字（全角の文字・日本語など）が含まれているため、"
+                      "送信しませんでした。システム設定の「基本設定」タブで、半角英数字・記号で入力し直してください。")
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         return None, _mask_api_key("APIの応答を解釈できませんでした: {}".format(exc), api_key)
     except Exception as exc:  # 想定外
@@ -3157,6 +3258,55 @@ def _attachment_disposition(filename):
     return "attachment; " + "; ".join(params)
 
 
+def smtp_reply_text(code, message):
+    """送信サーバーの応答(コードと本文)を1行の文字列にする(例: 「530 5.7.57 Client not authenticated」)。"""
+    if isinstance(message, bytes):
+        message = message.decode("utf-8", "replace")
+    text = " ".join(str(message or "").split())
+    return "{} {}".format(code, text).strip() if code not in (None, -1) else text
+
+
+# 送信サーバーの応答から分かる、よくある原因の案内
+SMTP_HINT_AUTH = ("送信サーバーがログイン（認証）または暗号化（STARTTLS）を求めています。このアプリはログイン・暗号化を"
+                  "せずに送るため、ログインなしで受け付ける送信サーバー・ポート（一般的には 25）をシステム設定の"
+                  "「基本設定」タブで設定してください（差出人のアドレスの誤りではありません）。")
+SMTP_HINT_RELAY = ("送信サーバーが、このPCからの中継（宛先への転送）を許可していません。送信サーバーの管理者にこのPCからの"
+                   "送信の許可を依頼するか、このPCから送れる送信サーバーを設定してください。")
+SMTP_HINT_POLICY = ("送信サーバーのセキュリティの設定（ログイン・暗号化の要求、送信元の制限など）で断られました。"
+                    "送信サーバーの管理者に確認してください。")
+
+
+def smtp_refusal_hint(replies):
+    """送信サーバーの拒否の応答 [(コード, 本文)] から、原因の案内を返す(分からなければ "")。"""
+    texts = [(code, smtp_reply_text(None, message).lower()) for code, message in replies]
+    if any("relay" in text for _code, text in texts):
+        return SMTP_HINT_RELAY
+    if any(code in (530, 535, 538) or "auth" in text or "starttls" in text or "5.7.0" in text
+           or "5.7.57" in text for code, text in texts):
+        return SMTP_HINT_AUTH
+    if any("5.7." in text for _code, text in texts):  # 拡張ステータスコード 5.7.x(セキュリティ・送信の制限)
+        return SMTP_HINT_POLICY
+    return ""
+
+
+def _refused_list(refused):
+    """拒否された宛先 {アドレス: (コード, 本文)} を「アドレス（コード 本文）」の一覧の文字列にする。"""
+    items = []
+    for addr, reply in refused.items():
+        code, message = reply if isinstance(reply, tuple) and len(reply) == 2 else (None, reply)
+        items.append("{}（{}）".format(addr, smtp_reply_text(code, message) or "理由の表示なし"))
+    return "、".join(items)
+
+
+def _refused_replies(refused):
+    return [reply if isinstance(reply, tuple) and len(reply) == 2 else (None, reply) for reply in refused.values()]
+
+
+# 接続はできたが、送信サーバーが応答しなかったとき(ポートの誤り・暗号化した接続のポートなど)の案内
+SMTP_HINT_SILENT = ("接続はできましたが、送信サーバーから応答がありません。ポート番号（MAIL_SMTP_PORT）が正しいかを"
+                    "確認してください（このアプリは 465〔SMTPS〕のような暗号化した接続には対応していません。一般的には 25）。")
+
+
 # 差出人・宛先に半角英数字以外の文字を含むアドレスがあるときのメッセージ({} はそのアドレス)
 NON_ASCII_ADDRESS_MESSAGE = ("差出人・宛先に半角英数字以外の文字を含むアドレスがあるため送信できません"
                              "（instance/config.py の MAIL_FROM・MAIL_TO・MAIL_CC を確認してください）: {}")
@@ -3167,6 +3317,8 @@ def send_mail(subject, text, html=None, attachments=(), to=None, cc=None, test=F
 
     戻り値: (成功したか, メッセージ)
     一部の宛先だけ拒否された場合は失敗扱いにし、メッセージで拒否された宛先を示す。
+    送信サーバーに拒否されたときは、サーバーの応答(コードと本文)と、分かる場合は原因の案内を付ける
+    (ログインが必要なサーバー・中継を許可していないサーバーなど。smtp_refusal_hint)。
     """
     problem = check_mail_settings(test, to=to)
     if problem:
@@ -3201,9 +3353,22 @@ def send_mail(subject, text, html=None, attachments=(), to=None, cc=None, test=F
             # ヘッダは78文字で折り返す(宛先が多い・件名が長いときに1行が長くなりすぎないように)
             refused = smtp.sendmail(mail_from, envelope, msg.as_string(maxheaderlen=78))
     except smtplib.SMTPRecipientsRefused as exc:
-        return False, "すべての宛先が拒否されました: {}".format("、".join(exc.recipients))
-    except smtplib.SMTPSenderRefused:
-        return False, "差出人（{}）が送信サーバーに拒否されました。".format(mail_from)
+        hint = smtp_refusal_hint(_refused_replies(exc.recipients))
+        return False, "すべての宛先が拒否されました: {}{}".format(
+            _refused_list(exc.recipients), "。" + hint if hint else "")
+    except smtplib.SMTPSenderRefused as exc:
+        reply = smtp_reply_text(exc.smtp_code, exc.smtp_error)
+        hint = smtp_refusal_hint([(exc.smtp_code, exc.smtp_error)])
+        if hint == SMTP_HINT_AUTH:
+            return False, "送信サーバーが送信を受け付けませんでした（サーバーの応答: {}）。{}".format(reply, hint)
+        return False, "差出人（{}）が送信サーバーに拒否されました（サーバーの応答: {}）。{}".format(
+            mail_from, reply, hint)
+    except smtplib.SMTPServerDisconnected as exc:
+        # 応答を待つ間のタイムアウトは、smtplib が「Connection unexpectedly closed: timed out」にする
+        # (切断されたのではなく、応答が無かった)
+        if isinstance(exc.__context__, (socket.timeout, TimeoutError)) or "timed out" in str(exc):
+            return False, "送信サーバーの応答がタイムアウトしました（{}秒）。{}".format(SMTP_TIMEOUT, SMTP_HINT_SILENT)
+        return False, "メール送信に失敗しました: {}".format(exc)
     except smtplib.SMTPException as exc:
         return False, "メール送信に失敗しました: {}".format(exc)
     except (socket.timeout, TimeoutError):
@@ -3219,8 +3384,9 @@ def send_mail(subject, text, html=None, attachments=(), to=None, cc=None, test=F
                        "半角英数字以外の文字が含まれていないかを確認してください）: {}".format(exc))
 
     if refused:
-        return False, "一部の宛先に送信できませんでした（拒否: {}）。他の {} 件には送信済みです。".format(
-            "、".join(refused), len(envelope) - len(refused))
+        hint = smtp_refusal_hint(_refused_replies(refused))
+        return False, "一部の宛先に送信できませんでした（拒否: {}）。他の {} 件には送信済みです。{}".format(
+            _refused_list(refused), len(envelope) - len(refused), hint)
     return True, "送信しました（To {}件・Cc {}件）。".format(len(to), len(cc))
 
 
@@ -3321,6 +3487,11 @@ def _match_registered_user(info):
     return user
 
 
+# 認証(ldap_client.py の authenticate。本番は LDAP認証API)で例外が起きたときの案内
+LOGIN_BACKEND_ERROR = ("認証サーバーに接続できなかったため、ログインできませんでした。しばらくしてからもう一度お試しください"
+                       "（解決しない場合はマネージャーに連絡してください）。")
+
+
 def _safe_next(value):
     """ログイン後に戻る先(next)が、このアプリの中のパスならそのまま返す。それ以外は None。
 
@@ -3354,11 +3525,18 @@ def login():
 
         # ① 本人確認: 固定ローカル管理者は instance/config.py で、
         #    それ以外は ldap_client.py の authenticate()(LDAP＋固定ローカル)で確認する
-        checked, info = _check_config_admin(username, password)
-        if not checked:
-            import ldap_client  # 本番環境ごとに差し替えるファイル(使うときに読み込む)
+        #    (本番の ldap_client.py は LDAP認証API に問い合わせる。止まっている・つながらないときの例外は
+        #    内部エラーの画面にせず、ログイン画面で案内する。パスワードはログに出さない)
+        try:
+            checked, info = _check_config_admin(username, password)
+            if not checked:
+                import ldap_client  # 本番環境ごとに差し替えるファイル(使うときに読み込む)
 
-            info = ldap_client.authenticate(username, password)
+                info = ldap_client.authenticate(username, password)
+        except Exception:
+            current_app.logger.exception("ログインの認証で例外が発生しました（ログインID: %s）", username)
+            flash(LOGIN_BACKEND_ERROR, "danger")
+            return render_template("auth/login.html", username=username)
         if info is None:
             flash("IDまたはパスワードが正しくありません。", "danger")
             return render_template("auth/login.html", username=username)
@@ -3578,14 +3756,95 @@ def _apply_outcomes(task, data):
         setattr(task, key, value)
 
 
-def _render_task_form(task, users, form, selected):
+def _render_task_form(task, users, form, selected, version=None):
+    """登録・編集の画面。version は編集画面の hidden(画面を開いたときの内容の控え)。
+
+    入力エラーで再表示するときは、送られた控えのまま(今の内容の控えにすると、再表示の後の保存で、
+    その間のほかの操作の変更を上書きしてしまうため)。
+    """
+    if task is not None and version is None:
+        version = form.get("version") if form is not None and form.get("version") is not None \
+            else field_versions(_task_values(task), TASK_VERSION_KEYS)
     return render_template(
         "tasks/form.html", task=task, users=users,
         status_choices=STATUS_CHOICES, priority_choices=PRIORITY_CHOICES,
         outcome_units=OUTCOME_UNITS, task_scales=TASK_SCALES,
-        form=form, selected_assignees=selected,
+        form=form, selected_assignees=selected, version=version,
         can_plan=current_user.is_manager,  # 計画系項目(優先度/日付/規模/担当者)を編集できるか
     )
+
+
+# 編集画面で、画面を開いた後のほかの操作の変更を確かめる項目(名前は画面の表示)
+TASK_VERSION_FIELDS = (
+    ("title", "タイトル"), ("description", "内容・詳細"), ("status", "ステータス"), ("priority", "優先度"),
+    ("start_date", "開始日"), ("due_date", "期限"), ("scale", "規模"), ("assignees", "担当者"),
+    ("outcome_quant_estimate", "成果（定量）の見込み"), ("outcome_quant_estimate_unit", "成果（定量）の見込みの単位"),
+    ("outcome_quant_actual", "成果（定量）の実績"), ("outcome_quant_actual_unit", "成果（定量）の実績の単位"),
+    ("outcome_quant_note", "成果（定量）の補足"), ("outcome_qual_estimate", "成果（定性）の見込み"),
+    ("outcome_qual_actual", "成果（定性）の実績"),
+)
+TASK_VERSION_KEYS = tuple(key for key, _label in TASK_VERSION_FIELDS)
+_TASK_FIELD_LABELS = dict(TASK_VERSION_FIELDS)
+
+
+def _task_values(task):
+    """編集画面で扱う項目の今の値(担当者はユーザーIDの一覧)。"""
+    values = {key: getattr(task, key) for key in TASK_VERSION_KEYS if key != "assignees"}
+    values["assignees"] = sorted(u.id for u in task.assignees)
+    return values
+
+
+def _task_form_value(value):
+    """項目の値を、編集画面の入力欄に入れる形にする(_task_values の値 → 文字列)。"""
+    if value is None:
+        return ""
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, float):
+        return _exact_num(value)
+    return str(value)
+
+
+def _task_conflict_form(task, changed):
+    """保存しなかったときの再表示の入力: 送られた入力に、ほかの操作で変わった項目の今の値を重ねる。
+
+    戻り値: (入力, 担当者として選ぶユーザーID の一覧 または None〔送られた選択のまま〕)
+    """
+    current = _task_values(task)
+    form = request.form.to_dict(flat=True)
+    selected = None
+    for key in changed:
+        if key == "assignees":
+            selected = current["assignees"]
+        else:
+            form[key] = _task_form_value(current[key])
+    form.pop("version", None)
+    return form, selected
+
+
+# 画面を開いた後に、そのタスク・定型業務が削除され、同じIDが新しい別の行に使われていたときの案内
+_STALE_TASK = ("画面を開いた後に、このタスクは削除されています（同じ番号が新しい別のタスクに使われています）。"
+               "操作は行っていません。一覧から開き直してください。")
+_STALE_ROUTINE = ("画面を開いた後に、この定型・定期業務は削除されています（同じ番号が新しい別の業務に使われています）。"
+                  "操作は行っていません。一覧から開き直してください。")
+
+
+def _back_to_referrer(default):
+    """前の画面(Referer)へ戻る URL。このアプリの中の画面(同じホスト)のときだけ使い、それ以外は default。
+
+    ほかのサイトの URL へは移動させない(オープンリダイレクトの防止。_safe_next と同じ確認)。
+    """
+    referrer = request.referrer
+    if referrer:
+        try:
+            parts = urlsplit(referrer)
+        except ValueError:
+            parts = None
+        if parts is not None and parts.scheme in ("http", "https") and parts.netloc == request.host:
+            path = parts.path + ("?" + parts.query if parts.query else "")
+            if _safe_next(path):
+                return path
+    return default
 
 
 def _read_scale():
@@ -3731,6 +3990,9 @@ def new_task():
         flash("タスクを登録できるのはマネージャーのみです。", "danger")
         return redirect(url_for("tasks.list_tasks"))
 
+    if request.method == "POST":
+        # 担当者の確認から保存までの間に、その人が削除されないように(チーム管理の削除と1つずつにする)
+        lock_for_write()
     users = get_active_users()
 
     if request.method == "POST":
@@ -3789,13 +4051,21 @@ def new_task():
 @login_required
 def task_detail(task_id):
     task = get_or_404(Task, task_id)
+    # メールのリンク(?t=印)が、削除されたタスク(同じIDの別の新しいタスク)を指していたら 404
+    if not row_key_matches(task, request.args.get("t")):
+        abort(404)
     return render_template("tasks/detail.html", task=task, can_edit=_can_edit(task))
 
 
 @tasks_bp.route("/<int:task_id>/edit", methods=["GET", "POST"])
 @login_required
 def edit_task(task_id):
+    if request.method == "POST":
+        lock_for_write()  # 確かめてから保存するまでの間に、ほかの保存・削除が入らないように
     task = get_or_404(Task, task_id)
+    if request.method == "POST" and not row_key_matches(task, request.form.get("row")):
+        flash(_STALE_TASK, "warning")
+        return redirect(url_for("tasks.list_tasks"))
     if not _can_edit(task):
         flash("このタスクを編集する権限がありません。", "danger")
         return redirect(url_for("tasks.detail", task_id=task.id))
@@ -3839,15 +4109,32 @@ def edit_task(task_id):
                 (task.status != STATUS_DONE or task.has_outcome_actual):
             flash(_COMPLETE_NEEDS_OUTCOME, "danger")
             return _render_task_form(task, users, request.form, sel)
+        start_date, due_date, scale = task.start_date, task.due_date, task.scale
         if current_user.is_manager:
             start_date = parse_date(request.form.get("start_date"))
             due_date = parse_date(request.form.get("due_date"))
+            scale = _read_scale()
             if start_date and due_date and start_date > due_date:
                 flash(_START_AFTER_DUE, "danger")
                 return _render_task_form(task, users, request.form, sel)
+        description = request.form.get("description", "").strip()
+
+        # 画面を開いた後に、ほかの操作(担当者の完了の登録・マネージャーの変更など)で変わった項目を、
+        # 古い画面の内容で上書きしない(控え version の無い以前の画面からの送信は確かめない)
+        current = _task_values(task)
+        new = dict(data, title=title, description=description, status=status, priority=priority,
+                   start_date=start_date, due_date=due_date, scale=scale,
+                   assignees=sorted(u.id for u in assignees))
+        changed = fields_changed_since(request.form.get("version"), current, TASK_VERSION_KEYS)
+        conflicts = conflicting_fields(changed, current, new)
+        if conflicts:
+            flash(_EDITED_ELSEWHERE.format("、".join(_TASK_FIELD_LABELS[k] for k in conflicts)), "warning")
+            form, selected = _task_conflict_form(task, changed)
+            return _render_task_form(task, users, form, sel if selected is None else selected,
+                                     version=field_versions(current, TASK_VERSION_KEYS))
 
         task.title = title
-        task.description = request.form.get("description", "").strip()
+        task.description = description
         task.status = status
         _log_status(task, task.status)  # 変更されていれば履歴に記録
         # 計画系の項目(優先度/開始日/期限/規模/担当者)はマネージャーのみ変更可。
@@ -3856,12 +4143,12 @@ def edit_task(task_id):
             task.priority = priority
             task.start_date = start_date
             task.due_date = due_date
-            task.scale = _read_scale()
+            task.scale = scale
             task.assignees = assignees
         _apply_outcomes(task, data)
         db.session.commit()
         flash("タスクを更新しました。", "success")
-        return redirect(url_for("tasks.detail", task_id=task.id))
+        return redirect(url_for("tasks.detail", task_id=task_id))
 
     return _render_task_form(task, users, None, [u.id for u in task.assignees])
 
@@ -3869,11 +4156,20 @@ def edit_task(task_id):
 @tasks_bp.route("/<int:task_id>/status", methods=["POST"])
 @login_required
 def update_status(task_id):
-    """一覧/詳細からワンクリックでステータスを変更する。"""
+    """一覧/詳細からワンクリックでステータスを変更する。
+
+    戻る先は前の画面(このアプリの中の画面だけ。_back_to_referrer)。同時に押された同じボタンで、
+    同じ状態を続けて記録しない(書き込みのロックを取ってから、記録を読み直して比べる)。
+    """
+    lock_for_write()
     task = get_or_404(Task, task_id)
+    back = _back_to_referrer(url_for("tasks.list_tasks"))
+    if not row_key_matches(task, request.form.get("row")):
+        flash(_STALE_TASK, "warning")
+        return redirect(url_for("tasks.list_tasks"))
     if not _can_edit(task):
         flash("このタスクを更新する権限がありません。", "danger")
-        return redirect(request.referrer or url_for("tasks.list_tasks"))
+        return redirect(back)
 
     new_status = request.form.get("status")
     if new_status in STATUS_CHOICES:
@@ -3884,24 +4180,31 @@ def update_status(task_id):
             _log_status(task, new_status)  # 変更日を履歴に記録(ガントの色分けに使用)
             db.session.commit()
             flash(f"ステータスを「{new_status}」に変更しました。", "success")
-    return redirect(request.referrer or url_for("tasks.list_tasks"))
+    return redirect(back)
 
 
 @tasks_bp.route("/<int:task_id>/comment", methods=["POST"])
 @login_required
 def add_comment(task_id):
-    """進捗状況の記載。担当者・作成者・マネージャーのみ(担当外のメンバーは不可)。"""
+    """進捗状況の記載。担当者・作成者・マネージャーのみ(担当外のメンバーは不可)。
+
+    書き込みのロックを取ってからタスクを確かめる(同時に削除されたタスクに記載を残さない)。
+    """
+    lock_for_write()
     task = get_or_404(Task, task_id)
+    if not row_key_matches(task, request.form.get("row")):
+        flash(_STALE_TASK, "warning")
+        return redirect(url_for("tasks.list_tasks"))
     if not _can_edit(task):
         flash("進捗状況を記載できるのは担当者・マネージャーのみです。", "danger")
-        return redirect(url_for("tasks.detail", task_id=task.id))
+        return redirect(url_for("tasks.detail", task_id=task_id))
     body = request.form.get("body", "").strip()
     if body:
         db.session.add(
-            TaskComment(task_id=task.id, user_id=current_user.id, body=body)
+            TaskComment(task_id=task_id, user_id=current_user.id, body=body)
         )
         db.session.commit()
-    return redirect(url_for("tasks.detail", task_id=task.id))
+    return redirect(url_for("tasks.detail", task_id=task_id))
 
 
 def _can_edit_comment(comment):
@@ -3916,13 +4219,17 @@ def _can_edit_comment(comment):
 @login_required
 def edit_comment(task_id, comment_id):
     """進捗状況の記載内容を変更する。記載者本人・マネージャーのみ。"""
+    lock_for_write()
     task = get_or_404(Task, task_id)
+    if not row_key_matches(task, request.form.get("row")):
+        flash(_STALE_TASK, "warning")
+        return redirect(url_for("tasks.list_tasks"))
     comment = db.session.get(TaskComment, comment_id)
     if comment is None or comment.task_id != task.id:
         abort(404)
     if not _can_edit_comment(comment):
         flash("進捗状況を変更できるのは記載者本人・マネージャーのみです。", "danger")
-        return redirect(url_for("tasks.detail", task_id=task.id))
+        return redirect(url_for("tasks.detail", task_id=task_id))
 
     body = request.form.get("body", "").strip()
     if not body:
@@ -3931,17 +4238,24 @@ def edit_comment(task_id, comment_id):
         comment.body = body
         db.session.commit()
         flash("進捗状況を更新しました。", "success")
-    return redirect(url_for("tasks.detail", task_id=task.id))
+    return redirect(url_for("tasks.detail", task_id=task_id))
 
 
 @tasks_bp.route("/<int:task_id>/delete", methods=["POST"])
 @login_required
 def delete_task(task_id):
-    task = get_or_404(Task, task_id)
+    lock_for_write()  # 同時に押された削除(二度押し・2人)は、後の側を「既に削除」にする
+    task = db.session.get(Task, task_id)
+    if task is None:
+        flash("このタスクは既に削除されています。", "info")
+        return redirect(url_for("tasks.list_tasks"))
+    if not row_key_matches(task, request.form.get("row")):
+        flash(_STALE_TASK, "warning")
+        return redirect(url_for("tasks.list_tasks"))
     # 削除はマネージャーのみ(担当メンバーは編集・状態変更は可、削除は不可)
     if not current_user.is_manager:
         flash("タスクを削除できるのはマネージャーのみです。", "danger")
-        return redirect(url_for("tasks.detail", task_id=task.id))
+        return redirect(url_for("tasks.detail", task_id=task_id))
 
     db.session.delete(task)
     db.session.commit()
@@ -4031,12 +4345,48 @@ def _forced_assignee_id():
     return None if current_user.is_manager else current_user.id
 
 
-def _render_routine_form(routine, users, form=None):
-    """登録・編集の画面を表示する(form は入力エラーで再表示する入力)。"""
+def _render_routine_form(routine, users, form=None, version=None):
+    """登録・編集の画面を表示する(form は入力エラーで再表示する入力)。
+
+    version は編集画面の hidden(画面を開いたときの内容の控え)。入力エラーで再表示するときは送られた控えのまま
+    (タスクの編集画面〔5-3〕と同じ)。
+    """
+    if routine is not None and version is None:
+        version = form.get("version") if form is not None and form.get("version") is not None \
+            else field_versions(_routine_values(routine), ROUTINE_VERSION_KEYS)
     return render_template(
         "routine/form.html", routine=routine, users=users,
-        freq_choices=FREQ_UNIT_CHOICES, manual_choices=MANUAL_CHOICES, form=form,
+        freq_choices=FREQ_UNIT_CHOICES, manual_choices=MANUAL_CHOICES, form=form, version=version,
     )
+
+
+# 編集画面で、画面を開いた後のほかの操作の変更を確かめる項目(名前は画面の表示)
+ROUTINE_VERSION_FIELDS = (
+    ("name", "業務名"), ("assignee_id", "担当者"), ("purpose", "目的"), ("frequency_count", "回数"),
+    ("frequency_unit", "頻度単位"), ("minutes_per", "1回の所要時間"), ("content", "業務内容"),
+    ("manual_status", "手順書作成状況"),
+)
+ROUTINE_VERSION_KEYS = tuple(key for key, _label in ROUTINE_VERSION_FIELDS)
+_ROUTINE_FIELD_LABELS = dict(ROUTINE_VERSION_FIELDS)
+
+
+def _routine_values(rw):
+    """編集画面で扱う項目の今の値。"""
+    return {key: getattr(rw, key) for key in ROUTINE_VERSION_KEYS}
+
+
+def _routine_conflict_form(current, changed):
+    """保存しなかったときの再表示の入力: 送られた入力に、ほかの操作で変わった項目の今の値を重ねる。"""
+    form = request.form.to_dict(flat=True)
+    for key in changed:
+        value = current[key]
+        if key == "assignee_id":
+            user = db.session.get(User, value) if value is not None else None
+            form[key] = user.form_key if user is not None else ""
+        else:
+            form[key] = "" if value is None else str(value)
+    form.pop("version", None)
+    return form
 
 
 def _fill_from_form(rw, form, users, forced_assignee_id=None):
@@ -4131,6 +4481,9 @@ def list_routines():
 @routine_bp.route("/new", methods=["GET", "POST"])
 @login_required
 def new_routine():
+    if request.method == "POST":
+        # 担当者の確認から保存までの間に、その人が削除されないように(チーム管理の削除と1つずつにする)
+        lock_for_write()
     users = _assignee_users()  # メンバーは自分のみ選択可
     if request.method == "POST":
         rw = RoutineWork(creator_id=current_user.id)
@@ -4163,20 +4516,34 @@ def routine_detail(routine_id):
 @routine_bp.route("/<int:routine_id>/edit", methods=["GET", "POST"])
 @login_required
 def edit_routine(routine_id):
+    if request.method == "POST":
+        lock_for_write()  # 確かめてから保存するまでの間に、ほかの保存・削除が入らないように
     rw = get_or_404(RoutineWork, routine_id)
+    if request.method == "POST" and not row_key_matches(rw, request.form.get("row")):
+        flash(_STALE_ROUTINE, "warning")
+        return redirect(url_for("routine.list_routines"))
     if not _can_edit_routine(rw):
         flash("この定型・定期業務を編集できるのは担当者・マネージャーのみです。", "danger")
         return redirect(url_for("routine.detail", routine_id=rw.id))
     users = _assignee_users(rw)
     if request.method == "POST":
+        current = _routine_values(rw)
         errors = _fill_from_form(rw, request.form, users, forced_assignee_id=_forced_assignee_id())
         if errors:
             for e in errors:
                 flash(e, "danger")
             return _render_routine_form(rw, users, request.form)
+        # 画面を開いた後に、ほかの操作で変わった項目を古い画面の内容で上書きしない(タスクの編集と同じ)
+        changed = fields_changed_since(request.form.get("version"), current, ROUTINE_VERSION_KEYS)
+        conflicts = conflicting_fields(changed, current, _routine_values(rw))
+        if conflicts:
+            db.session.rollback()  # フォームの値を反映した内容は保存しない(今の内容に戻す)
+            flash(_EDITED_ELSEWHERE.format("、".join(_ROUTINE_FIELD_LABELS[k] for k in conflicts)), "warning")
+            return _render_routine_form(rw, users, _routine_conflict_form(current, changed),
+                                        version=field_versions(current, ROUTINE_VERSION_KEYS))
         db.session.commit()
         flash("定型・定期業務を更新しました。", "success")
-        return redirect(url_for("routine.detail", routine_id=rw.id))
+        return redirect(url_for("routine.detail", routine_id=routine_id))
 
     return _render_routine_form(rw, users)
 
@@ -4187,10 +4554,17 @@ def edit_routine(routine_id):
 @routine_bp.route("/<int:routine_id>/delete", methods=["POST"])
 @login_required
 def delete_routine(routine_id):
-    rw = get_or_404(RoutineWork, routine_id)
+    lock_for_write()  # 同時に押された削除(二度押し・2人)は、後の側を「既に削除」にする
+    rw = db.session.get(RoutineWork, routine_id)
+    if rw is None:
+        flash("この定型・定期業務は既に削除されています。", "info")
+        return redirect(url_for("routine.list_routines"))
+    if not row_key_matches(rw, request.form.get("row")):
+        flash(_STALE_ROUTINE, "warning")
+        return redirect(url_for("routine.list_routines"))
     if not current_user.is_manager:
         flash("定型・定期業務を削除できるのはマネージャーのみです。", "danger")
-        return redirect(url_for("routine.detail", routine_id=rw.id))
+        return redirect(url_for("routine.detail", routine_id=routine_id))
     db.session.delete(rw)
     db.session.commit()
     flash("定型・定期業務を削除しました。", "info")
@@ -4456,6 +4830,7 @@ def new_leave():
             return _render_leave_form(None, request.form)
 
         with _leave_lock:
+            lock_for_write()  # 本人がチーム管理で同時に削除されていたら登録しない(ログイン画面へ)
             dup = _duplicate_on(current_user.id, leave_date)
             if dup:
                 flash("その取得日の年休は既に登録されています。", "warning")
@@ -4504,6 +4879,10 @@ def edit_leave(leave_id):
             flash(error, "danger")
             return _render_leave_form(leave, request.form)
         with _leave_lock:
+            # 書き込みのロックを取ってから読み直す(同時に取り消された年休は更新しない。404。
+            # ロックの順番は登録と同じ _leave_lock → DB)
+            lock_for_write()
+            leave = get_or_404(LeaveRequest, leave_id)
             dup = _duplicate_on(current_user.id, leave_date, exclude_id=leave.id)
             if dup:
                 flash("その取得日の年休は既に登録されています。", "warning")
@@ -4512,8 +4891,8 @@ def edit_leave(leave_id):
             leave.leave_type = leave_type
             db.session.commit()
         flash("年休を更新しました。", "success")
-        _registration_messages(current_user, leave_date, exclude_id=leave.id)
-        return redirect(url_for("leaves.detail", leave_id=leave.id))
+        _registration_messages(current_user, leave_date, exclude_id=leave_id)
+        return redirect(url_for("leaves.detail", leave_id=leave_id))
 
     return _render_leave_form(leave)
 
@@ -4524,7 +4903,11 @@ def edit_leave(leave_id):
 @leaves_bp.route("/<int:leave_id>/cancel", methods=["POST"])
 @login_required
 def cancel_leave(leave_id):
-    leave = get_or_404(LeaveRequest, leave_id)
+    lock_for_write()  # 同時に押された取消(二度押し)は、後の側を「既に取消」にする
+    leave = db.session.get(LeaveRequest, leave_id)
+    if leave is None:
+        flash("この年休は既に取消されています。", "info")
+        return redirect(url_for("leaves.calendar_view"))
     if not _can_cancel_leave(leave):
         flash("年休を取消できるのは本人のみです（無効化したメンバーの年休はマネージャーも取消できます）。", "danger")
         return redirect(url_for("leaves.detail", leave_id=leave.id))
@@ -4885,6 +5268,8 @@ def member(user_id):
 
 @skills_bp.route("/member/<int:user_id>/edit", methods=["GET", "POST"])
 def edit_member(user_id):
+    if request.method == "POST":
+        lock_for_write()  # 同時に削除されたメンバーに到達度の行を残さない
     member = get_or_404(User, user_id)
     if not _is_skill_target(member):
         # manager権限のユーザー・無効化されたユーザーはスキル管理の対象外
@@ -5964,9 +6349,17 @@ def delete_member(user_id):
     """メンバーを削除する。マネージャーのみ。
 
     業務データ(タスク・進捗・年休・スキル・定型業務)がある場合は、参照を壊さない
-    よう物理削除せず「無効化」する(一覧・割り当てから外れる)。データが無ければ物理削除。
+    よう物理削除せず「無効化」する。無効化した人はログインできなくなり、担当者の選択肢・一覧から外れるが、
+    担当中のタスク・定型業務は担当のまま残る(担当の付け替えはマネージャーが行う)。チームの紐づけは外す
+    (復帰しても戻らない)。データが無ければ物理削除。
+    書き込みのロックを取ってから業務データの有無を確かめる(同時に保存されたタスクの担当などを見落として、
+    行ごと削除しないように。削除した人のIDは次に追加した人に再利用されるため)。
     """
-    user = get_or_404(User, user_id)
+    lock_for_write()
+    user = db.session.get(User, user_id)
+    if user is None:
+        flash("このメンバーは既に削除されています。", "info")
+        return redirect(url_for("departments.manage"))
     if not _same_member(user):
         return redirect(url_for("departments.manage"))
     if user.id == current_user.id:
@@ -5980,14 +6373,21 @@ def delete_member(user_id):
 
     name = user.display_name
     if _member_has_history(user):
-        # チームの紐づけを外し、無効化(履歴は保持)
+        # チームの紐づけを外し、無効化(履歴は保持。担当中のタスク・定型業務は担当のまま)
+        open_tasks = sum(1 for t in user.assigned_tasks if t.status != STATUS_DONE)
+        routines = RoutineWork.query.filter_by(assignee_id=user.id).count()
+        teams = user.department_names
         user.departments = []
         user.is_active = False
         db.session.commit()
-        flash(
-            f"「{name}」は業務データがあるため無効化しました(一覧・割り当てから外れます)。",
-            "info",
-        )
+        message = (f"「{name}」は業務データがあるため無効化しました（ログインできなくなり、"
+                   "担当者の選択肢・一覧から外れます）。")
+        if open_tasks or routines:
+            message += (f"担当中の未完了のタスク {open_tasks}件・定型・定期業務 {routines}件は担当のまま残るため、"
+                        "必要なら担当を付け替えてください。")
+        if teams:
+            message += f"チームの紐づけ（{teams}）は外しました（復帰しても元に戻りません）。"
+        flash(message, "info")
     else:
         user.departments = []
         db.session.delete(user)
@@ -5999,13 +6399,19 @@ def delete_member(user_id):
 @departments_bp.route("/members/<int:user_id>/reactivate", methods=["POST"])
 @manager_required
 def reactivate_member(user_id):
-    """無効化したメンバーを復帰させる。マネージャーのみ。"""
+    """無効化したメンバーを復帰させる。マネージャーのみ。
+
+    無効化のときに外したチームの紐づけは戻らないため、紐づけが無ければその旨を案内する。
+    """
     user = get_or_404(User, user_id)
     if not _same_member(user):
         return redirect(url_for("departments.manage"))
     user.is_active = True
     db.session.commit()
     flash(f"メンバー「{user.display_name}」を復帰しました。", "success")
+    if not user.departments:
+        flash("チームの紐づけは外れたままです（無効化したときに外しました）。"
+              "必要なら下の「メンバーの紐づけ」で設定してください。", "info")
     return redirect(url_for("departments.manage"))
 
 
@@ -6069,6 +6475,8 @@ def save_memberships():
     """
     shown_keys = request.form.getlist("member_keys")
     shown_dept_ids = set(to_ints(request.form.getlist("dept_ids")))
+    # 紐づける人の確認から保存までの間に、その人が削除されないように(メンバーの削除と1つずつにする)
+    lock_for_write()
     if not shown_keys or not shown_dept_ids:
         flash("紐づけの表の内容を読み取れませんでした（保存していません）。画面を開き直してから保存してください。",
               "warning")
@@ -6600,6 +7008,9 @@ WEEKLY_SETTINGS_LABEL = "週報の設定ファイル"
 
 # 文章の見本などの最大文字数(設定ファイルの肥大化を防ぐ)
 WEEKLY_TEXT_MAX = 20000
+# ファイル名・メール件名のパターン(1行の項目)の最大文字数。ファイル名は作るときに FILENAME_MAX 文字までに
+# 切り詰める(差し込み記号は置き換えると長さが変わるため、パターンはそれより少し長くまで受け付ける)
+WEEKLY_PATTERN_MAX = {"filename_pattern": 200, "subject_pattern": 300}
 
 DEFAULT_TEAM_SAMPLE = """■全体の状況（{期間}）
 ・完了3件、新規着手2件。全体としておおむね計画どおりに進んでいる。
@@ -6789,6 +7200,9 @@ def parse_weekly_form(form):
         errors.append("ファイル名のパターンを入力してください。")
     if not values["subject_pattern"]:
         errors.append("メール件名のパターンを入力してください。")
+    for key, label in (("filename_pattern", "ファイル名のパターン"), ("subject_pattern", "メール件名のパターン")):
+        if len(values[key]) > WEEKLY_PATTERN_MAX[key]:
+            errors.append("{}は{}文字以内にしてください。".format(label, WEEKLY_PATTERN_MAX[key]))
     for key, label in (("team_sample", "チーム全体の見本"), ("person_sample", "個人の見本"),
                        ("guidelines", "書く際の注意点"), ("mail_body", "メール本文")):
         if len(values[key]) > WEEKLY_TEXT_MAX:
@@ -8203,10 +8617,17 @@ def link_base():
     return raw.rstrip("/"), None
 
 
-def task_path(task_id):
-    """タスク詳細画面のパス(例: /tasks/12)。リクエストの外でも作れるよう URL マップから作る。"""
+def task_path(task_id, row_key=None):
+    """タスク詳細画面のパス(例: /tasks/12?t=…)。リクエストの外でも作れるよう URL マップから作る。
+
+    row_key(Task.row_key)を付けると、そのタスクが削除された後に同じIDが別のタスクに使われても、
+    リンクは別のタスクを開かずに 404 になる(5-3 の task_detail)。
+    """
     adapter = current_app.url_map.bind("localhost")
-    return adapter.build("tasks.detail", {"task_id": task_id})
+    values = {"task_id": task_id}
+    if row_key:
+        values["t"] = row_key
+    return adapter.build("tasks.detail", values)
 
 
 # --------------------------------------------------------------------------- #
@@ -8267,7 +8688,7 @@ def _task_item(task, today, comment_count, base, show_status):
         "title": one_line(task.title, limit=200),
         "due_date": task.due_date,
         "meta": "［{}・{}］".format(task.status, due) if show_status else "［{}］".format(due),
-        "url": base + task_path(task.id) if base else "",
+        "url": base + task_path(task.id, task.row_key) if base else "",
         "comments": _comment_items(task, today, comment_count),
         # 担当者(無効化されたユーザーも含む)。(ユーザーID, 表示名, 有効か)
         "owners": [(u.id, u.display_name, bool(u.is_active)) for u in task.assignees],
@@ -8977,13 +9398,28 @@ def build_messages(skill, level, count, avoid=()):
     ]
 
 
+def _is_item_list(value):
+    """問題(オブジェクト)の配列か(空の配列も含む。選択肢のような文字列の配列は違う)。"""
+    return isinstance(value, list) and all(isinstance(v, dict) for v in value)
+
+
 def _extract_json_array(text):
-    """AIの応答からJSONの配列を取り出す(コードブロックや前後の文章があっても読む。4-1)。"""
+    """AIの応答からJSONの配列を取り出す(コードブロックや前後の文章があっても読む。4-1)。
+
+    {"questions": [...]} の形、1問だけを頼んだときに多い問題1つのオブジェクト({"question": …, "choices": […]})
+    の形も受け付ける(オブジェクトの中の選択肢の配列を、問題の配列として読まない)。
+    """
     data = parse_json_reply(text, "[", "]")
+    if not _is_item_list(data):
+        # 前後に説明文があるオブジェクトの応答は、配列として読むと中の選択肢の配列を拾うため、オブジェクトとして読み直す
+        obj = parse_json_reply(text, "{", "}")
+        if isinstance(obj, dict):
+            data = obj
     if isinstance(data, dict):
-        # {"questions": [...]} の形で返ってきた場合も受け付ける
+        if "question" in data:
+            return [data]
         for value in data.values():
-            if isinstance(value, list):
+            if isinstance(value, list) and value and _is_item_list(value):
                 return value
         return None
     return data if isinstance(data, list) else None
@@ -9139,7 +9575,7 @@ def generate_questions(skill, level, count, max_calls=None, stop_at=None):
 #     結果のレベル = 合格した最も高いレベル(レベル1が不合格なら0)
 #   ・到達度の自動登録: 結果のレベルが現在の到達度より高いときだけ skill_ratings に登録する
 #     (マネージャーが付けた到達度を下げることはない)。評価者は本人、メモは
-#     「スキルテストで自動登録（YYYY/MM/DD・正答率NN%）」
+#     「スキルテストで自動登録（YYYY/MM/DD・正答率NN%）」(それまでのメモは「 ／ 以前のメモ: …」として後ろに残す)
 #   ・受験できるのは有効なメンバー(role=member)だけ。受験中のテストは1人1つ(開くと再開)
 #   ・同じスキルの再受験は、前回の受験開始から retake_days 日後から
 #
@@ -9270,11 +9706,28 @@ def grade_levels(answers, pass_rate):
     return results, result_level
 
 
-def rating_note(finished_at, correct, total):
-    """自動登録した到達度のメモ(200文字以内)。"""
+RATING_NOTE_PREFIX = "スキルテストで自動登録"
+RATING_NOTE_PREVIOUS = " ／ 以前のメモ: "
+RATING_NOTE_MAX = 200
+# メモの先頭の、前の自動登録の文(と「 ／ 以前のメモ: 」)。これより後ろがマネージャーなどが書いたメモ
+_RATING_NOTE_AUTO = re.compile(r"^スキルテストで自動登録（[^）]*）\s*(?:／\s*以前のメモ:\s*)?")
+
+
+def rating_note(finished_at, correct, total, previous=None):
+    """自動登録した到達度のメモ(200文字以内)。
+
+    previous はそれまでのメモ。マネージャーが書いたメモは消さずに「 ／ 以前のメモ: …」として後ろに残す
+    (前の自動登録のメモに残っていた以前のメモも引き継ぐ。前の自動登録の文そのものは新しい文に置き換える)。
+    入りきらない分は切り詰める(末尾に「…」)。
+    """
     rate = int(round(correct * 100.0 / total)) if total else 0
-    return "スキルテストで自動登録（{}・正答率{}%）".format(
-        finished_at.strftime("%Y/%m/%d"), rate)[:200]
+    note = "{}（{}・正答率{}%）".format(RATING_NOTE_PREFIX, finished_at.strftime("%Y/%m/%d"), rate)
+    memo = _RATING_NOTE_AUTO.sub("", (previous or "").strip(), count=1).lstrip("。、,. 　").strip()
+    if memo:
+        note += RATING_NOTE_PREVIOUS + memo
+        if len(note) > RATING_NOTE_MAX:
+            note = note[:RATING_NOTE_MAX - 1] + "…"
+    return note[:RATING_NOTE_MAX]
 
 
 def _finish(attempt, now, status):
@@ -9303,7 +9756,7 @@ def _finish(attempt, now, status):
             rating = SkillRating(skill_id=attempt.skill_id, user_id=attempt.user_id)
             db.session.add(rating)
         rating.level = result_level
-        rating.note = rating_note(now, attempt.correct, attempt.total)
+        rating.note = rating_note(now, attempt.correct, attempt.total, rating.note)
         rating.rated_by_id = attempt.user_id
         rating.rated_at = now
         attempt.applied = True
@@ -9494,10 +9947,12 @@ def _pick_for_level(skill, level, count, served, state):
             finally:
                 lock.release()
         else:
-            # ほかの作成(補充など)が時間内に終わらなかった。残りのレベルでは待たずに諦める
+            # ほかの作成(補充など)が時間内に終わらなかった。残りのレベルでは待たずに諦める。
+            # 待っている間にほかの作成で保存された問題(まだ表示していないもの)は、再出題より先に使う
             state["errors"].append("Lv{}: ほかの問題の作成が時間内に終わりませんでした。".format(level))
             state["ai"] = False
             active = _active_questions(skill.id, level)
+            take(unseen_of(active))
 
     reused = 0
     if len(picked) < count:
@@ -10008,6 +10463,12 @@ STATE_ACTIVE = "active"
 STATE_INACTIVE = "inactive"
 
 
+# 受験の画面・操作を、受験できない人(マネージャー・無効化したメンバー)が使おうとしたときの 403 の見出しと案内
+SKILLTEST_TAKERS_ONLY = ("スキルテストを受験できません\n"
+                         "スキルテストの受験の画面・操作は、受験できるメンバー（有効なメンバー）だけが使えます。"
+                         "マネージャーは「スキルテスト管理」で受験の履歴・詳細を確認できます。")
+
+
 @skilltest_bp.before_request
 def _guard():
     """ログイン必須。管理画面(admin_〜)はマネージャー、それ以外は受験できるメンバーだけ。
@@ -10025,12 +10486,19 @@ def _guard():
         return None
     if is_test_taker(current_user):
         return None
-    if getattr(current_user, "is_manager", False) and endpoint == "skilltest.index" \
-            and request.method == "GET":
-        flash("マネージャーはスキル管理の対象外のため、スキルテストは受験できません。"
-              "スキルテスト管理を表示します。", "info")
-        return redirect(url_for("skilltest.admin_attempts"))
-    abort(403)
+    if getattr(current_user, "is_manager", False):
+        # マネージャーは受験しない。メンバーが貼ったリンクなどで受験の画面を開いたときは、管理の画面へ案内する
+        attempt_id = (request.view_args or {}).get("attempt_id")
+        if request.method == "GET" and endpoint in ("skilltest.question", "skilltest.result") \
+                and attempt_id is not None:
+            flash("マネージャーはスキル管理の対象外のため、受験の画面は開けません。"
+                  "スキルテスト管理の受験の詳細を表示します。", "info")
+            return redirect(url_for("skilltest.admin_attempt", attempt_id=attempt_id))
+        if request.method == "GET" or endpoint == "skilltest.start":
+            flash("マネージャーはスキル管理の対象外のため、スキルテストは受験できません。"
+                  "スキルテスト管理を表示します。", "info")
+            return redirect(url_for("skilltest.admin_attempts"))
+    abort(403, description=SKILLTEST_TAKERS_ONLY)
 
 
 def _tech_scale():
@@ -10829,16 +11297,39 @@ def _plain(text):
     return _ACK_STRIP.sub("", unicodedata.normalize("NFKC", str(text or "")).lower())
 
 
-def _phrase_pattern(*phrase_lists):
-    """言葉の一覧の繰り返しに一致する正規表現。言葉も比べる文と同じく _plain で正規化する
-    (「オッケー」の「ー」のように _plain で取り除く文字を含む言葉も一致するように)。"""
-    phrases = dict.fromkeys(p for phrases in phrase_lists for p in (_plain(x) for x in phrases) if p)
-    return re.compile("(?:{})+".format("|".join(re.escape(p) for p in sorted(phrases, key=len, reverse=True))))
+class PhraseSequence:
+    """言葉の一覧の繰り返しだけでできた文か(fullmatch)を確かめる。
+
+    言葉も比べる文と同じく _plain で正規化する(「オッケー」の「ー」のように _plain で取り除く文字を含む
+    言葉も一致するように)。正規表現の「(?:言葉|…)+」は、重なる言葉(「順調です」と「順調」＋「です」など)が
+    続く長い文で後戻りが指数的に増え、1件の記載で処理全体が止まるため、文の長さに比例する方法で確かめる
+    (先頭から、言葉の区切りとしてたどり着ける位置の集合を進める)。
+    """
+
+    def __init__(self, *phrase_lists):
+        phrases = dict.fromkeys(p for phrases in phrase_lists for p in (_plain(x) for x in phrases) if p)
+        self.by_first = {}
+        for phrase in phrases:
+            self.by_first.setdefault(phrase[0], []).append(phrase)
+
+    def fullmatch(self, text):
+        """text(_plain で正規化した文)が言葉の1回以上の繰り返しだけでできているか。"""
+        if not text:
+            return False
+        reachable = [False] * (len(text) + 1)
+        reachable[0] = True
+        for pos in range(len(text)):
+            if not reachable[pos]:
+                continue
+            for phrase in self.by_first.get(text[pos], ()):
+                if text.startswith(phrase, pos):
+                    reachable[pos + len(phrase)] = True
+        return reachable[len(text)]
 
 
 # あいさつ・お礼・了解の言葉(_plain で正規化したもの)
 _ACK_PLAIN = tuple(dict.fromkeys(p for p in (_plain(x) for x in _ACK_PHRASES) if p))
-_ACK_PATTERN = _phrase_pattern(_ACK_PHRASES, _ACK_FILLERS)
+_ACK_PATTERN = PhraseSequence(_ACK_PHRASES, _ACK_FILLERS)
 
 # 中身のない定型の進捗記載(これだけのものは「具体的な内容がない」)
 _GENERIC_PROGRESS_PHRASES = (
@@ -10850,7 +11341,7 @@ _GENERIC_PROGRESS_PHRASES = (
     "予定通りです", "予定通り", "予定どおり", "対応します", "やります", "実施します", "了解です", "了解",
     "承知しました", "承知", "完了しました", "完了です", "完了", "対応済みです", "対応済み", "済み", "済",
 )
-_GENERIC_PROGRESS_PATTERN = _phrase_pattern(_GENERIC_PROGRESS_PHRASES, _ACK_FILLERS)
+_GENERIC_PROGRESS_PATTERN = PhraseSequence(_GENERIC_PROGRESS_PHRASES, _ACK_FILLERS)
 
 
 def is_acknowledgement(text):
@@ -10862,7 +11353,7 @@ def is_acknowledgement(text):
     if not plain or len(plain) > _ACK_MAX_CHARS:
         return False
     # 了解・お礼などの言葉(と「です」「ね」など)だけでできている。「です」などだけのものは除く
-    return bool(_ACK_PATTERN.fullmatch(plain)) and any(p in plain for p in _ACK_PLAIN)
+    return _ACK_PATTERN.fullmatch(plain) and any(p in plain for p in _ACK_PLAIN)
 
 
 def progress_comment_issue(text):
@@ -11092,8 +11583,9 @@ def _attempt_view(a, now):
         state = "in_progress"
     else:
         state = "finished"
-    level_up = (a.status == ATTEMPT_FINISHED and a.new_level is not None
-                and a.prev_level is not None and a.new_level > a.prev_level)
+    # 時間切れで終わった受験も採点して到達度を登録する(_expire → _finish)ため、終了・時間切れの両方で数える
+    level_up = (a.status in (ATTEMPT_FINISHED, ATTEMPT_EXPIRED) and bool(a.applied)
+                and a.new_level is not None and a.prev_level is not None and a.new_level > a.prev_level)
     return {
         "attempt_id": a.id,
         "user_id": a.user_id,
@@ -11578,7 +12070,7 @@ def collect_analysis(period, now, settings):
 #
 # 候補(種類ごとの点数の目安。同じ種類の中は状況が重いものほど高い):
 #   期限超過(90〜)・マネージャーのコメントに返信なし(80〜)・進行中なのに記載がない(70〜)・
-#   期限が近いのに未着手(65〜)・保留が長い(60〜)・負荷が高い(58〜)・対応できる人が1名以下の業務(55)・
+#   期限が近いのに未着手(65〜70)・保留が長い(60〜)・負荷が高い(58〜)・対応できる人が1名以下の業務(55)・
 #   保有者が1名以下のスキル(48〜)・成果の書き直し推奨(45〜)・進捗記載の書き直し推奨(40)・
 #   スキルテストの未受験(35)・時間切れ／途中で終了・離脱が多い受験(33)
 # 同じ種類ばかりにならないよう種類ごとの上限(ACTION_CAPS)まで選び、5件に満たなければ上限を外して補う。
@@ -11642,6 +12134,13 @@ def _ask(item, with_assignee, without_assignee):
     return who + with_assignee if who else without_assignee
 
 
+def overdue_days_label(item):
+    """期限超過の日数の表示(「N営業日」。今日が土日祝で 0営業日のときは暦日の超過日数も付ける)。"""
+    if item["overdue_days"] == 0 and item.get("calendar_days"):
+        return "0営業日（{}日超過・休日）".format(item["calendar_days"])
+    return "{}営業日".format(item["overdue_days"])
+
+
 def _action_candidates(data):
     progress = data["progress"]
     skills = data["skills"]
@@ -11660,7 +12159,7 @@ def _action_candidates(data):
                  "担当者を決めて、期限超過の見通しを確認する"),
             _task_target(item),
             "期限（{}）を過ぎて未完了（{}）。".format(item["due_date"].strftime("%m/%d"), item["status"]),
-            ["期限超過 {}営業日".format(item["overdue_days"]),
+            ["期限超過 " + overdue_days_label(item),
              "優先度 {}".format(item["priority"]),
              "最後の進捗記載: {}".format(last["at"].strftime("%m/%d") if last else "なし")])
     # マネージャーのコメント: 1つのタスクに要フォローのコメントが複数あっても推奨アクションは1件にする
@@ -11706,7 +12205,11 @@ def _action_candidates(data):
                 item["basis"], item["elapsed_days"]),
             ["経過 {}営業日（しきい値 {}営業日）".format(item["elapsed_days"], progress["stale_days"])])
     for item in progress["due_soon"]:
-        add("due_soon", 65 + (progress["due_soon_days"] - item["days_left"]),
+        # 点数は 65〜70 の帯の中(ほかの種類と同じく上限あり。しきい値 N1 を大きくしても、期限超過・返信なし・
+        # 記載がない〔70 より上〕より上にしない)。N1 が5以下(既定は5)なら今までどおり 65＋(N1−残り営業日)、
+        # それより大きければ帯の幅(5)に縮める
+        n1, left = progress["due_soon_days"], item["days_left"]
+        add("due_soon", 65 + (n1 - left if n1 <= 5 else 5.0 * (n1 - left) / n1),
             _ask(item, "と着手の予定を確認する", "担当者を決めて、着手の予定を立てる"),
             _task_target(item),
             "期限（{}）まで残り{}営業日なのに未着手。".format(
@@ -11931,7 +12434,7 @@ def _analysis_task_facts(data):
 
     p = data["progress"]
     for r in p["overdue"]:
-        add(r["task_id"], "期限超過 {}営業日".format(r["overdue_days"]))
+        add(r["task_id"], "期限超過 " + overdue_days_label(r))
     for r in p["due_soon"]:
         add(r["task_id"], "期限まで残り{}営業日なのに未着手".format(r["days_left"]))
     for r in p["stale"]:
@@ -12646,7 +13149,9 @@ def team_material_sections(data, candidates, hidden_candidates):
         lines.append("  T{}「{}」（担当 {}）: [{}] {}".format(
             i["task_id"], _inline(i["title"]), _inline(i["assignee_names"]) or "なし", i["kind"], _inline(i["text"])))
     sections.append(("issues", lines))
-    sections.append(("other", ["・担当者のいないタスクについて（材料から分かったこと）: {}".format(text)
+    # AI が作った文(所見・分かったこと・まとめ)も、材料の見出しに見える記号・改行を置き換えて1行にする
+    # (コメントの指示に従った AI の文が、アプリの見出しと同じ形の行にならないように。_inline)
+    sections.append(("other", ["・担当者のいないタスクについて（材料から分かったこと）: {}".format(_inline(text))
                                for text in data.get("ai_other_notes") or []]))
     lines = ["・保留中:" + ("" if p["hold"] else " なし")]
     for r in p["hold"]:
@@ -12675,7 +13180,7 @@ def team_material_sections(data, candidates, hidden_candidates):
     sai = sk.get("ai") or {}
     for key, label in SKILLS_AI_KEYS:
         for text in sai.get(key) or []:
-            lines.append("・AIのまとめ（{}）: {}".format(label, text))
+            lines.append("・AIのまとめ（{}）: {}".format(label, _inline(text)))
     sections.append(("skills", lines))
 
     o = data["outputs"]
@@ -12703,9 +13208,9 @@ def team_material_sections(data, candidates, hidden_candidates):
         findings = row.get("ai") or {}
         for key, label in FINDING_KEYS:
             for text in findings.get(key) or []:
-                block.append("・AIの所見（{}）: {}".format(label, text))
+                block.append("・AIの所見（{}）: {}".format(label, _inline(text)))
         for text in row.get("ai_notes") or []:
-            block.append("・材料から分かったこと: {}".format(text))
+            block.append("・材料から分かったこと: {}".format(_inline(text)))
         lines.append("\n".join(block))
     sections.append(("persons", lines))
     sections.append(("candidates", team_candidate_lines(candidates, hidden_candidates)))
@@ -13487,7 +13992,7 @@ class AnalysisRun:
                          "件数は上のアプリの集計のとおり）】"]
             for key, label in SUMMARY_KEYS:
                 for text in points[key]:
-                    lines.append("・{}: {}".format(label, text))
+                    lines.append("・{}: {}".format(label, _inline(text)))
             if len(lines) == 2:
                 lines.append("・（要点を作れませんでした。読み込めなかった材料は未読込の内訳のとおり）")
             return lines
@@ -13524,7 +14029,7 @@ class AnalysisRun:
             if len(chunks) == 1 or len("\n".join(digest)) <= budget // 2 or (previous is not None and failed_keys):
                 break
             previous = points
-            units = [(key, [_part("{}の要点:".format(label))] + [_part("・" + t) for t in points[key]])
+            units = [(key, [_part("{}の要点:".format(label))] + [_part("・" + _inline(t)) for t in points[key]])
                      for key, label in SUMMARY_KEYS if points[key]]
         # 候補は入りきる数まで(少なくとも TEAM_MIN_CANDIDATES 件)
         room = budget - len("\n".join(core + digest + ids)) - 1
@@ -14109,6 +14614,9 @@ def apply_ai_result(data, stored):
             # 分析した後にその人が削除され、同じIDで別の人が追加された: 前の人の所見は出さない
             person = {}
             row["ai_state"] = AI_STATE_CHANGED
+        elif str(row["user_id"]) not in persons and isinstance(stored.get("persons"), dict):
+            # 分析の後に追加・復帰した(またはメンバーにした)人: 分析の対象にしていないので所見は無い
+            row["ai_state"] = AI_STATE_NEW
         row["ai"] = _str_lists(person.get("findings"), FINDING_KEYS)
         # 所見を作るときに読み込めなかった回の数(所見は読めた範囲だけに基づく)
         unread_parts = person.get("unread_parts")
@@ -14262,6 +14770,7 @@ def analysis_dashboard():
         skills_ai_keys=SKILLS_AI_KEYS,
         state_unread=AI_STATE_UNREAD,
         state_changed=AI_STATE_CHANGED,
+        state_new=AI_STATE_NEW,
     )
 
 
@@ -14404,6 +14913,9 @@ class Field:
     # secret: この値を送る接続先の項目。これらを変えるときは、保存済みの値を新しい接続先へ
     # 送らないよう、値を入力し直すか「空にする」を指定してもらう
     bound_to: tuple = ()
+    # url・secret: 半角英数字・記号(ASCII)だけを受け付ける(AI の呼び出し〔urllib〕は、URL・ヘッダに
+    # 全角の文字・日本語を含められないため)
+    ascii_only: bool = False
 
 
 FIELDS = (
@@ -14438,13 +14950,13 @@ FIELDS = (
         "（例: https://api.example.com/v1/chat/completions）。"
         "エンドポイントとAPIキーがどちらも空なら、AIは使いません（週報はルールベースで作成、"
         "スキルテストは問題プールにある問題だけで出題）。",
-        type=TYPE_URL,
+        type=TYPE_URL, ascii_only=True,
     ),
     Field(
         "AI_API_KEY", GROUP_AI, "APIキー",
         "OpenAI 公式を使う場合に必要です。キーが不要な独自APIなら空のままでかまいません。値は表示しません。"
         "エンドポイントの接続先（ホスト・ポート・http/https）を変えるときは、キーを入力し直すか「空にする」を指定してください。",
-        type=TYPE_SECRET, secret=True, bound_to=("AI_API_URL",),
+        type=TYPE_SECRET, secret=True, bound_to=("AI_API_URL",), ascii_only=True,
     ),
     Field(
         "AI_MODEL", GROUP_AI, "モデル名",
@@ -14688,6 +15200,10 @@ def _parse_url(field, raw):
         valid = False
     if not valid:
         return None, "http:// または https:// で始まるURLを入力してください。"
+    if field.ascii_only and not value.isascii():
+        return None, ("半角英数字・記号のURLを入力してください（全角の文字・日本語のドメインやパスは送信できません。"
+                      "日本語のドメインはピュニコード〔xn--〜〕、パスはパーセントエンコード〔%E3%81%82 など〕にした"
+                      "URLを入力してください）。")
     if url_has_userinfo(value):
         return None, "URL に ID・パスワード（user:pass@ の形）は含められません。"
     # 「?」「#」だけで終わる URL(空のクエリ・フラグメント)も受け付けない(リンクの後ろに付けると
@@ -14753,6 +15269,8 @@ def _parse_secret(field, form, current_value):
         return current_value, None, clear  # 変更しない
     if _CONFIG_CONTROL.search(raw):
         return None, "改行・制御文字は使えません。", clear
+    if field.ascii_only and not raw.isascii():
+        return None, "半角英数字・記号で入力してください（全角の文字・日本語は送信できないため使えません）。", clear
     if len(raw) > SECRET_MAX:
         return None, "{}文字以内で入力してください。".format(SECRET_MAX), clear
     if field.min_length and len(raw) < field.min_length:
@@ -15796,7 +16314,8 @@ class SqliteIntConverter(IntegerConverter):
 # Flask の MAX_FORM_MEMORY_SIZE の既定値(バイト。設定が無いときの案内に使う)
 FORM_MEMORY_DEFAULT = 500_000
 
-# 403・404・405 の画面の見出しと案内(英語の既定の画面の代わり。errors/http_error.html)
+# 403・404・405・500 の画面の見出しと案内(英語の既定の画面の代わり。errors/http_error.html)。
+# abort(403, description="見出し\n案内") のように説明を付けたときは、その見出し・案内を表示する
 HTTP_ERROR_PAGES = {
     403: ("この画面を開く権限がありません",
           "マネージャーだけが使える画面・操作などは、メンバーのアカウントでは開けません。"
@@ -15807,7 +16326,56 @@ HTTP_ERROR_PAGES = {
     405: ("この URL は画面として開けません",
           "保存・変更などのボタンから送るための URL のため、ブラウザで直接開くことはできません。"
           "画面のボタンから操作してください。"),
+    500: ("内部エラーが発生しました",
+          "処理の途中で予期しないエラーが発生したため、操作を完了できませんでした（保存・変更は行われていない場合が"
+          "あります）。もう一度操作しても同じ場合は、マネージャーに連絡してください（エラーの内容はサーバーのログに"
+          "記録されています）。"),
 }
+
+# ほかのサイト・別のポートの画面から送られた保存・変更などを断るときの見出しと案内(check_same_origin)
+CROSS_ORIGIN_MESSAGE = ("この操作は受け付けられません\n"
+                        "ほかのサイト（別のアドレス・ポートの画面）から送られた操作のため、受け付けませんでした"
+                        "（保存・変更は行っていません）。このアプリの画面を開き直して、画面のボタンから操作してください。")
+# 500 の画面を作れなかったとき(DB に接続できないなど)の最小限の画面
+_PLAIN_500 = ("<!doctype html><html lang=\"ja\"><meta charset=\"utf-8\"><title>内部エラー</title>"
+              "<h1>内部エラーが発生しました</h1><p>処理の途中で予期しないエラーが発生しました。"
+              "もう一度操作しても同じ場合は、マネージャーに連絡してください。</p></html>")
+
+
+def _same_origin(url):
+    """url(Origin・Referer の値)が、このアプリと同じスキーム・ホスト・ポートか。"""
+    try:
+        parts = urlsplit(str(url))
+        here = urlsplit(request.host_url)
+        defaults = {"http": 80, "https": 443}
+        return (parts.scheme.lower() == here.scheme.lower() and bool(parts.hostname)
+                and parts.hostname.lower() == (here.hostname or "").lower()
+                and (parts.port or defaults.get(parts.scheme.lower()))
+                == (here.port or defaults.get(here.scheme.lower())))
+    except ValueError:
+        return False
+
+
+def check_same_origin():
+    """before_request: 保存・変更など(GET・HEAD・OPTIONS 以外)は、このアプリの画面から送られたものだけを受け付ける。
+
+    Cookie の SameSite=Lax はほかのサイトからの送信を防ぐが、同じホストの別のポート(同じサーバーのほかの
+    Web サービス)は同じサイトとみなされ、ログイン中の Cookie が送られてしまう。ブラウザが付ける Origin
+    (無ければ Referer)が、このアプリと同じスキーム・ホスト・ポートでなければ 403 にする
+    (「Origin: null」も断る)。どちらも無い送信(ブラウザ以外。テスト・コマンドなど)は今までどおり受け付ける。
+    """
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return None
+    source = request.headers.get("Origin") or request.headers.get("Referer")
+    if not source or _same_origin(source):
+        return None
+    abort(403, description=CROSS_ORIGIN_MESSAGE)
+
+
+def frame_options(response):
+    """after_request: ほかのサイトの画面の中(iframe)に表示させない(クリックの乗っ取りの防止)。"""
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    return response
 
 
 def create_app():
@@ -15855,11 +16423,37 @@ def create_app():
     @app.errorhandler(405)
     def http_error(error):
         heading, message = HTTP_ERROR_PAGES[error.code]
+        custom = getattr(error, "description", None)
+        if custom and custom != type(error).description:
+            # abort(コード, description="見出し\n案内" または "案内") で、画面ごとの説明を付けたもの
+            if "\n" in custom:
+                heading, message = custom.split("\n", 1)
+            else:
+                message = custom
         response = make_response(render_template(
             "errors/http_error.html", code=error.code, heading=heading, message=message), error.code)
         if isinstance(error, MethodNotAllowed) and error.valid_methods:
             response.headers["Allow"] = ", ".join(error.valid_methods)  # 既定の画面と同じく受け付ける方法
         return response
+
+    # 想定外のエラー(500)も、英語の既定の画面ではなく日本語で案内する(内容はログに残る)。
+    # 途中まで行った DB の変更は取り消す。画面を作れなければ最小限の画面にする
+    @app.errorhandler(500)
+    def internal_error(_error):
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        heading, message = HTTP_ERROR_PAGES[500]
+        try:
+            return render_template("errors/http_error.html", code=500, heading=heading, message=message), 500
+        except Exception:
+            app.logger.exception("500 の画面を作れませんでした")
+            return Response(_PLAIN_500, status=500, mimetype="text/html")
+
+    # 保存・変更などは、このアプリの画面から送られたものだけを受け付ける。ほかのサイトの画面の中に表示させない
+    app.before_request(check_same_origin)
+    app.after_request(frame_options)
 
     app.cli.add_command(seed_command)
     app.cli.add_command(migrate_command)
@@ -16214,15 +16808,28 @@ def migrate_command(check_only, db_path):
     """既存DBを最新のモデル定義に合わせる(不足しているテーブル・列を追加する)。"""
     app = _migrate_target_app(db_path, check_only)
     try:
-        _migrate(app, check_only)
+        _migrate(app, check_only, db_path)
     except DatabaseError as exc:
         # 壊れたDB・先頭だけ SQLite に見えるファイルなど(トレースバックを出さずに止める)
         raise click.ClickException("DBを読み込めません: {}（{}）".format(
             getattr(exc, "orig", None) or exc.__class__.__name__, db_path or "instance/app.db"))
 
 
-def _migrate(app, check_only):
-    """migrate の本体(対象DBのアプリ app で、不足しているテーブル・列を確かめて追加する)。"""
+def migrate_run_hint(db_path):
+    """--check の後に表示する、実際に追加するときのコマンド(--db を付けて確認したときは同じ --db を付ける)。
+
+    --db を付けずに案内すると、確認したファイルではなく既定の instance/app.db が対象になってしまうため。
+    """
+    if db_path:
+        return 'flask --app app migrate --db "{}"'.format(db_path)
+    return "flask --app app migrate"
+
+
+def _migrate(app, check_only, db_path=None):
+    """migrate の本体(対象DBのアプリ app で、不足しているテーブル・列を確かめて追加する)。
+
+    db_path は --db で指定したファイル(--check の案内のコマンドに使う。指定が無ければ None)。
+    """
     with app.app_context():
         print("対象DB:", db.engine.url)  # 実際に接続しているDBを表示する
         insp = inspect(db.engine)
@@ -16242,7 +16849,7 @@ def _migrate(app, check_only):
             if check_only and missing_tables:
                 print("不足している列はありません。")
                 print("\n--check のため変更していません。"
-                      "実行するには: flask --app app migrate")
+                      "実行するには: {}".format(migrate_run_hint(db_path)))
                 print("\n結果: ★まだ不足があります: テーブル {}".format(", ".join(missing_tables)))
                 return
             print("不足している列はありません。DBは最新の状態です。")
@@ -16253,7 +16860,7 @@ def _migrate(app, check_only):
 
             if check_only:
                 print("\n--check のため変更していません。"
-                      "実行するには: flask --app app migrate")
+                      "実行するには: {}".format(migrate_run_hint(db_path)))
                 return
 
             added, skipped = 0, []

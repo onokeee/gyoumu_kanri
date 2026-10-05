@@ -50,7 +50,8 @@
 </head>
 <body class="bg-light">
   {% if current_user.is_authenticated %}
-  <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
+  {# マネージャーは項目が多いため、横に並べるのは幅 1200px 以上(それより狭い画面はメニューのボタンで開く) #}
+  <nav class="navbar {{ 'navbar-expand-xl' if current_user.is_manager else 'navbar-expand-lg' }} navbar-dark bg-primary">
     <div class="container-fluid">
       <a class="navbar-brand fw-bold" href="{{ url_for('main.dashboard') }}">
         <i class="bi bi-clipboard-check"></i> {{ app_name }}
@@ -90,40 +91,32 @@
                href="{{ url_for('leaves.calendar_view') }}"><i class="bi bi-calendar-check"></i> 年休</a>
           </li>
           {% if current_user.is_manager %}
-          {# スキルはマネージャーのみ。メンバーにはタブを出さない #}
-          <li class="nav-item">
-            <a class="nav-link {% if request.blueprint == 'skills' %}active{% endif %}"
-               href="{{ url_for('skills.list_skills') }}"><i class="bi bi-mortarboard"></i> スキル</a>
-          </li>
-          {# スキルテストの管理(受験履歴・問題プール。設定はシステム設定)。マネージャーは受験しない #}
-          <li class="nav-item">
-            <a class="nav-link {% if request.blueprint == 'skilltest' %}active{% endif %}"
-               href="{{ url_for('skilltest.admin_attempts') }}"><i class="bi bi-patch-check"></i> スキルテスト管理</a>
+          {# マネージャーだけの管理の画面(スキル・スキルテスト管理・マネージャーダッシュボード・チーム管理・
+             システム設定)は「管理」にまとめる(項目が多く、一般的な画面の幅で名前が途中で折り返さないように) #}
+          <li class="nav-item dropdown">
+            <a class="nav-link dropdown-toggle {% if request.blueprint in ('skills', 'skilltest', 'manager', 'departments', 'system') %}active{% endif %}"
+               href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false"><i class="bi bi-sliders"></i> 管理</a>
+            <ul class="dropdown-menu">
+              {# スキルはマネージャーのみ。メンバーにはタブを出さない #}
+              <li><a class="dropdown-item {% if request.blueprint == 'skills' %}active{% endif %}"
+                     href="{{ url_for('skills.list_skills') }}"><i class="bi bi-mortarboard"></i> スキル</a></li>
+              {# スキルテストの管理(受験履歴・問題プール。設定はシステム設定)。マネージャーは受験しない #}
+              <li><a class="dropdown-item {% if request.blueprint == 'skilltest' %}active{% endif %}"
+                     href="{{ url_for('skilltest.admin_attempts') }}"><i class="bi bi-patch-check"></i> スキルテスト管理</a></li>
+              <li><a class="dropdown-item {% if request.blueprint == 'manager' %}active{% endif %}"
+                     href="{{ url_for('manager.dashboard') }}"><i class="bi bi-graph-up-arrow"></i> マネージャーダッシュボード</a></li>
+              <li><a class="dropdown-item {% if request.blueprint == 'departments' %}active{% endif %}"
+                     href="{{ url_for('departments.manage') }}"><i class="bi bi-diagram-3"></i> チーム管理</a></li>
+              {# システム設定(基本設定・週報・期限超過通知・スキルテストの設定)はマネージャーのみ #}
+              <li><a class="dropdown-item {% if request.blueprint == 'system' %}active{% endif %}"
+                     href="{{ url_for('system.settings') }}"><i class="bi bi-gear"></i> システム設定</a></li>
+            </ul>
           </li>
           {% elif current_user.is_active and current_user.role == 'member' %}
           {# スキルテストの受験はメンバーのみ #}
           <li class="nav-item">
             <a class="nav-link {% if request.blueprint == 'skilltest' %}active{% endif %}"
                href="{{ url_for('skilltest.index') }}"><i class="bi bi-patch-question"></i> スキルテスト</a>
-          </li>
-          {% endif %}
-          {% if current_user.is_manager %}
-          <li class="nav-item">
-            <a class="nav-link {% if request.blueprint == 'manager' %}active{% endif %}"
-               href="{{ url_for('manager.dashboard') }}"><i class="bi bi-graph-up-arrow"></i> マネージャーダッシュボード</a>
-          </li>
-          {% endif %}
-          {% if current_user.is_manager %}
-          <li class="nav-item">
-            <a class="nav-link {% if request.blueprint == 'departments' %}active{% endif %}"
-               href="{{ url_for('departments.manage') }}"><i class="bi bi-diagram-3"></i> チーム管理</a>
-          </li>
-          {% endif %}
-          {% if current_user.is_manager %}
-          {# システム設定(基本設定・週報・期限超過通知・スキルテストの設定)はマネージャーのみ #}
-          <li class="nav-item">
-            <a class="nav-link {% if request.blueprint == 'system' %}active{% endif %}"
-               href="{{ url_for('system.settings') }}"><i class="bi bi-gear"></i> システム設定</a>
           </li>
           {% endif %}
         </ul>
@@ -205,7 +198,7 @@
 </div>
 {% endblock %}
 {#=== errors/http_error.html ===#}
-{# 権限が無い(403)・ページが見つからない(404)・画面として開けない URL(405)の画面。heading / message は app.py の HTTP_ERROR_PAGES #}
+{# 権限が無い(403)・ページが見つからない(404)・画面として開けない URL(405)・内部エラー(500)の画面。heading / message は app.py の HTTP_ERROR_PAGES(または abort の説明) #}
 {% extends "base.html" %}
 {% block title %}{{ heading }} &middot; {{ app_name }}{% endblock %}
 
@@ -353,7 +346,8 @@
       <input type="date" name="ato" value="{{ act_to.strftime('%Y-%m-%d') }}" class="form-control form-control-sm">
     </div>
     <div class="col-12 col-md-3">
-      <noscript><button type="submit" class="btn btn-sm btn-outline-primary">この期間で表示</button></noscript>
+      {# 日付の欄は自動では反映しない(入力の途中で再読み込みしないように。auto-filter.js) #}
+      <button type="submit" class="btn btn-sm btn-outline-primary">この期間で表示</button>
     </div>
   </div>
 </form>
@@ -416,7 +410,10 @@
       対象 {{ o_totals.tasks }} 件
       {% if o_undated %}<br><span class="text-danger"><i class="bi bi-exclamation-triangle"></i> 期限・開始日が未設定のため集計外: {{ o_undated }} 件</span>{% endif %}
       {% if o_no_unit %}<br><span class="text-danger"><i class="bi bi-exclamation-triangle"></i> 単位が未選択のため金額/時間に集計されないタスク: {{ o_no_unit }} 件</span>{% endif %}
-      <noscript><button type="submit" class="btn btn-sm btn-outline-primary ms-2">この期間で表示</button></noscript>
+    </div>
+    <div class="col-12">
+      {# 日付の欄は自動では反映しない(入力の途中で再読み込みしないように。auto-filter.js) #}
+      <button type="submit" class="btn btn-sm btn-outline-primary">この期間で表示</button>
     </div>
   </div>
 </form>
@@ -600,6 +597,7 @@
           <td data-sort="{{ status_choices.index(task.status) if task.status in status_choices else 9 }}">
             {% if task.id in editable_ids %}{# ステータスをその場で変更(作成者・担当者・マネージャーだけ。ほかは状態の表示だけ) #}
             <form method="post" action="{{ url_for('tasks.update_status', task_id=task.id) }}" class="d-inline">
+              <input type="hidden" name="row" value="{{ task.row_key }}">
               <select name="status" class="form-select form-select-sm badge-select"
                       onchange="this.form.submit()" style="width:auto;display:inline-block;">
                 {% for s in status_choices %}
@@ -680,6 +678,7 @@
   <div class="card-footer bg-white d-flex gap-2 align-items-center">
     {# クイックステータス変更 #}
     <form method="post" action="{{ url_for('tasks.update_status', task_id=task.id) }}" class="d-flex gap-2 me-auto">
+      <input type="hidden" name="row" value="{{ task.row_key }}">
       <select name="status" class="form-select form-select-sm" style="width:auto;">
         {% for s in ['未着手','進行中','保留','完了'] %}
         <option value="{{ s }}" {% if task.status == s %}selected{% endif %}>{{ s }}</option>
@@ -694,6 +693,7 @@
     {% if current_user.is_manager %}
     <form method="post" action="{{ url_for('tasks.delete_task', task_id=task.id) }}"
           onsubmit="return confirm('このタスクを削除しますか?');">
+      <input type="hidden" name="row" value="{{ task.row_key }}">
       <button class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i> 削除</button>
     </form>
     {% endif %}
@@ -755,6 +755,7 @@
       {% if editable %}
       <div class="collapse cmt{{ c.id }}">
         <form method="post" action="{{ url_for('tasks.edit_comment', task_id=task.id, comment_id=c.id) }}">
+          <input type="hidden" name="row" value="{{ task.row_key }}">
           <textarea name="body" class="form-control form-control-sm mb-1" rows="3" required>{{ c.body }}</textarea>
           <button class="btn btn-sm btn-primary"><i class="bi bi-check-lg"></i> 保存</button>
           <button type="button" class="btn btn-sm btn-outline-secondary"
@@ -770,6 +771,7 @@
 
     {% if can_edit %}
     <form method="post" action="{{ url_for('tasks.add_comment', task_id=task.id) }}">
+      <input type="hidden" name="row" value="{{ task.row_key }}">
       <textarea name="body" class="form-control mb-2" rows="3"
                 placeholder="進捗を記入(動きがあれば記載してください)&#10;複数行で記入できます" required></textarea>
       <button class="btn btn-primary"><i class="bi bi-pencil-square"></i> 記載</button>
@@ -798,6 +800,11 @@
     <h1 class="h3 mb-3">{{ 'タスク編集' if editing else 'タスク追加' }}</h1>
 
     <form method="post" class="card card-body shadow-sm">
+      {% if editing %}
+      {# 画面を開いたタスクの印(IDの再利用の取り違え防止)と、開いたときの内容の控え(ほかの操作の変更を上書きしない) #}
+      <input type="hidden" name="row" value="{{ task.row_key }}">
+      <input type="hidden" name="version" value="{{ version }}">
+      {% endif %}
       <div class="mb-3">
         <label class="form-label">タイトル <span class="text-danger">*</span></label>
         <input type="text" name="title" class="form-control" required value="{{ val('title') }}">
@@ -1124,6 +1131,7 @@
     {% if current_user.is_manager %}
     <form method="post" action="{{ url_for('routine.delete_routine', routine_id=routine.id) }}"
           onsubmit="return confirm('この定型・定期業務を削除しますか?');">
+      <input type="hidden" name="row" value="{{ routine.row_key }}">
       <button class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i> 削除</button>
     </form>
     {% endif %}
@@ -1147,6 +1155,11 @@
     <h1 class="h3 mb-3">{{ '定型・定期業務の編集' if editing else '定型・定期業務の登録' }}</h1>
 
     <form method="post" class="card card-body shadow-sm">
+      {% if editing %}
+      {# 画面を開いた業務の印(IDの再利用の取り違え防止)と、開いたときの内容の控え(ほかの操作の変更を上書きしない) #}
+      <input type="hidden" name="row" value="{{ routine.row_key }}">
+      <input type="hidden" name="version" value="{{ version }}">
+      {% endif %}
       <div class="row">
         <div class="col-md-7 mb-3">
           <label class="form-label">業務名 <span class="text-danger">*</span></label>
@@ -2390,6 +2403,7 @@
 {% endblock %}
 {#=== skilltest/question.html ===#}
 {% extends "base.html" %}
+{% from "_macros.html" import fmt_datetime %}
 {% block title %}スキルテスト（{{ item.seq }}/{{ attempt.total }}） &middot; {{ app_name }}{% endblock %}
 
 {% block content %}
@@ -2449,7 +2463,7 @@
     ・時間が0になると、その時点の選択で自動的に送信します（未選択なら時間切れ＝不正解）。<br>
     ・ほかのタブやアプリに切り替えると記録されます（マネージャーが確認します）。
     <span id="skilltestBlurNote" class="text-danger d-none">画面から離れたことを記録しました（<span id="skilltestBlurCount">0</span>回）。</span><br>
-    ・全体の期限: {{ attempt.deadline_at.strftime('%H:%M') }}（過ぎると自動で終了します）
+    ・全体の期限: {{ fmt_datetime(attempt.deadline_at) }}（過ぎると自動で終了します）
   </div>
   <noscript>
     <div class="alert alert-warning small mt-3">JavaScript が無効のため、残り時間が自動で更新されません。制限時間はサーバーで計っています。</div>
@@ -3081,7 +3095,7 @@
 </div>
 {% else %}
 <div class="card card-body shadow-sm text-muted text-center">
-  問題がありません。{% if testable %}「AIで補充」で作成するか、メンバーが受験を始めたときに不足分が自動で作成されます。{% endif %}
+  問題がありません。{% if testable and ai_enabled %}「AIで補充」で作成するか、メンバーが受験を始めたときに不足分が自動で作成されます。{% elif testable %}AIが未設定のため、問題を作成できません（メンバーが受験を始めても問題が無いため受験できません）。AIは<a href="{{ url_for('system.settings', tab='config') }}">システム設定の「基本設定」タブ</a>で設定します。{% endif %}
 </div>
 {% endfor %}
 {% endblock %}
@@ -3301,7 +3315,10 @@
       対象 {{ o_totals.tasks }} 件
       {% if o_undated %}<br><span class="text-danger"><i class="bi bi-exclamation-triangle"></i> 期限・開始日が未設定のため集計外: {{ o_undated }} 件</span>{% endif %}
       {% if o_no_unit %}<br><span class="text-danger"><i class="bi bi-exclamation-triangle"></i> 単位が未選択のため金額/時間に集計されないタスク: {{ o_no_unit }} 件</span>{% endif %}
-      <noscript><button type="submit" class="btn btn-sm btn-outline-primary ms-2">この期間で表示</button></noscript>
+    </div>
+    <div class="col-12">
+      {# 日付の欄は自動では反映しない(入力の途中で再読み込みしないように。auto-filter.js) #}
+      <button type="submit" class="btn btn-sm btn-outline-primary">この期間で表示</button>
     </div>
   </div>
 </form>
@@ -4031,7 +4048,7 @@
               <td>{{ task_cell(r) }}</td>
               <td class="text-nowrap">{{ r.assignee_names or '未割当' }}</td>
               <td class="text-nowrap">{{ fmt_date(r.due_date) }}</td>
-              <td class="text-nowrap text-danger fw-bold">{{ r.overdue_days }}営業日</td>
+              <td class="text-nowrap text-danger fw-bold">{% if r.overdue_days == 0 and r.calendar_days %}0営業日<span class="fw-normal small">（{{ r.calendar_days }}日超過・休日）</span>{% else %}{{ r.overdue_days }}営業日{% endif %}</td>
               <td>{{ last_comment(r.last_comment) }}</td>
             </tr>
             {% else %}
@@ -4582,6 +4599,8 @@
             <ul class="mb-0 ps-3">{% for line in r.ai[key] %}<li class="pre-wrap">{{ line }}</li>{% endfor %}</ul></div>
           {% endif %}
           {% endfor %}
+          {% elif r.ai_state == state_new %}
+          <div class="text-muted">{{ ai_state_badge(r.ai_state) }} 分析の後に追加したメンバー（または復帰・メンバーにした人）のため、所見はありません（もう一度「AIで分析」を実行すると作成します）。</div>
           {% elif r.ai_state %}
           <div class="text-muted">{{ ai_state_badge(r.ai_state) }} 分析した後にメンバーが変わった（削除・追加で同じIDの別の人になった）ため、所見を出していません。</div>
           {% else %}
@@ -5872,6 +5891,12 @@ a:hover {
   vertical-align: -2px;
 }
 
+/* メニューの名前を途中で折り返さない(「タ/ス/ク」のように1文字ずつ縦に並ばないように) */
+.navbar-nav .nav-link,
+.navbar-nav .dropdown-item {
+  white-space: nowrap;
+}
+
 /* 並び替え可能な表のヘッダ(sort-table.js) */
 .sortable-th {
   cursor: pointer;
@@ -6169,18 +6194,29 @@ a:hover {
  * テキスト入力は change(Enter または フォーカスを外したとき)で反映する。
  * 1文字ごとに再読み込みすると入力しづらいため、意図的に input では送信しない。
  *
+ * 日付・時刻の欄(type="date" など)は自動では送信しない。ブラウザ(Chrome・Edge)は、キーボードで年・月・日の
+ * どれか1つを変えるたびに change を出すため、1文字目で再読み込みされ、日付を最後まで入力できないため。
+ * 日付の欄のあるフォームには「この期間で表示」ボタンを置く(ボタンまたは Enter で反映する)。
+ *
  * JavaScript が無効な環境では <noscript> の送信ボタンが表示され、従来どおり操作できる。
  */
 (function () {
   "use strict";
 
+  // 自動では送信しない入力欄の種類(年・月・日などの部分ごとに change が出るもの)
+  var MANUAL_TYPES = ["date", "datetime-local", "month", "week", "time"];
+
   function setup(form) {
     // change はバブリングするのでフォームで一括して拾う
     form.addEventListener("change", function (event) {
       var el = event.target;
-      if (el && el.matches("input, select, textarea")) {
-        form.submit();
+      if (!el || !el.matches("input, select, textarea")) {
+        return;
       }
+      if (el.matches("input") && MANUAL_TYPES.indexOf((el.type || "").toLowerCase()) >= 0) {
+        return;  // 日付の欄は「この期間で表示」ボタン(または Enter)で反映する
+      }
+      form.submit();
     });
   }
 
