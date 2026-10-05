@@ -760,6 +760,8 @@
       <div class="collapse cmt{{ c.id }}">
         <form method="post" action="{{ url_for('tasks.edit_comment', task_id=task.id, comment_id=c.id) }}">
           <input type="hidden" name="row" value="{{ task.row_key }}">
+          {# 開いたときの記載の控え(ほかの操作の変更を古い画面の内容で上書きしない) #}
+          <input type="hidden" name="version" value="{{ comment_versions[c.id] }}">
           <textarea name="body" class="form-control form-control-sm mb-1" rows="3" required>{{ c.body }}</textarea>
           <button class="btn btn-sm btn-primary"><i class="bi bi-check-lg"></i> 保存</button>
           <button type="button" class="btn btn-sm btn-outline-secondary"
@@ -1468,7 +1470,9 @@
     <h1 class="h3 mb-3">{{ '年休の編集' if editing else '年休の登録' }}</h1>
 
     <form method="post" class="card card-body shadow-sm">{% if editing %}
-      <input type="hidden" name="row" value="{{ leave.row_key }}">{% endif %}
+      <input type="hidden" name="row" value="{{ leave.row_key }}">{% else %}
+      {# 登録の二度押しで、1回目の案内(同日の人数・今週の連絡)が表示されなくならないようにする1回限りの印 #}
+      <input type="hidden" name="once" value="{{ submit_token() }}">{% endif %}
       <div class="mb-3">
         <label class="form-label">取得日 <span class="text-danger">*</span></label>
         <input type="date" name="leave_date" class="form-control" required min="{{ year_min }}-01-01" max="{{ year_max }}-12-31"
@@ -1934,7 +1938,9 @@
               style="position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0;">{{ '更新' if editing else '追加' }}</button>
       {% if back %}<input type="hidden" name="back" value="{{ back }}">{% endif %}{% if editing %}
       {# 画面を開いたときの内容の控え(ほかの操作の変更を古い画面の保存で上書きしない) #}
-      <input type="hidden" name="version" value="{{ version }}">{% endif %}
+      <input type="hidden" name="version" value="{{ version }}">{% else %}
+      {# 追加の二度押しで同じスキル項目を2件にしないための1回限りの印(「AIで下書き」の再表示でも引き継ぐ) #}
+      <input type="hidden" name="once" value="{{ form.get('once') if form and form.get('once') else submit_token() }}">{% endif %}
       <div class="mb-3">
         <label class="form-label" for="item-name">スキル名 <span class="text-danger">*</span></label>
         <input type="text" name="name" id="item-name" class="form-control" required value="{{ val('name') }}">
@@ -2338,7 +2344,7 @@
         （{% for r in rules.rows %}Lv{{ r.level }} {{ r.count }}問{% if not loop.last %}・{% endif %}{% endfor %}）。
         やさしい問題（Lv1）から順に出題します。</li>
       <li>1問ずつの制限時間があります（{% for r in rules.rows %}Lv{{ r.level }} {{ r.limit }}秒{% if not loop.last %}・{% endif %}{% endfor %}。合計 約{{ rules.minutes }}分）。
-        0秒になると自動で次の問題へ進み、時間内に回答しなかった問題は不正解になります。ページを再読み込みしても残り時間は戻りません。</li>
+        0秒になると、その時点で選んでいる選択肢で自動的に送信して次の問題へ進みます（未選択なら時間切れ＝不正解）。ページを再読み込みしても残り時間は戻りません。</li>
       <li>1問ずつ回答し、<span class="fw-bold">前の問題には戻れません</span>。選択肢の並びは受験ごとに変わります。</li>
       <li>途中で画面を閉じた場合は、開き直すと続きから再開します。ただし開始から 約{{ rules.deadline_minutes }}分を過ぎると自動で終了し、未回答の問題は不正解として採点します。</li>
       <li>判定: あるレベルの正答率が{{ rules.pass_rate }}%以上で、それより下のレベルもすべて合格していれば、そのレベルに合格です。合格した最も高いレベルがテストの結果です（Lv1が不合格なら Lv0）。</li>
@@ -3824,6 +3830,9 @@
 
 {# 期間 #}
 <form method="get" class="card card-body shadow-sm mb-3" id="analysis-period-form">
+  {# 開いたときの日付の欄の値(日付を変えずに直近N日を選んだときに、日付の案内を出さないため) #}
+  <input type="hidden" name="shown_from" value="{{ period.start.strftime('%Y-%m-%d') }}">
+  <input type="hidden" name="shown_to" value="{{ period.end.strftime('%Y-%m-%d') }}">
   <div class="row g-2 align-items-end">
     <div class="col-sm-6 col-md-3">
       <label class="form-label small mb-1" for="analysis-period">期間内</label>
@@ -3897,6 +3906,9 @@
       ／ AIの呼び出し {{ r.calls.ok or 0 }}/{{ r.calls.total or 0 }} 回成功
       {% if r.unread.count or r.calls.failed %}<span class="badge bg-warning text-dark">一部のみ</span>{% elif r.errors %}<span class="badge bg-success">すべて読み込み（注意 {{ r.errors|length }} 件）</span>{% else %}<span class="badge bg-success">すべて読み込み</span>{% endif %}
     </div>
+    {% if r.aborted %}
+    <div class="alert alert-warning py-1 px-2 mb-1"><i class="bi bi-exclamation-triangle"></i> {{ r.aborted }}もう一度「AIで分析」を実行してください。</div>
+    {% endif %}
     {% if ai.applied %}
     <div class="mb-1">
       AIが読んだ材料: タスク {{ (r.read.task_ids or [])|length }} 件・コメント {{ r.read.comments or 0 }} 件
@@ -3921,7 +3933,8 @@
       <a href="{{ url_for('manager.analysis', **ai.other_period) }}">その期間で表示</a>するか、この期間で「AIで分析」を実行してください。
     </div>
     {% endif %}
-    {% elif not ai_run.running %}
+    {% elif not ai_run.running and not ai.error %}
+    {# 結果のファイルを読み込めないとき(ai.error)は、「まだ分析していない」とは表示しない #}
     <div class="text-muted mb-1">まだAIで分析していません。下の表はアプリの集計です。「AIで分析」を押すと、AIが本文を読んで、課題の抽出・コメントへの対応の判定・書き直し案・各人の所見・推奨アクションを加えます。</div>
     {% endif %}
     <div class="text-muted mt-2">
@@ -3985,7 +3998,7 @@
   {{ actions_table(a.actions) }}
   <div class="card-footer bg-white small text-muted">
     <i class="bi bi-info-circle"></i> {{ action_sources|join('・') }}から、最大{{ action_max }}件を選んでいます（同じ種類は数件まで）。
-    {% if ai.applied %}<br><i class="bi bi-exclamation-triangle"></i> AIによる推奨アクションを作れなかったため（AIの呼び出しの失敗など）、ルールで選んだものを表示しています。{% endif %}
+    {% if ai.applied and a.ai_actions is none %}<br><i class="bi bi-exclamation-triangle"></i> AIによる推奨アクションを作れなかったため（AIの呼び出しの失敗など）、ルールで選んだものを表示しています。{% endif %}
   </div>
   {% endif %}
 </div>
@@ -4685,6 +4698,8 @@
     {% for d in departments %}
     <form method="post" action="{{ url_for('departments.rename_department', dept_id=d.id) }}"
           class="row g-2 align-items-center mb-2">
+      {# 開いたときの内容の控え(ほかの操作の変更を古い画面の値で上書きしない) #}
+      <input type="hidden" name="version" value="{{ versions[d.id] }}">
       <div class="col-md-5">
         <input type="text" name="name" class="form-control form-control-sm" value="{{ d.name }}">
       </div>
@@ -4709,6 +4724,8 @@
 
     <hr>
     <form method="post" action="{{ url_for('departments.new_department') }}" class="row g-2 align-items-end">
+      {# 追加の二度押しで「既にあります」だけが表示されないようにする1回限りの印 #}
+      <input type="hidden" name="once" value="{{ submit_token() }}">
       <div class="col-md-5">
         <label class="form-label small mb-1">新しいチームを追加</label>
         <input type="text" name="name" class="form-control form-control-sm" placeholder="チームの名称" required>
@@ -4767,6 +4784,8 @@
 
     <hr>
     <form method="post" action="{{ url_for('departments.new_member') }}" class="row g-2 align-items-end">
+      {# 追加の二度押しで「既に使われています」だけが表示されないようにする1回限りの印 #}
+      <input type="hidden" name="once" value="{{ submit_token() }}">
       <div class="col-12"><label class="form-label small mb-1 fw-bold">新しいメンバーを追加</label></div>
       <div class="col-md-3">
         <label class="form-label small mb-1">氏名</label>
@@ -4814,6 +4833,9 @@
     {# 保存で変えるのは、この表に出している人・チームの組み合わせだけ(画面を開いた後の追加・削除を消さない) #}
     {% for u in users %}<input type="hidden" name="member_keys" value="{{ u.form_key }}">{% endfor %}
     {% for d in departments %}<input type="hidden" name="dept_ids" value="{{ d.id }}">{% endfor %}
+    {# 開いたときのチェックの状態(保存では、付けた・外したセルだけを変える。ほかの操作の変更を戻さない) #}
+    <input type="hidden" name="was_shown" value="1">
+    {% for d in departments %}{% for u in users %}{% if u.id in membership[d.id] %}<input type="hidden" name="was_{{ d.id }}" value="{{ u.form_key }}">{% endif %}{% endfor %}{% endfor %}
     <div class="table-responsive">
       <table class="table table-hover align-middle mb-0 text-center">
         <thead class="table-light">
@@ -4876,6 +4898,9 @@
           {{ upcoming.strftime('%Y/%m/%d') }}（{{ weekday_labels[upcoming.weekday()] }}）{{ upcoming.strftime('%H:%M') }}
         </div>
         <div class="small text-muted">対象期間 {{ upcoming_period }}</div>
+        {% if scheduler_stopped %}
+        <div class="small text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> 自動送信のスケジューラが動いていません（このフォルダで「flask --app app run」で起動したサーバーがありません）。このままでは、この時刻に送信されません。</div>
+        {% endif %}
         {% if selected_count == 0 %}
         <div class="small text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> 対象者が選択されていません。</div>
         {% endif %}
@@ -5068,6 +5093,9 @@
           {{ upcoming.strftime('%Y/%m/%d') }}（{{ weekday_labels[upcoming.weekday()] }}）{{ upcoming.strftime('%H:%M') }}
         </div>
         <div class="small text-muted">その時点で期限を過ぎているタスクを送信します。</div>
+        {% if scheduler_stopped %}
+        <div class="small text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> 自動送信のスケジューラが動いていません（このフォルダで「flask --app app run」で起動したサーバーがありません）。このままでは、この時刻に送信されません。</div>
+        {% endif %}
         {% if mail_problem %}
         <div class="small text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> メールの設定が不足しているため送信できません。</div>
         {% endif %}
@@ -5409,14 +5437,16 @@
 {% endmacro %}
 
 <p class="small text-muted">
-  環境ごとの設定（接続先・宛先・パスワードなど）です。保存すると設定ファイル <code>instance/config.py</code> の、変更した項目の行だけを書き換えます
-  （コメントやほかの項目はそのまま。変更前の内容は <code>instance/config.py.bak</code> に残します）。
+  環境ごとの設定（接続先・宛先・パスワードなど）です。保存すると設定ファイル <code>instance/config.py</code> の、変更した項目の値だけを書き換えます
+  （コメントやほかの項目はそのまま。複数行に分けて書いた一覧は1行になり、その中のコメントは消えます。変更前の内容は <code>instance/config.py.bak</code> に残します）。
   <span class="badge bg-warning text-dark">再起動が必要</span> の項目以外は、保存するとすぐに反映されます。
   <code>instance/config.py</code> はこれまでどおり直接編集することもできます（その場合はサーバーの再起動で反映）。
 </p>
 
 <form method="post" action="{{ url_for('system.save_config') }}" id="config-form" autocomplete="off" novalidate>
   <input type="hidden" name="version" value="{{ cfg.version }}">
+  {# 保存のボタンの二度押しの2回目を「ほかの人の保存」と案内しないための1回限りの印 #}
+  <input type="hidden" name="once" value="{{ submit_token() }}">
   {% for group in cfg.groups %}
   <div class="card shadow-sm mb-3">
     <div class="card-header bg-white fw-bold">{{ group.label }}</div>

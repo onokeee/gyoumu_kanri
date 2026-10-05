@@ -154,7 +154,8 @@ from flask import (
     Response,
     abort,
     current_app,
-    flash,
+    flash as _flask_flash,
+    has_request_context,
     jsonify,
     make_response,
     redirect,
@@ -374,7 +375,8 @@ APP_BASE_URL = ""
 #
 # ■ 画面からの更新(update_config。システム設定の「基本設定」タブで使う)
 #   1. 変更する項目の `KEY = ...` の値の部分だけを置き換える(無い項目は末尾に追記)。
-#      コメント・知らない項目・書式(改行コードを含む)はそのまま残す
+#      コメント・知らない項目・書式(改行コードを含む)はそのまま残す(値の部分は全体を書き直すため、
+#      複数行に分けて書いた一覧は1行になり、[ ] の中のコメントは消える)
 #   2. 先頭付近の「# 最終更新: ...」の行を1行だけ更新する(無ければ追加)
 #   3. 新しい内容が Python として正しく、期待どおりの値になることを確かめる
 #      (変更しない項目の値が変わっていないことも確かめる)
@@ -487,7 +489,8 @@ def _set_value(text, key, value, newline=None):
     """設定ファイルの本文で `KEY = ...` の値の部分を置き換える(無ければ末尾に追記)。
 
     値は format_value() で書き出す(文字列は repr()、一覧はリスト表記)。
-    行末のコメントや前後の行、ほかの項目はそのまま残す。
+    行末のコメントや前後の行、ほかの項目はそのまま残す(値の部分は全体を置き換えるため、複数行の一覧は
+    1行になり、[ ] の中のコメントは消える)。
     本文が Python として解釈できない場合や、単純な `KEY = 値` で決まっていない場合は
     末尾に `KEY = 値` を追記する(後の代入が優先されるため)。
     """
@@ -1065,6 +1068,15 @@ def prefers_json():
 CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ud800-\udfff\ufffe\uffff]")
 
 
+def flash(message, category="message"):
+    """画面の案内(flask.flash)。セッション(クッキー)に保存できない文字(対になっていないサロゲート・制御文字。
+    CONTROL_CHARS)を除いてから入れる(外から来た文〔AI・送信サーバーの応答など〕に含まれていても、
+    以後のすべての画面が内部エラーにならないように)。"""
+    if isinstance(message, str) and CONTROL_CHARS.search(message):
+        message = CONTROL_CHARS.sub("", message)
+    _flask_flash(message, category)
+
+
 def _now():
     """現在の日時。スキルテストの時刻と AI分析の基準の日時はすべてここから取る。
 
@@ -1274,15 +1286,21 @@ def already_submitted(kind):
     return hit[1] if hit else None
 
 
+def remember_submitted(kind, url):
+    """印と送った内容を覚える(DB を使わない保存〔設定ファイルなど〕の後に呼ぶ)。覚えたときはそのキー。"""
+    key = _submitted_key(kind)
+    if key is not None:
+        with _submitted_lock:
+            _submitted[key] = (monotonic(), url)
+    return key
+
+
 def commit_submitted(kind, url):
     """登録を保存し、印と送った内容を覚える(保存できなかったときは覚えない)。
 
     commit の前に覚える: commit で書き込みのロックが外れた直後に、同時に届いた2回目が確認するため。
     """
-    key = _submitted_key(kind)
-    if key is not None:
-        with _submitted_lock:
-            _submitted[key] = (monotonic(), url)
+    key = remember_submitted(kind, url)
     try:
         db.session.commit()
     except Exception:
@@ -1290,6 +1308,18 @@ def commit_submitted(kind, url):
             with _submitted_lock:
                 _submitted.pop(key, None)
         raise
+
+
+def commit_unique_submitted(kind, url, message):
+    """commit_submitted と同じく登録を保存して印を覚える。名前・IDの重複(UNIQUE 制約)で保存できなければ
+    取り消して message を表示し False(commit_unique と同じ)。"""
+    try:
+        commit_submitted(kind, url)
+        return True
+    except IntegrityError:
+        db.session.rollback()
+        flash(message, "warning")
+        return False
 
 
 # 二度押しの2回目を登録しなかったときの案内({} は登録したもの)
@@ -3124,7 +3154,21 @@ def ai_chat(messages):
     """メッセージ列(OpenAI形式の role/content の辞書のリスト)をAIに送る。
 
     戻り値: (応答の本文, None) / 失敗時は (None, エラーメッセージ)
+    応答の本文・エラーメッセージから、文字として保存・表示できない文字(対になっていないサロゲート
+    〔絵文字の途中で切れた応答など〕・制御文字。CONTROL_CHARS)を除く(画面の案内〔セッション〕や
+    JSON・Word・Excel に入れたときに、保存・表示できなくならないように)。
     """
+    text, error = _ai_chat(messages)
+    if error is not None:
+        return None, CONTROL_CHARS.sub("", str(error))
+    text = CONTROL_CHARS.sub("", text).strip()
+    if not text:
+        return None, "AIの応答が空でした。"
+    return text, None
+
+
+def _ai_chat(messages):
+    """ai_chat の本体(応答の本文・エラーメッセージは、まだ使えない文字を除いていない)。"""
     if not ai_is_configured():
         return None, ("ChatGPT-APIが未設定です。システム設定の「基本設定」タブで AI_API_KEY"
                       "（独自APIの場合は AI_API_URL）を設定してください。")
@@ -3470,6 +3514,19 @@ NON_ASCII_ADDRESS_MESSAGE = ("差出人・宛先に半角英数字以外の文�
                              "（instance/config.py の MAIL_FROM・MAIL_TO・MAIL_CC を確認してください）: {}")
 
 
+def _close_smtp(smtp):
+    """送信サーバーとの接続を QUIT で終える。QUIT の応答・切断のエラーは結果にしない。
+
+    送信の成否は本文の送信(sendmail)の応答で決まる。その後の QUIT に 221 以外が返る・接続が切れていても、
+    送信済みのメールを「失敗」にしない(with 文の終わりの QUIT は 221 以外で例外になるため使わない)。
+    本文の送信が例外になったときも、その例外(送れなかった理由)を QUIT のエラーで置き換えない。
+    """
+    try:
+        smtp.quit()
+    except (smtplib.SMTPException, OSError):
+        smtp.close()
+
+
 def send_mail(subject, text, html=None, attachments=(), to=None, cc=None, test=False):
     """メールを送る。
 
@@ -3507,9 +3564,12 @@ def send_mail(subject, text, html=None, attachments=(), to=None, cc=None, test=F
 
     try:
         # 暗号化(STARTTLS)・認証(ログイン)はしない。接続して送るだけ(終わると QUIT で切断する)
-        with smtplib.SMTP(values["server"], values["port"], timeout=SMTP_TIMEOUT) as smtp:
+        smtp = smtplib.SMTP(values["server"], values["port"], timeout=SMTP_TIMEOUT)
+        try:
             # ヘッダは78文字で折り返す(宛先が多い・件名が長いときに1行が長くなりすぎないように)
             refused = smtp.sendmail(mail_from, envelope, msg.as_string(maxheaderlen=78))
+        finally:
+            _close_smtp(smtp)
     except smtplib.SMTPRecipientsRefused as exc:
         hint = smtp_refusal_hint(_refused_replies(exc.recipients))
         return False, "すべての宛先が拒否されました: {}{}".format(
@@ -3749,9 +3809,37 @@ def _redirect_after_login():
             # ログインが切れた状態で保存・変更などを送った: その操作は行われていない
             flash("ログインの有効期限が切れていたため、直前の操作（保存・変更など）は行われていません。"
                   "必要ならもう一度操作してください。", "warning")
+        if page and _is_download(page):
+            # Excel 出力(ファイルのダウンロード)へ移動すると、ブラウザはログイン画面を表示したままになる
+            # (ダウンロードは画面を置き換えない)ため、画面へ移動して、もう一度押してもらう
+            if not current_user.is_manager:
+                return redirect(url_for("main.dashboard"))
+            flash("Excel出力のファイルは、ログインの後には自動で作成しません。"
+                  "必要ならもう一度「Excel出力」を押してください。", "info")
+            return redirect(url_for("manager.dashboard"))
         if page:
             return redirect(page)
     return redirect(url_for("main.dashboard"))
+
+
+# ファイルを返す(画面ではない)URL のエンドポイント(Excel 出力)
+_DOWNLOAD_ENDPOINT_PREFIXES = ("export.",)
+
+
+def _is_download(path):
+    """path(このアプリの中のパス)が、GET で開くとファイルのダウンロードになる URL か。"""
+    adapter = current_app.url_map.bind("localhost")
+    candidate = urlsplit(path).path
+    for _ in range(2):  # 末尾の「/」の違い(アプリが移動先へ転送する)は、移動先で確かめる
+        try:
+            endpoint, _args = adapter.match(candidate, method="GET")
+        except RequestRedirect as exc:
+            candidate = urlsplit(exc.new_url).path
+            continue
+        except HTTPException:
+            return False
+        return endpoint.startswith(_DOWNLOAD_ENDPOINT_PREFIXES)
+    return False
 
 
 def _page_for_next(path):
@@ -4240,7 +4328,10 @@ def task_detail(task_id):
     # メールのリンク(?t=印)が、削除されたタスク(同じIDの別の新しいタスク)を指していたら 404
     if not row_key_matches(task, request.args.get("t")):
         abort(404)
-    return render_template("tasks/detail.html", task=task, can_edit=_can_edit(task))
+    # 進捗の記載の編集フォームの控え(古い画面からの保存で、ほかの操作の変更を上書きしない)
+    comment_versions = {c.id: field_versions({"body": c.body}, COMMENT_VERSION_KEYS) for c in task.comments}
+    return render_template("tasks/detail.html", task=task, can_edit=_can_edit(task),
+                           comment_versions=comment_versions)
 
 
 @tasks_bp.route("/<int:task_id>/edit", methods=["GET", "POST"])
@@ -4401,6 +4492,10 @@ def add_comment(task_id):
     return redirect(back)
 
 
+# 進捗の記載の編集で、画面を開いた後の変更を確かめる項目(hidden の version)
+COMMENT_VERSION_KEYS = ("body",)
+
+
 def _can_edit_comment(comment):
     """進捗状況の記載内容を変更できるか:記載者本人・マネージャーのみ。
 
@@ -4428,10 +4523,17 @@ def edit_comment(task_id, comment_id):
     body = request.form.get("body", "").strip()
     if not body:
         flash("進捗状況の内容を入力してください。", "danger")
-    else:
-        comment.body = body
-        db.session.commit()
-        flash("進捗状況を更新しました。", "success")
+        return redirect(url_for("tasks.detail", task_id=task_id))
+    # 画面を開いた後に、ほかの操作(本人の別のタブ・マネージャー)で記載が変更されていたら上書きしない
+    # (控え version の無い以前の画面からの送信は確かめない)
+    current = {"body": comment.body}
+    changed = fields_changed_since(request.form.get("version"), current, COMMENT_VERSION_KEYS)
+    if conflicting_fields(changed, current, {"body": body}):
+        flash(_EDITED_ELSEWHERE.format("進捗状況の内容"), "warning")
+        return redirect(url_for("tasks.detail", task_id=task_id))
+    comment.body = body
+    db.session.commit()
+    flash("進捗状況を更新しました。", "success")
     return redirect(url_for("tasks.detail", task_id=task_id))
 
 
@@ -5036,6 +5138,13 @@ def new_leave():
         with _leave_lock:
             lock_for_write()  # 本人がチーム管理で同時に削除されていたら登録しない(ログイン画面へ)
             dup = _duplicate_on(current_user.id, leave_date)
+            calendar_url = url_for("leaves.calendar_view", year=leave_date.year, month=leave_date.month)
+            if dup and already_submitted("leave"):
+                # 登録のボタンの二度押しの2回目: 表示されるのはこちらの画面なので、1回目の案内
+                # (同日の人数・今週の連絡のお願い)をもう一度出す
+                flash(_SUBMITTED_TWICE.format("年休"), "info")
+                _registration_messages(current_user, leave_date, exclude_id=dup.id)
+                return redirect(calendar_url)
             if dup:
                 flash("その取得日の年休は既に登録されています。", "warning")
                 return redirect(url_for("leaves.detail", leave_id=dup.id))
@@ -5044,7 +5153,7 @@ def new_leave():
                 user_id=current_user.id, leave_date=leave_date, leave_type=leave_type
             )
             db.session.add(leave)
-            db.session.commit()
+            commit_submitted("leave", calendar_url)
         flash("年休を登録しました。", "success")
         _registration_messages(current_user, leave_date, exclude_id=leave.id)
         return redirect(url_for("leaves.calendar_view", year=leave_date.year, month=leave_date.month))
@@ -5287,6 +5396,9 @@ def list_skills():
 @skills_bp.route("/operations/<int:op_id>/edit", methods=["GET", "POST"])
 def edit_operation(op_id):
     """業務ごとの必要スキル(ヒトと同じ到達尺度のレベル)を設定する(マネージャー)。"""
+    if request.method == "POST":
+        # 確かめて(画面を開いたときの値と今の値を比べて)から保存するまでの間に、ほかの保存が入らないように
+        lock_for_write()
     op = get_or_404(Operation, op_id)
     all_skills = []
     for stype in SKILL_TYPE_CHOICES:
@@ -5733,6 +5845,7 @@ def draft_skill_description(name, skill_type, category, current=""):
 
 @skills_bp.route("/items/new", methods=["GET", "POST"])
 def new_item():
+    """スキル項目を追加する。追加のボタンの二度押し(同じ印 once・同じ内容)の2回目は追加しない。"""
     if request.method == "POST":
         name = request.form.get("name", "").strip()
         if not name:
@@ -5741,6 +5854,10 @@ def new_item():
         stype = request.form.get("skill_type")
         if stype not in SKILL_TYPE_CHOICES:
             stype = SKILL_TECHNICAL
+        lock_for_write()  # 二度押しの確認から追加までの間に、同時に届いた2回目が入らないように
+        if already_submitted("skill_item"):
+            flash(_SUBMITTED_TWICE.format("スキル項目「{}」".format(name)), "info")
+            return redirect(url_for("skills.items"))
         skill = Skill(
             name=name,
             skill_type=stype,
@@ -5749,7 +5866,7 @@ def new_item():
             sort_order=form_sort_order(request.form),
         )
         db.session.add(skill)
-        db.session.commit()
+        commit_submitted("skill_item", url_for("skills.items"))
         flash("スキル項目を追加しました。", "success")
         return redirect(url_for("skills.items"))
 
@@ -5828,7 +5945,8 @@ def description_draft():
         return jsonify(ok=draft is not None, draft=draft or "", message=message)
 
     # JavaScript が無効なとき: 入力を残し、説明の欄に下書きを入れて表示する(保存はしない)
-    form = {key: request.form.get(key, "") for key in ("name", "skill_type", "category", "sort_order")}
+    # (追加の画面の1回限りの印 once も引き継ぐ)
+    form = {key: request.form.get(key, "") for key in ("name", "skill_type", "category", "sort_order", "once")}
     form["description"] = draft if draft is not None else current
     flash(message, "info" if draft is not None else "danger")
     return _render_item_form(skill, form)
@@ -6567,9 +6685,12 @@ def manage():
     )
     # 紐づけ判定用: {dept_id: set(user_id)}
     membership = {d.id: {u.id for u in d.users} for d in departments}
+    # チームの名称・並び順のフォームの控え(古い画面からの保存で、ほかの操作の変更を上書きしない)
+    versions = {d.id: field_versions(_department_values(d), DEPARTMENT_VERSION_KEYS) for d in departments}
     return render_template(
         "departments/manage.html",
         departments=departments,
+        versions=versions,
         users=users,
         local_usernames={u.username for u in users if is_local_account(u.username)},
         inactive_members=inactive_members,
@@ -6583,16 +6704,22 @@ def manage():
 @departments_bp.route("/members/new", methods=["POST"])
 @manager_required
 def new_member():
-    """メンバー(ユーザー)を追加する。マネージャーのみ。"""
+    """メンバー(ユーザー)を追加する。マネージャーのみ。
+
+    追加のボタンの二度押し(同じ印 once・同じ内容)の2回目は、追加済みと案内する(「既に使われています」にしない)。
+    """
     username = request.form.get("username", "").strip()
     display_name = request.form.get("display_name", "").strip()
     role = request.form.get("role", ROLE_MEMBER)
     if role not in (ROLE_MANAGER, ROLE_MEMBER):
         role = ROLE_MEMBER
 
+    lock_for_write()  # 二度押しの確認から追加までの間に、同時に届いた2回目が入らないように
     existing = User.query.filter_by(username=username).first() if username else None
     if not username or not display_name:
         flash("ログインIDと氏名は必須です。", "danger")
+    elif existing is not None and already_submitted("member"):
+        flash(_SUBMITTED_TWICE.format(f"メンバー「{existing.display_name}」"), "info")
     elif existing is not None and not existing.is_active:
         # 無効化したメンバーは上のメンバーの表に出ないため、使われている理由と戻し方を案内する
         flash(f"ログインID「{username}」は無効化されたメンバー（{existing.display_name}）のものです。"
@@ -6607,7 +6734,8 @@ def new_member():
             role=role,
             is_active=True,
         ))
-        if commit_unique(f"ログインID「{username}」は既に使われています。"):
+        if commit_unique_submitted("member", url_for("departments.manage"),
+                                   f"ログインID「{username}」は既に使われています。"):
             flash(f"メンバー「{display_name}」を追加しました。", "success")
     return redirect(url_for("departments.manage"))
 
@@ -6688,8 +6816,13 @@ def reactivate_member(user_id):
 
     無効化のときに外したチームの紐づけは戻らないため、紐づけが無ければその旨を案内する。
     """
+    lock_for_write()  # 確かめてから保存するまでの間に、同時に押された復帰・削除が入らないように
     user = get_or_404(User, user_id)
     if not _same_member(user):
+        return redirect(url_for("departments.manage"))
+    if user.is_active:
+        # 古い画面(別のタブ・別のマネージャーが既に復帰した)からの復帰
+        flash(f"メンバー「{user.display_name}」は既に有効です（変更していません）。", "info")
         return redirect(url_for("departments.manage"))
     user.is_active = True
     db.session.commit()
@@ -6703,34 +6836,67 @@ def reactivate_member(user_id):
 @departments_bp.route("/new", methods=["POST"])
 @manager_required
 def new_department():
+    """チームを追加する。追加のボタンの二度押し(同じ印 once・同じ内容)の2回目は、追加済みと案内する。"""
     name = request.form.get("name", "").strip()
+    lock_for_write()  # 二度押しの確認から追加までの間に、同時に届いた2回目が入らないように
+    existing = Department.query.filter_by(name=name).first() if name else None
     if not name:
         flash("チームの名称を入力してください。", "danger")
-    elif Department.query.filter_by(name=name).first():
+    elif existing is not None and already_submitted("department"):
+        flash(_SUBMITTED_TWICE.format(f"チーム「{existing.name}」"), "info")
+    elif existing is not None:
         flash("同じ名称のチームが既にあります。", "warning")
     else:
         db.session.add(Department(name=name, sort_order=form_sort_order(request.form)))
-        if commit_unique("同じ名称のチームが既にあります。"):
+        if commit_unique_submitted("department", url_for("departments.manage"), "同じ名称のチームが既にあります。"):
             flash(f"チーム「{name}」を追加しました。", "success")
     return redirect(url_for("departments.manage"))
+
+
+# チームの名称・並び順の保存で、画面を開いた後のほかの操作の変更を確かめる項目(名前は画面の表示)
+DEPARTMENT_VERSION_FIELDS = (("name", "名称"), ("sort_order", "並び順"))
+DEPARTMENT_VERSION_KEYS = tuple(key for key, _label in DEPARTMENT_VERSION_FIELDS)
+
+
+def _department_values(dept):
+    """チームの一覧の名称のフォームで扱う項目の今の値。"""
+    return {key: getattr(dept, key) for key in DEPARTMENT_VERSION_KEYS}
 
 
 @departments_bp.route("/<int:dept_id>/rename", methods=["POST"])
 @manager_required
 def rename_department(dept_id):
+    """チームの名称・並び順を保存する。
+
+    画面を開いた後に、ほかの操作(別のタブ・別のマネージャー)で変わった項目は、古い画面の値で上書きせず
+    今の内容のままにする(控え version の無い以前の画面からの送信は確かめない)。ほかの項目は保存する。
+    """
+    lock_for_write()  # 確かめてから保存するまでの間に、ほかの保存が入らないように
     dept = get_or_404(Department, dept_id)
     name = request.form.get("name", "").strip()
     if not name:
         flash("チームの名称を入力してください。", "danger")
-    else:
-        other = Department.query.filter_by(name=name).first()
-        if other and other.id != dept.id:
-            flash("同じ名称のチームが既にあります。", "warning")
+        return redirect(url_for("departments.manage"))
+    current = _department_values(dept)
+    new = {"name": name, "sort_order": form_sort_order(request.form, dept.sort_order)}
+    changed = fields_changed_since(request.form.get("version"), current, DEPARTMENT_VERSION_KEYS)
+    conflicts = conflicting_fields(changed, current, new)
+    for key in conflicts:
+        new[key] = current[key]
+    other = Department.query.filter_by(name=new["name"]).first()
+    if other and other.id != dept.id:
+        flash("同じ名称のチームが既にあります。", "warning")
+        return redirect(url_for("departments.manage"))
+    dept.name = new["name"]
+    dept.sort_order = new["sort_order"]
+    if commit_unique("同じ名称のチームが既にあります。"):
+        if conflicts:
+            labels = dict(DEPARTMENT_VERSION_FIELDS)
+            flash("画面を開いた後に、ほかの操作でチーム「{}」の内容が変更されていたため、{}は今の内容のままにしました"
+                  "（ほかの項目の変更は保存しました）。確認して、必要ならもう一度変更して保存してください。".format(
+                      dept.name, "・".join(labels[k] for k in conflicts)), "warning")
         else:
-            dept.name = name
-            dept.sort_order = form_sort_order(request.form, dept.sort_order)
-            if commit_unique("同じ名称のチームが既にあります。"):
-                flash("チームを更新しました。", "success")
+            flash("チームを更新しました。", "success")
     return redirect(url_for("departments.manage"))
 
 
@@ -6760,10 +6926,14 @@ def save_memberships():
     変えるのは、画面を開いたときに表に出ていた人(member_keys。「ユーザーID:ログインID」)と
     チーム(dept_ids)の組み合わせだけ。画面を開いた後に追加・復帰した人や追加したチームの紐づけは
     そのまま残す(別のタブ・別のマネージャーの保存を古い画面の内容で消さないように)。
+    さらに、画面を開いたときのチェックの状態(was_<チームID>。was_shown のある画面)と比べて、
+    チェックを付けた・外したセルだけを変える。触っていないセルは、ほかの操作で変わっていても今の状態のまま。
     画面を開いた後に削除・無効化された人、IDが別の人に再利用された人は変えない(users_from_form_keys)。
     """
     shown_keys = request.form.getlist("member_keys")
     shown_dept_ids = set(to_ints(request.form.getlist("dept_ids")))
+    # 開いたときの状態の控えのある画面か(無い以前の画面は、今までどおり表のとおりに保存する)
+    diff_mode = request.form.get("was_shown") == "1"
     # 紐づける人の確認から保存までの間に、その人が削除されないように(メンバーの削除と1つずつにする)
     lock_for_write()
     if not shown_dept_ids and Department.query.count() == 0:
@@ -6774,20 +6944,33 @@ def save_memberships():
               "warning")
         return redirect(url_for("departments.manage"))
     members, stale = users_from_form_keys(shown_keys, get_active_users())
-    departments = Department.query.filter(Department.id.in_(shown_dept_ids)).all()
+    # チームは件数が少ないため、すべて読んでから選ぶ(送られたIDの一覧を SQL に渡すと、件数がとても多い
+    # 送信で SQL の変数の上限を超えて内部エラーになる)
+    departments = [d for d in Department.query.all() if d.id in shown_dept_ids]
+    kept = 0  # 画面を開いた後にほかの操作で変わり、今の状態のまま残したセルの数
     # 紐づけの追加は保存(commit)のときにまとめて行う(同時に送られた保存と重なっても commit_or_conflict で受け止める)
     with db.session.no_autoflush:
         for dept in departments:
             checked = set(request.form.getlist(f"dept_{dept.id}"))
+            was = set(request.form.getlist(f"was_{dept.id}"))
             current = list(dept.users)
             for user in members:
-                if user.form_key in checked and user not in current:
+                wanted = user.form_key in checked
+                if diff_mode and wanted == (user.form_key in was):
+                    # 触っていないセル: 今の状態のまま(ほかの操作の変更を古い画面の内容で戻さない)
+                    if wanted != (user in current):
+                        kept += 1
+                    continue
+                if wanted and user not in current:
                     dept.users.append(user)
-                elif user.form_key not in checked and user in current:
+                elif not wanted and user in current:
                     dept.users.remove(user)
     if not commit_or_conflict():
         return redirect(url_for("departments.manage"))
     flash("チームの紐づけを保存しました。", "success")
+    if kept:
+        flash(f"画面を開いた後に、ほかの操作で変更された紐づけ（{kept}件）は、今の状態のまま残しています"
+              "（この画面で付けた・外したチェックだけを保存しました）。", "info")
     if stale:
         flash("画面を開いた後に削除・無効化されたメンバーの紐づけは変更していません。", "info")
     return redirect(url_for("departments.manage"))
@@ -8539,6 +8722,8 @@ def _render_weekly(settings):
     run_from, run_to = period_for(today, settings["period_rule"])
 
     upcoming = next_weekly_run(settings, datetime.now())
+    # 自動送信が有効でも、スケジューラがどのプロセスでも動いていなければ送信されない(画面で注意する)
+    scheduler_stopped = upcoming is not None and scheduler_is_stopped(current_app)
     upcoming_period = None
     if upcoming is not None:
         upcoming_period = period_label(*period_for(upcoming.date(), settings["period_rule"]))
@@ -8555,6 +8740,7 @@ def _render_weekly(settings):
         preview=preview_names(settings, today),
         upcoming=upcoming,
         upcoming_period=upcoming_period,
+        scheduler_stopped=scheduler_stopped,
         last=settings["last_result"],
         run_from=run_from,
         run_to=run_to,
@@ -9247,11 +9433,14 @@ def _render_overdue(settings):
     base_url, link_problem = link_base()
     # 今この時点のメールの内容。「今すぐ送信」と同じく保存済みの設定で作る
     preview = build_overdue_content(date.today(), settings["comment_count"])
+    upcoming = next_overdue_run(settings, datetime.now())
     return render_template(
         "overdue/index.html",
         settings=settings,
         settings_error=OVERDUE_SETTINGS.load_error(),
-        upcoming=next_overdue_run(settings, datetime.now()),
+        upcoming=upcoming,
+        # 自動送信が有効でも、スケジューラがどのプロセスでも動いていなければ送信されない(画面で注意する)
+        scheduler_stopped=upcoming is not None and scheduler_is_stopped(current_app),
         weekday_labels=WEEKDAY_LABELS,
         last=settings["last_result"],
         mail=mail,
@@ -11367,7 +11556,9 @@ def analysis_period(args, today):
       kind  : "7" / "14" / "30" / "90" / "range"
       start / end : 期間の最初と最後の日(両端を含む)。範囲の指定で今日より後の日は今日にする
       error : 指定が正しくないときのメッセージ(そのときは直近30日)。ANALYSIS_MIN_DATE より前の日も誤りとする
-      note  : 直近N日の指定と一緒に、表示の期間と違う開始日・終了日が送られたときの案内(日付は使わない)
+      note  : 直近N日の指定と一緒に、表示の期間と違う開始日・終了日が送られたときの案内(日付は使わない)。
+              画面の期間のフォームは、開いたときの日付(shown_from / shown_to)も送る。日付の欄がそのまま
+              (前の期間の日付)なら、利用者は日付を指定していないので案内しない
     直近N日の指定は半角の数字だけ(「030」は「30」にそろえる。全角の数字・長すぎる数字は誤り)。
     """
     kind = str(args.get("period") or "").strip()
@@ -11402,7 +11593,9 @@ def analysis_period(args, today):
     if error is None:
         sent = [args.get("from"), args.get("to")]
         shown = [result["start"].isoformat(), result["end"].isoformat()]
-        if any(v not in (None, "", w) for v, w in zip(sent, shown)):
+        # 画面を開いたときに日付の欄に入っていた日付(変えていない日付は指定とみなさない)
+        before = [args.get("shown_from"), args.get("shown_to")]
+        if any(v not in (None, "", w, b) for v, w, b in zip(sent, shown, before)):
             # 日付の欄を変えても「期間内」が直近N日のままだと、日付は使われない(案内を出す)
             result["note"] = ("開始日・終了日の指定は、「期間内」で「日付で指定」を選んだときだけ使います"
                               "（直近{}日で表示しています）。".format(days))
@@ -11676,15 +11869,40 @@ _GENERIC_PROGRESS_PHRASES = (
 _GENERIC_PROGRESS_PATTERN = PhraseSequence(_GENERIC_PROGRESS_PHRASES, _ACK_FILLERS)
 
 
+# 了解・お礼・あいさつの反応とみなす絵文字(絵文字だけのコメントで使う。これ以外の絵文字だけのコメントは
+# 対応不要にしない。質問・注意の記号〔❓❗⚠🆘⏰ など〕は含めない)
+_ACK_EMOJI = frozenset(
+    "\U0001F44D\U0001F44C\U0001F646\U0001F647\U0001F64F\U0001F44F\U0001F64C\U0001F91D\U0001F4AA"  # 👍👌🙆🙇🙏👏🙌🤝💪
+    "\u2728\U0001F389\U0001F38A\U0001F4AF\U0001F197\u2B55\u2705\u2714\u2611"  # ✨🎉🎊💯🆗⭕✅✔☑
+    "\U0001F60A\U0001F600\U0001F603\U0001F604\U0001F601\U0001F642\u263A\U0001F609\U0001F606"  # 😊😀😃😄😁🙂☺😉😆
+    "\U0001F970\U0001F60D\U0001F917\u2764\u2665\U0001F495\U0001F496\U0001F497"  # 🥰😍🤗❤♥💕💖💗
+    "\u2B50\U0001F31F\U0001F44B\U0001F338\u2642\u2640"  # ⭐🌟👋🌸 と、🙇‍♂️ などの性別の記号
+)
+# 絵文字に付く文字(異体字セレクタ・ゼロ幅接合子・肌の色)
+_EMOJI_PARTS = frozenset("\ufe0e\ufe0f\u200d") | frozenset(chr(c) for c in range(0x1F3FB, 0x1F400))
+# 質問・注意を表す記号(これを含むコメントは、ほかが了解・お礼の言葉でも対応不要にしない)
+_QUESTION_ALERT_MARKS = frozenset(
+    "\u2753\u2754\u2757\u2755\u2049\u26A0\U0001F198\u23F0\U0001F6A8\u26D4\U0001F6AB\u274C"  # ❓❔❗❕⁉⚠🆘⏰🚨⛔🚫❌
+)
+
+
 def is_acknowledgement(text):
-    """あいさつ・お礼・了解だけのコメントか(質問・依頼を含まない短い文)。"""
+    """あいさつ・お礼・了解だけのコメントか(質問・依頼を含まない短い文)。
+
+    絵文字だけのコメントは、了解・お礼の反応の絵文字(_ACK_EMOJI。「👍」「🙏」など)だけのときに限る。
+    質問・注意の記号(「❓」「❗」「⚠️」「🆘」「⏰」など)を含むコメントは対応不要にしない。
+    """
+    if any(ch in _QUESTION_ALERT_MARKS for ch in str(text or "")):
+        return False
     raw = unicodedata.normalize("NFKC", str(text or ""))
     if "?" in raw:
         return False
     plain = _plain(raw)
     if not plain:
-        # 絵文字だけのコメント(「👍」など)は、了解・お礼の反応とみなす
-        return any(unicodedata.category(ch) == "So" for ch in raw)
+        # 絵文字だけのコメント(「👍」など): 了解・お礼の反応の絵文字だけでできていれば対応不要
+        marks = [ch for ch in _KAOMOJI.sub("", raw)
+                 if not ch.isspace() and ch not in _EMOJI_PARTS and not _ACK_STRIP.fullmatch(ch)]
+        return bool(marks) and all(ch in _ACK_EMOJI for ch in marks)
     if len(plain) > _ACK_MAX_CHARS:
         return False
     # 了解・お礼などの言葉(と「です」「ね」など)だけでできている。「です」などだけのものは除く
@@ -11854,7 +12072,10 @@ def _progress_section(tasks, members, period, now, settings):
         if due is not None and due < today:
             overdue.append(dict(_task_ref(t), overdue_days=business_days_ago(due, today),
                                 calendar_days=(today - due).days, last_comment=last))
-        if t["status"] == STATUS_TODO and due is not None and due >= today:
+        # 期限が N1 営業日より明らかに先(暦の日数で 2×N1＋21 日より後)のタスクは、営業日を数えない
+        # (9999-12-31 のような遠い期限で、その年までの祝日を毎回計算しないように。その日数なら営業日は N1 を超える)
+        if t["status"] == STATUS_TODO and due is not None and today <= due \
+                and (due - today).days <= due_soon_days * 2 + 21:
             left = business_days_ago(today, due)
             if left <= due_soon_days:
                 # due_today: 期限が今日(残り0営業日でも、期限が後の土日祝のものは「今日が期限」ではない)
@@ -13200,11 +13421,17 @@ def _shorten(text, size):
 
 
 def _carry_text(data, items, chunk, carry, body, memo_max):
-    """carry_text の本体。body: 前の回で送ったコメントの本文 "full"(全文)/"excerpt"(先頭だけ)/"none"(省く)。"""
+    """carry_text の本体。body: 前の回で送ったコメントの本文 "full"(全文)/"excerpt"(先頭だけ)/"none"(省く)。
+
+    この回で分けて送っているタスクのすべてを見る。判定を頼む単位がほかの人のタスク(共同担当で、この人が
+    持ち主でないタスク)でも、この人の長い進捗記載を分けて送っていれば、その前の部分を渡す
+    (マネージャーのコメント・成果のメモは、持ち主の単位の items にだけある)。
+    AI が書いたメモ(経過メモ・成果の事実メモ)は、利用者の本文と同じく記号を置き換えて1行にする(_inline)。
+    """
     tasks = data["tasks"]
     rest = chunk.get("comment_rest", set())
     lines = []
-    for task_id in items["split"]:
+    for task_id in [t for t in chunk["keys"] if t in chunk["split"]]:
         state = carry.get(task_id)
         if not state or state.get("failed"):
             continue
@@ -13216,7 +13443,7 @@ def _carry_text(data, items, chunk, carry, body, memo_max):
                 # この回に全文がある(前の回から続いている長いコメントは、前の部分〔依頼など〕とメモを渡す)
                 continue
             c = comments[i["comment_id"]]
-            memo = state["memos"].get(c["id"])
+            memo = _inline(state["memos"].get(c["id"]))
             memo = (_shorten(memo, memo_max) if memo and memo_max else memo) or "（前の回のメモなし）"
             if body == "none":
                 # 本文は省く(前の回の材料で送った。ID・日時・書いた人とメモだけを1行で)
@@ -13242,7 +13469,7 @@ def _carry_text(data, items, chunk, carry, body, memo_max):
                 "の先頭だけ" if body == "excerpt" and len(c["body"]) > CARRY_EXCERPT else "の全文"))
             block.append(_indent(c["body"] if body == "full" else _shorten(c["body"], CARRY_EXCERPT), "    "))
         if task_id in items["outcomes"] or task_id in items["memo_facts"]:
-            facts = state["facts"]
+            facts = _inline(state["facts"])
             block.append("  成果の事実メモ: {}".format(
                 _shorten(facts, memo_max) if facts and memo_max else (facts or "（前の回のメモなし）")))
         if block:
@@ -13381,6 +13608,9 @@ def findings_messages(data, group, notes, judged, budget, has_tasks=True, unread
         material.append("・（注意: {}）".format(unread_note))
     tail = ["", "【AIの判定の件数（アプリが数えた値）】"] + ["・" + j for j in judged] if judged else []
     used = len("\n".join(material + tail)) + 80
+    # notes は AI が書いた文(コメントの本文を読んだ結果)。依頼文の見出しのような行にならないよう、
+    # 利用者の本文と同じく記号を置き換えて1行にする(チームのまとめの材料と同じ)
+    notes = [n for n in (_inline(n) for n in notes) if n]
     shown = []
     for n in notes:
         if shown and used + len(n) + 3 > budget:
@@ -13914,8 +14144,11 @@ def parse_ref(value, prefix):
 #   issues [{task_id, kind, text, source, fp}], manager_comments {コメントID: {request, needs_response, judgement,
 #   remaining, evidence, fp_request, fp}}, outcomes {タスクID: {vague, reason, suggestion, fp}}, progress_comments
 #   {コメントID: {reason, suggestion, rule, fp}}, persons {メンバーID: {notes, findings}}, other_notes,
-#   skills {summary, tests, bias}, team {summary}, actions [推奨アクション], actions_source("ai" / "rule")
+#   skills {summary, tests, bias}, team {summary}, actions [推奨アクション], actions_source("ai" / "rule"),
+#   aborted(続けて失敗したため途中で中止したときの説明。中止しなかったときは無い)
 #   fp / fp_request は、判定に使った材料の指紋(9-8。分析の後に材料が変わった項目の判定は使わない)
+# 途中で中止したとき(aborted)は、行わなかった呼び出しを1つの「未読込」にまとめる。同じ期間の結果が保存済みなら、
+# 途中までの結果では上書きしない(前の結果を残し、中止したことを画面に表示する)。
 
 AI_ANALYSIS_RESULT_FILENAME = "ai_analysis.json"
 AI_ANALYSIS_RESULT_LABEL = "AI分析の結果ファイル"
@@ -13938,6 +14171,7 @@ class AnalysisRun:
         self.total = 0
         self.failures = 0
         self.aborted = None
+        self.skipped = None   # 中止したため行わなかった呼び出しをまとめた「未読込」(unread の parts の1件)
         self.read_tasks = set()
         self.read_comment_ids = set()
         self.unread_tasks = set()
@@ -14009,9 +14243,24 @@ class AnalysisRun:
         return parsed, None
 
     def unread(self, label, reason, task_ids=(), comment_ids=()):
-        """読めなかった材料を「未読込」として残す(コメントの数は ID で数える。同じコメントは1件)。"""
+        """読めなかった材料を「未読込」として残す(コメントの数は ID で数える。同じコメントは1件)。
+
+        途中で中止したため行わなかった呼び出し(reason が中止の説明)は、1件の「未読込」にまとめる。
+        """
         self.unread_tasks.update(task_ids)
         self.unread_comment_ids.update(comment_ids)
+        if self.aborted and reason == self.aborted:
+            if self.skipped is None:
+                self.skipped = {"label": "", "reason": one_line(reason, 300), "tasks": 0, "comments": 0,
+                                "calls": 0, "task_ids": set(), "comment_ids": set()}
+                self.result["unread"]["parts"].append(self.skipped)
+            part = self.skipped
+            part["calls"] += 1
+            part["task_ids"].update(task_ids)
+            part["comment_ids"].update(comment_ids)
+            part["label"] = "中止したため行っていない呼び出し（{}回）".format(part["calls"])
+            part["tasks"], part["comments"] = len(part["task_ids"]), len(part["comment_ids"])
+            return
         self.result["unread"]["parts"].append({
             "label": label, "reason": one_line(reason, 300), "tasks": len(task_ids), "comments": len(comment_ids)})
 
@@ -14069,6 +14318,15 @@ class AnalysisRun:
         self.run_skills(skill_chunks)
         self.run_team()
 
+        if self.skipped is not None:
+            # 途中で中止した: まとめた「未読込」から保存しない作業用の値を外し、中止したことを結果の先頭に書く
+            calls = self.skipped.pop("calls")
+            self.skipped.pop("task_ids")
+            self.skipped.pop("comment_ids")
+            message = "AIの呼び出しが{}回続けて失敗したため、途中で中止しました（残り {} 回の呼び出しは行っていません）。".format(
+                ANALYSIS_MAX_FAILURES, calls)
+            self.result["aborted"] = message
+            self.result["errors"].insert(0, message)
         self.result["masked_numbers"] = sum(self.masks.values())
         unread = self.result["unread"]
         unread["task_ids"] = sorted(self.unread_tasks)
@@ -14119,6 +14377,7 @@ class AnalysisRun:
         label = "{}の所見".format(group["label"])
         if len(chunks) > 1 and len(failed) == len(chunks):
             # 分けて送った材料を1回も読めなかった: 所見は作らない(材料が無いものとして所見を作らせない)
+            self.done += 1  # 予定に数えていた所見の呼び出しの分(進み具合の表示を最後まで進める)
             self.unread(label, "材料をすべて読み込めなかったため、所見を作っていません。")
         elif len(chunks) != 1:
             unread_note = ""
@@ -14347,6 +14606,11 @@ class AnalysisRun:
         if actions:
             self.masks[("actions",)] = masked
             self.result["actions"] = actions
+            self.result["actions_source"] = "ai"
+        elif not fallback and not ranked:
+            # 候補もルールの推奨アクションも無い(いま対応が必要な項目が無い): AI が空で答えたのは正しい応答
+            # (失敗の注意を出さない。画面は「いま対応が必要な項目はありません」)
+            self.result["actions"] = []
             self.result["actions_source"] = "ai"
         else:
             self.result["errors"].append("推奨アクション: AIの応答に使える推奨アクションが無かったため、ルールで選びました。")
@@ -14586,6 +14850,13 @@ def load_ai_analysis_result():
     return data, None
 
 
+def _saved_result_for_period(period):
+    """保存済みの結果(読み込めるもの)が、period(結果の period {start, end})と同じ期間のものか。"""
+    saved, _error = load_ai_analysis_result()
+    return bool(saved) and (saved["period"].get("start"), saved["period"].get("end")) == (
+        period.get("start"), period.get("end"))
+
+
 def save_ai_analysis_result(result):
     """結果を保存する(最新の1回分だけ。前の結果は上書き)。"""
     with _analysis_result_lock:
@@ -14633,6 +14904,10 @@ def run_ai_analysis_job(app, args):
             if not result["calls"]["ok"]:
                 ok, message = False, "AIの呼び出しがすべて失敗したため、結果を保存しませんでした（保存済みの結果は前のままです）。{}".format(
                     " ／ ".join("{}: {}".format(p["label"], p["reason"]) for p in result["unread"]["parts"][:2]))
+            elif result.get("aborted") and _saved_result_for_period(result["period"]):
+                # 途中で中止した結果(大部分が未読込)で、同じ期間の保存済みの結果を上書きしない
+                ok, message = False, "{}途中までの結果は保存していません（保存済みの同じ期間の結果は前のままです）。".format(
+                    result["aborted"])
             else:
                 save_ai_analysis_result(result)
                 ok, message = True, "AI分析が終わりました（期間 {}）。".format(period["label"])
@@ -15108,6 +15383,8 @@ def _ai_result_summary(stored):
         "unread": dict(unread, count=_int_value(unread.get("count"))),
         "unread_parts": [u for u in parts if isinstance(u, dict)],
         "actions_source": stored.get("actions_source"),
+        # 続けて失敗したため途中で中止したときの説明(中止しなかった結果・以前の版の結果には無い)
+        "aborted": str(stored.get("aborted") or ""),
     }
 
 
@@ -15479,10 +15756,36 @@ _ADDR = r"[^\s@<>()\[\],;:\"\\]+@[^\s@<>()\[\],;:\"\\.][^\s@<>()\[\],;:\"\\]*"
 _ADDRESS_RE = re.compile(r"[^<>,;\"\x00-\x1f\x7f]*<{0}>|{0}".format(_ADDR))
 _ADDRESS_SPLIT = re.compile(r"[\r\n,;]+")
 # 「その他」の項目で値を表示しない(秘密の値の可能性がある)キー
-# (本番の ldap_client.py 用に足した LDAP_BIND_PW・…_PWD・…_AUTH・…_PRIVATE_… なども含む)
-_SECRET_LIKE = re.compile(r"KEY|PASS|PWD|(^|_)PW($|_)|SECRET|TOKEN|CREDENTIAL|AUTH|PRIVATE", re.IGNORECASE)
+# (本番の ldap_client.py 用に足した LDAP_BIND_PW・LDAP_BINDPW・LDAP_ROOTPW・…_PWD・LDAP_CREDS・…_AUTH・
+# …_PRIVATE_… なども含む。名前のどこかに PW・CRED があれば表示しない)
+_SECRET_LIKE = re.compile(r"KEY|PASS|PW|SECRET|TOKEN|CRED|AUTH|PRIVATE", re.IGNORECASE)
 # URL の ID・パスワード(「スキーム://」の後から、ホストの前の最後の「@」まで)
 _URL_USERINFO = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*://)[^/?#]*@")
+# 文字列の中の URL の ID・パスワード(「スキーム://」の後から、空白・/?# の前の最後の「@」まで)
+_URL_USERINFO_IN_VALUE = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/?#\s]*@")
+# 表示する文字列(repr)の中の URL の ID・パスワード(文字列の引用符・空白で区切る。念のための2回目)
+_URL_USERINFO_IN_TEXT = re.compile("([A-Za-z][A-Za-z0-9+.-]*://)[^/?#\\s'\"]*@")
+
+
+def _mask_userinfo_in_value(value):
+    """値(文字列・一覧・辞書。入れ子も)の中の URL の ID・パスワードを「***@」にした値(表示用)。"""
+    if isinstance(value, str):
+        return _URL_USERINFO_IN_VALUE.sub(r"\1***@", value)
+    if isinstance(value, dict):
+        return {_mask_userinfo_in_value(k): _mask_userinfo_in_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return type(value)(_mask_userinfo_in_value(v) for v in value)
+    return value
+
+
+def masked_repr(value):
+    """「その他」の表に出す値の文字列(repr)。URL の ID・パスワード(user:pass@)は伏せる。"""
+    try:
+        text = repr(_mask_userinfo_in_value(value))
+    except Exception:  # 入れ子の値を作り直せない型など
+        text = repr(value)
+    return _URL_USERINFO_IN_TEXT.sub(r"\1***@", text)
+
 
 # 保存の結果
 CONFIG_SAVE_OK = "ok"
@@ -15498,6 +15801,12 @@ SaveResult = namedtuple("SaveResult", "status errors state changed restart_chang
 
 MSG_CONFLICT = ("画面を開いた後に、設定ファイル（instance/config.py）が更新されています"
                 "（ほかの人の保存・直接の編集）。最新の内容を表示しましたので、もう一度変更してください。")
+# 保存のボタンの二度押し(同じ画面からの同じ内容が、1回目の保存の後に届いた)のときの案内
+MSG_ALREADY_SAVED = ("この内容は既に保存されています（同じ内容の送信が2回届いたか、画面を開いた後に"
+                     "ほかの操作で同じ内容になっています）。設定ファイルは更新していません。")
+MSG_ALREADY_REMOVED = "未使用の設定は既に削除されています（設定ファイルは更新していません）。"
+# 基本設定の保存の1回限りの印(once)の種類(already_submitted)
+CONFIG_ONCE_KIND = "config"
 # 設定ファイルが無いとき(サーバーの実行中に削除・名前の変更をした)は、画面からは保存しない。
 # 一部の項目だけのファイルを作ると、自動作成(見本・秘密鍵・admin のパスワード)が行われなくなり、
 # 実行中の設定も既定値(空の admin のパスワードなど)で上書きしてしまうため
@@ -15794,6 +16103,8 @@ def save_config_form(app, form, username):
         if not info["exists"]:
             return result(CONFIG_SAVE_ERROR, message=MSG_CONFIG_MISSING)
         if form.get("version", "") != info["version"]:
+            if _config_already_saved(app, form, info):
+                return result(CONFIG_SAVE_UNCHANGED, message=MSG_ALREADY_SAVED)
             return result(CONFIG_SAVE_CONFLICT, message=MSG_CONFLICT)
 
         current = effective(app, info["values"])
@@ -15819,6 +16130,9 @@ def save_config_form(app, form, username):
             app.logger.warning("システム設定（基本設定）を保存できませんでした: %s", exc)
             return result(CONFIG_SAVE_ERROR, state=state, message=str(exc))
 
+        if has_request_context():
+            # 保存のボタンの二度押しの2回目を「ほかの人の保存」と案内しないように、印と内容を覚える
+            remember_submitted(CONFIG_ONCE_KIND, "")
         # 再起動が不要な項目は、実行中のアプリにもすぐ反映する
         applied = _apply_live(app, new_values)
         changed = [f.key for f in FIELDS if f.key in changes]
@@ -15827,6 +16141,24 @@ def save_config_form(app, form, username):
                         ", ".join(changed), username)
         return result(CONFIG_SAVE_OK, changed=changed, restart_changed=restart_changed,
                       applied=applied)
+
+
+def _config_already_saved(app, form, info):
+    """画面を開いた後にファイルが変わっていた(version が違う)保存が、既に保存された内容の2回目か。
+
+    ・同じ画面(1回限りの印 once)からの同じ内容が、少し前に保存されている(二度押し。新しいキーの生成も含む)
+    ・または、入力のとおりに保存しても値が1つも変わらない(新しいキーの生成を除く。上書きで失われるものが無い)
+    どちらでもなければ False(ほかの人の保存・直接の編集と重なった)。
+    """
+    if has_request_context() and already_submitted(CONFIG_ONCE_KIND) is not None:
+        return True
+    if any(form.get("generate_" + f.key) == "1" for f in FIELDS if f.type == TYPE_SECRET_KEY):
+        return False
+    current = effective(app, info["values"])
+    values, errors, _state = parse_config_form(form, current)
+    if errors:
+        return False
+    return all(same_value(values[f.key], current.get(f.key)) for f in FIELDS)
 
 
 def remove_unused_config(app, form, username):
@@ -15843,9 +16175,12 @@ def remove_unused_config(app, form, username):
             return CONFIG_SAVE_ERROR, [], str(exc)
         if not info["exists"]:
             return CONFIG_SAVE_ERROR, [], MSG_CONFIG_MISSING
-        if form.get("version", "") != info["version"]:
-            return CONFIG_SAVE_CONFLICT, [], MSG_CONFLICT
         keys = unused_keys_in_file(info["values"])
+        if form.get("version", "") != info["version"]:
+            if not keys:
+                # 二度押しの2回目など: 削除する項目はもう無い(削除し直すものが無いので、競合とはしない)
+                return CONFIG_SAVE_UNCHANGED, [], MSG_ALREADY_REMOVED
+            return CONFIG_SAVE_CONFLICT, [], MSG_CONFLICT
         if not keys:
             return CONFIG_SAVE_UNCHANGED, [], ""
         try:
@@ -15908,7 +16243,8 @@ def _other_rows(app, file_values):
         in_file = key in file_values
         value = file_values[key] if in_file else base.get(key)
         hidden = bool(_SECRET_LIKE.search(key))
-        text = repr(value) if (in_file or key in base) else ""
+        # 値の中の URL の ID・パスワード(user:pass@。一覧・辞書の中も)は伏せる(基本設定の URL の欄と同じ)
+        text = masked_repr(value) if (in_file or key in base) else ""
         rows.append({
             "key": key,
             "source": source,
@@ -16169,7 +16505,7 @@ def save_config():
         flash("基本設定を保存できませんでした: {}".format(result.message), "danger")
         return _render_system_settings(TAB_CONFIG, status=500, config_state=result.state)
     if result.status == CONFIG_SAVE_UNCHANGED:
-        message = "変更された項目はありません（設定ファイルは更新していません）。"
+        message = result.message or "変更された項目はありません（設定ファイルは更新していません）。"
         if result.applied:
             message += "設定ファイルの値を実行中の設定に反映しました: {}。".format("、".join(result.applied))
         flash(message, "info")
@@ -16201,7 +16537,7 @@ def remove_unused():
         flash("未使用の設定を削除しました（{}）。変更前の内容は instance/config.py.bak に残しています。".format(
             "、".join(removed)), "success")
     elif status == CONFIG_SAVE_UNCHANGED:
-        flash("削除する未使用の設定はありません（設定ファイルは更新していません）。", "info")
+        flash(message or "削除する未使用の設定はありません（設定ファイルは更新していません）。", "info")
     elif status == CONFIG_SAVE_CONFLICT:
         flash(message, "warning")
     else:
@@ -16240,7 +16576,8 @@ def test_ai():
         flash("AI接続テスト: 失敗しました。{}".format(mask_secrets(app, error)), "danger")
     else:
         # 先に伏せ字にしてから短くする(短くした後では、キーの一部が伏せ字にならずに残るため)
-        reply = mask_secrets(app, " ".join(str(reply).split()))
+        # (表示できない文字は ai_chat で除いてある)
+        reply = mask_secrets(app, " ".join(CONTROL_CHARS.sub("", str(reply)).split()))
         if len(reply) > AI_REPLY_MAX:
             reply = reply[:AI_REPLY_MAX] + "…"
         flash("AI接続テスト: OK（応答: {}）".format(reply), "success")
@@ -16526,24 +16863,93 @@ def _acquire_scheduler_lock(instance_path):
     return True
 
 
-def start_scheduler_once(app):
+def start_scheduler_once(app, interval=CHECK_INTERVAL):
     """スケジューラを起動する(ほかのプロセスが既に動かしていれば起動しない)。
 
     ロックのファイルを開けないときも起動しない(自動送信だけを止め、サーバーは起動する)。
+    起動しなかったときは、interval 秒ごとにロックを取り直してみる(_standby_scheduler)。同じフォルダの
+    ほかのサーバー(ロックを持っていたプロセス)が止まったら、このプロセスが自動送信を引き継ぐ。
     """
     try:
         acquired = _acquire_scheduler_lock(app.instance_path)
     except OSError:
-        app.logger.warning("instance/%s を開けないため、定期メールの自動送信スケジューラは起動しません。",
-                           SCHEDULER_LOCK_FILENAME, exc_info=True)
-        return None
+        app.logger.warning("instance/%s を開けないため、定期メールの自動送信スケジューラは起動しません"
+                           "（開けるようになったら起動します）。", SCHEDULER_LOCK_FILENAME, exc_info=True)
+        acquired = False
+    else:
+        if not acquired:
+            app.logger.info("定期メールの自動送信スケジューラは別のプロセスで動いているため、"
+                            "このプロセスでは起動しません。そのプロセスが終了したら、このプロセスが引き継ぎます。")
     if not acquired:
-        app.logger.info("定期メールの自動送信スケジューラは別のプロセスで動いているため、"
-                        "このプロセスでは起動しません。")
+        threading.Thread(target=_standby_scheduler, args=(app, interval),
+                         name="mail-scheduler-standby", daemon=True).start()
         return None
     thread = start_scheduler(app)
     _notice("定期メール（週報・期限超過通知）の自動送信スケジューラを起動しました。")
     return thread
+
+
+def _standby_scheduler(app, interval):
+    """ロックを取れなかったプロセスで、interval 秒ごとにロックを取り直してみる。取れたらスケジューラを起動する。
+
+    同じ (日付, 時刻) の二重の送信は、各ジョブの設定ファイルの印(last_auto_key)で防ぐ(引き継いだ分の中でも)。
+    """
+    wait = threading.Event()
+    while True:
+        wait.wait(interval)
+        try:
+            acquired = _acquire_scheduler_lock(app.instance_path)
+        except OSError:
+            continue  # 開けない理由は起動のときにログに出した。開けるようになるまで待つ
+        except Exception:
+            app.logger.exception("定期メールの自動送信スケジューラのロックの確認でエラーが発生しました")
+            continue
+        if acquired:
+            start_scheduler(app)
+            _notice("定期メール（週報・期限超過通知）の自動送信を、このプロセスで引き継ぎました"
+                    "（スケジューラを動かしていたプロセスが終了したため）。")
+            return
+
+
+def scheduler_is_stopped(app):
+    """自動送信のスケジューラが、このフォルダのどのプロセスでも動いていないか(画面の注意の表示用)。
+
+    このプロセスがロックを持っていれば、スケジューラのスレッドが動いているかで決める。
+    持っていなければ、instance/scheduler.lock のロックを取れるか(取れたらすぐ外す)で確かめる:
+    取れない = ほかのプロセスが持っている(動いている)。ファイルが無い・取れた = どこでも動いていない。
+    ファイルを開けないときは、どのプロセスもロックを持てないため止まっているとみなす。ファイルは作らない。
+    """
+    if _scheduler_lock_file is not None:
+        return not (_scheduler_thread is not None and _scheduler_thread.is_alive())
+    path = os.path.join(app.instance_path, SCHEDULER_LOCK_FILENAME)
+    if not os.path.isfile(path):
+        return True
+    try:
+        probe = open(path, "rb")
+    except OSError:
+        return True
+    try:
+        if os.name == "nt":
+            import msvcrt
+            probe.seek(0)
+            try:
+                msvcrt.locking(probe.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                return False
+            probe.seek(0)
+            msvcrt.locking(probe.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            try:
+                fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return False
+            fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
 
 
 # #############################################################################
