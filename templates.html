@@ -44,8 +44,11 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}{{ app_name }}{% endblock %}</title>
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+  {# CDN のファイルは integrity(公開されている SHA-384)と一致するときだけ使う(配信元・経路で書き換えられたものを読まない) #}
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"
+        integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet"
+        integrity="sha384-XGjxtQfXaH2tnPFa9x+ruJTuLE3Aa6LhHSWRr1XeTyhezb4abCG4ccI5AkVDxqC+" crossorigin="anonymous">
   <link href="{{ url_for('static', filename='css/style.css') }}" rel="stylesheet">
 </head>
 <body class="bg-light">
@@ -157,7 +160,8 @@
     {{ app_name }}
   </footer>
 
-  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"
+          integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz" crossorigin="anonymous"></script>
   <script src="{{ url_for('static', filename='js/sort-table.js') }}"></script>
   <script src="{{ url_for('static', filename='js/auto-filter.js') }}"></script>
   {% block scripts %}{% endblock %}
@@ -589,7 +593,7 @@
         {% for task in tasks %}
         <tr class="{% if task.is_done %}table-light text-muted{% endif %}">
           <td><a href="{{ url_for('tasks.detail', task_id=task.id) }}" class="fw-medium">{{ task.title }}</a></td>
-          <td><small>{{ task.assignee_names or '未割当' }}</small></td>
+          <td><small>{{ task.assignee_labels or '未割当' }}</small></td>
           {# 並び替えキー: 優先度は 高→低、ステータスは 未着手→完了 の定義順 #}
           <td data-sort="{{ priority_choices.index(task.priority) if task.priority in priority_choices else 9 }}">
             <span class="badge bg-{{ task.priority_color }} text-dark">{{ task.priority }}</span>
@@ -648,7 +652,7 @@
 
     <dl class="row mb-0">
       <dt class="col-sm-3 text-muted">担当者</dt>
-      <dd class="col-sm-9">{{ task.assignee_names or '未割当' }}</dd>
+      <dd class="col-sm-9">{{ task.assignee_labels or '未割当' }}</dd>
 
       <dt class="col-sm-3 text-muted">開始日</dt>
       <dd class="col-sm-9">{{ task.start_date.strftime('%Y年%m月%d日') if task.start_date else '―' }}</dd>
@@ -772,6 +776,7 @@
     {% if can_edit %}
     <form method="post" action="{{ url_for('tasks.add_comment', task_id=task.id) }}">
       <input type="hidden" name="row" value="{{ task.row_key }}">
+      <input type="hidden" name="once" value="{{ submit_token() }}">
       <textarea name="body" class="form-control mb-2" rows="3"
                 placeholder="進捗を記入(動きがあれば記載してください)&#10;複数行で記入できます" required></textarea>
       <button class="btn btn-primary"><i class="bi bi-pencil-square"></i> 記載</button>
@@ -804,6 +809,9 @@
       {# 画面を開いたタスクの印(IDの再利用の取り違え防止)と、開いたときの内容の控え(ほかの操作の変更を上書きしない) #}
       <input type="hidden" name="row" value="{{ task.row_key }}">
       <input type="hidden" name="version" value="{{ version }}">
+      {% else %}
+      {# 登録の二度押しで同じタスクを2件にしないための1回限りの印 #}
+      <input type="hidden" name="once" value="{{ submit_token() }}">
       {% endif %}
       <div class="mb-3">
         <label class="form-label">タイトル <span class="text-danger">*</span></label>
@@ -978,7 +986,7 @@
       <tbody>
         {% for s in summary_rows %}
         <tr>
-          <td class="text-start text-nowrap">{{ s.assignee.display_name if s.assignee else '(不明)' }}</td>
+          <td class="text-start text-nowrap">{{ s.assignee.name_label if s.assignee else '(不明)' }}</td>
           <td data-sort="{{ s.count }}">{{ s.count }}</td>
           <td class="text-nowrap" data-sort="{{ s.minutes }}">{{ "{:,}".format(s.minutes) }}分
             <span class="text-muted small">({{ "%.1f"|format(s.minutes / 60) }}時間)</span></td>
@@ -1053,7 +1061,7 @@
       <tbody>
         {% for r in routines %}
         <tr>
-          <td class="text-nowrap">{{ r.assignee.display_name }}</td>
+          <td class="text-nowrap">{{ r.assignee.name_label }}</td>
           <td><a href="{{ url_for('routine.detail', routine_id=r.id) }}" class="fw-medium">{{ r.name }}</a></td>
           <td><small class="text-muted">{{ r.purpose or '―' }}</small></td>
           <td class="text-nowrap">{{ r.frequency_label }}</td>
@@ -1096,7 +1104,7 @@
 
     <dl class="row mb-0">
       <dt class="col-sm-3 text-muted">担当者</dt>
-      <dd class="col-sm-9">{{ routine.assignee.display_name }}</dd>
+      <dd class="col-sm-9">{{ routine.assignee.name_label }}</dd>
 
       <dt class="col-sm-3 text-muted">目的</dt>
       <dd class="col-sm-9">{{ routine.purpose or '―' }}</dd>
@@ -1159,6 +1167,9 @@
       {# 画面を開いた業務の印(IDの再利用の取り違え防止)と、開いたときの内容の控え(ほかの操作の変更を上書きしない) #}
       <input type="hidden" name="row" value="{{ routine.row_key }}">
       <input type="hidden" name="version" value="{{ version }}">
+      {% else %}
+      {# 登録の二度押しで同じ業務を2件にしないための1回限りの印 #}
+      <input type="hidden" name="once" value="{{ submit_token() }}">
       {% endif %}
       <div class="row">
         <div class="col-md-7 mb-3">
@@ -1426,6 +1437,7 @@
     <a href="{{ url_for('leaves.edit_leave', leave_id=leave.id) }}" class="btn btn-sm btn-secondary"><i class="bi bi-pencil"></i> 編集</a>
     <form method="post" action="{{ url_for('leaves.cancel_leave', leave_id=leave.id) }}"
           onsubmit="return confirm('この年休を取消しますか?');">
+      <input type="hidden" name="row" value="{{ leave.row_key }}">
       <button class="btn btn-sm btn-outline-danger"><i class="bi bi-x-lg"></i> 取消</button>
     </form>
   </div>
@@ -1433,6 +1445,7 @@
   <div class="card-footer bg-white d-flex flex-wrap gap-2 align-items-center">
     <form method="post" action="{{ url_for('leaves.cancel_leave', leave_id=leave.id) }}"
           onsubmit="return confirm('この年休を取消しますか?');">
+      <input type="hidden" name="row" value="{{ leave.row_key }}">
       <button class="btn btn-sm btn-outline-danger"><i class="bi bi-x-lg"></i> 取消</button>
     </form>
     <span class="text-muted small"><i class="bi bi-info-circle"></i> 無効化したメンバーの年休のため、マネージャーが取消できます（編集は本人のみ）。</span>
@@ -1454,7 +1467,8 @@
   <div class="col-lg-6">
     <h1 class="h3 mb-3">{{ '年休の編集' if editing else '年休の登録' }}</h1>
 
-    <form method="post" class="card card-body shadow-sm">
+    <form method="post" class="card card-body shadow-sm">{% if editing %}
+      <input type="hidden" name="row" value="{{ leave.row_key }}">{% endif %}
       <div class="mb-3">
         <label class="form-label">取得日 <span class="text-danger">*</span></label>
         <input type="date" name="leave_date" class="form-control" required min="{{ year_min }}-01-01" max="{{ year_max }}-12-31"
@@ -1918,7 +1932,9 @@
          ブラウザがあるため、1px に切り取って見えなくする) #}
       <button type="submit" tabindex="-1" aria-hidden="true"
               style="position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0;">{{ '更新' if editing else '追加' }}</button>
-      {% if back %}<input type="hidden" name="back" value="{{ back }}">{% endif %}
+      {% if back %}<input type="hidden" name="back" value="{{ back }}">{% endif %}{% if editing %}
+      {# 画面を開いたときの内容の控え(ほかの操作の変更を古い画面の保存で上書きしない) #}
+      <input type="hidden" name="version" value="{{ version }}">{% endif %}
       <div class="mb-3">
         <label class="form-label" for="item-name">スキル名 <span class="text-danger">*</span></label>
         <input type="text" name="name" id="item-name" class="form-control" required value="{{ val('name') }}">
@@ -2119,6 +2135,7 @@
     {% for o in operations %}
     <div class="border rounded p-2 mb-2">
       <form method="post" action="{{ url_for('skills.rename_operation', op_id=o.id) }}" class="row g-2 align-items-end">
+        <input type="hidden" name="version" value="{{ versions[o.id] }}">
         <div class="col-md-4">
           <label class="form-label small mb-1">業務名</label>
           <input type="text" name="name" class="form-control form-control-sm {% if not o.is_active %}text-muted{% endif %}" value="{{ o.name }}">
@@ -2988,7 +3005,7 @@
     <form method="post" action="{{ url_for('skilltest.admin_deactivate_all', skill_id=skill.id) }}">
       <button class="btn btn-sm btn-outline-danger" {% if not active_total or running_this %}disabled{% endif %}
               title="{{ 'このスキルの問題を補充中のため、補充が終わってから使えます' if running_this else '説明を変えた後、古い説明で作った問題を入れ替えるときに使います' }}"
-              data-confirm="「{{ skill.name }}」の有効な問題 {{ active_total }}問をすべて停止（無効）にします。今後は出題しません（受験履歴には残り、1問ずつ有効に戻せます）。よろしいですか？"
+              data-confirm="「{{ skill.name }}」の有効な問題 {{ active_total }}問をすべて停止（無効）にします。今後は出題しません（受験履歴には残り、1問ずつ有効に戻せます）。{% if testable and not ai_enabled %}AIが未設定のため新しい問題は作れず、有効に戻すまでメンバーはこのスキルのテストを受験できません。{% endif %}よろしいですか？"
               onclick="return confirm(this.dataset.confirm);">
         <i class="bi bi-slash-circle"></i> このスキルの問題をすべて停止
       </button>
@@ -3095,7 +3112,7 @@
 </div>
 {% else %}
 <div class="card card-body shadow-sm text-muted text-center">
-  問題がありません。{% if testable and ai_enabled %}「AIで補充」で作成するか、メンバーが受験を始めたときに不足分が自動で作成されます。{% elif testable %}AIが未設定のため、問題を作成できません（メンバーが受験を始めても問題が無いため受験できません）。AIは<a href="{{ url_for('system.settings', tab='config') }}">システム設定の「基本設定」タブ</a>で設定します。{% endif %}
+  {% if (filters.level or filters.state) and counts %}絞り込みの条件に合う問題はありません。{% else %}問題がありません。{% if testable and ai_enabled %}「AIで補充」で作成するか、メンバーが受験を始めたときに不足分が自動で作成されます。{% elif testable %}AIが未設定のため、問題を作成できません（メンバーが受験を始めても問題が無いため受験できません）。AIは<a href="{{ url_for('system.settings', tab='config') }}">システム設定の「基本設定」タブ</a>で設定します。{% endif %}{% endif %}
 </div>
 {% endfor %}
 {% endblock %}
@@ -3526,7 +3543,7 @@
         <tr>
           <td><a href="{{ url_for('tasks.detail', task_id=q.task.id) }}">{{ q.task.title }}</a>
             <span class="badge bg-{{ q.task.status_color }}">{{ q.task.status }}</span></td>
-          <td class="small text-nowrap">{{ q.task.assignee_names or '未割当' }}</td>
+          <td class="small text-nowrap">{{ q.task.assignee_labels or '未割当' }}</td>
           <td class="small pre-wrap">{{ q.estimate or '―' }}</td>
           <td class="small pre-wrap fw-medium">{{ q.actual or '―' }}</td>
         </tr>
@@ -3698,7 +3715,7 @@
       {% for g in gantt %}
       <div class="gantt-row">
         <div class="gantt-c-task"><a href="{{ url_for('tasks.detail', task_id=g.task.id) }}" title="{{ g.task.title }}">{{ g.task.title }}</a></div>
-        <div class="gantt-c-assignee" title="{{ g.task.assignee_names }}">{{ g.task.assignee_names or '未割当' }}</div>
+        <div class="gantt-c-assignee" title="{{ g.task.assignee_labels }}">{{ g.task.assignee_labels or '未割当' }}</div>
         <div class="gantt-timeline">
           {% for tick in gticks %}<div class="gantt-tick" style="left:{{ tick.left }}%;"></div>{% endfor %}
           {% if gtoday_left is not none %}<div class="gantt-today" style="left:{{ gtoday_left }}%;"></div>{% endif %}
@@ -3839,6 +3856,8 @@
 </form>
 {% if period.error %}
 <div class="alert alert-warning small"><i class="bi bi-exclamation-triangle"></i> {{ period.error }}</div>
+{% endif %}{% if period.note %}
+<div class="alert alert-info small"><i class="bi bi-info-circle"></i> {{ period.note }}</div>
 {% endif %}
 
 {# ===== AIで分析(別スレッドで実行。結果は instance/ai_analysis.json に最新の1回分) ===== #}
@@ -4789,7 +4808,8 @@
 
 {# メンバーの紐づけ(兼務対応) #}
 <div class="card shadow-sm">
-  <div class="card-header bg-white fw-bold">メンバーの紐づけ(兼務可)</div>
+  <div class="card-header bg-white fw-bold">メンバーの紐づけ(兼務可)</div>{% if not departments %}
+  <div class="card-body text-muted small"><i class="bi bi-info-circle"></i> チームがまだありません。上の「新しいチームを追加」で追加してから紐づけます。</div>{% else %}
   <form method="post" action="{{ url_for('departments.save_memberships') }}">
     {# 保存で変えるのは、この表に出している人・チームの組み合わせだけ(画面を開いた後の追加・削除を消さない) #}
     {% for u in users %}<input type="hidden" name="member_keys" value="{{ u.form_key }}">{% endfor %}
@@ -4824,7 +4844,7 @@
     <div class="card-footer bg-white">
       <button class="btn btn-primary"><i class="bi bi-check-lg"></i> 紐づけを保存</button>
     </div>
-  </form>
+  </form>{% endif %}
 </div>
 {% endblock %}
 {#=== weekly/index.html ===#}
@@ -5384,7 +5404,7 @@
          value="{{ row.value }}" autocomplete="off" spellcheck="false"
          {% if f.type == 'url' %}inputmode="url" placeholder="https://..."{% elif f.type == 'address' %}inputmode="email" placeholder="name@example.com"{% endif %}>
 {% endif %}
-{% if row.error %}<div class="invalid-feedback d-block">{{ row.error }}</div>{% endif %}
+{% if row.error %}<div class="invalid-feedback d-block">{{ row.error }}</div>{% endif %}{% if row.notice %}<div class="small text-danger"><i class="bi bi-exclamation-triangle"></i> {{ row.notice }}</div>{% endif %}
 <div class="form-text">{{ f.help }}</div>
 {% endmacro %}
 
@@ -5515,6 +5535,7 @@
 
 <form method="post" action="{{ url_for('system.save_weekly') }}" id="weekly-settings-form"
       data-preview-url="{{ url_for('weekly.preview') }}">
+  <input type="hidden" name="version" value="{{ wk.version }}">
 
   <div class="card shadow-sm mb-4">
     <div class="card-header bg-white fw-bold"><i class="bi bi-calendar-week"></i> 自動送信のスケジュール</div>
@@ -5678,6 +5699,7 @@
 </p>
 
 <form method="post" action="{{ url_for('system.save_overdue') }}">
+  <input type="hidden" name="version" value="{{ od.version }}">
   <div class="card shadow-sm mb-4">
     <div class="card-header bg-white fw-bold"><i class="bi bi-sliders"></i> 期限超過通知の設定</div>
     <div class="card-body">
@@ -5700,7 +5722,7 @@
         <div class="col-md-6">
           <div class="form-text mt-md-4">
             各タスクに、直近の進捗記載（コメント）をこの件数まで古い順に載せます（{{ od.comment_min }}〜{{ od.comment_max }}件）。
-            経過日数は土日祝を除いた営業日で数えます（今日の記載は「本日」）。記載が無いタスクは「コメントなし」になります。
+            経過日数は土日祝を除いた営業日で数えます（今日の記載は「本日」。土日祝に送ったときは、直前の営業日とその後の土日祝の記載を「1日前」として数えます）。記載が無いタスクは「コメントなし」になります。
           </div>
         </div>
       </div>
@@ -5724,6 +5746,7 @@
 </p>
 
 <form method="post" action="{{ url_for('system.save_skilltest') }}">
+  <input type="hidden" name="version" value="{{ st.version }}">
   <div class="card shadow-sm mb-3">
     <div class="card-header bg-white fw-bold d-flex justify-content-between flex-wrap gap-2">
       <span><i class="bi bi-list-ol"></i> 出題（レベルごと）</span>
@@ -5813,6 +5836,7 @@
 </p>
 
 <form method="post" action="{{ url_for('system.save_analysis') }}">
+  <input type="hidden" name="version" value="{{ an.version }}">
   <div class="card shadow-sm mb-4">
     <div class="card-header bg-white fw-bold"><i class="bi bi-sliders"></i> しきい値（営業日）</div>
     <div class="card-body">
@@ -6243,6 +6267,10 @@ a:hover {
 (function () {
   "use strict";
 
+  // ログインの有効期限が切れていたとき(サーバーが 401 を返した・ログイン画面へ転送された)の案内
+  var LOGIN_EXPIRED = "ログインの有効期限が切れています。別のタブでログインし直してから、もう一度「AIで下書き」を押してください" +
+    "（入力中の内容はまだ保存されていません。この画面を開き直すと消えます）。";
+
   function setStatus(box, text, kind) {
     if (!box) return;
     box.textContent = text;
@@ -6280,6 +6308,11 @@ a:hover {
         headers: { "Accept": "application/json" },
         credentials: "same-origin"
       }).then(function (response) {
+        if (response.status === 401 || response.redirected) {
+          var expired = new Error(LOGIN_EXPIRED);
+          expired.loginExpired = true;
+          throw expired;
+        }
         return response.json().catch(function () {
           throw new Error("サーバーの応答を読み取れませんでした（" + response.status + "）");
         });
@@ -6291,7 +6324,7 @@ a:hover {
           setStatus(status, data.message || "下書きを作成できませんでした。", "danger");
         }
       }).catch(function (error) {
-        setStatus(status, "下書きを作成できませんでした: " + error.message, "danger");
+        setStatus(status, error.loginExpired ? error.message : "下書きを作成できませんでした: " + error.message, "danger");
       }).then(function () {
         button.disabled = false;
         button.innerHTML = original;
@@ -6683,6 +6716,8 @@ a:hover {
  *   (自動では反映しない。タスクの画面に貼り付けて使う)。
  * ・実行中の表示: 「AIで分析」の実行中は、状態(/manager/analysis/status)を数秒ごとに確認して
  *   進み具合を表示し、終わったら画面を再読み込みする。
+ * ・期間のフォーム: 開始日・終了日を変えたら「期間内」を「日付で指定」にする(直近N日のままだと日付が
+ *   使われないため)。
  *
  * JavaScript が無効でも、実行中の表示と「しばらくしてから再読み込み」の案内は表示される(サーバー側)。
  */
@@ -6765,6 +6800,11 @@ a:hover {
     function tick() {
       fetch(url, { credentials: "same-origin", headers: { "Accept": "application/json" } })
         .then(function (response) {
+          if (response.status === 401) {
+            // ログインの有効期限が切れた: 画面を読み直してログイン画面へ(ログインの後はこの画面に戻る)
+            window.location.reload();
+            return new Promise(function () {});
+          }
           if (!response.ok) throw new Error(String(response.status));
           return response.json();
         })
@@ -6785,9 +6825,23 @@ a:hover {
     window.setTimeout(tick, POLL_MS);
   }
 
+  function setupPeriod() {
+    var select = document.getElementById("analysis-period");
+    if (!select) return;
+    var range = select.querySelector("option:last-child");
+    ["analysis-from", "analysis-to"].forEach(function (id) {
+      var input = document.getElementById(id);
+      if (!input || !range) return;
+      input.addEventListener("change", function () {
+        select.value = range.value;
+      });
+    });
+  }
+
   function init() {
     setupCopy();
     setupPolling();
+    setupPeriod();
   }
 
   if (document.readyState === "loading") {
