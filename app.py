@@ -512,6 +512,10 @@ def _set_value(text, key, value, newline=None):
 
     if text and not text.endswith(("\n", "\r")):
         text += newline
+    # 追記する項目は空行で前の行と区切る(前の項目のまとまり・その説明のコメントの続きにしない。続けて書くと、
+    # 「未使用の設定を削除」で前の項目を削除したときに、その説明のコメントが追記した項目の上に残るため)
+    if text.strip() and not re.search(r"(?:\r\n|\r|\n)[ \t]*(?:\r\n|\r|\n)$", text):
+        text += newline
     return text + "{} = {}{}".format(key, literal, newline)
 
 
@@ -947,15 +951,40 @@ def _read_old_ai_settings(db_path):
     return values
 
 
-def _build_content(db_path):
-    """新しく作る instance/config.py の内容を組み立てる。"""
+# 旧「AI接続設定」画面の値(ai_settings テーブル)を instance/config.py に引き継いだ印のファイル(instance/ の中)。
+# 引き継ぎは1回だけにする(この印がある・config.py.bak がある〔画面から保存したことがある〕ときは引き継がない)。
+# config.py を作り直したときに、画面で消した APIキーなどが古い値で戻らないように
+LEGACY_AI_MARKER = "legacy_ai_imported.json"
+
+
+def _legacy_ai_done(instance_path):
+    """旧「AI接続設定」の値を、以前に引き継いだ(または引き継ぐべきでない)か。"""
+    return (os.path.exists(os.path.join(instance_path, LEGACY_AI_MARKER))
+            or os.path.exists(config_path(instance_path) + BACKUP_SUFFIX))
+
+
+def _mark_legacy_ai_done(instance_path, keys):
+    """旧「AI接続設定」の値を引き継いだ印を残す(項目の名前と日時だけ。値は書かない)。"""
+    data = {"imported_at": datetime.now().strftime("%Y-%m-%d %H:%M"), "keys": list(keys)}
+    try:
+        write_file_atomic(os.path.join(instance_path, LEGACY_AI_MARKER),
+                          json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"), ".legacy_ai_")
+    except OSError as exc:
+        _notice("旧「AI接続設定」の引き継ぎの印を保存できませんでした: {} ({})".format(LEGACY_AI_MARKER, exc))
+
+
+def _build_content(db_path, legacy=None):
+    """新しく作る instance/config.py の内容を組み立てる。
+
+    legacy は旧「AI接続設定」画面から引き継ぐ値(None なら db_path の ai_settings テーブルから読む)。
+    """
     text = CONFIG_TEMPLATE
     values = {
         "SECRET_KEY": secrets.token_hex(32),
         "ADMIN_PASSWORD": secrets.token_urlsafe(12),
     }
-    # 旧画面のAI接続設定を1回だけ引き継ぐ(空の項目は見本の値のまま)
-    values.update(_read_old_ai_settings(db_path))
+    # 旧画面のAI接続設定を引き継ぐ(空の項目は見本の値のまま。1回だけ: ensure_instance_config)
+    values.update(_read_old_ai_settings(db_path) if legacy is None else legacy)
 
     for key, value in values.items():
         text = _set_value(text, key, value)
@@ -984,7 +1013,10 @@ def ensure_instance_config(instance_path):
     if os.path.exists(path):
         return False
 
-    content = _build_content(os.path.join(instance_path, "app.db"))
+    # 旧「AI接続設定」の値は1回だけ引き継ぐ(以前に引き継いだ・画面から保存したことがあるフォルダでは引き継がない)
+    legacy = {} if _legacy_ai_done(instance_path) else \
+        _read_old_ai_settings(os.path.join(instance_path, "app.db"))
+    content = _build_content(os.path.join(instance_path, "app.db"), legacy)
     try:
         # "x" = 新規作成専用。同時に別プロセスが作成していても上書きしない
         with open(path, "x", encoding="utf-8", newline="\n") as f:
@@ -997,6 +1029,10 @@ def ensure_instance_config(instance_path):
 
     _notice("設定ファイルを作成しました（管理者パスワード等はこのファイルで確認・変更）: {}"
             .format(path))
+    if legacy:
+        _mark_legacy_ai_done(instance_path, legacy)
+        _notice("以前の「AI接続設定」画面の値を引き継ぎました（{}。引き継ぐのはこの1回だけです）。"
+                .format("・".join(legacy)))
     return True
 
 
@@ -1023,6 +1059,9 @@ login_manager.login_message_category = "warning"
 # ログインが切れた状態で送られた保存・変更など(GET 以外。行われていない)の送り先のパスを残すセッションのキー
 # (ログインの後に「直前の操作は行われていません」と知らせるため。auth.login で取り出す)
 DROPPED_REQUEST_KEY = "dropped_request_path"
+# 固定ローカル管理者(admin など)でログインしたときの、パスワードの印(_local_credential_mark)を残すセッションのキー
+# (パスワードを変えたら、既にログインしていたブラウザも使えなくする。load_user で照合する)
+LOCAL_AUTH_KEY = "local_auth"
 
 
 @login_manager.unauthorized_handler
@@ -2025,6 +2064,14 @@ def load_user(user_id):
     user = db.session.get(User, number)
     if user is None or user.username != username:
         return None
+    if is_local_account(user.username):
+        # 固定ローカル管理者は、ログインしたときのパスワードの印が今のパスワードと合うときだけ復元する
+        # (ADMIN_PASSWORD を変えたら、既にログインしていたブラウザもログイン画面に戻る。印の無い以前の
+        # 形式のセッションも復元しない)
+        mark = session.get(LOCAL_AUTH_KEY)
+        if not isinstance(mark, str) or not hmac.compare_digest(
+                mark.encode("utf-8"), _local_credential_mark(user.username).encode("utf-8")):
+            return None
     return user
 
 
@@ -2554,15 +2601,19 @@ DESC_EXCLUDE = "出題しない範囲"
 SKILL_DESCRIPTION_HEADINGS = (DESC_SCOPE, DESC_TOOLS, DESC_LEVELS, DESC_EXCLUDE)
 # 「レベルごとの目安」に書くレベル(スキルテストで判定するレベルと同じ 1〜4)
 SKILL_DESCRIPTION_LEVELS = (1, 2, 3, 4)
+# スキルテストの対象外の区分(コンセプチュアル・ヒューマン)の説明の見出し。説明はマネージャーが到達度を
+# 判断する基準なので、テストの言葉(出題・問う)を使わず、「レベルごとの目安」は到達尺度のすべてのレベルで書く
+DESC_OUTSIDE = "対象外の内容"
 # 説明の中の見出しの行(行頭の「■」「#」「【」などは省略可。「レベルごとの目安」は後ろの（Lv1〜Lv4）も省略可)
 _DESCRIPTION_HEADING_RE = re.compile(
     r"^[ \t\u3000]*(?:[■□◆◇●○#＃]+|【|\[)?[ \t\u3000]*"
-    r"(対象範囲|使う道具・言語・ソフト|レベルごとの目安|出題しない範囲)", re.MULTILINE)
+    r"(対象範囲|使う道具・言語・ソフト|レベルごとの目安|出題しない範囲|対象外の内容)", re.MULTILINE)
 _DESCRIPTION_HEADING_KEYS = {
     "対象範囲": DESC_SCOPE,
     "使う道具・言語・ソフト": DESC_TOOLS,
     "レベルごとの目安": DESC_LEVELS,
     "出題しない範囲": DESC_EXCLUDE,
+    "対象外の内容": DESC_OUTSIDE,
 }
 
 
@@ -3669,6 +3720,26 @@ def _check_config_admin(username, password):
     }
 
 
+def _local_credential_mark(username):
+    """固定ローカル管理者の、今のパスワードの印(SECRET_KEY で作る HMAC。パスワードそのものは含まない)。
+
+    ログインのときにセッションに残し、load_user で今の値と照合する。admin で ADMIN_PASSWORD が設定されて
+    いればその値、それ以外は ldap_client.py の _LOCAL_ACCOUNTS のパスワードから作る。
+    """
+    expected = str(current_app.config.get("ADMIN_PASSWORD") or "")
+    if username == ADMIN_USERNAME and expected:
+        material = "config:" + expected
+    else:
+        import ldap_client  # 本番環境ごとに差し替えるファイル(使うときに読み込む)
+
+        accounts = getattr(ldap_client, "_LOCAL_ACCOUNTS", None)
+        local = accounts.get(username) if isinstance(accounts, dict) else None
+        password = local.get("password") if isinstance(local, dict) else None
+        material = "ldap_client:" + str(password or "")
+    key = str(current_app.config.get("SECRET_KEY") or "").encode("utf-8")
+    return hmac.new(key, (str(username) + ":" + material).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 def is_local_account(username):
     """固定ローカル管理者(admin と ldap_client.py の _LOCAL_ACCOUNTS)のログインIDか。
 
@@ -3682,6 +3753,18 @@ def is_local_account(username):
     return isinstance(accounts, dict) and username in accounts
 
 
+def _login_display_name(info):
+    """認証の結果の氏名(display_name)。文字列で空白以外の文字があればその値(前後の空白を除く)、無ければ None。
+
+    ldap_client.py は本番環境ごとに差し替えるため、LDAP-API が氏名を返さない(None・キーが無い・空)ことがある。
+    そのときは登録済みの氏名を消さない(呼び出し側で今の氏名のまま、または新しい行ならログインIDにする)。
+    """
+    name = info.get("display_name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    return None
+
+
 def _ensure_local_user(info):
     """固定ローカルアカウント(admin 等)は、アプリ未登録でも用意する(初期・緊急用)。
 
@@ -3693,8 +3776,9 @@ def _ensure_local_user(info):
         if user is None:
             user = User(username=info["username"])
             db.session.add(user)
-        user.display_name = info["display_name"]
-        user.role = info["role"]
+        user.display_name = _login_display_name(info) or user.display_name or info["username"]
+        role = info.get("role")
+        user.role = role if role in (ROLE_MANAGER, ROLE_MEMBER) else (user.role or ROLE_MANAGER)
         user.is_active = True
         try:
             db.session.commit()
@@ -3714,8 +3798,11 @@ def _match_registered_user(info):
     user = User.query.filter_by(username=info["username"]).first()
     if user is None or not user.is_active:
         return None
-    user.display_name = info["display_name"]
-    db.session.commit()
+    name = _login_display_name(info)
+    if name is not None and name != user.display_name:
+        # 氏名を返さなかった(None・空)ときは、マネージャーが登録した氏名のまま(空の氏名で上書きしない)
+        user.display_name = name
+        db.session.commit()
     return user
 
 
@@ -3748,9 +3835,19 @@ def _safe_next(value):
 @auth_bp.route("/login", methods=["GET", "POST"])
 def login():
     # すでにログイン済み(別のタブでログインし直した後に、残っていたログイン画面を開いた・送信したなど)なら、
-    # ログインしたときと同じく next の画面(このアプリの中だけ)へ。無ければトップへ
+    # ログインしたときと同じく next の画面(このアプリの中だけ)へ。無ければトップへ。
+    # ただし、ログイン中の人と別のIDが送られたとき(共用のPCで、前の人のログインが残ったままの画面から
+    # 別の人がログインした)は、前の人のログインを終えてから、送られたID・パスワードを確かめる
+    # (前の人のまま操作を続けさせない。パスワードが違えばログアウトした状態でログイン画面に戻す)
     if current_user.is_authenticated:
-        return _redirect_after_login()
+        posted = request.form.get("username", "").strip() if request.method == "POST" else ""
+        if not posted or posted == current_user.username:
+            return _redirect_after_login()
+        previous = current_user.display_name
+        logout_user()
+        session.pop(DROPPED_REQUEST_KEY, None)
+        session.pop(LOCAL_AUTH_KEY, None)
+        flash(f"{previous} さんのログインを終了しました（別のIDが入力されたため）。", "info")
 
     if request.method == "POST":
         username = request.form.get("username", "").strip()
@@ -3768,6 +3865,14 @@ def login():
                 info = ldap_client.authenticate(username, password)
         except Exception:
             current_app.logger.exception("ログインの認証で例外が発生しました（ログインID: %s）", username)
+            flash(LOGIN_BACKEND_ERROR, "danger")
+            return render_template("auth/login.html", username=username)
+        if info is not None and (not isinstance(info, dict) or not isinstance(info.get("username"), str)
+                                 or not info["username"].strip()):
+            # ldap_client.py の authenticate() の戻り値の形が違う(辞書でない・ログインIDが無い)。内部エラーの
+            # 画面にせず、認証サーバーにつながらないときと同じ案内にする(内容はログに残す。パスワードは出さない)
+            current_app.logger.error("ログインの認証の結果の形が正しくありません（ログインID: %s、種類: %s）",
+                                     username, type(info).__name__)
             flash(LOGIN_BACKEND_ERROR, "danger")
             return render_template("auth/login.html", username=username)
         if info is None:
@@ -3788,6 +3893,10 @@ def login():
                 return render_template("auth/login.html", username=username)
 
         login_user(user)
+        if is_local_account(user.username):
+            session[LOCAL_AUTH_KEY] = _local_credential_mark(user.username)
+        else:
+            session.pop(LOCAL_AUTH_KEY, None)
         flash(f"ようこそ、{user.display_name} さん。", "success")
         return _redirect_after_login()
 
@@ -3886,6 +3995,7 @@ def logout():
     # またログアウトしてしまうため)
     logout_user()
     session.pop(DROPPED_REQUEST_KEY, None)  # ログインが切れた状態で送った操作の印も消す
+    session.pop(LOCAL_AUTH_KEY, None)  # 固定ローカル管理者のパスワードの印も消す
     flash("ログアウトしました。", "info")
     return redirect(url_for("auth.login"))
 
@@ -4453,6 +4563,14 @@ def update_status(task_id):
         return redirect(back)
 
     new_status = request.form.get("status")
+    # 画面を開いたときの状態(hidden の from。無い以前の画面は今までどおり)。その後にほかの操作で状態が
+    # 変わっていたら、古い画面の選択で上書きしない(完了にしたタスクを、古い一覧から保留などに戻さない)
+    shown = request.form.get("from")
+    if new_status in STATUS_CHOICES and shown is not None and shown != task.status \
+            and new_status != task.status:
+        flash(f"画面を開いた後に、ほかの操作で状態が「{task.status}」に変更されています（変更していません）。"
+              "確認して、必要ならもう一度変更してください。", "warning")
+        return redirect(back)
     if new_status in STATUS_CHOICES:
         if new_status == STATUS_DONE and task.status != STATUS_DONE and not task.has_outcome_actual:
             flash(_COMPLETE_NEEDS_OUTCOME + "(タスクの編集画面から入力できます)", "warning")
@@ -4918,12 +5036,29 @@ def _can_cancel_leave(leave):
     return current_user.is_manager and leave.user is not None and not leave.user.is_active
 
 
-def _render_leave_form(leave, form=None):
-    """登録・編集の画面を表示する(form は入力エラーで再表示する入力)。"""
+# 年休の編集で、画面を開いた後の変更を確かめる項目(hidden の version)と、案内に使う名前
+LEAVE_VERSION_KEYS = ("leave_date", "leave_type")
+_LEAVE_FIELD_LABELS = {"leave_date": "取得日", "leave_type": "種別"}
+
+
+def _leave_values(leave):
+    """編集画面の項目の今の値(画面を開いた後の変更を確かめるため)。"""
+    return {"leave_date": leave.leave_date, "leave_type": leave.leave_type}
+
+
+def _render_leave_form(leave, form=None, version=None):
+    """登録・編集の画面を表示する(form は入力エラーで再表示する入力)。
+
+    version は編集画面の hidden(画面を開いたときの内容の控え)。入力エラーで再表示するときは送られた控えのまま
+    (タスク・定型業務の編集画面と同じ)。
+    """
+    if leave is not None and version is None:
+        version = form.get("version") if form is not None and form.get("version") is not None \
+            else field_versions(_leave_values(leave), LEAVE_VERSION_KEYS)
     return render_template(
         "leaves/form.html", leave=leave,
         type_choices=LEAVE_TYPE_CHOICES, daily_limit=LEAVE_DAILY_LIMIT, form=form,
-        year_min=LEAVE_YEAR_MIN, year_max=LEAVE_YEAR_MAX,
+        year_min=LEAVE_YEAR_MIN, year_max=LEAVE_YEAR_MAX, version=version,
     )
 
 
@@ -5203,6 +5338,19 @@ def edit_leave(leave_id):
             if not row_key_matches(leave, request.form.get("row")):
                 flash(_STALE_LEAVE, "warning")
                 return redirect(url_for("leaves.calendar_view"))
+            # 画面を開いた後に、ほかの操作(別のタブなど)で変わった項目を古い画面の内容で上書きしない
+            # (控え version の無い以前の画面は今までどおり)
+            current = _leave_values(leave)
+            changed = fields_changed_since(request.form.get("version"), current, LEAVE_VERSION_KEYS)
+            conflicts = conflicting_fields(changed, current, {"leave_date": leave_date, "leave_type": leave_type})
+            if conflicts:
+                flash(_EDITED_ELSEWHERE.format("、".join(_LEAVE_FIELD_LABELS[k] for k in conflicts)), "warning")
+                shown = request.form.to_dict(flat=True)
+                for key in changed:
+                    value = current[key]
+                    shown[key] = value.isoformat() if isinstance(value, date) else str(value or "")
+                shown.pop("version", None)
+                return _render_leave_form(leave, shown, version=field_versions(current, LEAVE_VERSION_KEYS))
             dup = _duplicate_on(current_user.id, leave_date, exclude_id=leave.id)
             if dup:
                 flash("その取得日の年休は既に登録されています。", "warning")
@@ -5709,12 +5857,42 @@ def _item_back():
 
 
 def _item_scales():
-    """区分ごとの到達尺度のうち、説明の「レベルごとの目安」に書くレベル(Lv1〜Lv4)の文言。"""
-    return {
-        stype: [(level, scale_for(stype)[level]) for level in SKILL_DESCRIPTION_LEVELS
-                if level < len(scale_for(stype))]
-        for stype in SKILL_TYPE_CHOICES
-    }
+    """区分ごとの到達尺度のうち、説明の「レベルごとの目安」に書くレベルの文言。
+
+    テクニカルスキルはスキルテストで判定するレベル(Lv1〜Lv4)。テストの対象外の区分(コンセプチュアル・
+    ヒューマン)は、マネージャーが到達度を判断する基準なので、到達尺度のすべてのレベル(Lv1〜最大)。
+    """
+    result = {}
+    for stype in SKILL_TYPE_CHOICES:
+        scale = scale_for(stype)
+        levels = SKILL_DESCRIPTION_LEVELS if stype == SKILL_TECHNICAL else range(1, len(scale))
+        result[stype] = [(level, scale[level]) for level in levels if level < len(scale)]
+    return result
+
+
+def description_outline(skill_type):
+    """「AIで下書き」で作る説明の見出しと、見出しの下に書く内容([(見出し, 内容)])。
+
+    テクニカルスキルはスキルテストの出題範囲の基準(4つの見出し)。テストの対象外の区分は、到達度の
+    判断基準として、対象範囲・すべてのレベルの目安・対象外の内容の3つの見出しにする。
+    """
+    if skill_type == SKILL_TECHNICAL:
+        return [
+            (DESC_SCOPE, "このスキルで扱う知識・作業の範囲（テストで問う範囲）"),
+            (DESC_TOOLS, "使う道具・プログラミング言語・ソフトウェア（分かればバージョンや機能の範囲も）"),
+            (DESC_LEVELS, "「・Lv1: 」〜「・Lv4: 」の4行。上の到達尺度の文言を、このスキルで具体的に"
+                          "できること・分かっていることで書く"),
+            (DESC_EXCLUDE, "テストで問わない内容（ほかのスキルで扱う内容、使わない機能、特定の組織だけの事情など）"),
+        ]
+    levels = [level for level, _label in _item_scales().get(skill_type, [])]
+    top = levels[-1] if levels else 1
+    return [
+        (DESC_SCOPE, "このスキルで扱う行動・考え方・知識の範囲（到達度を判断する範囲）"),
+        ("レベルごとの目安（Lv1〜Lv{}）".format(top),
+         "「・Lv1: 」〜「・Lv{}: 」の{}行。上の到達尺度の文言を、このスキルで具体的にできること・"
+         "見てとれる行動で書く".format(top, top)),
+        (DESC_OUTSIDE, "このスキルでは評価しない内容（ほかのスキルで扱う内容、特定の組織だけの事情など）"),
+    ]
 
 
 # スキル項目の編集で、画面を開いた後のほかの操作の変更を確かめる項目(名前は画面の表示。タスクの編集と同じ)
@@ -5743,6 +5921,8 @@ def _render_item_form(skill, form=None, status=200, version=None):
         technical_type=SKILL_TECHNICAL,
         scales=_item_scales(),
         headings=SKILL_DESCRIPTION_HEADINGS,
+        # テストの対象外の区分(コンセプチュアル・ヒューマン)の見出し(到達尺度のレベルの数は同じ)
+        outline_off=description_outline(SKILL_CONCEPTUAL),
         ai_enabled=ai_is_configured(),
         ai_status=ai_status_label(),
         back=_item_back(),
@@ -5750,10 +5930,20 @@ def _render_item_form(skill, form=None, status=200, version=None):
 
 
 def build_description_messages(name, skill_type, category, current=""):
-    """スキルの説明の下書きをAIに作らせるメッセージ(OpenAI形式)。"""
+    """スキルの説明の下書きをAIに作らせるメッセージ(OpenAI形式)。
+
+    テクニカルスキルはスキルテストの出題範囲・難易度の基準として、テストの対象外の区分(コンセプチュアル・
+    ヒューマン)はマネージャーが到達度を判断する基準として作らせる(description_outline)。
+    """
+    outline = description_outline(skill_type)
+    if skill_type == SKILL_TECHNICAL:
+        purpose = "この説明は、スキルテストの4択問題を作るときの出題範囲と難易度の基準として使います。"
+    else:
+        purpose = ("この説明は、マネージャーがメンバーの到達度（レベル）を判断するときの基準として使います"
+                   "（この区分はテストを行いません）。")
     lines = [
         "次のスキルの「説明」の下書きを作成してください。",
-        "この説明は、スキルテストの4択問題を作るときの出題範囲と難易度の基準として使います。",
+        purpose,
         "",
         "■スキル",
         "名称: {}".format(name),
@@ -5773,23 +5963,21 @@ def build_description_messages(name, skill_type, category, current=""):
     lines += [
         "",
         "■出力の形式",
-        "次の4つの見出しを、この順に書く。見出しの行は「■見出し」の形にし、"
-        "見出しの下は「・」で始まる箇条書きにする。",
-        "■{}".format(DESC_SCOPE),
-        "  このスキルで扱う知識・作業の範囲（テストで問う範囲）",
-        "■{}".format(DESC_TOOLS),
-        "  使う道具・プログラミング言語・ソフトウェア（分かればバージョンや機能の範囲も）",
-        "■{}".format(DESC_LEVELS),
-        "  「・Lv1: 」〜「・Lv4: 」の4行。上の到達尺度の文言を、このスキルで具体的に"
-        "できること・分かっていることで書く",
-        "■{}".format(DESC_EXCLUDE),
-        "  テストで問わない内容（ほかのスキルで扱う内容、使わない機能、特定の組織だけの事情など）",
+        "次の{}つの見出しを、この順に書く。見出しの行は「■見出し」の形にし、"
+        "見出しの下は「・」で始まる箇条書きにする。".format(len(outline)),
+    ]
+    for heading, body in outline:
+        lines += ["■{}".format(heading), "  " + body]
+    lines += [
         "",
         "■守ること",
         "・特定の組織の事情に依存しない、一般的な表現で書く",
-        "・スキル名・カテゴリから判断できない道具・ソフトは決めつけず、「（例）」を付けて候補として書く",
+    ]
+    if skill_type == SKILL_TECHNICAL:
+        lines.append("・スキル名・カテゴリから判断できない道具・ソフトは決めつけず、「（例）」を付けて候補として書く")
+    lines += [
         "・全体で600文字程度までにまとめる",
-        "・4つの見出しと箇条書きだけを出力する（前置き・まとめの文・コードブロックは付けない）",
+        "・{}つの見出しと箇条書きだけを出力する（前置き・まとめの文・コードブロックは付けない）".format(len(outline)),
     ]
     return [
         {"role": "system",
@@ -5799,8 +5987,15 @@ def build_description_messages(name, skill_type, category, current=""):
     ]
 
 
-def clean_description_draft(text):
-    """AIの応答を説明の下書きに整える(コードブロック・Markdown の記号を除き、見出しを「■」にそろえる)。"""
+def clean_description_draft(text, skill_type=None):
+    """AIの応答を説明の下書きに整える(コードブロック・Markdown の記号を除き、見出しを「■」にそろえる)。
+
+    skill_type を渡すと、「レベルごとの目安」の見出しをその区分の書き方(description_outline)にそろえる。
+    """
+    levels_heading = DESC_LEVELS
+    if skill_type is not None:
+        levels_heading = next((h for h, _b in description_outline(skill_type) if h.startswith("レベルごとの目安")),
+                              DESC_LEVELS)
     body = strip_code_fence(str(text or "").replace("\r\n", "\n").replace("\r", "\n"))
     lines = []
     for line in body.split("\n"):
@@ -5809,8 +6004,9 @@ def clean_description_draft(text):
         known = _DESCRIPTION_HEADING_RE.match(stripped)
         heading = re.match(r"^#{1,6}\s*(.+)$", stripped)
         if known and _HEADING_TAIL.match(stripped, known.end()):
-            # 4つの見出しだけの行(「## 対象範囲」「【出題しない範囲】」など)は「■見出し」にそろえる
-            line = "■" + _DESCRIPTION_HEADING_KEYS[known.group(1)]
+            # 見出しだけの行(「## 対象範囲」「【出題しない範囲】」など)は「■見出し」にそろえる
+            key = _DESCRIPTION_HEADING_KEYS[known.group(1)]
+            line = "■" + (levels_heading if key == DESC_LEVELS else key)
         elif heading:
             line = "■" + heading.group(1).strip().lstrip("■").strip()
         elif re.match(r"^[-*]\s+", stripped):
@@ -5833,11 +6029,16 @@ def draft_skill_description(name, skill_type, category, current=""):
     text, error = ai_chat(build_description_messages(name, skill_type, category, current))
     if error:
         return None, "AIで下書きを作成できませんでした: {}".format(error)
-    draft = clean_description_draft(text)
+    draft = clean_description_draft(text, skill_type)
     if not draft:
         return None, "AIの応答が空でした。もう一度お試しください。"
     message = "AIの下書きを説明の欄に入れました（まだ保存していません）。内容を確認・修正してから保存してください。"
-    missing = [h for h in SKILL_DESCRIPTION_HEADINGS if h not in description_headings(draft)]
+    if skill_type == SKILL_TECHNICAL:
+        missing = [h for h in SKILL_DESCRIPTION_HEADINGS if h not in description_headings(draft)]
+    else:
+        found = {_DESCRIPTION_HEADING_KEYS[m.group(1)] for m in _DESCRIPTION_HEADING_RE.finditer(draft)}
+        missing = [h for h, _b in description_outline(skill_type)
+                   if (DESC_LEVELS if h.startswith("レベルごとの目安") else h) not in found]
     if missing:
         message += "下書きに見出し（{}）がありません。必要なら書き足してください。".format("、".join(missing))
     return draft, message
@@ -5987,10 +6188,16 @@ def operations():
 
 @skills_bp.route("/operations/new", methods=["POST"])
 def new_operation():
+    """業務項目を追加する。追加のボタンの二度押し(同じ印 once・同じ内容)の2回目は、追加済みと案内する
+    (チームの追加と同じ。「既にあります」の注意にしない)。"""
     name = request.form.get("name", "").strip()
+    lock_for_write()  # 二度押しの確認から追加までの間に、同時に届いた2回目が入らないように
+    existing = Operation.query.filter_by(name=name).first() if name else None
     if not name:
         flash("業務名を入力してください。", "danger")
-    elif Operation.query.filter_by(name=name).first():
+    elif existing is not None and already_submitted("operation"):
+        flash(_SUBMITTED_TWICE.format(f"業務「{existing.name}」"), "info")
+    elif existing is not None:
         flash("同じ名称の業務が既にあります。", "warning")
     else:
         db.session.add(Operation(
@@ -5998,7 +6205,7 @@ def new_operation():
             description=request.form.get("description", "").strip() or None,
             sort_order=form_sort_order(request.form),
         ))
-        if commit_unique("同じ名称の業務が既にあります。"):
+        if commit_unique_submitted("operation", url_for("skills.operations"), "同じ名称の業務が既にあります。"):
             flash(f"業務「{name}」を追加しました。", "success")
     return redirect(url_for("skills.operations"))
 
@@ -6781,7 +6988,8 @@ def delete_member(user_id):
     if is_local_account(user.username):
         # 固定ローカル管理者はログインのたびに有効に戻る(無効化してもログインは止まらない)
         flash(f"「{user.display_name}」({user.username})は固定ローカル管理者のため、削除・無効化できません"
-              "（ログインを止めるには instance/config.py の ADMIN_PASSWORD を変更してください）。", "warning")
+              "（ログインを止めるには instance/config.py の ADMIN_PASSWORD を変更してください。"
+              "変更すると、既にログインしているブラウザもログイン画面に戻ります）。", "warning")
         return redirect(url_for("departments.manage"))
 
     name = user.display_name
@@ -7802,7 +8010,9 @@ def _task_facts(task, start, end, today=None):
         "start_label": _year_aware_label(task.start_date, end),
         "due_label": _year_aware_label(due, end),
         "scale_label": task.scale_label or "",
-        "assignees": task.assignee_names,
+        # 担当者の表示名(無効化された人は「［無効］」付き。タスクの一覧・期限超過通知と同じく、担当の
+        # 付け替えが必要なことが分かるように)。人数の集計には assignee_ids を使う
+        "assignees": task.assignee_labels,
         "assignee_ids": {u.id for u in task.assignees},
         "comments": comments,
         "changes": changes,
@@ -9640,6 +9850,15 @@ def questions_for(settings, level):
                                                    SKILLTEST_DEFAULTS["questions_per_level"]["1"]))
 
 
+def topup_target_for(settings, level):
+    """補充で目標にする、そのレベルの有効な問題の数(目標数。1回の受験に必要な問題数より少なければその数)。
+
+    目標数を1回の受験の問題数より少なく設定しても、補充の後にプールが足りないまま(受験の開始のたびに
+    AI の作成を待たせる)にならないようにする。
+    """
+    return max(int(settings["pool_target_per_level"]), questions_for(settings, level))
+
+
 def time_limit_for(settings, level):
     """そのレベルの1問の制限時間(秒)。"""
     return int(settings["time_limits"].get(str(level), SKILLTEST_DEFAULTS["time_limits"]["1"]))
@@ -10863,14 +11082,13 @@ def _topup(app, skill_id):
             else:
                 name = skill.name
                 settings = load_skilltest_settings()
-                target = settings["pool_target_per_level"]
                 parts, added_total, error = [], 0, None
                 for level in tested_levels(settings, skill.max_level):
                     # 受験の開始時の作成と重ねない(作成中なら終わるのを待ち、その後の問題数で数える)
                     with generation_lock(skill.id):
                         active = SkillTestQuestion.query.filter_by(
                             skill_id=skill.id, level=level, is_active=True).count()
-                        need = target - active
+                        need = topup_target_for(settings, level) - active
                         if need <= 0:
                             parts.append("Lv{} 追加なし（{}問）".format(level, active))
                             continue
@@ -11165,6 +11383,7 @@ def admin_attempts():
     return render_template(
         "skilltest/admin_attempts.html",
         nav_top_level=_rules(load_skilltest_settings())["top_level"],
+        settings_error=SKILLTEST_SETTINGS.load_error(),
         attempts=attempts,
         filters=filters,
         users=users,
@@ -11204,6 +11423,8 @@ def admin_pool():
         .all()
     )
     levels = tested_levels(settings, len(_tech_scale()) - 1)
+    # 目標数が1回の受験に必要な問題数より少ないレベル(補充はそのレベルを必要な数まで作る)
+    below_need = [lv for lv in levels if settings["pool_target_per_level"] < questions_for(settings, lv)]
     rows = []
     for skill in skills:
         per_level = counts.get(skill.id, {})
@@ -11229,10 +11450,12 @@ def admin_pool():
     return render_template(
         "skilltest/admin_pool.html",
         nav_top_level=_rules(settings)["top_level"],
+        settings_error=SKILLTEST_SETTINGS.load_error(),
         rows=rows,
         levels=levels,
         settings=settings,
         target=settings["pool_target_per_level"],
+        below_need=below_need,
         last=settings["last_result"],
         running=is_topup_running(),
         running_name=running_skill_name(),
@@ -11278,6 +11501,9 @@ def admin_pool_skill(skill_id):
         running_name=running_skill_name(),
         ai_enabled=ai_is_configured(),
         target=settings["pool_target_per_level"],
+        below_need=[lv for lv in tested_levels(settings, skill.max_level)
+                    if settings["pool_target_per_level"] < questions_for(settings, lv)],
+        settings_error=SKILLTEST_SETTINGS.load_error(),
         active_total=SkillTestQuestion.query.filter_by(skill_id=skill.id, is_active=True).count(),
         headings=SKILL_DESCRIPTION_HEADINGS,
         found_headings=description_headings(skill.description),
@@ -11295,9 +11521,25 @@ def admin_topup(skill_id):
     if not ai_is_configured():
         flash("AI（ChatGPT互換API）が未設定のため、問題を作成できません。", "danger")
         return redirect(back)
+    settings_error = SKILLTEST_SETTINGS.load_error()
+    if settings_error:
+        # 既定値で補充しても、結果(前回の補充の結果)を記録できず、設定した目標数も使えないため行わない
+        # (週報・期限超過通知の今すぐ実行と同じ)
+        flash("スキルテストの設定ファイルを読み込めないため、補充できません（結果を記録できないため）。{}".format(
+            settings_error), "danger")
+        return redirect(back)
     app = current_app._get_current_object()
     if not start_topup(app, skill):
-        flash("別の補充を処理中です。完了してから、もう一度実行してください。", "warning")
+        running_id, running_name = running_skill_id(), running_skill_name()
+        if running_id == skill.id:
+            # 二度押しなど: 同じスキルの補充を既に処理中(1回目の補充は進んでいる)
+            flash("「{}」の問題を補充中です（結果は問題プールの「前回の補充の結果」に表示されます。"
+                  "しばらくしてから画面を再読み込みして確認してください）。".format(skill.name), "info")
+        elif running_name:
+            flash("別のスキル（{}）の補充を処理中です。完了してから、もう一度実行してください。".format(running_name),
+                  "warning")
+        else:
+            flash("別の補充を処理中です。完了してから、もう一度実行してください。", "warning")
         return redirect(back)
     flash("「{}」の問題の補充を開始しました。数分かかることがあります。結果は問題プールの"
           "「前回の補充の結果」に表示されます（画面を再読み込みして確認してください）。".format(skill.name),
@@ -11471,7 +11713,8 @@ AI_ANALYSIS_FIELDS = (
      "「未着手」のタスクで、期限まで残りこの営業日数以内のものを「期限が近いのに未着手」にします（今日が期限なら残り0）。"),
     ("stale_days", "記載がないとみなす営業日数（N2）", STALE_DAYS_MIN, STALE_DAYS_MAX,
      "「進行中」のタスクで、担当者の最後の進捗記載（記載が無いとき・進行中にした後に記載が無いときは進行中にした日）から"
-     "この営業日数以上たったものを「進行中なのに記載がない」にします。"),
+     "この営業日数以上たったものを「進行中なのに記載がない」にします。"
+     "保留がこの営業日数以上続くタスクも、推奨アクション（保留の理由・再開の条件の確認）の候補にします。"),
 )
 # AI への送信の設定(画面では「AIへの送信」の欄に表示する。形は AI_ANALYSIS_FIELDS と同じ)
 AI_ANALYSIS_SEND_FIELDS = (
@@ -14137,10 +14380,15 @@ def parse_ref(value, prefix):
 # 同じ理由で続けて失敗する(接続できない・タイムアウトなど)ときは、ANALYSIS_MAX_FAILURES 回で残りを中止する。
 #
 # 保存する結果の形(JSON。ID のキーは文字列):
-#   version, generated_at(基準の日時), finished_at, period {kind, start, end, label}, settings, model,
+#   version, generated_at(基準の日時。表示用の分まで), generated_at_exact(基準の日時。秒・マイクロ秒まで。
+#   「分析の後に追加」の判定に使う。以前の版の結果には無い), finished_at, period {kind, start, end, label}, settings, model,
 #   status("ok" / "partial"), calls {total, ok, failed}, errors [未読込のほかの注意の文], masked_numbers(◯にした数),
-#   read {task_ids, comments}, unread {count, task_ids, comments, parts [{label, reason, tasks, comments}]}
-#   (comments は読んだ・読めなかったコメントの数。同じコメントを2回送っても1件),
+#   read {task_ids, comments, any_task_ids}, unread {count, task_ids, comments, judge_task_ids, progress_ids,
+#   parts [{label, reason, tasks, comments, calls}]}
+#   (comments は読んだ・読めなかったコメントの数。同じコメントを2回送っても1件。any_task_ids は1回でも読めた
+#   タスク、judge_task_ids は判定〔マネージャーのコメント・成果〕を頼む回が失敗したタスク、progress_ids は判定できなかった
+#   進捗記載のコメントID〔項目ごとの「未読込」の表示に使う。以前の版の結果には無い〕。parts の calls は中止したため
+#   行わなかった呼び出しをまとめた1件の回数〔ほかは1回〕),
 #   issues [{task_id, kind, text, source, fp}], manager_comments {コメントID: {request, needs_response, judgement,
 #   remaining, evidence, fp_request, fp}}, outcomes {タスクID: {vague, reason, suggestion, fp}}, progress_comments
 #   {コメントID: {reason, suggestion, rule, fp}}, persons {メンバーID: {notes, findings}}, other_notes,
@@ -14176,6 +14424,11 @@ class AnalysisRun:
         self.read_comment_ids = set()
         self.unread_tasks = set()
         self.unread_comment_ids = set()
+        # 項目ごとの「未読込」: 判定(マネージャーのコメント・成果)を頼む回(タスクの持ち主の回)が失敗したタスクと、
+        # 判定できなかった進捗記載(書いた人の回が失敗した)。複数担当のタスクで、ほかの担当者の回だけが失敗した
+        # ときに、読めた項目まで「未読込」にしないため
+        self.unjudged_tasks = set()
+        self.unjudged_progress_ids = set()
         self.task_numbers = {}
         # 「◯」にした数(画面に出す文の分だけ。保存する場所ごとに数え、最後に合計を masked_numbers にする。
         # 同じ項目の結果を後の応答で上書きしたときも、二重に数えない)
@@ -14186,6 +14439,9 @@ class AnalysisRun:
         self.result = {
             "version": AI_ANALYSIS_RESULT_VERSION,
             "generated_at": data["now"].strftime("%Y-%m-%d %H:%M"),
+            # 「分析の後に追加」の判定に使う基準の日時(分の切り捨てをしない。同じ分のうちに後から書かれた
+            # コメントなどを、AI が読んだものとして扱わないように)
+            "generated_at_exact": data["now"].isoformat(timespec="microseconds"),
             "finished_at": None,
             "period": {"kind": period["kind"], "start": period["start"].isoformat(),
                        "end": period["end"].isoformat(), "label": period["label"]},
@@ -14252,10 +14508,12 @@ class AnalysisRun:
         if self.aborted and reason == self.aborted:
             if self.skipped is None:
                 self.skipped = {"label": "", "reason": one_line(reason, 300), "tasks": 0, "comments": 0,
-                                "calls": 0, "task_ids": set(), "comment_ids": set()}
+                                "calls": 0, "no_task_calls": 0, "task_ids": set(), "comment_ids": set()}
                 self.result["unread"]["parts"].append(self.skipped)
             part = self.skipped
             part["calls"] += 1
+            if not task_ids:
+                part["no_task_calls"] += 1  # タスクの無い呼び出し(スキル・チームのまとめ・所見など)
             part["task_ids"].update(task_ids)
             part["comment_ids"].update(comment_ids)
             part["label"] = "中止したため行っていない呼び出し（{}回）".format(part["calls"])
@@ -14318,9 +14576,12 @@ class AnalysisRun:
         self.run_skills(skill_chunks)
         self.run_team()
 
+        skipped_no_task = 0
         if self.skipped is not None:
             # 途中で中止した: まとめた「未読込」から保存しない作業用の値を外し、中止したことを結果の先頭に書く
-            calls = self.skipped.pop("calls")
+            # (行わなかった呼び出しの回数 calls は残す。画面の「読み込めなかった呼び出し」の回数に使う)
+            calls = self.skipped["calls"]
+            skipped_no_task = self.skipped.pop("no_task_calls")
             self.skipped.pop("task_ids")
             self.skipped.pop("comment_ids")
             message = "AIの呼び出しが{}回続けて失敗したため、途中で中止しました（残り {} 回の呼び出しは行っていません）。".format(
@@ -14331,9 +14592,15 @@ class AnalysisRun:
         unread = self.result["unread"]
         unread["task_ids"] = sorted(self.unread_tasks)
         unread["comments"] = len(self.unread_comment_ids)
-        unread["count"] = len(self.unread_tasks) + sum(1 for p in unread["parts"] if not p["tasks"])
+        unread["judge_task_ids"] = sorted(self.unjudged_tasks)
+        unread["progress_ids"] = sorted(self.unjudged_progress_ids)
+        # 未読込の数 = 読めなかったタスクの件数 + タスクの無い呼び出し(スキル・チームのまとめなど)の回数
+        # (中止したため行わなかった呼び出しのうち、タスクの無いものも1回ずつ数える)
+        unread["count"] = (len(self.unread_tasks) + skipped_no_task
+                           + sum(1 for p in unread["parts"] if not p["tasks"] and p is not self.skipped))
         self.result["read"] = {"task_ids": sorted(self.read_tasks - self.unread_tasks),
-                               "comments": len(self.read_comment_ids - self.unread_comment_ids)}
+                               "comments": len(self.read_comment_ids - self.unread_comment_ids),
+                               "any_task_ids": sorted(self.read_tasks)}
         if self.result["errors"] or unread["count"]:
             self.result["status"] = "partial"
         self.progress(self.done, self.total, "保存しています")
@@ -14361,6 +14628,10 @@ class AnalysisRun:
             if parsed is None:
                 self.unread(label, error, chunk["keys"], chunk["comment_ids"])
                 failed.append((index, list(chunk["keys"])))
+                # この回で判定する(またはこの回が失敗すると判定できなくなる)項目: この人が持ち主のタスクと、
+                # この人の進捗記載(分けて送る記載の前の部分を含む)
+                self.unjudged_tasks.update(task_id for task_id in chunk["keys"] if owner.get(task_id) == group["key"])
+                self.unjudged_progress_ids.update(cid for cid in chunk["comment_ids"] if cid in group["progress_ids"])
                 continue
             self.read_tasks.update(chunk["keys"])
             self.read_comment_ids |= chunk["comment_ids"]
@@ -15009,18 +15280,43 @@ def comment_identity(t, comment_id):
     return {"tid": task_identity(t), "at": _at_text(c["at"]) if c else ""}
 
 
-def same_comment(stored, t, c, generated_at):
+def _analysis_base_time(stored):
+    """保存した結果の基準の日時: (日時 または None, 秒まで分かるか)。
+
+    generated_at_exact(秒・マイクロ秒まで)があればそれを、無い以前の版の結果は generated_at(分まで)を使う。
+    """
+    try:
+        return datetime.fromisoformat(str(stored.get("generated_at_exact") or "")), True
+    except ValueError:
+        pass
+    try:
+        return datetime.strptime(str(stored.get("generated_at") or ""), "%Y-%m-%d %H:%M"), False
+    except ValueError:
+        return None, False
+
+
+def _after_analysis(at, generated_at, exact):
+    """日時 at が、分析(基準の日時)の後か。基準が分までのとき(以前の版の結果)は at の秒を切り捨てて比べる。"""
+    if at is None or generated_at is None:
+        return False
+    try:
+        return (at if exact else at.replace(second=0, microsecond=0)) > generated_at
+    except TypeError:  # タイムゾーンの有無が違う日時(手で書き換えたファイルなど)
+        return False
+
+
+def same_comment(stored, t, c, generated_at, exact=False):
     """保存したコメントの判定 stored が、今のコメント c(タスク t)のものか。
 
     印(tid・at)が違う、または分析(generated_at)の後に書かれたコメントは別のコメント(IDの再利用)とみなす。
     印の無い古い結果は、分析の後に書かれたコメントでなければ同じとみなす。
+    exact は generated_at が秒まで分かるか(_analysis_base_time)。
     """
     if stored.get("tid") and stored["tid"] != task_identity(t):
         return False
     if stored.get("at") and stored["at"] != _at_text(c["at"]):
         return False
-    if generated_at is not None and c["at"] is not None and \
-            c["at"].replace(second=0, microsecond=0) > generated_at:
+    if _after_analysis(c["at"], generated_at, exact):
         return False
     return True
 
@@ -15136,20 +15432,34 @@ def recount_manager_comments(data):
 def apply_ai_result(data, stored):
     """保存した AI の結果 stored を集計結果 data に反映する(data を書き換える)。"""
     tasks = data["tasks"]
-    unread = _result_ids((stored.get("unread") or {}).get("task_ids"))
-    read = _result_ids((stored.get("read") or {}).get("task_ids"))
-    try:
-        generated_at = datetime.strptime(str(stored.get("generated_at") or ""), "%Y-%m-%d %H:%M")
-    except ValueError:
-        generated_at = None
+    stored_unread = stored.get("unread") if isinstance(stored.get("unread"), dict) else {}
+    stored_read = stored.get("read") if isinstance(stored.get("read"), dict) else {}
+    unread = _result_ids(stored_unread.get("task_ids"))
+    read = _result_ids(stored_read.get("task_ids"))
+    # 項目ごとの「未読込」(この版から保存する。以前の版の結果はタスクごとに判断する)
+    per_item = all(isinstance(v, list) for v in (stored_unread.get("judge_task_ids"),
+                                                 stored_unread.get("progress_ids"),
+                                                 stored_read.get("any_task_ids")))
+    unjudged_tasks = _result_ids(stored_unread.get("judge_task_ids"))
+    unjudged_progress = _result_ids(stored_unread.get("progress_ids"))
+    read_any = _result_ids(stored_read.get("any_task_ids"))
+    generated_at, exact = _analysis_base_time(stored)
 
-    def state(task_id, has_result, at=None):
-        """AI の判定が無い項目の状態。at はその項目の日時(コメントの日時・完了日時)。"""
+    def state(task_id, has_result, at=None, comment_id=None):
+        """AI の判定が無い項目の状態。at はその項目の日時(コメントの日時・完了日時)。
+
+        comment_id は進捗記載のコメントID(進捗記載は書いた人の回、マネージャーのコメント・成果はタスクの持ち主の
+        回が読めたかで決める。ほかの担当者の回だけが失敗した複数担当のタスクの項目は「判定なし」)。
+        """
         if has_result:
             return None
-        if at is not None and generated_at is not None and \
-                at.replace(second=0, microsecond=0) > generated_at:
+        if _after_analysis(at, generated_at, exact):
             return AI_STATE_NEW   # 分析(基準の日時)の後に書かれた・完了した項目
+        if per_item:
+            missed = comment_id in unjudged_progress if comment_id is not None else task_id in unjudged_tasks
+            if missed:
+                return AI_STATE_UNREAD
+            return AI_STATE_NONE if task_id in read_any else AI_STATE_NEW
         if task_id in unread:
             return AI_STATE_UNREAD
         if task_id in read:
@@ -15187,7 +15497,7 @@ def apply_ai_result(data, stored):
         if ai is not None:
             t = tasks[item["task_id"]]
             c = next((c for c in t["comments"] if c["id"] == item["comment_id"]), None)
-            if c is None or not same_comment(ai, t, c, generated_at):
+            if c is None or not same_comment(ai, t, c, generated_at, exact):
                 ai = None  # 同じIDの別のコメント(削除したタスクのコメントのIDが再利用された)
         changed = False
         if ai is not None:
@@ -15243,7 +15553,7 @@ def apply_ai_result(data, stored):
         cid = int(key)
         item = by_id.get(cid)
         found = comment_index.get(cid)
-        if found is not None and not same_comment(ai, found[0], found[1], generated_at):
+        if found is not None and not same_comment(ai, found[0], found[1], generated_at, exact):
             # 同じIDの別のコメント(削除したタスクのコメントのIDが再利用された): 判定・書き直し案は使わない
             continue
         if found is not None and _changed(ai.get("fp"), comment_fingerprint(found[0], cid)):
@@ -15268,7 +15578,7 @@ def apply_ai_result(data, stored):
     for item in ab["progress_rewrite"]:
         if item.get("ai") is None:
             item["ai_state"] = (AI_STATE_CHANGED if item["comment_id"] in changed_pc
-                                else state(item["task_id"], False, item.get("at")))
+                                else state(item["task_id"], False, item.get("at"), item["comment_id"]))
     ab["progress_rewrite"].sort(key=lambda i: i["at"] or datetime.min, reverse=True)
     persons = entries("persons")
     out_rows = {r["user_id"]: r for r in outputs["rows"]}
@@ -15382,6 +15692,8 @@ def _ai_result_summary(stored):
                      comments=_int_value(read.get("comments"))),
         "unread": dict(unread, count=_int_value(unread.get("count"))),
         "unread_parts": [u for u in parts if isinstance(u, dict)],
+        # 読み込めなかった呼び出しの回数(中止したため行わなかった呼び出しをまとめた1件は、その回数)
+        "unread_calls": sum(_int_value(u.get("calls")) or 1 for u in parts if isinstance(u, dict)),
         "actions_source": stored.get("actions_source"),
         # 続けて失敗したため途中で中止したときの説明(中止しなかった結果・以前の版の結果には無い)
         "aborted": str(stored.get("aborted") or ""),
@@ -15778,6 +16090,19 @@ def _mask_userinfo_in_value(value):
     return value
 
 
+def _has_secret_like_key(value, depth=0):
+    """値(辞書・一覧。入れ子も)の中に、名前が秘密の値らしい辞書のキー(bind_password・Authorization など。
+    _SECRET_LIKE)があるか。「その他」の表で、上の段の名前が普通でも値を表示しないために使う。"""
+    if depth > 20:
+        return True  # 深すぎる入れ子は確かめきれないので、表示しない側にする
+    if isinstance(value, dict):
+        return any((isinstance(k, str) and _SECRET_LIKE.search(k)) or _has_secret_like_key(v, depth + 1)
+                   for k, v in value.items())
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_has_secret_like_key(v, depth + 1) for v in value)
+    return False
+
+
 def masked_repr(value):
     """「その他」の表に出す値の文字列(repr)。URL の ID・パスワード(user:pass@)は伏せる。"""
     try:
@@ -15942,7 +16267,8 @@ def _parse_address(field, raw):
     if not value:
         return "", None
     if not _valid_address(value):
-        return None, "メールアドレスの形式が正しくありません（例: name@example.com）。"
+        return None, ("メールアドレスの形式が正しくありません（例: name@example.com、表示名 <name@example.com>。"
+                      "表示名に「\"」「,」「;」「<」「>」は使えません）。")
     return value, None
 
 
@@ -15951,8 +16277,9 @@ def _parse_addresses(field, raw):
     items = [item for item in items if item]
     bad = [item for item in items if not _valid_address(item)]
     if bad:
-        return None, "メールアドレスの形式が正しくありません: {}".format(
-            "、".join(item[:80] for item in bad[:3]))
+        return None, ("メールアドレスの形式が正しくありません: {}（1行に1件。「,」「;」は区切りとして扱うため、"
+                      "表示名に「,」「;」「\"」「<」「>」は使えません）".format(
+                          "、".join(item[:80] for item in bad[:3])))
     if len(items) > ADDRESS_MAX_COUNT:
         return None, "アドレスは{}件までにしてください。".format(ADDRESS_MAX_COUNT)
     return list(dict.fromkeys(items)), None
@@ -16027,6 +16354,21 @@ def _check_secret_destinations(form, current, values, errors):
             values.pop(field.key, None)
 
 
+def _shown_unchanged(field, raw, current_value):
+    """入力欄の値 raw が、画面に表示した今の値(_display)のままか(改行の書き方・前後の空白の違いは同じとみなす)。
+
+    ID・パスワードを含む URL は画面では伏せて表示する(値は変わる)ため、ここでは同じとみなさない
+    (その URL のままでは保存できない。URL_USERINFO_NOTICE)。
+    """
+    if field.type == TYPE_URL and url_has_userinfo(str(current_value or "")):
+        return False
+
+    def norm(text):
+        return str(text).replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    return norm(raw) == norm(_display(field, current_value))
+
+
 def parse_config_form(form, current):
     """フォームの入力を検証する。
 
@@ -16059,7 +16401,13 @@ def parse_config_form(form, current):
         else:
             raw = form.get(key, "")
             state[key] = raw
-            value, error = _PARSERS[field.type](field, raw)
+            if _shown_unchanged(field, raw, current.get(key)):
+                # 画面に表示した今の値のまま(変更していない欄)は、検証し直さずに今の値を使う
+                # (ファイルの値が、アプリでは正しく使えるのに入力欄の検証より緩い書き方〔「"表示名" <アドレス>」・
+                # 60.0 など〕のときに、触っていない欄のために、ほかの項目の保存まで断らないように)
+                value, error = current.get(key), None
+            else:
+                value, error = _PARSERS[field.type](field, raw)
         if error:
             errors[key] = error
         else:
@@ -16082,6 +16430,69 @@ def _apply_live(app, file_values):
             applied.append(field.key)
         app.config[field.key] = final[field.key]
     return applied
+
+
+# 画面から保存した instance/config.py の版(file_version)を、同じフォルダで動いているほかのサーバー(プロセス)に
+# 知らせるファイル(instance/ の中)。同じフォルダで2つ以上のサーバーを起動したとき・--debug の見張る側の
+# プロセス(自動送信)にも、画面で保存した値を反映するために使う(refresh_live_config)。
+# 直接の編集(この印の版と違う)は、今までどおりサーバーの再起動で反映する(書きかけのファイルを読まないように)
+CONFIG_SAVED_SIGNAL = "config_saved.json"
+# このプロセスの実行中の設定に反映済みの instance/config.py の版(app.extensions のキー)
+CONFIG_LIVE_VERSION_KEY = "config_live_version"
+
+
+def _config_signal_path(instance_path):
+    return os.path.join(instance_path, CONFIG_SAVED_SIGNAL)
+
+
+def announce_config_saved(app, version):
+    """画面からの保存・反映の後に呼ぶ(config_file_lock の中)。保存した版を記録し、ほかのプロセスに知らせる。"""
+    app.extensions[CONFIG_LIVE_VERSION_KEY] = version
+    try:
+        write_file_atomic(_config_signal_path(app.instance_path),
+                          json.dumps({"version": version}).encode("utf-8"), ".config_saved_")
+    except OSError as exc:
+        app.logger.warning("基本設定の保存をほかのサーバーに知らせるファイルを保存できませんでした: %s（%s）",
+                           CONFIG_SAVED_SIGNAL, exc.__class__.__name__)
+
+
+def refresh_live_config(app):
+    """ほかのプロセス(同じフォルダのほかのサーバー)が画面から保存した instance/config.py を、このプロセスの
+    実行中の設定に反映する(再起動が不要な項目だけ。_apply_live)。反映した項目の一覧を返す。
+
+    要求のたび(before_request)と、自動送信の前(_execute)に呼ぶ。ファイルの版が反映済みと同じなら何もしない
+    (ファイルの更新日時・サイズを見るだけ)。版が変わっていても、画面からの保存の印(CONFIG_SAVED_SIGNAL)の版と
+    違うとき(直接の編集・保存の途中)は反映しない(直接の編集は今までどおり再起動で反映)。ログには項目名だけを書く。
+    """
+    path = config_path(app.instance_path)
+    version = file_version(path)
+    if version == app.extensions.get(CONFIG_LIVE_VERSION_KEY):
+        return []
+    try:
+        with open(_config_signal_path(app.instance_path), "rb") as f:
+            signal = json.loads(f.read().decode("utf-8")).get("version")
+    except (OSError, ValueError, AttributeError):
+        return []
+    if signal != version:
+        return []
+    with config_file_lock:
+        try:
+            info = read_config(app.instance_path)
+        except ConfigFileError as exc:
+            app.logger.warning("ほかのサーバーで保存された基本設定を読み込めませんでした: %s", exc)
+            return []
+        if not info["exists"] or info["version"] != signal:
+            return []
+        app.extensions[CONFIG_LIVE_VERSION_KEY] = info["version"]
+        applied = _apply_live(app, info["values"])
+    if applied:
+        app.logger.info("ほかのサーバーで保存された基本設定を実行中の設定に反映しました: %s", ", ".join(applied))
+    return applied
+
+
+def refresh_live_config_before_request():
+    """before_request: ほかのサーバーで画面から保存された基本設定を、この要求の前に反映する(応答は返さない)。"""
+    refresh_live_config(current_app._get_current_object())
 
 
 def save_config_form(app, form, username):
@@ -16119,6 +16530,9 @@ def save_config_form(app, form, username):
             if applied:
                 app.logger.info("システム設定（基本設定）: ファイルの値を実行中の設定に反映しました: %s（%s）",
                                 ", ".join(applied), username)
+            # ほかのサーバーにも今のファイルの値を反映させる(このサーバーだけ再起動済みで、ほかのサーバーが
+            # 直接の編集の前の値のままのときも、ここで保存すれば揃う)
+            announce_config_saved(app, info["version"])
             return result(CONFIG_SAVE_UNCHANGED, applied=applied)
 
         try:
@@ -16133,8 +16547,9 @@ def save_config_form(app, form, username):
         if has_request_context():
             # 保存のボタンの二度押しの2回目を「ほかの人の保存」と案内しないように、印と内容を覚える
             remember_submitted(CONFIG_ONCE_KIND, "")
-        # 再起動が不要な項目は、実行中のアプリにもすぐ反映する
+        # 再起動が不要な項目は、実行中のアプリにもすぐ反映する(同じフォルダのほかのサーバーにも知らせる)
         applied = _apply_live(app, new_values)
+        announce_config_saved(app, file_version(info["path"]))
         changed = [f.key for f in FIELDS if f.key in changes]
         restart_changed = [key for key in changed if FIELD_MAP[key].restart_required]
         app.logger.info("システム設定（基本設定）を変更しました: %s（%s）",
@@ -16194,6 +16609,7 @@ def remove_unused_config(app, form, username):
         # 実行中の設定からも外す(どこからも使われていないが、ファイルと揃える)
         for key in removed:
             app.config.pop(key, None)
+        announce_config_saved(app, file_version(config_path(app.instance_path)))
         app.logger.info("システム設定（基本設定）: 未使用の設定を削除しました: %s（%s）",
                         ", ".join(removed), username)
         return CONFIG_SAVE_OK, removed, ""
@@ -16242,7 +16658,9 @@ def _other_rows(app, file_values):
     for key, source in keys:
         in_file = key in file_values
         value = file_values[key] if in_file else base.get(key)
-        hidden = bool(_SECRET_LIKE.search(key))
+        # 名前が秘密の値らしい項目と、値の辞書の中に秘密の値らしいキー(bind_password・Authorization など)が
+        # ある項目は、値を表示しない
+        hidden = bool(_SECRET_LIKE.search(key)) or _has_secret_like_key(value)
         # 値の中の URL の ID・パスワード(user:pass@。一覧・辞書の中も)は伏せる(基本設定の URL の欄と同じ)
         text = masked_repr(value) if (in_file or key in base) else ""
         rows.append({
@@ -16741,7 +17159,15 @@ _scheduler_thread = None
 
 
 def _execute(app, job, settings, now):
-    """ジョブを実行する(例外はここで捕まえて、そのジョブの前回の結果に書く)。"""
+    """ジョブを実行する(例外はここで捕まえて、そのジョブの前回の結果に書く)。
+
+    実行の前に、ほかのサーバー(画面を返すプロセス)で保存された基本設定(メール・AI・リンク)を反映する
+    (自動送信を行うプロセスが、保存した後も古い宛先・送信サーバーで送らないように)。
+    """
+    try:
+        refresh_live_config(app)
+    except Exception:
+        app.logger.exception("ほかのサーバーで保存された基本設定を反映できませんでした")
     try:
         ok = job.run(app, settings, now)
         app.logger.info("%sの自動送信: %s", job.label, "成功" if ok else "失敗")
@@ -17162,6 +17588,8 @@ def load_instance_config(app):
     ldap_client.py の固定のパスワードに任せることになるため)。
     """
     path = config_path(app.instance_path)
+    # 読み込んだ版(ほかのサーバーが画面から保存したときに反映するため。refresh_live_config)
+    app.extensions[CONFIG_LIVE_VERSION_KEY] = file_version(path)
     try:
         app.config.from_pyfile(CONFIG_FILENAME, silent=True)
     except Exception as exc:  # 設定ファイルの評価の例外すべて(書式の誤り・未定義の名前など)
@@ -17285,6 +17713,31 @@ def limit_streamed_body():
     return None
 
 
+# 開く(GET)だけで状態が変わる画面: スキルテストの出題(1問の時間の計り始め・時間切れの記録・次の問題・終了)と
+# ログアウト。ほかのサイト・別のポートの画面(画像のタグ・リンクなど)から開かれたときは、そのまま行わない
+# (エンドポイント → 案内の画面のボタンの表示)
+GUARDED_GET_ENDPOINTS = {
+    "skilltest.question": "問題を表示する",
+    "auth.logout": "ログアウトする",
+}
+CROSS_SITE_GET_HEADING = "このアプリの画面から開いてください"
+CROSS_SITE_GET_MESSAGE = ("ほかのサイト（別のアドレス・ポートの画面）から開かれたため、まだ何も行っていません。"
+                          "続ける場合は、下のボタンを押してください。")
+
+
+def _cross_site_get():
+    """GET・HEAD が、このアプリ以外の画面から送られたか(ブラウザが付ける Sec-Fetch-Site、無ければ Referer)。
+
+    アドレスを直接入力した・ブックマークから開いた(Sec-Fetch-Site: none)・このアプリの画面から開いた
+    (same-origin)ものは False。どちらのヘッダーも無い要求(テスト・コマンドなど)も False。
+    """
+    site = (request.headers.get("Sec-Fetch-Site") or "").strip().lower()
+    if site:
+        return site not in ("same-origin", "none")
+    referer = request.headers.get("Referer")
+    return bool(referer) and not _same_origin(referer)
+
+
 def check_same_origin():
     """before_request: 保存・変更など(GET・HEAD・OPTIONS 以外)は、このアプリの画面から送られたものだけを受け付ける。
 
@@ -17294,7 +17747,22 @@ def check_same_origin():
     (「Origin: null」も断る)。どちらも無い送信(ブラウザ以外。テスト・コマンドなど)は今までどおり受け付ける。
     """
     if request.method in ("GET", "HEAD", "OPTIONS"):
-        return None
+        # 開くだけで状態が変わる画面(GUARDED_GET_ENDPOINTS)は、このアプリ以外の画面から開かれたら行わない。
+        # 画像・iframe などとして読み込まれたものは 403、画面として開かれたものは確認のボタンの画面にする
+        # (ボタンはこのアプリの画面からのリンクなので、押すと通常どおり開く)
+        label = GUARDED_GET_ENDPOINTS.get(request.endpoint)
+        if label is None or request.method == "OPTIONS" or not _cross_site_get():
+            return None
+        dest = (request.headers.get("Sec-Fetch-Dest") or "").strip().lower()
+        if dest and dest != "document":
+            abort(403, description=CROSS_ORIGIN_MESSAGE)
+        target = request.script_root + request.path + (
+            "?" + request.query_string.decode("latin-1") if request.query_string else "")
+        response = make_response(render_template(
+            "errors/http_error.html", code=200, heading=CROSS_SITE_GET_HEADING, message=CROSS_SITE_GET_MESSAGE,
+            confirm_url=target, confirm_label=label))
+        response.headers["Cache-Control"] = "no-store"
+        return response
     source = request.headers.get("Origin") or request.headers.get("Referer")
     if not source or _same_origin(source):
         return None
@@ -17380,6 +17848,9 @@ def create_app():
             app.logger.exception("500 の画面を作れませんでした")
             return Response(_PLAIN_500, status=500, mimetype="text/html")
 
+    # ほかのサーバー(同じフォルダ)で画面から保存された基本設定を、この要求の前に反映する(admin のパスワードなど。
+    # ログインの確認〔load_user〕より前に行う)
+    app.before_request(refresh_live_config_before_request)
     # Content-Length の無い送信も本文の上限を確かめる。保存・変更などは、このアプリの画面から送られたものだけを
     # 受け付ける。ほかのサイトの画面の中に表示させない
     app.before_request(limit_streamed_body)

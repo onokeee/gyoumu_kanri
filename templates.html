@@ -184,6 +184,11 @@
 {% macro fmt_datetime(dt) -%}
   {%- if dt -%}{{ dt.strftime('%Y/%m/%d %H:%M') }}{%- else -%}―{%- endif -%}
 {%- endmacro %}
+
+{# 「AIで分析」で AI の接続先に送る内容(AI分析の画面とシステム設定の「AI分析」タブで同じ文を使う) #}
+{% macro ai_analysis_sent_items() -%}
+  タスクの名前・説明・コメント（書いた人の氏名・日時を含む）・状態の変更（日時を含む）・成果・メンバーの氏名・スキル・スキルテストの結果
+{%- endmacro %}
 {#=== errors/too_large.html ===#}
 {# 送信された入力が大きすぎる(413)ときの画面。limit_bytes は1回の送信の上限(バイト) #}
 {% extends "base.html" %}
@@ -202,7 +207,8 @@
 </div>
 {% endblock %}
 {#=== errors/http_error.html ===#}
-{# 権限が無い(403)・ページが見つからない(404)・画面として開けない URL(405)・内部エラー(500)の画面。heading / message は app.py の HTTP_ERROR_PAGES(または abort の説明) #}
+{# 権限が無い(403)・ページが見つからない(404)・画面として開けない URL(405)・内部エラー(500)の画面。heading / message は app.py の HTTP_ERROR_PAGES(または abort の説明)。
+   confirm_url があれば、続けるためのボタンも表示する(ほかのサイトから開かれたスキルテストの出題・ログアウト。check_same_origin) #}
 {% extends "base.html" %}
 {% block title %}{{ heading }} &middot; {{ app_name }}{% endblock %}
 
@@ -213,7 +219,8 @@
       <h1 class="h5"><i class="bi bi-exclamation-triangle"></i> {{ heading }}</h1>
       <p class="mb-0">{{ message }}</p>
     </div>
-    <a href="{{ url_for('main.dashboard') }}" class="btn btn-outline-secondary">トップへ</a>
+    {% if confirm_url %}<a href="{{ confirm_url }}" class="btn btn-primary me-2">{{ confirm_label }}</a>
+    {% endif %}<a href="{{ url_for('main.dashboard') }}" class="btn btn-outline-secondary">トップへ</a>
   </div>
 </div>
 {% endblock %}
@@ -602,6 +609,7 @@
             {% if task.id in editable_ids %}{# ステータスをその場で変更(作成者・担当者・マネージャーだけ。ほかは状態の表示だけ) #}
             <form method="post" action="{{ url_for('tasks.update_status', task_id=task.id) }}" class="d-inline">
               <input type="hidden" name="row" value="{{ task.row_key }}">
+              <input type="hidden" name="from" value="{{ task.status }}">{# 画面を開いたときの状態(ほかの操作の変更を上書きしない) #}
               <select name="status" class="form-select form-select-sm badge-select"
                       onchange="this.form.submit()" style="width:auto;display:inline-block;">
                 {% for s in status_choices %}
@@ -683,6 +691,7 @@
     {# クイックステータス変更 #}
     <form method="post" action="{{ url_for('tasks.update_status', task_id=task.id) }}" class="d-flex gap-2 me-auto">
       <input type="hidden" name="row" value="{{ task.row_key }}">
+      <input type="hidden" name="from" value="{{ task.status }}">{# 画面を開いたときの状態(ほかの操作の変更を上書きしない) #}
       <select name="status" class="form-select form-select-sm" style="width:auto;">
         {% for s in ['未着手','進行中','保留','完了'] %}
         <option value="{{ s }}" {% if task.status == s %}selected{% endif %}>{{ s }}</option>
@@ -1119,7 +1128,7 @@
 
       <dt class="col-sm-3 text-muted">所要時間(月換算)</dt>
       <dd class="col-sm-9">{{ routine.monthly_minutes_label }}
-        <span class="text-muted small">（4週/月・30日/月で換算)</span>
+        <span class="text-muted small">（4週/月・30日/月で換算）</span>
       </dd>
 
       <dt class="col-sm-3 text-muted">業務内容</dt>
@@ -1147,6 +1156,7 @@
     {% endif %}
   </div>
   {% endif %}
+</div>
 {% endblock %}
 {#=== routine/form.html ===#}
 {% extends "base.html" %}
@@ -1470,7 +1480,8 @@
     <h1 class="h3 mb-3">{{ '年休の編集' if editing else '年休の登録' }}</h1>
 
     <form method="post" class="card card-body shadow-sm">{% if editing %}
-      <input type="hidden" name="row" value="{{ leave.row_key }}">{% else %}
+      <input type="hidden" name="row" value="{{ leave.row_key }}">
+      <input type="hidden" name="version" value="{{ version }}">{# 画面を開いたときの内容の控え(ほかの操作で変わった項目を、この画面の古い内容で上書きしない) #}{% else %}
       {# 登録の二度押しで、1回目の案内(同日の人数・今週の連絡)が表示されなくならないようにする1回限りの印 #}
       <input type="hidden" name="once" value="{{ submit_token() }}">{% endif %}
       <div class="mb-3">
@@ -1566,7 +1577,7 @@
     <table class="table table-bordered table-hover align-middle mb-0 text-center" style="min-width:600px;">
       <thead class="table-light">
         <tr>
-          <th class="text-start" style="position:sticky; left:0;">スキル項目</th>
+          <th class="text-start sticky-col">スキル項目</th>
           {# 業務列(ヒトの左側) #}
           {% for o in operations %}
           <th class="small text-nowrap bg-body-secondary" title="{{ o.description or o.name }}">
@@ -1582,7 +1593,7 @@
         </tr>
         {% if show_op and operations|length %}
         <tr class="small text-muted">
-          <th class="text-start fw-normal" style="position:sticky; left:0;"></th>
+          <th class="text-start fw-normal sticky-col"></th>
           {% for o in operations %}<th class="fw-normal bg-body-secondary">業務</th>{% endfor %}
           {% for u in users %}<th class="fw-normal">ヒト</th>{% endfor %}
           {% if show_person %}<th></th>{% endif %}
@@ -1596,14 +1607,14 @@
         {# 全スキル表示時は区分ごとに小見出し行(到達尺度が区分で異なるため) #}
         <tr class="table-{{ grp.color }}">
           <td class="text-start fw-bold" colspan="{{ ncols }}">
-            {{ grp.label }}（0〜{{ grp.scale|length - 1 }}）
+            <span class="sticky-label">{{ grp.label }}（0〜{{ grp.scale|length - 1 }}）</span>
           </td>
         </tr>
         {% endif %}
         {% for s in grp.skills %}
         {% set ns.rows = ns.rows + 1 %}
         <tr>
-          <td class="text-start">
+          <td class="text-start sticky-col">
             {{ s.name }}
             {% if s.category %}<br><span class="text-muted small">{{ s.category }}</span>{% endif %}
           </td>
@@ -1991,15 +2002,20 @@
             <strong>スキルテストの問題は、AIがこの説明を読んで作ります</strong>（スキル名・カテゴリ・到達尺度とあわせて使います）。
             説明が具体的なほど、範囲外の問題や的外れな問題が減ります。次の見出しで書くことをおすすめします。
           </p>
-          <p class="mb-1{% if current_type == technical_type %} d-none{% endif %}" data-skilltest="off">
-            この区分はスキルテストの対象外です（問題を作るのはテクニカルスキルだけです）。
-            説明は到達度の判断基準として、次の見出しで書くことをおすすめします。
-          </p>
-          <ul class="mb-1 ps-3">
+          <ul class="mb-1 ps-3{% if current_type != technical_type %} d-none{% endif %}" data-skilltest="on">
             <li><strong>■{{ headings[0] }}</strong> … このスキルで扱う知識・作業の範囲（テストで問う範囲）</li>
             <li><strong>■{{ headings[1] }}</strong> … 例: 表計算ソフト（関数・ピボットテーブル）、Python 3 など</li>
             <li><strong>■{{ headings[2] }}</strong> … 各レベルで具体的にできること（下の到達尺度を、このスキルの言葉で書く）</li>
             <li><strong>■{{ headings[3] }}</strong> … テストで問わない内容（ほかのスキルで扱う内容・使わない機能など）</li>
+          </ul>
+          <p class="mb-1{% if current_type == technical_type %} d-none{% endif %}" data-skilltest="off">
+            この区分はスキルテストの対象外です（問題を作るのはテクニカルスキルだけです）。
+            説明は到達度の判断基準として、次の見出しで書くことをおすすめします。
+          </p>
+          <ul class="mb-1 ps-3{% if current_type == technical_type %} d-none{% endif %}" data-skilltest="off">
+            <li><strong>■{{ outline_off[0][0] }}</strong> … このスキルで扱う行動・考え方・知識の範囲（到達度を判断する範囲）</li>
+            <li><strong>■{{ outline_off[1][0] }}</strong> … 各レベルで具体的にできること・見てとれる行動（下の到達尺度を、このスキルの言葉で書く）</li>
+            <li><strong>■{{ outline_off[2][0] }}</strong> … このスキルでは評価しない内容（ほかのスキルで扱う内容など）</li>
           </ul>
           <p class="mb-1">
             「AIで下書き」を押すと、スキル名・区分・カテゴリと到達尺度（今の説明があればそれも参考）から、AIがこの形の下書きを説明の欄に入れます。
@@ -2011,10 +2027,10 @@
             {% if editing %}<a href="{{ url_for('skilltest.admin_pool_skill', skill_id=skill.id) }}">問題プール</a>{% else %}問題プール{% endif %}
             の「このスキルの問題をすべて停止」で止めてから、「AIで補充」で作り直してください。
           </p>
-          <div class="mb-0">
-            到達尺度（Lv1〜Lv4）:
+          <div class="mb-0">{# テクニカルスキルはテストで判定する Lv1〜Lv4、ほかの区分は到達尺度のすべてのレベル #}
             {% for t, levels in scales.items() %}
             <span class="skill-scale {% if t != current_type %}d-none{% endif %}" data-skill-type="{{ t }}">
+              到達尺度（Lv1〜Lv{{ levels[-1][0] if levels else 1 }}）:
               {% if not editing %}<span class="text-muted">{{ type_labels[t] }}</span>{% endif %}
               {% for lv, label in levels %}Lv{{ lv }}「{{ label }}」{% if not loop.last %}・{% endif %}{% endfor %}
             </span>
@@ -2070,7 +2086,7 @@
     <table class="table table-bordered table-hover align-middle text-center mb-0" style="min-width:600px;">
       <thead class="table-light">
         <tr>
-          <th class="text-start" style="position:sticky; left:0;">業務</th>
+          <th class="text-start sticky-col">業務</th>
           <th class="small text-nowrap">必要<br>スキル数</th>
           {% for u in users %}
           <th class="small text-nowrap"><a href="{{ url_for('skills.member', user_id=u.id) }}">{{ u.display_name }}</a></th>
@@ -2081,7 +2097,7 @@
       <tbody>
         {% for row in rows %}
         <tr>
-          <td class="text-start" title="{{ row.op.description or row.op.name }}">
+          <td class="text-start sticky-col" title="{{ row.op.description or row.op.name }}">
             {% if can_edit %}<a href="{{ url_for('skills.edit_operation', op_id=row.op.id) }}">{{ row.op.name }}</a>
             {% else %}{{ row.op.name }}{% endif %}
           </td>
@@ -2109,7 +2125,7 @@
       {% if rows %}
       <tfoot class="table-light fw-bold">
         <tr>
-          <td class="text-start">対応可能な業務数</td>
+          <td class="text-start sticky-col">対応可能な業務数</td>
           <td></td>
           {% for c in per_user_doable %}<td>{{ c }}</td>{% endfor %}
           <td></td>
@@ -2176,6 +2192,7 @@
 
     <hr>
     <form method="post" action="{{ url_for('skills.new_operation') }}" class="row g-2 align-items-end">
+      <input type="hidden" name="once" value="{{ submit_token() }}">{# 追加の二度押しで「既にあります」と案内しないための1回限りの印 #}
       <div class="col-md-4">
         <label class="form-label small mb-1">新しい業務を追加</label>
         <input type="text" name="name" class="form-control form-control-sm" placeholder="例: アプリ開発 / 要件定義" required>
@@ -2619,7 +2636,11 @@
   <li class="nav-item">
     <a class="nav-link {% if active == 'pool' %}active{% endif %}" href="{{ url_for('skilltest.admin_pool') }}"><i class="bi bi-collection"></i> 問題プール</a>
   </li>
-</ul>
+</ul>{% if settings_error %}
+<div class="alert alert-danger small">
+  <i class="bi bi-x-octagon"></i> <strong>スキルテストの設定ファイルを読み込めません。</strong> {{ settings_error }}<br>
+  この画面とメンバーの受験には既定値を使っています。ファイルを直すまで、問題の補充はできません（結果を記録できないため）。
+</div>{% endif %}
 {#=== skilltest/admin_attempts.html ===#}
 {% extends "base.html" %}
 {% from "_macros.html" import fmt_datetime %}
@@ -2890,7 +2911,7 @@
           {{ ai_status }}
         </div>
         <ul class="mb-0">
-          <li>「補充」を押すと、そのスキルの各レベルの有効な問題が {{ target }} 問になるまで、AIが問題を作ってプールに追加します（バックグラウンド。数分かかることがあります）。</li>
+          <li>「補充」を押すと、そのスキルの各レベルの有効な問題が {{ target }} 問になるまで、AIが問題を作ってプールに追加します（バックグラウンド。数分かかることがあります）。{% if below_need %}目標数が1回の受験に必要な問題数より少ないレベル（{% for lv in below_need %}Lv{{ lv }}{% if not loop.last %}・{% endif %}{% endfor %}）は、必要な問題数まで作ります。{% endif %}</li>
           <li>受験の開始時に、その人が見たことのない問題が足りなければ、その場でAIが作ります（受験者を1〜2分待たせるため、事前の補充をおすすめします）。</li>
           <li>AIが使えず問題が足りないときは、その人が以前に解いた問題を再出題します（受験履歴の「再出題」に件数を表示）。それでも足りなければ受験を開始できません。</li>
           <li>AIの作った問題は誤りを含むことがあります。問題の一覧で内容を確認し、不適切な問題は「無効にする」で出題から外してください。</li>
@@ -3021,12 +3042,16 @@
       <input type="hidden" name="back" value="skill">
       <button class="btn btn-sm btn-outline-primary" {% if running or not ai_enabled %}disabled{% endif %}
               {%- if running and not running_this %} title="別のスキル（{{ running_name }}）を補充中のため、終わってから補充できます"{% endif %}>
-        <i class="bi bi-plus-circle"></i> AIで補充（各レベル {{ target }}問まで）
+        <i class="bi bi-plus-circle"></i> AIで補充（各レベル {{ target }}問まで{% if below_need %}。1回の受験に必要な数より少ないレベルは必要な数まで{% endif %}）
       </button>
     </form>
     {% endif %}
   </div>
-</div>
+</div>{% if settings_error %}
+<div class="alert alert-danger small">
+  <i class="bi bi-x-octagon"></i> <strong>スキルテストの設定ファイルを読み込めません。</strong> {{ settings_error }}<br>
+  この画面とメンバーの受験には既定値を使っています。ファイルを直すまで、問題の補充はできません（結果を記録できないため）。
+</div>{% endif %}
 
 {# スキルの説明(AIが問題を作るときの出題範囲の基準)。説明なしの警告は受験の対象のスキルだけ #}
 {% if not (skill.description or '').strip() %}{% if testable %}
@@ -3224,7 +3249,7 @@
   {# メンバー別 平均到達度 #}
   <div class="col-lg-5">
     <div class="card shadow-sm h-100">
-      <div class="card-header bg-white fw-bold"><i class="bi bi-person-lines-fill"></i> メンバー別 平均到達度</div>
+      <div class="card-header bg-white fw-bold"><i class="bi bi-person-lines-fill"></i> メンバー別 平均到達度(テクニカル・未評価は0として平均)</div>{# 平均は有効なテクニカルスキルだけ(コンセプチュアル・ヒューマンは含めない。未評価のスキルは0として数える) #}
       <ul class="list-group list-group-flush">
         {% for m in member_avg %}
         <li class="list-group-item d-flex justify-content-between align-items-center small">
@@ -3760,7 +3785,7 @@
 {#=== manager/analysis.html ===#}
 {# マネージャーダッシュボード「AI分析（サマリーと推奨アクション）」。集計は app.py の 9 章(collect_analysis) #}
 {% extends "base.html" %}
-{% from '_macros.html' import fmt_date, fmt_datetime %}
+{% from '_macros.html' import fmt_date, fmt_datetime, ai_analysis_sent_items %}
 {% block title %}AI分析（サマリーと推奨アクション） &middot; {{ app_name }}{% endblock %}
 
 {# 推奨アクションの対象へのリンク #}
@@ -3859,7 +3884,7 @@
     <strong>期間内</strong>: {{ period.start.strftime('%Y/%m/%d') }}〜{{ period.end.strftime('%Y/%m/%d') }}（{{ period.days }}日・営業日 {{ period.business_days }}日）
     ／ <strong>現時点</strong>: {{ a.now.strftime('%Y/%m/%d %H:%M') }}
     ／ 対象メンバー {{ a.members|length }} 名
-    ／ しきい値: 期限が近い {{ settings.due_soon_days }}営業日以内・記載がない {{ settings.stale_days }}営業日以上
+    ／ しきい値: 期限が近い {{ settings.due_soon_days }}営業日以内・記載がない {{ settings.stale_days }}営業日以上（長い保留も同じ日数）
     （<a href="{{ url_for('system.settings', tab='analysis') }}">システム設定の「AI分析」タブで変更</a>）
   </div>
 </form>
@@ -3918,7 +3943,7 @@
     <div class="mb-1 text-muted">分析の後にコメント・状態・成果などが変わった項目は「{{ state_changed }}」とし、そのAIの判定・書き直し案は使っていません（もう一度「AIで分析」を実行すると判定し直します）。</div>
     {% if r.unread_parts or r.errors %}
     <details class="mb-1">
-      <summary class="{{ 'text-danger' if r.unread_parts else 'text-warning-emphasis' }}">読み込めなかった材料・注意（読み込めなかった呼び出し {{ r.unread_parts|length }} 回・注意 {{ r.errors|length }} 件）</summary>
+      <summary class="{{ 'text-danger' if r.unread_parts else 'text-warning-emphasis' }}">読み込めなかった材料・注意（読み込めなかった呼び出し {{ r.unread_calls }} 回・注意 {{ r.errors|length }} 件）</summary>
       <ul class="mb-0 ps-3">
         {% for u in r.unread_parts %}
         <li class="text-danger">未読込: {{ u.label }}{% if u.tasks %}（タスク {{ u.tasks }} 件・コメント {{ u.comments }} 件）{% endif %}: {{ u.reason }}</li>
@@ -3939,7 +3964,7 @@
     {% endif %}
     <div class="text-muted mt-2">
       <i class="bi bi-shield-exclamation"></i>
-      「AIで分析」を押すと、タスクの名前・説明・コメント（書いた人の氏名・日時を含む）・状態の変更・成果・メンバーの氏名・スキル・スキルテストの結果が、
+      「AIで分析」を押すと、{{ ai_analysis_sent_items() }}が、
       システム設定の「基本設定」で設定したAIの接続先に送られます{% if ai_configured %}（{{ ai_status }}）{% endif %}。
       結果は <code>instance/ai_analysis.json</code> に最新の1回分だけを保存します（DB には保存しません。メンバーは見られません）。
       {% if not ai_configured %}<br><span class="text-danger"><i class="bi bi-exclamation-circle"></i> AIが未設定のため、「AIで分析」は使えません（システム設定の「基本設定」タブで AI_API_KEY または AI_API_URL を設定すると使えます）。</span>{% endif %}
@@ -5846,7 +5871,7 @@
           <label class="form-label small mb-1 fw-bold" for="skilltest-pool_target_per_level">問題プールの目標数（レベルごと）</label>
           <input type="number" class="form-control form-control-sm" id="skilltest-pool_target_per_level" name="pool_target_per_level"
                  value="{{ st.settings.pool_target_per_level }}" min="{{ st.limits.POOL_TARGET_MIN }}" max="{{ st.limits.POOL_TARGET_MAX }}" step="1" required>
-          <div class="form-text">問題プールの「補充」で、各レベルの有効な問題がこの数になるまでAIで作成します。</div>
+          <div class="form-text">問題プールの「補充」で、各レベルの有効な問題がこの数になるまでAIで作成します（1回の受験に必要な問題数より少ないレベルは、必要な問題数まで作成します）。</div>
         </div>
       </div>
     </div>
@@ -5857,6 +5882,7 @@
 </form>
 {#=== system/_analysis_tab.html ===#}
 {# システム設定「AI分析」タブ(instance/ai_analysis_settings.json に保存)。入力チェックは app.py の parse_ai_analysis_form #}
+{% from '_macros.html' import ai_analysis_sent_items %}
 <p class="small text-muted d-flex flex-wrap justify-content-between gap-2">
   <span>
     マネージャーダッシュボードの「AI分析（サマリーと推奨アクション）」で使うしきい値と、AIへの送信の設定です。日数は土日・祝日を除いた営業日で数えます。
@@ -5896,7 +5922,7 @@
         {% endfor %}
       </div>
       <div class="form-text mt-2">
-        「AIで分析」を押すと、タスクの名前・説明・コメント（書いた人の氏名・日時を含む）・成果・メンバーの氏名・スキル・スキルテストの結果が、
+        「AIで分析」を押すと、{{ ai_analysis_sent_items() }}が、
         「基本設定」タブの AI の接続先に送られます。結果は <code>instance/ai_analysis.json</code> に最新の1回分だけを保存します。
       </div>
     </div>
@@ -5927,6 +5953,25 @@ main.container {
 
 .card {
   border: none;
+}
+
+/* 横にスクロールする表(スキルマップ・業務×ヒト)の1列目(スキル項目・業務の名前)を左に固定する。
+   見出し・本文・合計の行の1列目に sticky-col を付ける(見出しだけを固定すると、名前が見えなくなり、
+   固定した見出しがほかの見出しに重なるため)。背景は Bootstrap の表のセルの背景(不透明)をそのまま使う */
+.sticky-col {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+}
+thead .sticky-col,
+tfoot .sticky-col {
+  z-index: 2;
+}
+/* 区分の小見出しの行(表の幅いっぱいのセル)の文字も、横にスクロールしたときに左に残す */
+.sticky-label {
+  position: sticky;
+  left: 0.5rem;
+  display: inline-block;
 }
 
 /* 一覧のステータス選択(バッジ風) */
@@ -6290,7 +6335,8 @@ a:hover {
  * ・「AIで下書き」: 入力中のスキル名・区分・カテゴリ・説明をサーバー(/skills/items/description-draft)に
  *   送り、AIの下書きを説明の欄に入れる(保存はしない。保存は「更新」「追加」のボタンで行う)。
  *   説明の欄に入力がある場合は、置き換える前に確認する。
- * ・区分を選び直したときに、その区分の到達尺度(Lv1〜Lv4)を表示する。
+ * ・区分を選び直したときに、その区分の到達尺度(テクニカルは Lv1〜Lv4、ほかの区分はすべてのレベル)と、
+ *   スキルテストの案内・説明の見出しの案内(data-skilltest)を切り替える。
  *
  * JavaScript が無効でも、「AIで下書き」は入力を残したまま下書きを入れた画面を表示する(サーバー側)。
  */
@@ -6809,14 +6855,27 @@ a:hover {
       if (!button) return;
       var source = document.getElementById(button.getAttribute("data-copy-target"));
       if (!source) return;
-      var original = button.innerHTML;
+      // 元の表示は最初の1回だけ覚える(結果の表示中にもう一度押したときに、「コピーしました」などを元の表示として
+      // 覚えて、そのまま戻らなくならないように)。前の押下の「元に戻す」予約は取り消してから予約し直す
+      if (button.getAttribute("data-copy-label") === null) {
+        button.setAttribute("data-copy-label", button.innerHTML);
+      }
+      var original = button.getAttribute("data-copy-label");
+      if (button._copyTimer) {
+        window.clearTimeout(button._copyTimer);
+        button._copyTimer = null;
+      }
       copyText(source.textContent.trim()).then(function () {
         button.innerHTML = '<i class="bi bi-check2"></i> コピーしました';
       }).catch(function () {
         selectText(source);
         button.innerHTML = "コピーできませんでした（案を選んだので Ctrl+C でコピーしてください）";
       }).then(function () {
-        window.setTimeout(function () { button.innerHTML = original; }, 2000);
+        if (button._copyTimer) window.clearTimeout(button._copyTimer);
+        button._copyTimer = window.setTimeout(function () {
+          button._copyTimer = null;
+          button.innerHTML = original;
+        }, 2000);
       });
     });
   }
