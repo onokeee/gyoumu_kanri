@@ -6,7 +6,7 @@ Python のコードはすべてこの app.py にまとめている。ほかの�
   instance/        DB(app.db)・環境ごとの設定(config.py)・画面で編集する設定(*.json)。Git管理外。
                    config.py が無ければ初回の起動時に自動作成する
 
-起動(サーバー。定期メール〔週報・期限超過通知〕の自動送信もこのときだけ行う):
+起動(サーバー。定期メール〔週報・期限超過通知・定型業務リマインド〕の自動送信もこのときだけ行う):
   flask --app app run --port 8050                  このPCだけで使う
   flask --app app run --host 0.0.0.0 --port 8050   同じネットワーク(LAN)の他のPCからも使う
 開発・動作確認(自分のPCだけ。.py を変更すると自動で再起動する。自動送信は1つのプロセスだけが行う):
@@ -17,7 +17,7 @@ Python のコードはすべてこの app.py にまとめている。ほかの�
   flask --app app migrate [--check] [--db パス]     既存DBを最新のモデル定義に合わせる
 
 動作確認で差し替える関数(呼び出すたびにこのモジュールから探すので、app._now = ... で差し替えられる):
-  _now()            スキルテストの時刻・AI分析の基準の日時(2-2)
+  _now()            スキルテストの時刻・AI分析の基準の日時・定型業務のリマインドの今日(2-2)
   _call_chat_api()  AI(ChatGPT互換API)の呼び出し(4-1。独自APIへの移行もここだけを書き換える)
 
 目次(章は「# ####」、節は「# ====」の見出しで始まる):
@@ -87,19 +87,28 @@ Python のコードはすべてこの app.py にまとめている。ほかの�
       9-7. AI分析: 実行(バックグラウンド)と保存
       9-8. AI分析: 結果の反映(画面・チームのまとめの材料)
       9-9. AI分析: 画面
-  10. システム設定
-      10-1. システム設定: 基本設定の項目の定義
-      10-2. システム設定: 基本設定の入力チェック・保存
-      10-3. システム設定: 画面
-  11. 定期メールの自動送信スケジューラ
-      11-1. スケジューラ(週報・期限超過通知)
-      11-2. サーバーとして起動したときの開始(プロセス間で1つだけ)
-  12. アプリの組み立て
-      12-1. 画面テンプレート・静的ファイル(templates.html)
-      12-2. create_app(アプリの作成)
-  13. flask コマンド(seed / migrate)
-      13-1. seed: 初期データの投入
-      13-2. migrate: 既存DBを最新のモデル定義に合わせる
+  10. 定型業務のリマインド(メール)
+      10-1. リマインド: 予定の作り方(繰り返しのルール・休日の扱い)
+      10-2. リマインド: 予定(実施予定日)の作成と未完了の一覧
+      10-3. リマインド: メールアドレス(user_emails)
+      10-4. リマインド: 業務ごとの設定(定型業務の画面の「リマインド」)
+      10-5. リマインド: 送信の設定(instance/routine_reminder_settings.json)
+      10-6. リマインド: メールの作成(宛先ごとに1通)
+      10-7. リマインド: 作成・送信のとりまとめ
+      10-8. リマインド: 画面
+  11. システム設定
+      11-1. システム設定: 基本設定の項目の定義
+      11-2. システム設定: 基本設定の入力チェック・保存
+      11-3. システム設定: 画面
+  12. 定期メールの自動送信スケジューラ
+      12-1. スケジューラ(週報・期限超過通知・定型業務リマインド)
+      12-2. サーバーとして起動したときの開始(プロセス間で1つだけ)
+  13. アプリの組み立て
+      13-1. 画面テンプレート・静的ファイル(templates.html)
+      13-2. create_app(アプリの作成)
+  14. flask コマンド(seed / migrate)
+      14-1. seed: 初期データの投入
+      14-2. migrate: 既存DBを最新のモデル定義に合わせる
 """
 import ast
 import calendar
@@ -181,6 +190,7 @@ from jinja2 import BaseLoader, TemplateNotFound
 from openpyxl import Workbook
 from openpyxl.styles import Font
 from sqlalchemy import case, func, inspect, text
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import DatabaseError, IntegrityError
 from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.exc import StaleDataError
@@ -1152,7 +1162,7 @@ def flash(message, category="message"):
 
 
 def _now():
-    """現在の日時。スキルテストの時刻と AI分析の基準の日時はすべてここから取る。
+    """現在の日時。スキルテストの時刻・AI分析の基準の日時・定型業務のリマインドの今日(画面・テスト送信)はすべてここから取る。
 
     動作確認ではこの関数を差し替える(app._now = ...。呼び出すたびにこのモジュールから探す)。
     """
@@ -1473,7 +1483,8 @@ _EDITED_ELSEWHERE = ("画面を開いた後に、ほかの操作でこの内容�
 # 画面で編集する設定(JSONファイル)の読み書きの共通部品。
 #
 # 週報(instance/weekly_settings.json)・期限超過通知(instance/overdue_settings.json)・
-# スキルテスト(instance/skilltest_settings.json)・AI分析(instance/ai_analysis_settings.json)など、
+# スキルテスト(instance/skilltest_settings.json)・AI分析(instance/ai_analysis_settings.json)・
+# 定型業務リマインド(instance/routine_reminder_settings.json)など、
 # DBを使わずに instance/ のJSONファイルへ設定と「前回の結果」を保存する機能で使う。
 #
 #   read_json(path, label)      : 読む。無ければ None、あるのに読めなければ SettingsFileError
@@ -2110,6 +2121,25 @@ def load_user(user_id):
     return user
 
 
+class UserEmail(db.Model):
+    """ユーザーのメールアドレス(定型業務のリマインドの宛先。10 章)。1人1件。
+
+    users テーブルにはメールアドレスの列が無いため、別のテーブルに持つ(users テーブルは変えない)。
+    マネージャーはチーム管理のメンバーの表で全員の分を、各ユーザーはユーザーメニューの「メールアドレス」で
+    自分の分を変更する。空にすると行を削除する。メンバーを削除(物理削除)するときは一緒に削除する。
+    """
+    __tablename__ = "user_emails"
+
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), primary_key=True)
+    email = db.Column(db.String(254), nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+    user = db.relationship("User")
+
+    def __repr__(self):
+        return f"<UserEmail {self.user_id}>"
+
+
 # =============================================================================
 # 3-2. タスク
 # =============================================================================
@@ -2554,6 +2584,92 @@ class RoutineWork(db.Model):
 
     def __repr__(self):
         return f"<RoutineWork {self.id}: {self.name}>"
+
+
+# 定型業務のリマインド(10 章)。業務ごとの実施日のルールと宛先(routine_reminders。1業務に1行)と、
+# 実施予定日ごとの完了の記録(routine_occurrences。1業務・1日に1行)。どちらも新しいテーブル
+# (routine_works は変えない)。業務を削除するときは一緒に削除する(5-4)。
+#
+# routine_reminders の値の書き方(すべて文字列):
+#   rule_type      : daily(毎営業日) / weekly(毎週) / monthly(毎月) / dates(指定日)
+#   weekdays       : 曜日の番号(0=月〜6=日)を「,」でつないだもの(例: "0,3")
+#   month_days     : 日(1〜31)・月末(last)・最終営業日(last_bd)を「,」でつないだもの(例: "1,15,last_bd")
+#   dates          : 指定日(YYYY-MM-DD)を「,」でつないだもの
+#   holiday_rule   : 営業日でない日に当たったとき prev(前の営業日。既定) / next(次の営業日) / keep(そのまま)
+#   extra_user_ids : 追加の宛先のユーザーID を「,」でつないだもの
+#   extra_emails   : 追加の宛先のアドレス(1行に1件)
+class RoutineReminder(db.Model):
+    __tablename__ = "routine_reminders"
+
+    routine_id = db.Column(db.Integer, db.ForeignKey("routine_works.id"), primary_key=True)
+    enabled = db.Column(db.Boolean, nullable=False, default=False)
+    rule_type = db.Column(db.String(16), nullable=False, default="weekly")
+    weekdays = db.Column(db.String(32))
+    month_days = db.Column(db.String(200))
+    dates = db.Column(db.Text)
+    holiday_rule = db.Column(db.String(8), nullable=False, default="prev")
+    start_date = db.Column(db.Date, nullable=False)          # この日より前の実施予定日は作らない
+    extra_user_ids = db.Column(db.Text)
+    extra_emails = db.Column(db.Text)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+    updated_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+
+    routine = db.relationship("RoutineWork")
+    updated_by = db.relationship("User", foreign_keys=[updated_by_id])
+
+    @staticmethod
+    def _split(value):
+        return [part.strip() for part in str(value or "").replace("\n", ",").split(",") if part.strip()]
+
+    @property
+    def weekday_list(self):
+        """曜日の番号の一覧(0=月〜6=日。正しくない値は除く)。"""
+        return sorted({int(v) for v in self._split(self.weekdays) if v.isdigit() and int(v) <= 6})
+
+    @property
+    def month_day_list(self):
+        """日の一覧("1"〜"31"・"last"・"last_bd"。正しくない値は除く。並びは日の順)。"""
+        return sort_month_days(self._split(self.month_days))
+
+    @property
+    def date_list(self):
+        """指定日の一覧(date。正しくない値は除く。昇順)。"""
+        return sorted({d for d in (parse_date(v) for v in self._split(self.dates)) if d is not None})
+
+    @property
+    def extra_user_id_list(self):
+        return [n for n in dict.fromkeys(to_int(v) for v in self._split(self.extra_user_ids)) if n is not None]
+
+    @property
+    def extra_email_list(self):
+        return [line.strip() for line in str(self.extra_emails or "").splitlines() if line.strip()]
+
+    def __repr__(self):
+        return f"<RoutineReminder {self.routine_id}>"
+
+
+class RoutineOccurrence(db.Model):
+    """定型業務の実施予定日1回分(完了の入力が無いあいだ、リマインドのメールを送る)。"""
+    __tablename__ = "routine_occurrences"
+    __table_args__ = (db.UniqueConstraint("routine_id", "due_date", name="uq_routine_occurrence_day"),)
+
+    id = db.Column(db.Integer, primary_key=True)
+    routine_id = db.Column(db.Integer, db.ForeignKey("routine_works.id"), nullable=False, index=True)
+    due_date = db.Column(db.Date, nullable=False)
+    completed_at = db.Column(db.DateTime)
+    completed_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    created_at = db.Column(db.DateTime, default=datetime.now)
+
+    routine = db.relationship("RoutineWork")
+    completed_by = db.relationship("User", foreign_keys=[completed_by_id])
+
+    @property
+    def row_key(self):
+        """メールのリンク・画面のボタンでこの回を指す印(IDの再利用の取り違え防止。make_row_key)。"""
+        return make_row_key(self)
+
+    def __repr__(self):
+        return f"<RoutineOccurrence {self.id}: {self.routine_id} {self.due_date}>"
 
 
 # =============================================================================
@@ -4065,6 +4181,7 @@ def logout():
 #
 # 活動状況・ガントチャート・成果は、マネージャーダッシュボードと同じ集計処理を
 # 「自分の担当分だけ」に絞って再利用している(マネージャーダッシュボード(5-7)の _build_*)。
+# 「今日の定型業務」は、定型業務のリマインド(10 章)の未完了の回のうち自分が担当のもの。
 
 main_bp = Blueprint("main", __name__)
 
@@ -4103,6 +4220,8 @@ def main_dashboard():
 
     return render_template(
         "main/dashboard.html",
+        # 「今日の定型業務」(自分が担当で、リマインドが有効な業務の未完了の回。10-8)。無ければ None
+        routine_panel=dashboard_routine_panel(reminder_today(), me),
         my_tasks=my_tasks,
         my_overdue=my_overdue,
         status_counts=status_counts,
@@ -4749,6 +4868,9 @@ def delete_task(task_id):
 #   ・登録   : 全員。メンバーは担当者が自分に固定され、マネージャーは担当者を選べる
 #   ・編集   : マネージャーはすべて、メンバーは自分が担当のものだけ(_can_edit_routine)
 #   ・削除   : マネージャーのみ
+#
+# 業務ごとのリマインド(実施日のメールと完了の入力)は 10 章。登録・編集の画面の「リマインド」の欄の入力チェック・
+# 保存は 10-4、一覧・詳細の未完了の回と完了の入力・取り消しの画面は 10-8(この Blueprint に登録する)。
 
 routine_bp = Blueprint("routine", __name__, url_prefix="/routine")
 
@@ -4822,18 +4944,32 @@ def _forced_assignee_id():
     return None if current_user.is_manager else current_user.id
 
 
-def _render_routine_form(routine, users, form=None, version=None):
+def _render_routine_form(routine, users, form=None, version=None, rem_state=None, rem_version=None):
     """登録・編集の画面を表示する(form は入力エラーで再表示する入力)。
 
     version は編集画面の hidden(画面を開いたときの内容の控え)。入力エラーで再表示するときは送られた控えのまま
     (タスクの編集画面〔5-3〕と同じ)。
+    「リマインド」の欄(10-4)も同じ: rem_state は欄に出す値(省略時は送られた入力か今の設定)、rem_version は
+    リマインドの設定の控え(hidden の reminder_version)。
     """
+    rem = db.session.get(RoutineReminder, routine.id) if routine is not None else None
+    choices = reminder_extra_user_choices(rem)
     if routine is not None and version is None:
         version = form.get("version") if form is not None and form.get("version") is not None \
             else field_versions(_routine_values(routine), ROUTINE_VERSION_KEYS)
+    if routine is not None and rem_version is None:
+        rem_version = form.get("reminder_version") if form is not None and form.get("reminder_version") is not None \
+            else field_versions(reminder_values(rem), REMINDER_VERSION_KEYS)
+    if rem_state is None:
+        if form is not None and form.get(REMINDER_FORM_MARK) and hasattr(form, "getlist"):
+            rem_state = reminder_state_from_form(form)
+        else:
+            rem_state = reminder_state_from_values(reminder_values(rem), reminder_today(), choices)
     return render_template(
         "routine/form.html", routine=routine, users=users,
         freq_choices=FREQ_UNIT_CHOICES, manual_choices=MANUAL_CHOICES, form=form, version=version,
+        rem=rem_state, rem_version=rem_version, rem_choices=choices, rem_ctx=reminder_form_context(),
+        rem_mark=REMINDER_FORM_MARK,
     )
 
 
@@ -4949,6 +5085,8 @@ def list_routines():
         summary_rows=summary_rows,
         summary_totals=summary_totals,
         filters={"assignee": assignee_id, "manual": manual, "scope": scope, "q": keyword},
+        # 「未完了の定型業務」(リマインドが有効な業務の、完了の入力がまだの回。10-8)
+        pending_panel=routine_list_panel(reminder_today(), current_user),
     )
 
 
@@ -4969,14 +5107,25 @@ def new_routine():
     if request.method == "POST":
         rw = RoutineWork(creator_id=current_user.id)
         errors = _fill_from_form(rw, request.form, users, forced_assignee_id=_forced_assignee_id())
+        # 「リマインド」の欄(10-4。この欄の無い以前の画面からの登録では作らない)
+        today = reminder_today()
+        rem_values = None
+        if request.form.get(REMINDER_FORM_MARK):
+            rem_values, rem_errors = parse_reminder_form(request.form, reminder_extra_user_choices(None), today)
+            errors += rem_errors
         if errors:
             for e in errors:
                 flash(e, "danger")
             return _render_routine_form(None, users, request.form)
         db.session.add(rw)
         db.session.flush()
+        notes = []
+        if rem_values is not None:
+            _rem, notes = save_routine_reminder(rw.id, None, rem_values, current_user.id, today)
         commit_submitted("routine", url_for("routine.detail", routine_id=rw.id))
         flash("定型・定期業務を登録しました。", "success")
+        for note in notes:
+            flash(note, "info")
         return redirect(url_for("routine.detail", routine_id=rw.id))
 
     return _render_routine_form(None, users)
@@ -4989,7 +5138,12 @@ def new_routine():
 @login_required
 def routine_detail(routine_id):
     rw = get_or_404(RoutineWork, routine_id)
-    return render_template("routine/detail.html", routine=rw, can_edit=_can_edit_routine(rw))
+    # メールのリンク(?r=印)が、削除された業務(同じIDの別の新しい業務)を指していたら 404
+    if not row_key_matches(rw, request.args.get("r")):
+        abort(404)
+    return render_template("routine/detail.html", routine=rw, can_edit=_can_edit_routine(rw),
+                           # 「リマインド」(設定・宛先・未完了の回。10-8)。設定が無ければ None
+                           reminder=routine_reminder_panel(rw, reminder_today(), current_user))
 
 
 # --------------------------------------------------------------------------- #
@@ -5010,21 +5164,50 @@ def edit_routine(routine_id):
     users = _assignee_users(rw)
     if request.method == "POST":
         current = _routine_values(rw)
+        today = reminder_today()
+        rem = db.session.get(RoutineReminder, rw.id)
+        rem_current = reminder_values(rem)
+        rem_choices = reminder_extra_user_choices(rem)
         errors = _fill_from_form(rw, request.form, users, forced_assignee_id=_forced_assignee_id())
+        # 「リマインド」の欄(10-4)。この欄の無い以前の画面からの保存では、リマインドの設定を変えない
+        rem_values = None
+        if request.form.get(REMINDER_FORM_MARK):
+            rem_values, rem_errors = parse_reminder_form(request.form, rem_choices, today,
+                                                         current_start=rem_current["start_date"])
+            errors += rem_errors
         if errors:
+            db.session.rollback()  # フォームの値を反映した内容は保存しない
             for e in errors:
                 flash(e, "danger")
             return _render_routine_form(rw, users, request.form)
         # 画面を開いた後に、ほかの操作で変わった項目を古い画面の内容で上書きしない(タスクの編集と同じ)
         changed = fields_changed_since(request.form.get("version"), current, ROUTINE_VERSION_KEYS)
         conflicts = conflicting_fields(changed, current, _routine_values(rw))
-        if conflicts:
+        rem_changed, rem_conflicts = [], []
+        if rem_values is not None:
+            rem_changed = fields_changed_since(request.form.get("reminder_version"), rem_current,
+                                               REMINDER_VERSION_KEYS) or []
+            rem_conflicts = conflicting_fields(rem_changed, rem_current, rem_values)
+        if conflicts or rem_conflicts:
             db.session.rollback()  # フォームの値を反映した内容は保存しない(今の内容に戻す)
-            flash(_EDITED_ELSEWHERE.format("、".join(_ROUTINE_FIELD_LABELS[k] for k in conflicts)), "warning")
-            return _render_routine_form(rw, users, _routine_conflict_form(current, changed),
-                                        version=field_versions(current, ROUTINE_VERSION_KEYS))
+            labels = [_ROUTINE_FIELD_LABELS[k] for k in conflicts] + [REMINDER_FIELD_LABELS[k] for k in rem_conflicts]
+            flash(_EDITED_ELSEWHERE.format("、".join(labels)), "warning")
+            # リマインドの欄: ほかの操作で変わった項目は今の値、ほかの項目は送られた入力のまま
+            shown = dict(rem_values) if rem_values is not None else dict(rem_current)
+            for key in rem_changed:
+                shown[key] = rem_current[key]
+            return _render_routine_form(
+                rw, users, _routine_conflict_form(current, changed),
+                version=field_versions(current, ROUTINE_VERSION_KEYS),
+                rem_state=reminder_state_from_values(shown, today, rem_choices),
+                rem_version=field_versions(rem_current, REMINDER_VERSION_KEYS))
+        notes = []
+        if rem_values is not None:
+            _rem, notes = save_routine_reminder(rw.id, rem, rem_values, current_user.id, today)
         db.session.commit()
         flash("定型・定期業務を更新しました。", "success")
+        for note in notes:
+            flash(note, "info")
         return redirect(url_for("routine.detail", routine_id=routine_id))
 
     return _render_routine_form(rw, users)
@@ -5047,6 +5230,8 @@ def delete_routine(routine_id):
     if not current_user.is_manager:
         flash("定型・定期業務を削除できるのはマネージャーのみです。", "danger")
         return redirect(url_for("routine.detail", routine_id=routine_id))
+    # リマインドの設定と実施予定日の行も削除する(IDが次に登録した業務に再利用されても引き継がないように。10-2)
+    delete_routine_reminder_rows(rw.id)
     db.session.delete(rw)
     db.session.commit()
     flash("定型・定期業務を削除しました。", "info")
@@ -6923,12 +7108,13 @@ def gantt_full():
 # チーム(Department)の管理ルーティング。マネージャーのみ(各画面に manager_required〔2-5〕)。
 #
 # チームの追加・名称変更・有効/無効、および 人とチームの紐づけ(兼務対応)を管理する。
+# メンバーのメールアドレス(定型業務のリマインドの宛先)の保存は 10-8(save_member_email)。
 
 departments_bp = Blueprint("departments", __name__, url_prefix="/departments")
 
 
 def _member_has_history(user):
-    """メンバーが業務データ(タスク/進捗/年休/スキル/スキルテスト/定型業務)を持つか。
+    """メンバーが業務データ(タスク/進捗/年休/スキル/スキルテスト/定型業務・その完了の入力)を持つか。
 
     履歴があるユーザーは物理削除するとタスク等の参照が壊れるため、無効化に切り替える。
     """
@@ -6944,6 +7130,8 @@ def _member_has_history(user):
         (RoutineWork.assignee_id == user.id) | (RoutineWork.creator_id == user.id)
     ).first():
         return True
+    if RoutineOccurrence.query.filter_by(completed_by_id=user.id).first():
+        return True  # 定型業務の完了を入力した記録(10 章)
     return False
 
 
@@ -6959,10 +7147,15 @@ def manage():
     membership = {d.id: {u.id for u in d.users} for d in departments}
     # チームの名称・並び順のフォームの控え(古い画面からの保存で、ほかの操作の変更を上書きしない)
     versions = {d.id: field_versions(_department_values(d), DEPARTMENT_VERSION_KEYS) for d in departments}
+    # メンバーのメールアドレス(定型業務のリマインドの宛先。10-3)と、そのフォームの控え
+    emails = user_email_map(u.id for u in users)
     return render_template(
         "departments/manage.html",
         departments=departments,
         versions=versions,
+        emails=emails,
+        email_versions={u.id: email_version(emails.get(u.id, "")) for u in users},
+        email_max=EMAIL_MAX,
         users=users,
         local_usernames={u.username for u in users if is_local_account(u.username)},
         inactive_members=inactive_members,
@@ -7076,6 +7269,8 @@ def delete_member(user_id):
         flash(message, "info")
     else:
         user.departments = []
+        # メールアドレスと、定型業務のリマインドの追加の宛先からも除く(IDが次に追加した人に再利用されるため。10-3)
+        forget_user_for_reminders(user.id)
         db.session.delete(user)
         db.session.commit()
         flash(f"メンバー「{name}」を削除しました。", "success")
@@ -7371,7 +7566,28 @@ def _routine_sheets():
         "ID", "業務名", "担当者", "目的", "回数", "頻度単位", "1回所要(分)",
         "月間所要(分)", "業務内容", "手順書", "登録者", "登録日時", "更新日時",
     ]
-    return [("定型・定期業務", headers, rows)]
+    # 定型業務のリマインド(10 章)の業務ごとの設定と、実施予定日ごとの完了の記録
+    names = {u.id: u.display_name for u in User.query.all()}
+    reminders = (RoutineReminder.query.options(selectinload(RoutineReminder.routine))
+                 .order_by(RoutineReminder.routine_id).all())
+    rem_rows = [[
+        rem.routine_id, rem.routine.name if rem.routine else "", rem.enabled,
+        describe_reminder_rule(reminder_rule_of(rem)), rem.start_date,
+        "、".join(names.get(i, "") for i in rem.extra_user_id_list), "\n".join(rem.extra_email_list),
+        names.get(rem.updated_by_id, ""), rem.updated_at,
+    ] for rem in reminders]
+    occurrences = (RoutineOccurrence.query.options(selectinload(RoutineOccurrence.routine))
+                   .order_by(RoutineOccurrence.routine_id, RoutineOccurrence.due_date).all())
+    occ_rows = [[
+        o.routine_id, o.routine.name if o.routine else "", o.due_date, o.completed_at is not None,
+        o.completed_at, names.get(o.completed_by_id, ""),
+    ] for o in occurrences]
+    return [
+        ("定型・定期業務", headers, rows),
+        ("リマインドの設定", ["業務ID", "業務名", "リマインドする", "予定の作り方", "開始日",
+                       "追加の宛先（メンバー）", "追加の宛先（アドレス）", "更新者", "更新日時"], rem_rows),
+        ("実施予定日と完了", ["業務ID", "業務名", "実施予定日", "完了", "完了の入力日時", "完了を入力した人"], occ_rows),
+    ]
 
 
 def _skills_sheets():
@@ -7495,13 +7711,14 @@ def _teams_sheets():
     ] for d in depts]
 
     users = User.query.order_by(User.display_name).all()
+    emails = user_email_map()
     u_rows = [[
-        u.username, u.display_name, u.role_label, u.is_active, u.department_names,
+        u.username, u.display_name, u.role_label, u.is_active, u.department_names, emails.get(u.id, ""),
     ] for u in users]
 
     return [
         ("チーム", ["ID", "チーム名", "有効", "並び順", "所属メンバー"], d_rows),
-        ("メンバー", ["ログインID", "氏名", "役割", "有効", "所属チーム"], u_rows),
+        ("メンバー", ["ログインID", "氏名", "役割", "有効", "所属チーム", "メールアドレス"], u_rows),
     ]
 
 
@@ -7563,7 +7780,7 @@ def all_xlsx():
 #   6-8 画面           週報の画面と「今すぐ作成」(Blueprint: weekly_bp, /weekly)
 #
 # アプリ共通の部品を使う: AI(4-1 ai_chat)・メール送信(4-2 send_mail)・
-# 自動送信のスケジューラ(11。「flask --app app run」で起動したときだけ動く)。
+# 自動送信のスケジューラ(12。「flask --app app run」で起動したときだけ動く)。
 # 接続設定(メール・AI)はすべて instance/config.py から読み込む(システム設定の「基本設定」タブで変更)。
 
 
@@ -9142,7 +9359,7 @@ def weekly_run_now():
 #   7-6 画面           画面・プレビュー・今すぐ送信(Blueprint: overdue_bp, /overdue)
 #
 # アプリ共通の部品を使う: メール送信(4-2 send_mail)・営業日カレンダー(2-4)・
-# 自動送信のスケジューラ(11。「flask --app app run」で起動したときだけ動く)。
+# 自動送信のスケジューラ(12。「flask --app app run」で起動したときだけ動く)。
 # メールの送信サーバー・宛先・リンクの基準URL(APP_BASE_URL)は instance/config.py から読み込む
 # (システム設定の「基本設定」タブで変更)。
 
@@ -15927,27 +16144,1434 @@ def analysis_status():
 
 
 # #############################################################################
-# 10. システム設定
+# 10. 定型業務のリマインド(メール)
+# #############################################################################
+# 定型・定期業務(3-4・5-4)の実施日に担当者へメールで知らせ、その回の完了の入力があるまで1日2回
+# (設定の時刻1・時刻2)リマインドのメールを送る。業務ごとに実施日のルールと追加の宛先を設定する。
+#
+#   10-1 予定の作り方    繰り返しのルール(毎営業日・毎週・毎月・指定日)と休日の扱いから実施予定日を計算する
+#                        (純粋関数)
+#   10-2 予定と完了      実施予定日の行(routine_occurrences)の作成・未完了の一覧・完了の入力ができる人
+#   10-3 メールアドレス  ユーザーのメールアドレス(user_emails)の確認・読み書き
+#   10-4 業務ごとの設定  定型業務の登録・編集の画面の「リマインド」の入力チェック・保存(routine_reminders)
+#   10-5 送信の設定      自動送信の設定と前回の結果(instance/routine_reminder_settings.json)
+#   10-6 メールの作成    宛先ごとに1通にまとめたメール(件名・テキスト版・HTML版)の作成
+#   10-7 とりまとめ      作成〜送信(自動送信・テスト送信)と前回の結果の記録
+#   10-8 画面            完了の入力・取り消し、メールアドレスの画面(自分の分・チーム管理のメンバーの分)
+#
+# 実施予定日の行は、画面を開いたとき・送信のときに「開始日〜今日」の分をまとめて作る(未来の日は作らない)。
+# 未完了 = 実施予定日が今日以前で、完了の入力が無いもの(リマインドが有効な業務だけ)。完了を入力すると、
+# その回のリマインドはすぐに止まる(送信のたびに未完了の回を読み直すため)。
+# ルール・開始日を変えても、既に作った回(未完了・完了とも)はそのまま残る(変えるのはまだ作っていない回だけ)。
+#
+# アプリ共通の部品を使う: メール送信(4-2 send_mail。差出人は MAIL_FROM)・営業日カレンダー(2-4)・
+# 画面で編集する設定(2-3 JsonSettings)・自動送信のスケジューラ(12。「flask --app app run」のときだけ)。
+# リンクの基準URL(APP_BASE_URL)は期限超過通知と同じ(7-4 の link_base)。
+# 基準の日時(今日・今)は _now()(2-2。動作確認で差し替える)から取る。自動送信はスケジューラの時刻を使う。
+
+
+# =============================================================================
+# 10-1. リマインド: 予定の作り方(繰り返しのルール・休日の扱い)
+# =============================================================================
+# 繰り返しのルールから実施予定日を計算する(DBにもFlaskにも依存しない純粋関数)。
+#
+#   daily   毎営業日(土日・祝日以外の毎日。休日の扱いは使わない)
+#   weekly  毎週、選んだ曜日(0=月〜6=日。複数可)
+#   monthly 毎月、選んだ日(1〜31。その月に無い日〔2月30日など〕は月末)・月末(last)・最終営業日(last_bd)。複数可
+#   dates   指定した日付(複数可)
+# 計算した日が営業日でないときの扱い(holiday_rule。毎週・毎月・指定日。最終営業日は営業日なので使わない):
+#   prev 前の営業日にする(既定) / next 次の営業日にする / keep その日のまま
+# ずらした結果、同じ日になったものは1つにする。
+
+RULE_DAILY = "daily"
+RULE_WEEKLY = "weekly"
+RULE_MONTHLY = "monthly"
+RULE_DATES = "dates"
+RULE_TYPES = (RULE_DAILY, RULE_WEEKLY, RULE_MONTHLY, RULE_DATES)
+RULE_LABELS = {
+    RULE_DAILY: "毎営業日",
+    RULE_WEEKLY: "毎週（曜日）",
+    RULE_MONTHLY: "毎月（日）",
+    RULE_DATES: "指定日",
+}
+
+HOLIDAY_PREV = "prev"
+HOLIDAY_NEXT = "next"
+HOLIDAY_KEEP = "keep"
+HOLIDAY_RULES = (HOLIDAY_PREV, HOLIDAY_NEXT, HOLIDAY_KEEP)
+HOLIDAY_RULE_LABELS = {
+    HOLIDAY_PREV: "前の営業日にする",
+    HOLIDAY_NEXT: "次の営業日にする",
+    HOLIDAY_KEEP: "その日のまま",
+}
+
+MONTH_END = "last"
+MONTH_LAST_BUSINESS_DAY = "last_bd"
+MONTH_DAY_CHOICES = tuple(str(d) for d in range(1, 32)) + (MONTH_END, MONTH_LAST_BUSINESS_DAY)
+MONTH_DAY_NAMES = {MONTH_END: "月末", MONTH_LAST_BUSINESS_DAY: "最終営業日"}
+
+# 開始日・指定日として受け付ける範囲(営業日カレンダー〔2-4〕の春分・秋分の計算式が使える範囲)
+REMINDER_DATE_MIN = date(2000, 1, 1)
+REMINDER_DATE_MAX = date(2099, 12, 31)
+# 指定日の最大件数
+REMINDER_DATES_MAX = 400
+# 開始日を今日より前にできる日数(開始日〜今日の回をまとめて作るため、遠い過去は受け付けない)
+REMINDER_PAST_DAYS_MAX = 31
+
+# 実施予定日のルール(業務ごとの設定 RoutineReminder・画面の入力の両方から作る)
+#   weekdays: 曜日の番号の一覧 / month_days: "1"〜"31"・"last"・"last_bd" の一覧 / dates: date の一覧
+ReminderRule = namedtuple("ReminderRule", "rule_type weekdays month_days dates holiday_rule")
+
+
+def sort_month_days(values):
+    """日の一覧を、選択肢の順(1〜31・月末・最終営業日)に並べる(重複・選択肢に無い値は除く)。"""
+    wanted = {str(v) for v in values}
+    return [v for v in MONTH_DAY_CHOICES if v in wanted]
+
+
+def month_day_label(value):
+    """日の表示(「15日」「月末」「最終営業日」)。"""
+    return MONTH_DAY_NAMES.get(value) or "{}日".format(value)
+
+
+def shift_to_business_day(d, holiday_rule):
+    """d が営業日でなければ、holiday_rule に従って前・次の営業日にする(keep・営業日はそのまま)。"""
+    if holiday_rule == HOLIDAY_KEEP or is_business_day(d):
+        return d
+    step = -_ONE_DAY if holiday_rule == HOLIDAY_PREV else _ONE_DAY
+    candidate = d
+    for _ in range(_SEARCH_DAYS):
+        candidate += step
+        if is_business_day(candidate):
+            return candidate
+    return d
+
+
+def last_business_day_of_month(year, month):
+    """その月の最終営業日。"""
+    d = date(year, month, calendar.monthrange(year, month)[1])
+    for _ in range(_SEARCH_DAYS):
+        if is_business_day(d):
+            return d
+        d -= _ONE_DAY
+    return d
+
+
+def _raw_rule_dates(rule, first, last):
+    """ずらす前の日付と、営業日でないときにずらすか [(日付, ずらすか)](first〜last の月・日)。"""
+    if rule.rule_type == RULE_WEEKLY:
+        wanted = set(rule.weekdays)
+        if not wanted:
+            return
+        d = first
+        while d <= last:
+            if d.weekday() in wanted:
+                yield d, True
+            d += _ONE_DAY
+    elif rule.rule_type == RULE_MONTHLY:
+        year, month = first.year, first.month
+        while (year, month) <= (last.year, last.month):
+            end = calendar.monthrange(year, month)[1]
+            for value in rule.month_days:
+                if value == MONTH_LAST_BUSINESS_DAY:
+                    yield last_business_day_of_month(year, month), False
+                elif value == MONTH_END:
+                    yield date(year, month, end), True
+                elif str(value).isdigit() and 1 <= int(value) <= 31:
+                    yield date(year, month, min(int(value), end)), True
+            year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+    elif rule.rule_type == RULE_DATES:
+        for d in rule.dates:
+            if first <= d <= last:
+                yield d, True
+
+
+def reminder_due_dates(rule, first, last):
+    """ルール rule の実施予定日のうち、first〜last のもの(昇順・重複なし)。
+
+    営業日でない日をずらす(最大 _SEARCH_DAYS 日)ため、ずらす前の日付は前後に _SEARCH_DAYS 日広く調べる
+    (例: 月曜日が初日で、前の土曜日が「次の営業日」で月曜日になるもの)。
+    """
+    if first > last:
+        return []
+    if rule.rule_type == RULE_DAILY:
+        result = []
+        d = first
+        while d <= last:
+            if is_business_day(d):
+                result.append(d)
+            d += _ONE_DAY
+        return result
+    margin = timedelta(days=_SEARCH_DAYS)
+    found = set()
+    for raw, shiftable in _raw_rule_dates(rule, first - margin, last + margin):
+        due = shift_to_business_day(raw, rule.holiday_rule) if shiftable else raw
+        if first <= due <= last:
+            found.add(due)
+    return sorted(found)
+
+
+def describe_reminder_rule(rule):
+    """ルールの説明(例: 「毎週 月・木曜日（営業日でない日は前の営業日）」)。"""
+    if rule.rule_type == RULE_DAILY:
+        return "毎営業日（土日・祝日を除く毎日）"
+    if rule.rule_type == RULE_WEEKLY:
+        days = "・".join(WEEKDAY_LABELS[w] for w in sorted(rule.weekdays))
+        text = "毎週 {}曜日".format(days) if days else "毎週（曜日が未選択）"
+    elif rule.rule_type == RULE_MONTHLY:
+        days = "・".join(month_day_label(v) for v in sort_month_days(rule.month_days))
+        text = "毎月 {}".format(days) if days else "毎月（日が未選択）"
+        if list(rule.month_days) == [MONTH_LAST_BUSINESS_DAY]:
+            return text  # 最終営業日だけなら休日の扱いは使わない
+    else:
+        shown = [d.strftime("%Y/%m/%d") for d in rule.dates[:5]]
+        text = "指定日 {}".format("・".join(shown)) if shown else "指定日（日付が未入力）"
+        if len(rule.dates) > 5:
+            text += " ほか{}日".format(len(rule.dates) - 5)
+    return "{}（営業日でない日は{}）".format(text, HOLIDAY_RULE_LABELS.get(rule.holiday_rule, ""))
+
+
+def elapsed_label(due, today):
+    """実施予定日からの経過(今日なら「本日」、過ぎていれば「N営業日経過」)。
+
+    今日が土日祝のとき(営業日以外にも送る設定・テスト送信・画面)は、期限超過通知の経過日数(7-4 の
+    _age_label)と同じく、直前の営業日とその後の土日祝を「1営業日経過」として数える。
+    """
+    if due >= today:
+        return "本日"
+    days = business_days_ago(due, today) + (0 if is_business_day(today) else 1)
+    return "{}営業日経過".format(days)
+
+
+# =============================================================================
+# 10-2. リマインド: 予定(実施予定日)の作成と未完了の一覧
+# =============================================================================
+# 実施予定日の行(routine_occurrences)の作成と、未完了の回の一覧・完了の入力ができる人の判定。
+#
+#   ensure_routine_occurrences(today)  有効なリマインドの「開始日〜today」の行を作る(既にある日は作らない)。
+#                                      画面(定型業務の一覧・詳細・個人ダッシュボード・システム設定)と送信の前に呼ぶ
+#   pending_occurrences(today, ...)    未完了の回(実施予定日が today 以前で、完了の入力が無いもの)
+#   occurrence_rows(occs, today, user) 画面に出す値(経過・完了を入力できるか・印)
+#
+# 行の作成は同じ日の行を2つ作らない(一意制約。同時に作っても INSERT OR IGNORE で1つだけ)。
+# 作成済みの範囲はプロセスの中で覚え(_occurrence_progress)、次からは前回の後の日だけを調べる
+# (ルール・開始日・業務ごとの設定を変えたときは最初から調べ直す)。
+
+_occurrence_progress = {}
+_occurrence_progress_lock = threading.Lock()
+# 1回の INSERT で作る行数(SQLite の変数の上限を超えないように)
+_OCCURRENCE_INSERT_CHUNK = 200
+
+
+def reminder_today():
+    """リマインドの基準の今日(_now() の日付。動作確認では app._now を差し替える)。"""
+    return _now().date()
+
+
+def reminder_rule_of(rem):
+    """業務ごとの設定(RoutineReminder)の実施予定日のルール。"""
+    return ReminderRule(rem.rule_type, rem.weekday_list, rem.month_day_list, rem.date_list, rem.holiday_rule)
+
+
+def _occurrence_signature(rem):
+    return (rem.rule_type, rem.weekdays or "", rem.month_days or "", rem.dates or "", rem.holiday_rule,
+            rem.start_date, rem.updated_at)
+
+
+def forget_occurrence_progress(routine_id):
+    """作成済みの範囲の記録を消す(業務を削除したとき。同じIDの新しい業務を最初から調べるように)。"""
+    with _occurrence_progress_lock:
+        for key in [k for k in _occurrence_progress if k[1] == routine_id]:
+            del _occurrence_progress[key]
+
+
+def ensure_routine_occurrences(today, routine_id=None, commit=True):
+    """有効なリマインドの、開始日〜today の実施予定日の行を作る(未来の日・開始日より前の日は作らない)。
+
+    routine_id を指定するとその業務だけ。戻り値: 作った行の数。commit=False なら保存は呼び出し側で行う。
+    """
+    query = RoutineReminder.query.filter(RoutineReminder.enabled.is_(True))
+    if routine_id is not None:
+        query = query.filter(RoutineReminder.routine_id == routine_id)
+    reminders = query.all()
+    if not reminders:
+        return 0
+    db_key = str(db.engine.url)
+    rows, done = [], []
+    for rem in reminders:
+        if rem.start_date is None or rem.start_date > today:
+            continue
+        signature = _occurrence_signature(rem)
+        key = (db_key, rem.routine_id)
+        with _occurrence_progress_lock:
+            progress = _occurrence_progress.get(key)
+        first = rem.start_date
+        if progress is not None and progress[0] == signature:
+            if progress[1] >= today:
+                continue
+            first = max(first, progress[1] + _ONE_DAY)
+        dates = reminder_due_dates(reminder_rule_of(rem), first, today)
+        if dates:
+            have = {d for (d,) in db.session.query(RoutineOccurrence.due_date).filter(
+                RoutineOccurrence.routine_id == rem.routine_id,
+                RoutineOccurrence.due_date >= dates[0], RoutineOccurrence.due_date <= dates[-1])}
+            created = datetime.now()
+            rows.extend({"routine_id": rem.routine_id, "due_date": d, "created_at": created}
+                        for d in dates if d not in have)
+        done.append((key, signature))
+    for i in range(0, len(rows), _OCCURRENCE_INSERT_CHUNK):
+        db.session.execute(sqlite_insert(RoutineOccurrence.__table__)
+                           .values(rows[i:i + _OCCURRENCE_INSERT_CHUNK]).on_conflict_do_nothing())
+    if rows:
+        # 調べてから作るまでの間に、ほかの操作で業務(とリマインドの設定)が削除されていたら、その業務の行は残さない
+        # (削除した業務のIDが次に登録した業務に再利用されたとき、古い回が付かないように。作った後は書き込みの
+        # ロックを持っているため、この確認の後に削除が入ることはない)
+        touched = {row["routine_id"] for row in rows}
+        alive = {rid for (rid,) in db.session.query(RoutineReminder.routine_id).filter(
+            RoutineReminder.routine_id.in_(touched))}
+        gone = touched - alive
+        if gone:
+            RoutineOccurrence.query.filter(RoutineOccurrence.routine_id.in_(gone)).delete(synchronize_session=False)
+            done = [(key, signature) for key, signature in done if key[1] not in gone]
+    if commit and rows:
+        db.session.commit()
+    if commit or not rows:
+        with _occurrence_progress_lock:
+            for key, signature in done:
+                _occurrence_progress[key] = (signature, today)
+    return len(rows)
+
+
+def refresh_occurrences_for_page(today):
+    """画面を開いたときの行の作成(失敗しても画面は表示する。作れなかった回は次の表示・送信で作る)。"""
+    try:
+        ensure_routine_occurrences(today)
+    except Exception:
+        db.session.rollback()
+        current_app.logger.warning("定型業務の実施予定日を作成できませんでした（次の表示で作成します）", exc_info=True)
+
+
+def pending_occurrences(today, routine_id=None, assignee_id=None):
+    """未完了の回(実施予定日が today 以前で完了の入力が無い。リマインドが有効な業務だけ)。予定日の古い順。"""
+    query = (
+        RoutineOccurrence.query
+        .join(RoutineReminder, RoutineReminder.routine_id == RoutineOccurrence.routine_id)
+        .join(RoutineWork, RoutineWork.id == RoutineOccurrence.routine_id)
+        .filter(RoutineReminder.enabled.is_(True), RoutineOccurrence.completed_at.is_(None),
+                RoutineOccurrence.due_date <= today)
+        .options(selectinload(RoutineOccurrence.routine).selectinload(RoutineWork.assignee))
+    )
+    if routine_id is not None:
+        query = query.filter(RoutineOccurrence.routine_id == routine_id)
+    if assignee_id is not None:
+        query = query.filter(RoutineWork.assignee_id == assignee_id)
+    return query.order_by(RoutineOccurrence.due_date, RoutineWork.name, RoutineOccurrence.id).all()
+
+
+def can_complete_occurrence(occ, user):
+    """完了を入力できるか: その業務の担当者とマネージャー。"""
+    if not getattr(user, "is_authenticated", False):
+        return False
+    return user.is_manager or (occ.routine is not None and occ.routine.assignee_id == user.id)
+
+
+def occurrence_rows(occurrences, today, user):
+    """画面に出す値の一覧 [{"occ", "routine", "due", "is_today", "elapsed", "can_complete", "key"}]。"""
+    return [{
+        "occ": occ,
+        "routine": occ.routine,
+        "due": occ.due_date,
+        "is_today": occ.due_date >= today,
+        "elapsed": elapsed_label(occ.due_date, today),
+        "can_complete": can_complete_occurrence(occ, user),
+        "key": occ.row_key,
+    } for occ in occurrences]
+
+
+def has_enabled_reminders(assignee_id=None):
+    """リマインドが有効な業務があるか(assignee_id を指定するとその人が担当のもの)。"""
+    query = db.session.query(RoutineReminder.routine_id).filter(RoutineReminder.enabled.is_(True))
+    if assignee_id is not None:
+        query = query.join(RoutineWork, RoutineWork.id == RoutineReminder.routine_id).filter(
+            RoutineWork.assignee_id == assignee_id)
+    return query.first() is not None
+
+
+def delete_routine_reminder_rows(routine_id):
+    """業務を削除するときに、その業務のリマインドの設定と実施予定日の行を削除する(commit は呼び出し側)。"""
+    RoutineOccurrence.query.filter_by(routine_id=routine_id).delete(synchronize_session=False)
+    RoutineReminder.query.filter_by(routine_id=routine_id).delete(synchronize_session=False)
+    forget_occurrence_progress(routine_id)
+
+
+# =============================================================================
+# 10-3. リマインド: メールアドレス(user_emails)
+# =============================================================================
+# ユーザーのメールアドレス(1人1件。user_emails)の確認と読み書き。
+# 形式は「local@domain」だけ(半角。表示名・<>・改行は不可)。空にすると行を削除する。
+
+EMAIL_MAX = 254
+EMAIL_FORMAT_HELP = ("メールアドレスの形式が正しくありません（例: name@example.com。半角で、表示名や「< >」は付けずに"
+                     "入力してください）。")
+
+
+def plain_address_ok(value):
+    """メールアドレス1件(local@domain。表示名なし)の形式か。"""
+    if not value or len(value) > EMAIL_MAX or not value.isascii() or _CONFIG_CONTROL.search(value):
+        return False
+    if not re.fullmatch(_ADDR, value) or parseaddr(value)[1] != value:
+        return False
+    domain = value.rpartition("@")[2]
+    return ".." not in domain and not domain.endswith(".")
+
+
+def check_email(raw):
+    """入力されたメールアドレスを確かめる。戻り値: (アドレス〔前後の空白を除く。空なら ""〕, 誤り または None)。"""
+    value = str(raw if raw is not None else "").strip()
+    if not value:
+        return "", None
+    if "\r" in value or "\n" in value:
+        return None, "メールアドレスに改行は使えません。"
+    if len(value) > EMAIL_MAX:
+        return None, "メールアドレスは{}文字以内で入力してください。".format(EMAIL_MAX)
+    if not plain_address_ok(value):
+        return None, EMAIL_FORMAT_HELP
+    return value, None
+
+
+def user_email_map(user_ids=None):
+    """{ユーザーID: メールアドレス}(user_ids を指定するとその人たちだけ)。"""
+    query = UserEmail.query
+    if user_ids is not None:
+        ids = list(user_ids)
+        if not ids:
+            return {}
+        query = query.filter(UserEmail.user_id.in_(ids))
+    return {row.user_id: row.email for row in query.all()}
+
+
+def user_email(user_id):
+    """ユーザーのメールアドレス(無ければ "")。"""
+    row = db.session.get(UserEmail, user_id)
+    return row.email if row is not None else ""
+
+
+def set_user_email(user_id, email):
+    """メールアドレスを保存する(空なら削除)。commit は呼び出し側。"""
+    row = db.session.get(UserEmail, user_id)
+    if not email:
+        if row is not None:
+            db.session.delete(row)
+        return
+    if row is None:
+        db.session.add(UserEmail(user_id=user_id, email=email))
+    elif row.email != email:
+        row.email = email
+
+
+def forget_user_for_reminders(user_id):
+    """メンバーを削除(物理削除)するときに、メールアドレスと、リマインドの追加の宛先からその人を除く。
+
+    削除した人のIDは次に追加した人に再利用されるため、別の人に送らないように。commit は呼び出し側。
+    """
+    UserEmail.query.filter_by(user_id=user_id).delete(synchronize_session=False)
+    for rem in RoutineReminder.query.all():
+        ids = rem.extra_user_id_list
+        if user_id in ids:
+            rem.extra_user_ids = ",".join(str(i) for i in ids if i != user_id)
+        if rem.updated_by_id == user_id:
+            rem.updated_by_id = None
+
+
+# =============================================================================
+# 10-4. リマインド: 業務ごとの設定(定型業務の画面の「リマインド」)
+# =============================================================================
+# 業務ごとのリマインドの設定(routine_reminders)の入力チェックと保存。定型業務の登録・編集の画面の
+# 「リマインド」の欄で入力する(権限は業務の登録・編集と同じ。5-4)。
+#
+#   parse_reminder_form(form, choices, today)  入力を確かめる → (保存する値, 誤りの一覧)
+#   save_routine_reminder(...)                 保存する(変更前の内容と比べて、予定の作り方を変えたときの扱いも行う)
+#   reminder_state_from_values / _from_form    画面の欄に出す値
+#
+# - 「リマインドする」がオフで、まだ設定の行が無い業務は、何も保存しない(何かを選んで保存したときは、オフのまま保存する)
+# - 選んだ繰り返しの項目だけを保存する(毎週なら曜日だけ。ほかの繰り返しの日・指定日は空にする)
+# - 既にある設定の予定の作り方(繰り返し・曜日・日・指定日・営業日でない日の扱い)を変えたとき、またはオフから
+#   オンにしたときは、開始日を今日にする(今日より前の日の予定を新しいルールで作らないように。同じ保存で開始日も
+#   変えたときは、入力した開始日のまま)。変える前のルールの今日までの回は、変える前に作っておく
+# - 「リマインド」の欄の無い以前の画面からの保存では、リマインドの設定を変えない(REMINDER_FORM_MARK)
+
+# この欄のある画面からの送信の印(hidden)
+REMINDER_FORM_MARK = "rem_shown"
+# 追加の宛先(アドレス)の最大件数
+REMINDER_EXTRA_EMAILS_MAX = 50
+
+# 編集画面で、画面を開いた後のほかの操作の変更を確かめる項目(名前は画面の表示)
+REMINDER_VERSION_FIELDS = (
+    ("enabled", "リマインドする"), ("rule_type", "繰り返し"), ("weekdays", "曜日"), ("month_days", "日"),
+    ("dates", "指定日"), ("holiday_rule", "営業日でない日の扱い"), ("start_date", "開始日"),
+    ("extra_user_ids", "追加の宛先（メンバー）"), ("extra_emails", "追加の宛先（アドレス）"),
+)
+REMINDER_VERSION_KEYS = tuple(key for key, _label in REMINDER_VERSION_FIELDS)
+REMINDER_FIELD_LABELS = {key: "リマインドの" + label for key, label in REMINDER_VERSION_FIELDS}
+# 予定の作り方の項目(変えると開始日を今日にする)
+REMINDER_RULE_KEYS = ("rule_type", "weekdays", "month_days", "dates", "holiday_rule")
+
+REMINDER_DEFAULTS = {
+    "enabled": False, "rule_type": RULE_WEEKLY, "weekdays": "", "month_days": "", "dates": "",
+    "holiday_rule": HOLIDAY_PREV, "start_date": None, "extra_user_ids": "", "extra_emails": "",
+}
+
+# 指定日・追加のアドレスの区切り(改行・「,」「;」・空白。全角の「、」「，」も)
+_REMINDER_LIST_SPLIT = re.compile(r"[\s,;、，；]+")
+
+
+def reminder_values(rem):
+    """業務ごとの設定の今の値(保存する形)。設定の行が無ければ既定値(開始日は None)。"""
+    if rem is None:
+        return dict(REMINDER_DEFAULTS)
+    return {
+        "enabled": bool(rem.enabled),
+        "rule_type": rem.rule_type if rem.rule_type in RULE_TYPES else RULE_WEEKLY,
+        "weekdays": rem.weekdays or "",
+        "month_days": rem.month_days or "",
+        "dates": rem.dates or "",
+        "holiday_rule": rem.holiday_rule if rem.holiday_rule in HOLIDAY_RULES else HOLIDAY_PREV,
+        "start_date": rem.start_date,
+        "extra_user_ids": rem.extra_user_ids or "",
+        "extra_emails": rem.extra_emails or "",
+    }
+
+
+def reminder_extra_user_choices(rem):
+    """追加の宛先(メンバー)の選択肢: 有効なユーザーと、設定済みの無効化されたユーザー(画面では「［無効］」)。"""
+    users = get_active_users()
+    if rem is not None:
+        shown = {u.id for u in users}
+        for user_id in rem.extra_user_id_list:
+            user = db.session.get(User, user_id) if user_id not in shown else None
+            if user is not None:
+                users.append(user)
+                shown.add(user.id)
+    return users
+
+
+def _parse_reminder_day(token):
+    """指定日・開始日の1つ(YYYY-MM-DD・YYYY/MM/DD。全角の数字も可)。範囲外・読めなければ None。"""
+    text = unicodedata.normalize("NFKC", str(token or "")).strip().replace("/", "-")
+    try:
+        d = datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    return d if REMINDER_DATE_MIN <= d <= REMINDER_DATE_MAX else None
+
+
+def _shown_values(values, limit=5):
+    """誤りの案内に出す入力の値(最大 limit 件・各40文字まで)。"""
+    shown = ["「{}」".format(v if len(v) <= 40 else v[:39] + "…") for v in values[:limit]]
+    return "、".join(shown) + (" ほか{}件".format(len(values) - limit) if len(values) > limit else "")
+
+
+def parse_reminder_form(form, choices, today, current_start=None):
+    """「リマインド」の欄の入力を確かめる。戻り値: (保存する値〔reminder_values と同じ形〕, 誤りの一覧)。
+
+    choices は追加の宛先(メンバー)の選択肢(reminder_extra_user_choices)。値は「ユーザーID:ログインID」で、
+    この中の人だけを受け付ける。開始日が空なら今日。開始日を今日から REMINDER_PAST_DAYS_MAX 日より前にはできない
+    (過去の回をまとめて作り、未完了のリマインドが大量に送られないように)。保存済みの開始日(current_start)のままなら
+    確かめない(前から設定してある業務のほかの項目を直せるように)。
+    """
+    errors = []
+    values = dict(REMINDER_DEFAULTS)
+    values["enabled"] = form.get("rem_enabled") == "1"
+    rule_type = form.get("rem_rule_type") or RULE_WEEKLY
+    values["rule_type"] = rule_type if rule_type in RULE_TYPES else RULE_WEEKLY
+    holiday_rule = form.get("rem_holiday_rule") or HOLIDAY_PREV
+    values["holiday_rule"] = holiday_rule if holiday_rule in HOLIDAY_RULES else HOLIDAY_PREV
+
+    weekdays = sorted({int(v) for v in form.getlist("rem_weekdays") if str(v).isdigit() and int(v) <= 6})
+    month_days = sort_month_days(form.getlist("rem_month_days"))
+    dates, bad_dates = [], []
+    for token in _REMINDER_LIST_SPLIT.split(form.get("rem_dates") or ""):
+        if token:
+            d = _parse_reminder_day(token)
+            if d is None:
+                bad_dates.append(token)
+            elif d not in dates:
+                dates.append(d)
+    dates.sort()
+
+    # 選んだ繰り返しの項目だけを保存する
+    if values["rule_type"] == RULE_WEEKLY:
+        values["weekdays"] = ",".join(str(w) for w in weekdays)
+        if values["enabled"] and not weekdays:
+            errors.append("リマインドの曜日を選んでください（毎週）。")
+    elif values["rule_type"] == RULE_MONTHLY:
+        values["month_days"] = ",".join(month_days)
+        if values["enabled"] and not month_days:
+            errors.append("リマインドの日を選んでください（毎月）。")
+    elif values["rule_type"] == RULE_DATES:
+        if bad_dates:
+            errors.append("リマインドの指定日に、日付として読めない値・{}〜{}年以外の日付があります: {}"
+                          "（YYYY-MM-DD の形で、1行に1つずつ入力してください）。".format(
+                              REMINDER_DATE_MIN.year, REMINDER_DATE_MAX.year, _shown_values(bad_dates)))
+        elif len(dates) > REMINDER_DATES_MAX:
+            errors.append("リマインドの指定日は{}日までです（{}日あります）。".format(REMINDER_DATES_MAX, len(dates)))
+        values["dates"] = ",".join(d.isoformat() for d in dates)
+        if values["enabled"] and not dates and not bad_dates:
+            errors.append("リマインドの指定日を入力してください。")
+    if values["rule_type"] == RULE_DAILY:
+        values["holiday_rule"] = HOLIDAY_PREV  # 毎営業日は休日の扱いを使わない
+
+    raw_start = (form.get("rem_start_date") or "").strip()
+    if not raw_start:
+        values["start_date"] = today
+    else:
+        start = _parse_reminder_day(raw_start)
+        if start is None:
+            errors.append("リマインドの開始日を {}〜{}年の日付で入力してください。".format(
+                REMINDER_DATE_MIN.year, REMINDER_DATE_MAX.year))
+        elif start != current_start and start < today - timedelta(days=REMINDER_PAST_DAYS_MAX):
+            earliest = today - timedelta(days=REMINDER_PAST_DAYS_MAX)
+            errors.append("リマインドの開始日は、今日から{}日前（{}）以降の日付にしてください"
+                          "（開始日から今日までの回をまとめて作るため）。".format(
+                              REMINDER_PAST_DAYS_MAX, earliest.strftime("%Y/%m/%d")))
+        values["start_date"] = start
+
+    chosen, stale = users_from_form_keys(form.getlist("rem_extra_users"), choices)
+    if stale:
+        errors.append("リマインドの追加の宛先に、削除・無効化されたか登録されていないメンバーがあります。"
+                      "選択し直してください。")
+    values["extra_user_ids"] = ",".join(str(i) for i in sorted({u.id for u in chosen}))
+
+    addresses, bad, seen = [], [], set()
+    for token in _REMINDER_LIST_SPLIT.split(form.get("rem_extra_emails") or ""):
+        if not token:
+            continue
+        address, error = check_email(token)
+        if error:
+            bad.append(token)
+        elif address.lower() not in seen:
+            seen.add(address.lower())
+            addresses.append(address)
+    if bad:
+        errors.append("リマインドの追加の宛先（アドレス）の形式が正しくありません: {}"
+                      "（name@example.com の形で、1行に1件ずつ入力してください）。".format(_shown_values(bad)))
+    elif len(addresses) > REMINDER_EXTRA_EMAILS_MAX:
+        errors.append("リマインドの追加の宛先（アドレス）は{}件までです。".format(REMINDER_EXTRA_EMAILS_MAX))
+    values["extra_emails"] = "\n".join(addresses)
+    return values, errors
+
+
+def _reminder_is_blank(values):
+    """何も選んでいない(既定のまま)か。リマインドがオフで設定の行が無いとき、行を作らない。"""
+    return (values["rule_type"] == RULE_WEEKLY and values["holiday_rule"] == HOLIDAY_PREV
+            and not any(values[k] for k in ("weekdays", "month_days", "dates", "extra_user_ids", "extra_emails")))
+
+
+def save_routine_reminder(routine_id, rem, values, user_id, today):
+    """業務ごとの設定を保存する(commit は呼び出し側)。戻り値: (設定の行 または None, 画面に出す案内の一覧)。
+
+    rem は今の設定の行(無ければ None)、values は parse_reminder_form の値。
+    """
+    notes = []
+    old = reminder_values(rem) if rem is not None else None
+    if rem is None:
+        if not values["enabled"] and _reminder_is_blank(values):
+            return None, notes
+        rem = RoutineReminder(routine_id=routine_id)
+        db.session.add(rem)
+    elif old == values:
+        return rem, notes
+    new = dict(values)
+    if old is not None:
+        rule_changed = any(old[key] != new[key] for key in REMINDER_RULE_KEYS)
+        turned_on = new["enabled"] and not old["enabled"]
+        if old["enabled"] and (rule_changed or not new["enabled"]):
+            # 変える前のルールで今日までの回を作っておく(変えるのはまだ作っていない回だけ)
+            ensure_routine_occurrences(today, routine_id=routine_id, commit=False)
+        if ((rule_changed or turned_on) and new["start_date"] == old["start_date"]
+                and old["start_date"] is not None and old["start_date"] < today):
+            new["start_date"] = today
+            notes.append("リマインドの{}ため、開始日を今日（{}）にしました（今日より前の日の予定は作りません。"
+                         "前の日から作るときは、開始日を変更して保存してください）。".format(
+                             "予定の作り方を変えた" if rule_changed else "リマインドをオンにした",
+                             today.strftime("%Y/%m/%d")))
+    for key in REMINDER_VERSION_KEYS:
+        setattr(rem, key, new[key])
+    rem.updated_by_id = user_id
+    return rem, notes
+
+
+def reminder_state_from_values(values, today, choices):
+    """画面の「リマインド」の欄に出す値(保存する形の値 values から)。"""
+    ids = {to_int(v) for v in values["extra_user_ids"].split(",") if v}
+    return {
+        "enabled": values["enabled"],
+        "rule_type": values["rule_type"],
+        "weekdays": {v for v in values["weekdays"].split(",") if v},
+        "month_days": {v for v in values["month_days"].split(",") if v},
+        "dates": "\n".join(v for v in values["dates"].split(",") if v),
+        "holiday_rule": values["holiday_rule"],
+        "start_date": (values["start_date"] or today).isoformat(),
+        "extra_keys": {u.form_key for u in choices if u.id in ids},
+        "extra_emails": values["extra_emails"],
+    }
+
+
+def reminder_state_from_form(form):
+    """画面の「リマインド」の欄に出す値(入力の誤りで再表示するときの、送られた入力のまま)。"""
+    return {
+        "enabled": form.get("rem_enabled") == "1",
+        "rule_type": form.get("rem_rule_type") or RULE_WEEKLY,
+        "weekdays": set(form.getlist("rem_weekdays")),
+        "month_days": set(form.getlist("rem_month_days")),
+        "dates": form.get("rem_dates") or "",
+        "holiday_rule": form.get("rem_holiday_rule") or HOLIDAY_PREV,
+        "start_date": form.get("rem_start_date") or "",
+        "extra_keys": set(form.getlist("rem_extra_users")),
+        "extra_emails": form.get("rem_extra_emails") or "",
+    }
+
+
+def reminder_form_context():
+    """「リマインド」の欄の選択肢。"""
+    return {
+        "rule_types": [(key, RULE_LABELS[key]) for key in RULE_TYPES],
+        "weekday_labels": WEEKDAY_LABELS,
+        "month_days": [(value, month_day_label(value)) for value in MONTH_DAY_CHOICES],
+        "holiday_rules": [(key, HOLIDAY_RULE_LABELS[key]) for key in HOLIDAY_RULES],
+        "date_min": REMINDER_DATE_MIN.isoformat(),
+        "date_max": REMINDER_DATE_MAX.isoformat(),
+        "sending_enabled": load_reminder_settings()["enabled"],
+    }
+
+
+def upcoming_due_dates(rem, today, count=5):
+    """今日より後の実施予定日(最大 count 件。約1年先まで)。"""
+    first = max(today + _ONE_DAY, rem.start_date or today)
+    return reminder_due_dates(reminder_rule_of(rem), first, first + timedelta(days=400))[:count]
+
+
+def reminder_recipients_for(routine, rem, users, emails):
+    """業務のリマインドの宛先と、送れない宛先。
+
+    users: {ユーザーID: User}、emails: {ユーザーID: アドレス}。
+    戻り値: (宛先 [{"address", "name", "kind"}], 送れない宛先 [{"name", "reason", "kind"}])。
+    担当者・追加の宛先(メンバー)は、有効でメールアドレスがある人だけに送る。無効化された人・アドレスの無い人は
+    送れない宛先にする(追加の宛先のアドレスは、そのまま送る)。
+    """
+    recipients, problems = [], []
+    assignee = routine.assignee
+    if assignee is None:
+        problems.append({"name": "（担当者なし）", "reason": "担当者がいません", "kind": "担当者"})
+    elif not assignee.is_active:
+        problems.append({"name": assignee.display_name, "reason": "無効化されたメンバー", "kind": "担当者"})
+    elif not emails.get(assignee.id):
+        problems.append({"name": assignee.display_name, "reason": "メールアドレス未登録", "kind": "担当者"})
+    else:
+        recipients.append({"address": emails[assignee.id], "name": assignee.display_name, "kind": "担当者"})
+    for user_id in rem.extra_user_id_list:
+        user = users.get(user_id)
+        if user is None:
+            continue  # 削除された人(削除のときに除いているため、通常は無い)
+        if not user.is_active:
+            problems.append({"name": user.display_name, "reason": "無効化されたメンバー", "kind": "追加の宛先"})
+        elif not emails.get(user_id):
+            problems.append({"name": user.display_name, "reason": "メールアドレス未登録", "kind": "追加の宛先"})
+        else:
+            recipients.append({"address": emails[user_id], "name": user.display_name, "kind": "追加の宛先"})
+    for address in rem.extra_email_list:
+        if plain_address_ok(address):
+            recipients.append({"address": address, "name": "", "kind": "追加の宛先"})
+    return recipients, problems
+
+
+# =============================================================================
+# 10-5. リマインド: 送信の設定(instance/routine_reminder_settings.json)
+# =============================================================================
+# 定型業務リマインドの自動送信の設定(画面で編集する値)と前回の結果。DBは使わず、
+# instance/routine_reminder_settings.json(Git管理外)に保存する(2-3 の JsonSettings。instance/config.py には置かない)。
+# 画面はシステム設定の「定型業務リマインド」タブ(11-3)。
+#
+# 保存項目:
+#   enabled            : 自動送信する/しない(既定はしない)
+#   time1 / time2      : 送信の時刻("HH:MM"。既定 "09:00" / "15:00")。それぞれ1日1回
+#   business_days_only : 営業日(土日・祝日以外)だけ送る(既定はオン)
+#   last_result        : 前回の結果(日時・きっかけ・成否・メッセージ)。毎回上書き
+
+REMINDER_SETTINGS_FILENAME = "routine_reminder_settings.json"
+REMINDER_SETTINGS_LABEL = "定型業務リマインドの設定ファイル"
+
+REMINDER_SETTINGS_DEFAULTS = {
+    "enabled": False,
+    "time1": "09:00",
+    "time2": "15:00",
+    "business_days_only": True,
+    "last_result": None,
+}
+REMINDER_EDITABLE_KEYS = [k for k in REMINDER_SETTINGS_DEFAULTS if k != "last_result"]
+
+
+def _normalize_reminder_settings(data):
+    """読み込んだ値を検証し、不正・欠落した項目は既定値で補う。"""
+    result = copy.deepcopy(REMINDER_SETTINGS_DEFAULTS)
+    if not isinstance(data, dict):
+        return result
+    for key in ("enabled", "business_days_only"):
+        if isinstance(data.get(key), bool):
+            result[key] = data[key]
+    for key in ("time1", "time2"):
+        at = parse_hhmm(data.get(key)) if isinstance(data.get(key), str) else None
+        if at is not None:
+            result[key] = at.strftime("%H:%M")
+    result["last_result"] = normalize_last_result(data.get("last_result"))
+    return keep_auto_run_key(result, data)
+
+
+REMINDER_SETTINGS = JsonSettings(REMINDER_SETTINGS_FILENAME, REMINDER_SETTINGS_LABEL,
+                                 _normalize_reminder_settings, REMINDER_EDITABLE_KEYS)
+load_reminder_settings = REMINDER_SETTINGS.load              # 現在の設定(読み込めなければ既定値)
+save_reminder_settings = REMINDER_SETTINGS.save              # 画面で編集した項目を保存する
+set_reminder_last_result = REMINDER_SETTINGS.set_last_result  # 前回の結果を上書きする
+
+REMINDER_LABEL = "定型業務リマインド"
+REMINDER_SAVED_MESSAGE = "定型業務リマインドの設定を保存しました。"
+
+
+def reminder_send_times(settings):
+    """送信の時刻("HH:MM")の一覧(早い順・重複なし)。"""
+    return sorted({settings[key] for key in ("time1", "time2") if parse_hhmm(settings.get(key)) is not None})
+
+
+def parse_reminder_settings_form(form):
+    """システム設定の「定型業務リマインド」タブの入力を検証する。戻り値: (values, errors)。"""
+    errors = []
+    values = {"enabled": form.get("enabled") == "1", "business_days_only": form.get("business_days_only") == "1"}
+    for key, label in (("time1", "送信時刻1"), ("time2", "送信時刻2")):
+        at = parse_hhmm(form.get(key))
+        if at is None:
+            errors.append("{}を「時:分」（例: 09:00）で入力してください。".format(label))
+        else:
+            values[key] = at.strftime("%H:%M")
+    if not errors and values["time1"] == values["time2"]:
+        errors.append("送信時刻1と送信時刻2には、違う時刻を入力してください（1日2回送ります）。")
+    return values, errors
+
+
+def reminder_settings_form_context(settings):
+    """「定型業務リマインド」タブの設定フォームの表示に使う値。"""
+    return {"settings": settings}
+
+
+def reminder_due_key(settings, now):
+    """今が自動送信の実行時刻なら (日付, "HH:MM") を返す。そうでなければ None。
+
+    自動送信が有効で、今の時刻(HH:MM)が送信時刻1・2のどちらかと一致し、営業日だけの設定なら今日が営業日のとき。
+    """
+    if not settings.get("enabled"):
+        return None
+    at = now.strftime("%H:%M")
+    if at not in reminder_send_times(settings):
+        return None
+    if settings.get("business_days_only") and not is_business_day(now.date()):
+        return None
+    return (now.date(), at)
+
+
+def next_reminder_run(settings, now):
+    """次回の自動送信日時。自動送信が無効なら None。当日の実行時刻の「分」の間は当日の日時を返す。"""
+    times = [parse_hhmm(t) for t in reminder_send_times(settings)]
+    if not settings.get("enabled") or not times:
+        return None
+    floor = now.replace(second=0, microsecond=0)
+    day = now.date()
+    for _ in range(_SEARCH_DAYS):
+        if not settings.get("business_days_only") or is_business_day(day):
+            for at in times:
+                candidate = datetime.combine(day, time(at.hour, at.minute))
+                if candidate >= floor:
+                    return candidate
+        day += _ONE_DAY
+    return None
+
+
+# =============================================================================
+# 10-6. リマインド: メールの作成(宛先ごとに1通)
+# =============================================================================
+# 未完了の回を宛先ごとにまとめ、1つの宛先に1通のメールを作る(件名・テキスト版・HTML版)。
+#   ■本日実施予定          : 実施予定日が今日のもの
+#   ■【リマインド】未完了  : 実施予定日を過ぎたもの(予定日と経過した営業日数を付ける。古い順)
+# 件名の例: 【定型業務】本日実施 2件／未完了 1件
+# 各業務には担当者の名前、業務の画面へのリンクと完了の入力の画面へのリンク(APP_BASE_URL ＋ パス。印付き)を付ける。
+# APP_BASE_URL が空・不正ならリンクは付けない(期限超過通知と同じ。7-4 の link_base)。
+# HTML版はテンプレート(templates.html の routine/reminder_mail.html)で作り、すべての値をエスケープする。
+
+REMINDER_TODAY_TITLE = "本日実施予定"
+REMINDER_OVERDUE_TITLE = "【リマインド】未完了"
+REMINDER_NONE_TEXT = "該当なし"
+
+
+def routine_path(routine_id, row_key=None):
+    """定型業務の詳細画面のパス(例: /routine/3?r=…)。リクエストの外でも作れるよう URL マップから作る。
+
+    row_key を付けると、その業務が削除された後に同じIDが別の業務に使われても、リンクは別の業務を開かずに 404 になる。
+    """
+    values = {"routine_id": routine_id}
+    if row_key:
+        values["r"] = row_key
+    return current_app.url_map.bind("localhost").build("routine.detail", values)
+
+
+def occurrence_path(occ_id, row_key):
+    """実施予定日1回分の画面(完了の入力)のパス(例: /routine/occurrences/5?o=…)。"""
+    return current_app.url_map.bind("localhost").build("routine.occurrence", {"occ_id": occ_id, "o": row_key})
+
+
+def _due_label(d):
+    return "{}（{}）".format(d.strftime("%Y/%m/%d"), WEEKDAY_LABELS[d.weekday()])
+
+
+def _reminder_item(occ, today, base):
+    """メールに載せる1回分の値。"""
+    routine = occ.routine
+    return {
+        "id": occ.id,
+        "name": one_line(routine.name, limit=200),
+        "assignee": routine.assignee.name_label if routine.assignee is not None else "（担当者なし）",
+        "due_date": occ.due_date,
+        "due_label": _due_label(occ.due_date),
+        "is_today": occ.due_date >= today,
+        "elapsed": elapsed_label(occ.due_date, today),
+        "url": base + routine_path(routine.id, routine.row_key) if base else "",
+        "complete_url": base + occurrence_path(occ.id, occ.row_key) if base else "",
+    }
+
+
+def build_reminder_subject(today_count, overdue_count):
+    """件名(例: 【定型業務】本日実施 2件／未完了 1件)。"""
+    return "【定型業務】本日実施 {}件／未完了 {}件".format(today_count, overdue_count)
+
+
+def _reminder_mail(address, name, items, now, base, note=""):
+    """1通分のメール {"address", "name", "today_items", "overdue_items", "subject", "text", "html"}。"""
+    today_items = sorted((i for i in items if i["is_today"]), key=lambda i: (i["name"], i["id"]))
+    overdue_items = sorted((i for i in items if not i["is_today"]), key=lambda i: (i["due_date"], i["name"], i["id"]))
+    mail = {
+        "address": address,
+        "name": name,
+        "today_items": today_items,
+        "overdue_items": overdue_items,
+        "subject": build_reminder_subject(len(today_items), len(overdue_items)),
+        "intro": ("{} 時点の、定型・定期業務の本日の実施予定と、完了の入力がまだのもののお知らせです。".format(
+            now.strftime("%Y/%m/%d %H:%M"))),
+        "guide": ("実施したら、業務ごとの「完了の入力」から完了を入力してください（入力すると、その回のリマインドは止まります）。"
+                  if base else
+                  "実施したら、このアプリの定型・定期業務の画面で「完了」を入力してください（入力すると、その回のリマインドは止まります）。"),
+        "note": note,
+        "footer": "※このメールは{}から送信しています。".format(display_app_name()),
+    }
+    mail["text"] = build_reminder_text(mail)
+    mail["html"] = render_template("routine/reminder_mail.html", mail=mail, today_title=REMINDER_TODAY_TITLE,
+                                   overdue_title=REMINDER_OVERDUE_TITLE, none_text=REMINDER_NONE_TEXT)
+    return mail
+
+
+def build_reminder_text(mail):
+    """テキスト版の本文(業務名の次の行から、業務の画面と完了の入力の URL)。"""
+    lines = []
+    if mail["name"]:
+        lines += ["{}さん".format(mail["name"]), ""]
+    if mail["note"]:
+        lines += [mail["note"], ""]
+    lines += [mail["intro"], mail["guide"], ""]
+    for title, items in ((REMINDER_TODAY_TITLE, mail["today_items"]), (REMINDER_OVERDUE_TITLE, mail["overdue_items"])):
+        lines.append("■{}（{}件）".format(title, len(items)))
+        if not items:
+            lines.append(REMINDER_NONE_TEXT)
+        for item in items:
+            if item["is_today"]:
+                lines.append("・{}（担当: {}）".format(item["name"], item["assignee"]))
+            else:
+                lines.append("・{}［予定日 {}・{}］（担当: {}）".format(
+                    item["name"], item["due_label"], item["elapsed"], item["assignee"]))
+            if item["url"]:
+                lines.append("　　業務の画面: {}".format(item["url"]))
+            if item["complete_url"]:
+                lines.append("　　完了の入力: {}".format(item["complete_url"]))
+        lines.append("")
+    lines.append(mail["footer"])
+    return "\n".join(lines)
+
+
+def collect_reminder_mails(today, now):
+    """未完了の回を宛先ごとにまとめたメールを作る(送らない)。
+
+    戻り値: {"today", "now", "items"(すべての未完了の回), "mails"(宛先ごと。アドレスの順),
+             "today_count", "overdue_count", "unreachable"(宛先が1つも無い回の数),
+             "problems"(送れない宛先 [{"name", "reason", "kind", "count"}]), "link_problem", "base"}
+    """
+    pending = pending_occurrences(today)
+    base, link_problem = link_base()
+    reminders = {r.routine_id: r for r in RoutineReminder.query.filter(RoutineReminder.enabled.is_(True)).all()}
+    users = {u.id: u for u in User.query.all()}
+    emails = user_email_map()
+    boxes, items, problems = {}, [], {}
+    unreachable = 0
+    for occ in pending:
+        rem = reminders.get(occ.routine_id)
+        if rem is None or occ.routine is None:
+            continue
+        item = _reminder_item(occ, today, base)
+        items.append(item)
+        recipients, troubles = reminder_recipients_for(occ.routine, rem, users, emails)
+        for trouble in troubles:
+            key = (trouble["name"], trouble["reason"], trouble["kind"])
+            problems[key] = problems.get(key, 0) + 1
+        if not recipients:
+            unreachable += 1
+        for recipient in recipients:
+            box = boxes.setdefault(recipient["address"].lower(), {
+                "address": recipient["address"], "name": recipient["name"], "items": {}})
+            if not box["name"] and recipient["name"]:
+                box["name"] = recipient["name"]
+            box["items"][item["id"]] = item
+    mails = [_reminder_mail(box["address"], box["name"], list(box["items"].values()), now, base)
+             for _key, box in sorted(boxes.items())]
+    return {
+        "today": today,
+        "now": now,
+        "items": items,
+        "mails": mails,
+        "today_count": sum(1 for i in items if i["is_today"]),
+        "overdue_count": sum(1 for i in items if not i["is_today"]),
+        "unreachable": unreachable,
+        "problems": [{"name": n, "reason": r, "kind": k, "count": c} for (n, r, k), c in problems.items()],
+        "link_problem": link_problem,
+        "base": base,
+    }
+
+
+def build_reminder_test_mail(data):
+    """テスト送信の1通(すべての未完了の回。宛先は差出人)。"""
+    note = ("これは定型業務リマインドのテスト送信です（差出人宛て）。今の未完了の回をすべて載せています。"
+            "本番では宛先ごとに、その宛先に関係する業務だけを1通にまとめて送ります（今の宛先 {}件）。".format(
+                len(data["mails"])))
+    return _reminder_mail("", "", data["items"], data["now"], data["base"], note=note)
+
+
+def reminder_address_problems():
+    """リマインドが有効な業務の、送れない宛先(担当者・追加の宛先のメンバーの、アドレス未登録・無効化)。
+
+    戻り値: [{"routine"(RoutineWork), "name", "reason", "kind"}](業務名の順)。画面の注意に使う。
+    """
+    reminders = RoutineReminder.query.filter(RoutineReminder.enabled.is_(True)).all()
+    if not reminders:
+        return []
+    users = {u.id: u for u in User.query.all()}
+    emails = user_email_map()
+    result = []
+    for rem in reminders:
+        routine = db.session.get(RoutineWork, rem.routine_id)
+        if routine is None:
+            continue
+        for trouble in reminder_recipients_for(routine, rem, users, emails)[1]:
+            result.append(dict(trouble, routine=routine))
+    result.sort(key=lambda t: (t["routine"].name, t["routine"].id, t["kind"] != "担当者", t["name"]))
+    return result
+
+
+# =============================================================================
+# 10-7. リマインド: 作成・送信のとりまとめ
+# =============================================================================
+# 定型業務リマインドの作成・送信(自動送信〔スケジューラ〕とテスト送信〔システム設定の画面〕から使う)。
+#
+# run_routine_reminders(app, trigger, now=None, test=False):
+#   1. 開始日〜今日の実施予定日の行を作る(ensure_routine_occurrences)
+#   2. 未完了の回を宛先ごとにまとめる(collect_reminder_mails)
+#   3. test=False : 宛先ごとに1通ずつ送る(To はその宛先だけ。Cc なし)。アドレスの無い担当者には送らない
+#                   (追加の宛先には送る)。送れなかった宛先・失敗は前回の結果に残す
+#      test=True  : すべての未完了の回を載せた1通を差出人(MAIL_FROM)に送る
+#   成否にかかわらず「前回の結果」を上書きする。未完了の回が無ければ送らない(テスト送信は「該当なし」で送る)。
+# 送信は同時に1つだけ(二重送信の防止。_reminder_send_lock)。必ず app.app_context() の中で動く。
+
+_reminder_send_lock = threading.Lock()
+
+
+def reminder_is_sending():
+    """リマインドの送信(自動・テスト)の処理中か。"""
+    return _reminder_send_lock.locked()
+
+
+def _send_reminder_mails(data):
+    """本番の送信(宛先ごとに1通)。戻り値: (成否, 前回の結果のメッセージ)。"""
+    parts = []
+    if not data["items"]:
+        return True, "未完了の定型業務はありません（送信していません）。"
+    sent, failures = 0, []
+    if data["mails"]:
+        problem = check_mail_settings(test=True)  # 送信サーバー・差出人(宛先は DB のアドレス)
+        if problem:
+            return False, problem
+    for mail in data["mails"]:
+        ok, message = send_mail(mail["subject"], mail["text"], html=mail["html"], to=[mail["address"]], cc=[])
+        if ok:
+            sent += 1
+        else:
+            failures.append("{}（{}）".format(mail["address"], message.rstrip("。")))
+    parts.append("送信 {}通・失敗 {}通（本日実施 {}件・未完了 {}件）".format(
+        sent, len(failures), data["today_count"], data["overdue_count"]))
+    if data["unreachable"]:
+        parts.append("宛先が無いため送れなかった回 {}件".format(data["unreachable"]))
+    if data["problems"]:
+        parts.append("送れない宛先: " + "、".join(
+            "{}（{}・{}・{}件）".format(p["name"], p["kind"], p["reason"], p["count"]) for p in data["problems"]))
+    if data["link_problem"]:
+        parts.append("リンクなし（APP_BASE_URL 未設定・不正）")
+    if failures:
+        parts.append("失敗: " + "、".join(failures))
+    ok = not failures and sent > 0
+    return ok, " ／ ".join(parts)
+
+
+def _deliver_reminders(app, trigger, now, test):
+    """送信の本体(_reminder_send_lock を持った状態で呼ぶ)。成否にかかわらず「前回の結果」を上書きする。"""
+    with app.app_context():
+        try:
+            now = now or _now()
+            ensure_routine_occurrences(now.date())
+            data = collect_reminder_mails(now.date(), now)
+            if test:
+                problem = check_mail_settings(test=True)
+                if problem:
+                    ok, message = False, problem
+                else:
+                    mail = build_reminder_test_mail(data)
+                    ok, send_message = send_mail(mail["subject"], mail["text"], html=mail["html"], test=True)
+                    message = "{} ／ 本日実施 {}件・未完了 {}件 ／ 本番の宛先 {}件".format(
+                        send_message.rstrip("。"), data["today_count"], data["overdue_count"], len(data["mails"]))
+            else:
+                ok, message = _send_reminder_mails(data)
+        except Exception as exc:
+            db.session.rollback()
+            app.logger.exception("定型業務リマインドの作成・送信に失敗しました")
+            ok, message = False, "定型業務リマインドの作成中にエラーが発生しました: {}".format(exc)
+        try:
+            set_reminder_last_result(trigger, ok, message)
+        except Exception:
+            app.logger.exception("定型業務リマインドの前回の結果を保存できませんでした")
+        return {"ok": ok, "message": message}
+
+
+def run_routine_reminders(app, trigger, now=None, test=False):
+    """定型業務リマインドを作成して送信する(呼び出したスレッドで最後まで実行。処理中なら終わるまで待つ)。
+
+    戻り値: {"ok", "message"}。例外は外に出さず、失敗は ok=False とメッセージで返す。
+    """
+    with _reminder_send_lock:
+        return _deliver_reminders(app, trigger, now, test)
+
+
+def try_run_routine_reminders(app, trigger, now=None, test=False):
+    """run_routine_reminders と同じ。ただし送信の処理中なら待たずに None を返す(画面のテスト送信用)。"""
+    if not _reminder_send_lock.acquire(blocking=False):
+        return None
+    try:
+        return _deliver_reminders(app, trigger, now, test)
+    finally:
+        _reminder_send_lock.release()
+
+
+def reminder_status_context(app):
+    """システム設定の「定型業務リマインド」タブの状況の表示(次回の送信・前回の結果・注意・プレビュー)。"""
+    settings = load_reminder_settings()
+    now = _now()
+    refresh_occurrences_for_page(now.date())
+    data = collect_reminder_mails(now.date(), now)
+    upcoming = next_reminder_run(settings, datetime.now())
+    test_mail = build_reminder_test_mail(data)
+    return {
+        "settings": settings,
+        "upcoming": upcoming,
+        "scheduler_stopped": upcoming is not None and scheduler_is_stopped(app),
+        "weekday_labels": WEEKDAY_LABELS,
+        "last": settings["last_result"],
+        "mail_problem": check_mail_settings(test=True),
+        "link_problem": data["link_problem"],
+        "data": data,
+        "previews": [dict(mail, document=_preview_document(mail["html"])) for mail in data["mails"]],
+        "test_mail": dict(test_mail, document=_preview_document(test_mail["html"])),
+        "address_problems": reminder_address_problems(),
+        "enabled_count": RoutineReminder.query.filter(RoutineReminder.enabled.is_(True)).count(),
+        "sending": reminder_is_sending(),
+    }
+
+
+# =============================================================================
+# 10-8. リマインド: 画面
+# =============================================================================
+# 完了の入力・取り消しと、メールアドレスの画面。未完了の回の一覧は、定型業務の一覧(「未完了の定型業務」)・
+# 詳細・個人ダッシュボード(「今日の定型業務」)に出す(5-4・5-2 の画面から routine_*_panel を使う)。
+#
+# GET  /routine/occurrences/<id>?o=<印>   1回分の画面(メールの「完了の入力」のリンク。開くだけでは何も変えない)
+# POST /routine/occurrences/<id>/complete  完了を入力する(担当者・マネージャー)
+# POST /routine/occurrences/<id>/undo      完了を取り消す(マネージャーのみ)
+# GET/POST /account/email                  自分のメールアドレス(ユーザーメニューの「メールアドレス」。全員)
+# POST /departments/members/<id>/email     メンバーのメールアドレス(チーム管理のメンバーの表。マネージャーのみ)
+#
+# 完了・取り消しは書き込みのロックを取ってから確かめる(同時に押された2回目は「既に完了」と表示する)。
+# 印(o)は回ごとに違う(make_row_key)。削除された業務の回のIDが別の回に使われても、古い画面・メールのリンクから
+# 別の回を完了にしない。
+
+account_bp = Blueprint("account", __name__, url_prefix="/account")
+
+# 画面を開いた後に、その回(業務)が削除されていたときの案内
+_STALE_OCCURRENCE = ("この定型業務の回は見つかりません（業務・リマインドが削除された可能性があります）。"
+                     "操作は行っていません。定型・定期業務の一覧から開き直してください。")
+# 完了の入力の後に戻る画面(フォームの back)
+OCCURRENCE_BACK_PAGES = ("list", "detail", "dashboard", "occurrence")
+
+
+def routine_list_panel(today, user):
+    """定型業務の一覧の「未完了の定型業務」(リマインドが有効な業務が無ければ None)。"""
+    if not has_enabled_reminders():
+        return None
+    refresh_occurrences_for_page(today)
+    return {"rows": occurrence_rows(pending_occurrences(today), today, user)}
+
+
+def dashboard_routine_panel(today, user):
+    """個人ダッシュボードの「今日の定型業務」(自分が担当で、リマインドが有効な業務が無ければ None)。"""
+    if not has_enabled_reminders(assignee_id=user.id):
+        return None
+    refresh_occurrences_for_page(today)
+    done_today = (
+        RoutineOccurrence.query
+        .join(RoutineReminder, RoutineReminder.routine_id == RoutineOccurrence.routine_id)
+        .join(RoutineWork, RoutineWork.id == RoutineOccurrence.routine_id)
+        .filter(RoutineReminder.enabled.is_(True), RoutineWork.assignee_id == user.id,
+                RoutineOccurrence.due_date == today, RoutineOccurrence.completed_at.isnot(None))
+        .order_by(RoutineWork.name, RoutineOccurrence.id).all()
+    )
+    return {
+        "rows": occurrence_rows(pending_occurrences(today, assignee_id=user.id), today, user),
+        "done_today": done_today,
+        "email_missing": not user_email(user.id),
+        "sending_enabled": load_reminder_settings()["enabled"],
+    }
+
+
+def routine_reminder_panel(routine, today, user):
+    """定型業務の詳細の「リマインド」(設定・宛先・未完了の回・最近の完了・今後の予定)。設定の行が無ければ None。"""
+    rem = db.session.get(RoutineReminder, routine.id)
+    if rem is None:
+        return None
+    if rem.enabled:
+        try:
+            ensure_routine_occurrences(today, routine_id=routine.id)
+        except Exception:
+            db.session.rollback()
+            current_app.logger.warning("定型業務の実施予定日を作成できませんでした", exc_info=True)
+    users = {u.id: u for u in User.query.all()}
+    recipients, problems = reminder_recipients_for(routine, rem, users, user_email_map())
+    completed = (RoutineOccurrence.query.filter(RoutineOccurrence.routine_id == routine.id,
+                                                RoutineOccurrence.completed_at.isnot(None))
+                 .order_by(RoutineOccurrence.due_date.desc(), RoutineOccurrence.id.desc()).limit(10).all())
+    return {
+        "rem": rem,
+        "rule_text": describe_reminder_rule(reminder_rule_of(rem)),
+        "recipients": recipients,
+        "problems": problems,
+        "rows": occurrence_rows(pending_occurrences(today, routine_id=routine.id), today, user) if rem.enabled else [],
+        "completed": [{"occ": occ, "key": occ.row_key} for occ in completed],
+        "upcoming": upcoming_due_dates(rem, today) if rem.enabled else [],
+        "sending_enabled": load_reminder_settings()["enabled"],
+        "weekday_labels": WEEKDAY_LABELS,
+    }
+
+
+def _occurrence_back_url(occ, back):
+    """完了の入力・取り消しの後に戻る画面の URL。"""
+    if back == "list" or occ is None:
+        return url_for("routine.list_routines")
+    if back == "dashboard":
+        return url_for("main.dashboard")
+    if back == "occurrence":
+        return url_for("routine.occurrence", occ_id=occ.id, o=occ.row_key)
+    return url_for("routine.detail", routine_id=occ.routine_id)
+
+
+@routine_bp.route("/occurrences/<int:occ_id>", endpoint="occurrence")
+@login_required
+def occurrence_page(occ_id):
+    """1回分の画面(メールの「完了の入力」のリンク)。開くだけでは何も変えない(完了はボタンの POST)。"""
+    occ = get_or_404(RoutineOccurrence, occ_id)
+    # 印(?o=)が、削除された業務の回(同じIDの別の新しい回)を指していたら 404
+    if not row_key_matches(occ, request.args.get("o")) or occ.routine is None:
+        abort(404)
+    today = reminder_today()
+    rem = db.session.get(RoutineReminder, occ.routine_id)
+    return render_template(
+        "routine/occurrence.html", occ=occ, routine=occ.routine,
+        row=occurrence_rows([occ], today, current_user)[0],
+        reminder_enabled=rem is not None and rem.enabled, weekday_labels=WEEKDAY_LABELS,
+    )
+
+
+@routine_bp.route("/occurrences/<int:occ_id>/complete", methods=["POST"])
+@login_required
+def complete_occurrence(occ_id):
+    """完了を入力する(その業務の担当者・マネージャー)。入力するとその回のリマインドは止まる。"""
+    lock_for_write()  # 同時に押された完了(二度押し・2人)は、後の側を「既に完了」にする
+    occ = db.session.get(RoutineOccurrence, occ_id)
+    back = request.form.get("back", "detail")
+    if occ is None or occ.routine is None or not row_key_matches(occ, request.form.get("o")):
+        flash(_STALE_OCCURRENCE, "warning")
+        return redirect(url_for("routine.list_routines"))
+    target = _occurrence_back_url(occ, back)
+    label = "「{}」（予定日 {}）".format(occ.routine.name, _due_label(occ.due_date))
+    if not can_complete_occurrence(occ, current_user):
+        flash("完了を入力できるのは、この業務の担当者とマネージャーだけです。", "danger")
+        return redirect(target)
+    if occ.completed_at is not None:
+        who = occ.completed_by.display_name if occ.completed_by is not None else "（不明）"
+        flash("{}は既に完了が入力されています（{}・{}）。".format(
+            label, who, occ.completed_at.strftime("%Y/%m/%d %H:%M")), "info")
+        return redirect(target)
+    occ.completed_at = _now()
+    occ.completed_by_id = current_user.id
+    db.session.commit()
+    flash("{}の完了を入力しました。この回のリマインドは送られません。".format(label), "success")
+    return redirect(target)
+
+
+@routine_bp.route("/occurrences/<int:occ_id>/undo", methods=["POST"])
+@login_required
+def undo_occurrence(occ_id):
+    """完了を取り消す(マネージャーのみ)。その回は未完了に戻り、リマインドの対象になる。"""
+    lock_for_write()
+    occ = db.session.get(RoutineOccurrence, occ_id)
+    back = request.form.get("back", "detail")
+    if occ is None or occ.routine is None or not row_key_matches(occ, request.form.get("o")):
+        flash(_STALE_OCCURRENCE, "warning")
+        return redirect(url_for("routine.list_routines"))
+    target = _occurrence_back_url(occ, back)
+    label = "「{}」（予定日 {}）".format(occ.routine.name, _due_label(occ.due_date))
+    if not current_user.is_manager:
+        flash("完了の取り消しはマネージャーのみです。", "danger")
+        return redirect(target)
+    if occ.completed_at is None:
+        flash("{}は完了が入力されていません（変更していません）。".format(label), "info")
+        return redirect(target)
+    occ.completed_at = None
+    occ.completed_by_id = None
+    db.session.commit()
+    flash("{}の完了を取り消しました（未完了に戻り、リマインドの対象になります）。".format(label), "info")
+    return redirect(target)
+
+
+# 画面を開いた後に、ほかの操作でメールアドレスが変更されていたため保存しなかったときの案内({} は誰の)
+_EMAIL_EDITED_ELSEWHERE = ("画面を開いた後に、ほかの操作で{}メールアドレスが変更されていたため、保存していません"
+                           "（今のアドレスを表示しています）。確認して、必要ならもう一度変更して保存してください。")
+
+
+def email_version(address):
+    """メールアドレスのフォームの控え(hidden の version)。"""
+    return field_versions({"email": address}, ("email",))
+
+
+def _email_conflict(version, current, new):
+    """画面を開いた後にほかの操作で変わり、今回の保存で別の値にしようとしているか。"""
+    changed = fields_changed_since(version, {"email": current}, ("email",))
+    return bool(conflicting_fields(changed, {"email": current}, {"email": new}))
+
+
+def _render_account_email(address, version, status=200):
+    routines = (RoutineWork.query.join(RoutineReminder, RoutineReminder.routine_id == RoutineWork.id)
+                .filter(RoutineReminder.enabled.is_(True), RoutineWork.assignee_id == current_user.id)
+                .order_by(RoutineWork.name).all())
+    return render_template("account/email.html", address=address, version=version, routines=routines,
+                           saved=user_email(current_user.id), email_max=EMAIL_MAX), status
+
+
+@account_bp.route("/email", methods=["GET", "POST"], endpoint="email")
+@login_required
+def account_email():
+    """自分のメールアドレス(定型業務のリマインドの宛先)。空にして保存すると削除する。"""
+    if request.method == "POST":
+        lock_for_write()  # 確かめてから保存するまでの間に、ほかの保存が入らないように
+        current = user_email(current_user.id)
+        raw = request.form.get("email", "")
+        value, error = check_email(raw)
+        if error:
+            flash(error, "danger")
+            return _render_account_email(raw, request.form.get("version") or email_version(current), 400)
+        if _email_conflict(request.form.get("version"), current, value):
+            flash(_EMAIL_EDITED_ELSEWHERE.format(""), "warning")
+            return _render_account_email(current, email_version(current), 409)
+        if value == current:
+            flash("メールアドレスは変わっていません（変更していません）。", "info")
+            return redirect(url_for("account.email"))
+        set_user_email(current_user.id, value)
+        db.session.commit()
+        flash("メールアドレスを{}しました。".format("保存" if value else "削除"), "success")
+        return redirect(url_for("account.email"))
+    current = user_email(current_user.id)
+    return _render_account_email(current, email_version(current))
+
+
+@departments_bp.route("/members/<int:user_id>/email", methods=["POST"])
+@manager_required
+def save_member_email(user_id):
+    """メンバーのメールアドレスを保存する(チーム管理のメンバーの表。マネージャーのみ。空なら削除)。"""
+    lock_for_write()
+    user = db.session.get(User, user_id)
+    if user is None:
+        flash("このメンバーは既に削除されています。", "info")
+        return redirect(url_for("departments.manage"))
+    if not _same_member(user):
+        return redirect(url_for("departments.manage"))
+    raw = request.form.get("email", "")
+    value, error = check_email(raw)
+    if error:
+        shown = raw.strip() if len(raw.strip()) <= 100 else raw.strip()[:99] + "…"
+        flash("{}さんのメールアドレス（{}）を保存できません: {}".format(
+            user.display_name, " ".join(shown.split()), error), "danger")
+        return redirect(url_for("departments.manage"))
+    current = user_email(user.id)
+    if _email_conflict(request.form.get("version"), current, value):
+        flash(_EMAIL_EDITED_ELSEWHERE.format("{}さんの".format(user.display_name)), "warning")
+        return redirect(url_for("departments.manage"))
+    if value == current:
+        flash("{}さんのメールアドレスは変わっていません（変更していません）。".format(user.display_name), "info")
+        return redirect(url_for("departments.manage"))
+    set_user_email(user.id, value)
+    db.session.commit()
+    flash("{}さんのメールアドレスを{}しました。".format(user.display_name, "保存" if value else "削除"), "success")
+    return redirect(url_for("departments.manage"))
+
+
+# #############################################################################
+# 11. システム設定
 # #############################################################################
 # マネージャーのみ。アプリのすべての設定を1つの画面(タブ)で変更する。
 #
-#   10-1 項目の定義    基本設定の項目の定義(キー・グループ・表示名・説明・種類・再起動の要否・秘密か)。
+#   11-1 項目の定義    基本設定の項目の定義(キー・グループ・表示名・説明・種類・再起動の要否・秘密か)。
 #                      項目の定義はここの1か所だけにある
-#   10-2 入力チェック  基本設定の入力チェック・保存(instance/config.py の書き換え)・画面表示用の値
-#   10-3 画面          Blueprint: system_bp, /system/settings。タブ:
+#   11-2 入力チェック  基本設定の入力チェック・保存(instance/config.py の書き換え)・画面表示用の値
+#   11-3 画面          Blueprint: system_bp, /system/settings。タブ:
 #                        基本設定（config） : instance/config.py の環境ごとの設定
 #                        週報               : instance/weekly_settings.json
 #                        期限超過通知       : instance/overdue_settings.json
 #                        スキルテスト       : instance/skilltest_settings.json
 #                        AI分析             : instance/ai_analysis_settings.json
+#                        定型業務リマインド : instance/routine_reminder_settings.json
 #
-# 週報・期限超過通知・スキルテスト・AI分析の入力チェックと表示用の値は、各機能の設定フォーム
-# (6-3・7-3・8-2・9-1)にあり(保存先も各機能の設定の保存のまま)、この画面から使う。
+# 週報・期限超過通知・スキルテスト・AI分析・定型業務リマインドの入力チェックと表示用の値は、各機能の設定フォーム
+# (6-3・7-3・8-2・9-1・10-5)にあり(保存先も各機能の設定の保存のまま)、この画面から使う。
 # 各機能の画面には、実行・状況の表示だけが残る(設定はこの画面へのリンク)。
 
 
 # =============================================================================
-# 10-1. システム設定: 基本設定の項目の定義
+# 11-1. システム設定: 基本設定の項目の定義
 # =============================================================================
 # 基本設定(instance/config.py)の項目の定義。項目の定義はここ(FIELDS)の1か所だけに置く。
 #
@@ -16150,8 +17774,9 @@ FIELDS = (
     # ---- リンク ----
     Field(
         "APP_BASE_URL", GROUP_SERVER, "リンクの基準URL",
-        "メールに載せるタスクへのリンクの基準URLです（メンバーのPCからこのアプリを開くときのURL。"
-        "末尾の / は不要。例: http://192.0.2.10:8050）。空ならリンクを付けません（タスク名だけ）。",
+        "メールに載せるタスク・定型業務へのリンクの基準URLです（メンバーのPCからこのアプリを開くときのURL。"
+        "末尾の / は不要。例: http://192.0.2.10:8050）。空ならリンクを付けません（タスク名・業務名だけ）。"
+        "期限超過通知と定型業務リマインドのメールに使います。",
         type=TYPE_URL, no_query=True,
     ),
 )
@@ -16202,11 +17827,11 @@ def documented_keys():
 
 
 # =============================================================================
-# 10-2. システム設定: 基本設定の入力チェック・保存
+# 11-2. システム設定: 基本設定の入力チェック・保存
 # =============================================================================
 # 基本設定(instance/config.py)の入力チェック・保存・画面表示用の値。
 #
-# 項目の定義は FIELDS(10-1。1か所)にあり、ここではそれに従って処理する。
+# 項目の定義は FIELDS(11-1。1か所)にあり、ここではそれに従って処理する。
 #
 # 保存の流れ(save_config_form):
 #   1. instance/config.py を読み、画面を開いたときから変わっていないか確かめる(版の比較)
@@ -16927,16 +18552,18 @@ def config_form_context(app, state=None, errors=None):
 
 
 # =============================================================================
-# 10-3. システム設定: 画面
+# 11-3. システム設定: 画面
 # =============================================================================
 # システム設定の画面。マネージャーのみ(未ログインはログイン画面へ、メンバーは403)。
 #
-# GET  /system/settings?tab=<タブ>     設定画面(タブ: config / weekly / overdue / skilltest / analysis)
+# GET  /system/settings?tab=<タブ>     設定画面(タブ: config / weekly / overdue / skilltest / analysis / reminder)
 # POST /system/settings/config         基本設定の保存(instance/config.py)
 # POST /system/settings/weekly         週報の設定の保存(instance/weekly_settings.json)
 # POST /system/settings/overdue        期限超過通知の設定の保存(instance/overdue_settings.json)
 # POST /system/settings/skilltest      スキルテストの設定の保存(instance/skilltest_settings.json)
 # POST /system/settings/analysis       AI分析の設定の保存(instance/ai_analysis_settings.json)
+# POST /system/settings/reminder       定型業務リマインドの設定の保存(instance/routine_reminder_settings.json)
+# POST /system/settings/reminder/test  定型業務リマインドのテスト送信(今の未完了の回をすべて載せて、差出人宛てに1通)
 # POST /system/settings/config/remove-unused
 #                                      基本設定の「未使用の設定を削除」(instance/config.py から
 #                                      今は使わない項目の行を削除する。RETIRED_KEYS)
@@ -16953,6 +18580,7 @@ TAB_WEEKLY = "weekly"
 TAB_OVERDUE = "overdue"
 TAB_SKILLTEST = "skilltest"
 TAB_ANALYSIS = "analysis"
+TAB_REMINDER = "reminder"
 
 # (キー, 表示名, アイコン)
 TABS = (
@@ -16961,6 +18589,7 @@ TABS = (
     (TAB_OVERDUE, "期限超過通知", "bi-alarm"),
     (TAB_SKILLTEST, "スキルテスト", "bi-patch-check"),
     (TAB_ANALYSIS, "AI分析", "bi-clipboard-data"),
+    (TAB_REMINDER, "定型業務リマインド", "bi-bell"),
 )
 TAB_KEYS = tuple(key for key, _label, _icon in TABS)
 
@@ -16990,6 +18619,9 @@ FEATURES = {
         AI_ANALYSIS_LABEL, AI_ANALYSIS_SAVED_MESSAGE, load_ai_analysis_settings,
         save_ai_analysis_settings, parse_ai_analysis_form, settings_with_input,
         ai_analysis_form_context),
+    TAB_REMINDER: SettingsFeature(
+        REMINDER_LABEL, REMINDER_SAVED_MESSAGE, load_reminder_settings, save_reminder_settings,
+        parse_reminder_settings_form, settings_with_input, reminder_settings_form_context),
 }
 
 # タブ → 設定ファイル(読み込めないときの表示に使う)と、読み込めないあいだの動き
@@ -16998,12 +18630,14 @@ SETTINGS_STORES = {
     TAB_OVERDUE: OVERDUE_SETTINGS,
     TAB_SKILLTEST: SKILLTEST_SETTINGS,
     TAB_ANALYSIS: AI_ANALYSIS_SETTINGS,
+    TAB_REMINDER: REMINDER_SETTINGS,
 }
 SETTINGS_FILE_ERROR_NOTES = {
     TAB_WEEKLY: "週報は自動送信されず、週報の画面から作成・送信もできません",
     TAB_OVERDUE: "期限超過通知は自動送信されず、期限超過通知の画面から送信もできません",
     TAB_SKILLTEST: "スキルテストは既定値の設定で動きます",
     TAB_ANALYSIS: "AI分析は既定値の設定で動きます",
+    TAB_REMINDER: "定型業務リマインドは自動送信されず、テスト送信もできません",
 }
 
 # AI接続テストで送る問い合わせ(短く、応答も短くなるもの)
@@ -17053,6 +18687,9 @@ def _render_system_settings(tab, status=200, config_state=None, config_errors=No
         od=contexts[TAB_OVERDUE],
         st=contexts[TAB_SKILLTEST],
         an=contexts[TAB_ANALYSIS],
+        rm=contexts[TAB_REMINDER],
+        # 定型業務リマインドの状況(次回の送信・前回の結果・送れない宛先・プレビュー)
+        rm_status=reminder_status_context(app),
     ), status
 
 
@@ -17169,7 +18806,7 @@ def test_ai():
 
 
 # --------------------------------------------------------------------------- #
-# 機能ごとの設定(週報・期限超過通知・スキルテスト・AI分析)
+# 機能ごとの設定(週報・期限超過通知・スキルテスト・AI分析・定型業務リマインド)
 # --------------------------------------------------------------------------- #
 # 画面を開いた後に、ほかの操作で同じ機能の設定が変更されていたため保存しなかったときの案内({} は機能の名前)
 _SETTINGS_EDITED_ELSEWHERE = ("画面を開いた後に、ほかの操作（別のタブ・別のマネージャー）で{}の設定が変更されていたため、"
@@ -17234,31 +18871,57 @@ def save_analysis():
     return _save_feature(TAB_ANALYSIS)
 
 
+@system_bp.route("/settings/reminder", methods=["POST"])
+def save_reminder():
+    return _save_feature(TAB_REMINDER)
+
+
+@system_bp.route("/settings/reminder/test", methods=["POST"])
+def test_reminder():
+    """定型業務リマインドのテスト送信(今の未完了の回をすべて載せた1通を、差出人〔MAIL_FROM〕宛てに送る)。"""
+    settings_error = REMINDER_SETTINGS.load_error()
+    if settings_error:
+        # 前回の結果に記録できないため、始めない
+        flash("定型業務リマインドの設定ファイルを読み込めないため、送信できません。{}".format(settings_error), "danger")
+        return redirect(_tab_url(TAB_REMINDER))
+    app = current_app._get_current_object()
+    result = try_run_routine_reminders(app, TRIGGER_TEST, test=True)
+    if result is None:
+        flash("別の送信を処理中です。完了してから、もう一度実行してください。", "warning")
+    elif result["ok"]:
+        flash("定型業務リマインドのテスト送信: OK（{}）".format(mask_secrets(app, result["message"])), "success")
+    else:
+        flash("定型業務リマインドのテスト送信: 失敗しました。{}".format(mask_secrets(app, result["message"])), "danger")
+    return redirect(_tab_url(TAB_REMINDER))
+
+
 # #############################################################################
-# 11. 定期メールの自動送信スケジューラ
+# 12. 定期メールの自動送信スケジューラ
 # #############################################################################
 
 
 # =============================================================================
-# 11-1. スケジューラ(週報・期限超過通知)
+# 12-1. スケジューラ(週報・期限超過通知・定型業務リマインド)
 # =============================================================================
-# 定期メールの自動送信スケジューラ(バックグラウンドのスレッド1本で、2つの仕事を確認する)。
+# 定期メールの自動送信スケジューラ(バックグラウンドのスレッド1本で、3つの仕事を確認する)。
 #
 # 約30秒ごとに、次の仕事(ジョブ)ごとに設定(instance/ のJSON)を読み、実行時刻なら1回だけ実行する。
 #   weekly  : 週報。自動送信が有効で、今の曜日・時刻(HH:MM)が設定と一致したとき
 #   overdue : 期限超過通知。自動送信が有効で、今日が営業日(土日・祝日以外)で、
 #             今の時刻(HH:MM)が設定と一致したとき
+#   reminder: 定型業務リマインド(10 章)。自動送信が有効で、今の時刻(HH:MM)が送信時刻1・2のどちらかと一致し、
+#             営業日だけの設定なら今日が営業日のとき(時刻ごとに1日1回)
 #
 # - 起動するのは「flask --app app run」でサーバーとして動かしたときだけ(create_app() の最後で
 #   start_scheduler_once() を呼ぶ。seed / migrate コマンド・テスト・import では起動しない)。
 #   flask run --debug の自動再読み込みで2つのプロセスがアプリを作っても、instance/scheduler.lock の
-#   ロックを取れた1つのプロセスだけが動かす(11-2)
+#   ロックを取れた1つのプロセスだけが動かす(12-2)
 # - ジョブごとに、同じ (日付, 時刻) では1回しか実行しない。メモリ上の記録(fired)に加えて、各ジョブの
 #   設定ファイルに最後に実行した印(last_auto_key)を残す(実行時刻の分の中でサーバーを再起動しても、
 #   新しいプロセスがもう一度送らないように)
 # - サーバーが止まっていて実行時刻を過ぎた分は、後から実行しない(取りこぼしの再実行なし)
 # - 実行履歴はDBに残さない(結果は各機能の「前回の結果」に上書き)
-# - 実行はジョブごとに別のスレッドで行う(時間のかかる週報の作成中も、もう一方の
+# - 実行はジョブごとに別のスレッドで行う(時間のかかる週報の作成中も、ほかの
 #   ジョブの時刻の確認が止まらないようにするため)
 # - 例外はジョブごとに捕まえてそのジョブの「前回の結果」に書き、他のジョブ・スレッドは止めない
 
@@ -17313,11 +18976,25 @@ def _overdue_failure(message):
     set_overdue_last_result(TRIGGER_AUTO, False, message)
 
 
+# --------------------------------------------------------------------------- #
+# 定型業務リマインド
+# --------------------------------------------------------------------------- #
+def _reminder_run(app, settings, now):
+    result = run_routine_reminders(app, TRIGGER_AUTO, now=now)
+    return result["ok"]
+
+
+def _reminder_failure(message):
+    set_reminder_last_result(TRIGGER_AUTO, False, message)
+
+
 JOBS = (
     Job("weekly", "週報", load_weekly_settings, _weekly_due_key, _weekly_run, _weekly_failure,
         WEEKLY_SETTINGS.claim_auto_run),
     Job("overdue", "期限超過通知", load_overdue_settings, overdue_due_key,
         _overdue_run, _overdue_failure, OVERDUE_SETTINGS.claim_auto_run),
+    Job("reminder", "定型業務リマインド", load_reminder_settings, reminder_due_key,
+        _reminder_run, _reminder_failure, REMINDER_SETTINGS.claim_auto_run),
 )
 
 _scheduler_start_lock = threading.Lock()
@@ -17413,13 +19090,13 @@ def start_scheduler(app, interval=CHECK_INTERVAL):
             target=_loop, args=(app, interval), name="mail-scheduler", daemon=True
         )
         _scheduler_thread.start()
-    app.logger.info("定期メール（週報・期限超過通知）の自動送信スケジューラを起動しました（%s秒ごとに確認）",
+    app.logger.info("定期メール（週報・期限超過通知・定型業務リマインド）の自動送信スケジューラを起動しました（%s秒ごとに確認）",
                     interval)
     return _scheduler_thread
 
 
 # =============================================================================
-# 11-2. サーバーとして起動したときの開始(プロセス間で1つだけ)
+# 12-2. サーバーとして起動したときの開始(プロセス間で1つだけ)
 # =============================================================================
 SCHEDULER_LOCK_FILENAME = "scheduler.lock"
 
@@ -17477,7 +19154,7 @@ def start_scheduler_once(app, interval=CHECK_INTERVAL):
                          name="mail-scheduler-standby", daemon=True).start()
         return None
     thread = start_scheduler(app)
-    _notice("定期メール（週報・期限超過通知）の自動送信スケジューラを起動しました。")
+    _notice("定期メール（週報・期限超過通知・定型業務リマインド）の自動送信スケジューラを起動しました。")
     return thread
 
 
@@ -17498,7 +19175,7 @@ def _standby_scheduler(app, interval):
             continue
         if acquired:
             start_scheduler(app)
-            _notice("定期メール（週報・期限超過通知）の自動送信を、このプロセスで引き継ぎました"
+            _notice("定期メール（週報・期限超過通知・定型業務リマインド）の自動送信を、このプロセスで引き継ぎました"
                     "（スケジューラを動かしていたプロセスが終了したため）。")
             return
 
@@ -17545,12 +19222,12 @@ def scheduler_is_stopped(app):
 
 
 # #############################################################################
-# 12. アプリの組み立て
+# 13. アプリの組み立て
 # #############################################################################
 
 
 # =============================================================================
-# 12-1. 画面テンプレート・静的ファイル(templates.html)
+# 13-1. 画面テンプレート・静的ファイル(templates.html)
 # =============================================================================
 # 画面テンプレート(Jinja2)・CSS・JavaScript は、プロジェクト直下の templates.html に
 # ファイルごとのセクションとしてまとめてある(TemplateSections で読む)。
@@ -17667,7 +19344,7 @@ def send_static_section(filename):
 
 
 # =============================================================================
-# 12-2. create_app(アプリの作成)
+# 13-2. create_app(アプリの作成)
 # =============================================================================
 # 設定の読み込み順:
 #   1. Config(このファイルの固定設定と、環境ごとの設定の既定値)
@@ -17689,11 +19366,13 @@ BLUEPRINTS = (
     manager_bp,
     departments_bp,
     export_bp,
-    # 定期メール(週報・期限超過通知)の画面。自動送信のスケジューラは create_app() の最後で
+    # 定期メール(週報・期限超過通知)の画面。自動送信のスケジューラ(定型業務リマインドを含む)は create_app() の最後で
     # 「flask run」のときだけ起動する
     weekly_bp,
     overdue_bp,
-    # システム設定(マネージャーのみ。基本設定・週報・期限超過通知・スキルテスト・AI分析の設定を1画面で変更)
+    # 自分のメールアドレス(定型業務のリマインドの宛先。全員。10-8)
+    account_bp,
+    # システム設定(マネージャーのみ。基本設定・週報・期限超過通知・スキルテスト・AI分析・定型業務リマインドの設定を1画面で変更)
     system_bp,
 )
 
@@ -18074,7 +19753,7 @@ def create_app():
 
 
 # #############################################################################
-# 13. flask コマンド(seed / migrate)
+# 14. flask コマンド(seed / migrate)
 # #############################################################################
 # 「flask --app app <コマンド>」で使えるコマンド(create_app() で登録する)。
 #   flask --app app seed                          初期データの投入
@@ -18083,7 +19762,7 @@ def create_app():
 
 
 # =============================================================================
-# 13-1. seed: 初期データの投入
+# 14-1. seed: 初期データの投入
 # =============================================================================
 # サンプルデータ(タスク・定型業務・チーム・年休・スキルの到達度)の担当者などに使う、
 # 同梱の ldap_client.py の動作確認用のユーザー
@@ -18312,7 +19991,7 @@ def seed_command():
 
 
 # =============================================================================
-# 13-2. migrate: 既存DBを最新のモデル定義に合わせる
+# 14-2. migrate: 既存DBを最新のモデル定義に合わせる
 # =============================================================================
 # コードを新しいものに差し替えたあと、**実運用中のDBを消さずに** flask --app app migrate を
 # 1回実行すれば、不足しているテーブル・列が追加されて動くようになる。

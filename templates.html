@@ -13,9 +13,11 @@
   目次(区切りの名前。この順に並ぶ):
     共通　　　　　　　  base.html  _macros.html  errors/too_large.html  errors/http_error.html
     ログイン　　　　　  auth/login.html
+    メールアドレス　　  account/email.html
     個人ダッシュボード  main/dashboard.html
     タスク　　　　　　  tasks/list.html  tasks/detail.html  tasks/form.html
     定型業務　　　　　  routine/list.html  routine/detail.html  routine/form.html
+                        routine/occurrence.html  routine/reminder_mail.html
     年休　　　　　　　  leaves/list.html  leaves/calendar.html  leaves/detail.html  leaves/form.html
     スキル　　　　　　  skills/map.html  skills/member.html  skills/member_edit.html  skills/items.html
                         skills/item_form.html  skills/coverage.html  skills/operations.html
@@ -31,8 +33,9 @@
     期限超過通知　　　  overdue/index.html  overdue/mail.html
     システム設定　　　  system/settings.html  system/_config_tab.html  system/_weekly_tab.html
                         system/_overdue_tab.html  system/_skilltest_tab.html
-                        system/_analysis_tab.html
+                        system/_analysis_tab.html  system/_reminder_tab.html
     静的ファイル　　　  static/css/style.css  static/js/sort-table.js  static/js/auto-filter.js
+                        static/js/routine-form.js
                         static/js/skill-item-form.js  static/js/skilltest.js
                         static/js/weekly-settings.js  static/js/system-settings.js
                         static/js/ai-analysis.js
@@ -77,7 +80,7 @@
                href="{{ url_for('routine.list_routines') }}"><i class="bi bi-arrow-repeat"></i> 定型・定期業務</a>
           </li>
           {% if current_user.is_manager %}
-          {# 定期メール(週報・期限超過通知)はマネージャーのみ #}
+          {# 定期メール(週報・期限超過通知・定型業務リマインドの設定)はマネージャーのみ #}
           <li class="nav-item dropdown">
             <a class="nav-link dropdown-toggle {% if request.blueprint in ('weekly', 'overdue') %}active{% endif %}"
                href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false"><i class="bi bi-envelope-paper"></i> 定期メール</a>
@@ -86,6 +89,8 @@
                      href="{{ url_for('weekly.index') }}"><i class="bi bi-file-earmark-text"></i> 週報</a></li>
               <li><a class="dropdown-item {% if request.blueprint == 'overdue' %}active{% endif %}"
                      href="{{ url_for('overdue.index') }}"><i class="bi bi-alarm"></i> 期限超過通知</a></li>
+              {# 定型業務リマインドは画面を持たず、システム設定のタブ(設定・プレビュー・テスト送信)で扱う #}
+              <li><a class="dropdown-item" href="{{ url_for('system.settings', tab='reminder') }}"><i class="bi bi-bell"></i> 定型業務リマインド</a></li>
             </ul>
           </li>
           {% endif %}
@@ -134,6 +139,8 @@
               <li><span class="dropdown-item-text small text-muted"><i class="bi bi-diagram-3"></i> {{ current_user.department_names }}</span></li>
               <li><hr class="dropdown-divider"></li>
               {% endif %}
+              {# 自分のメールアドレス(定型業務のリマインドの宛先) #}
+              <li><a class="dropdown-item {% if request.blueprint == 'account' %}active{% endif %}" href="{{ url_for('account.email') }}"><i class="bi bi-envelope"></i> メールアドレス</a></li>
               <li><a class="dropdown-item" href="{{ url_for('auth.logout') }}"><i class="bi bi-box-arrow-right"></i> ログアウト</a></li>
             </ul>
           </li>
@@ -183,6 +190,27 @@
 {# 日時 YYYY/MM/DD HH:MM。Noneは ― #}
 {% macro fmt_datetime(dt) -%}
   {%- if dt -%}{{ dt.strftime('%Y/%m/%d %H:%M') }}{%- else -%}―{%- endif -%}
+{%- endmacro %}
+
+{# 定型業務の実施予定日1回分の「完了」ボタン(row は app.py の occurrence_rows の1行。back は押した後に戻る画面:
+   list / detail / dashboard / occurrence) #}
+{% macro occurrence_complete_button(row, back, size='btn-sm') -%}
+<form method="post" action="{{ url_for('routine.complete_occurrence', occ_id=row.occ.id) }}" class="d-inline">
+  <input type="hidden" name="o" value="{{ row.key }}">
+  <input type="hidden" name="back" value="{{ back }}">
+  <button class="btn {{ size }} btn-success text-nowrap"><i class="bi bi-check2-circle"></i> 完了</button>
+</form>
+{%- endmacro %}
+
+{# 定型業務の完了の取り消しボタン(マネージャーのみ。occ は RoutineOccurrence、key はその印) #}
+{% macro occurrence_undo_button(occ, key, back) -%}
+<form method="post" action="{{ url_for('routine.undo_occurrence', occ_id=occ.id) }}" class="d-inline"
+      data-confirm="この回の完了を取り消します。未完了に戻り、リマインドの対象になります。よろしいですか？"
+      onsubmit="return confirm(this.dataset.confirm);">
+  <input type="hidden" name="o" value="{{ key }}">
+  <input type="hidden" name="back" value="{{ back }}">
+  <button class="btn btn-sm btn-outline-secondary text-nowrap"><i class="bi bi-arrow-counterclockwise"></i> 取り消し</button>
+</form>
 {%- endmacro %}
 
 {# 「AIで分析」で AI の接続先に送る内容(AI分析の画面とシステム設定の「AI分析」タブで同じ文を使う) #}
@@ -258,8 +286,56 @@
   </div>
 </div>
 {% endblock %}
+{#=== account/email.html ===#}
+{# 自分のメールアドレス(定型業務のリマインドの宛先)。ユーザーメニューの「メールアドレス」から開く。app.py の account_email #}
+{% extends "base.html" %}
+{% block title %}メールアドレス &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+  <div class="col-lg-7">
+    <h1 class="h3 mb-1"><i class="bi bi-envelope"></i> メールアドレス</h1>
+    <p class="text-muted small">
+      定型・定期業務のリマインド（実施日のお知らせと、完了の入力がまだのもののリマインド）を受け取るアドレスです。
+      マネージャーはチーム管理の画面からも変更できます。
+    </p>
+    {% if not saved %}
+    <div class="alert alert-warning small py-2">
+      <i class="bi bi-exclamation-triangle"></i> メールアドレスが未登録です。担当の定型業務のリマインドのメールは届きません。
+    </div>
+    {% endif %}
+    <form method="post" action="{{ url_for('account.email') }}" class="card card-body shadow-sm">
+      {# 開いたときのアドレスの控え(ほかの操作の変更を古い画面の値で上書きしない) #}
+      <input type="hidden" name="version" value="{{ version }}">
+      <label class="form-label" for="account-email">メールアドレス</label>
+      <input type="email" name="email" id="account-email" class="form-control" value="{{ address }}"
+             maxlength="{{ email_max }}" placeholder="name@example.com" autocomplete="email">
+      <div class="form-text">
+        半角で、表示名や「&lt; &gt;」は付けずに入力します（例: name@example.com）。
+        空にして保存すると削除します（リマインドのメールは届かなくなります）。
+      </div>
+      <div class="mt-3 d-flex gap-2">
+        <button class="btn btn-primary"><i class="bi bi-check-lg"></i> 保存</button>
+        <a href="{{ url_for('main.dashboard') }}" class="btn btn-outline-secondary">戻る</a>
+      </div>
+    </form>
+
+    <div class="card shadow-sm mt-3">
+      <div class="card-header bg-white fw-bold"><i class="bi bi-bell"></i> リマインドが設定された担当の定型業務</div>
+      <ul class="list-group list-group-flush">
+        {% for r in routines %}
+        <li class="list-group-item"><a href="{{ url_for('routine.detail', routine_id=r.id) }}">{{ r.name }}</a></li>
+        {% else %}
+        <li class="list-group-item text-muted small">リマインドが設定された担当の業務はありません。</li>
+        {% endfor %}
+      </ul>
+    </div>
+  </div>
+</div>
+{% endblock %}
 {#=== main/dashboard.html ===#}
 {% extends "base.html" %}
+{% from "_macros.html" import fmt_date, occurrence_complete_button %}
 {% block title %}ダッシュボード &middot; {{ app_name }}{% endblock %}
 
 {% block content %}
@@ -292,6 +368,44 @@
 <div class="alert alert-danger">
   <i class="bi bi-exclamation-triangle-fill"></i>
   期限切れのタスクが <strong>{{ my_overdue|length }}</strong> 件あります。
+</div>
+{% endif %}
+
+{# 今日の定型業務(自分が担当で、リマインドが設定された業務の、実施予定日が今日以前で完了の入力がまだの回。
+   完了を入力すると、その回のリマインドは止まる。リマインドが設定された担当の業務が無ければ表示しない) #}
+{% if routine_panel %}
+<div class="card shadow-sm mb-3 {% if routine_panel.rows %}border-warning{% endif %}">
+  <div class="card-header bg-white d-flex justify-content-between align-items-center">
+    <span class="fw-bold"><i class="bi bi-bell"></i> 今日の定型業務</span>
+    <a href="{{ url_for('routine.list_routines', scope='mine') }}" class="btn btn-sm btn-outline-secondary">定型・定期業務へ</a>
+  </div>
+  {% if routine_panel.email_missing and routine_panel.sending_enabled %}
+  <div class="alert alert-warning small rounded-0 mb-0 py-2">
+    <i class="bi bi-exclamation-triangle"></i> メールアドレスが未登録のため、リマインドのメールは届きません。
+    <a href="{{ url_for('account.email') }}">メールアドレスを登録する</a>
+  </div>
+  {% endif %}
+  <ul class="list-group list-group-flush">
+    {% for row in routine_panel.rows %}
+    <li class="list-group-item d-flex justify-content-between align-items-center flex-wrap gap-2">
+      <span>
+        <a href="{{ url_for('routine.detail', routine_id=row.routine.id) }}" class="fw-medium">{{ row.routine.name }}</a>
+        {% if row.is_today %}<span class="badge bg-primary">本日実施</span>
+        {% else %}<span class="badge bg-danger">未完了</span>
+        <span class="small text-danger text-nowrap">予定日 {{ fmt_date(row.due) }}・{{ row.elapsed }}</span>{% endif %}
+      </span>
+      {% if row.can_complete %}{{ occurrence_complete_button(row, 'dashboard') }}{% endif %}
+    </li>
+    {% endfor %}
+    {% for occ in routine_panel.done_today %}
+    <li class="list-group-item small text-muted">
+      <i class="bi bi-check-circle-fill text-success"></i> {{ occ.routine.name }}（本日実施・完了 {{ occ.completed_at.strftime('%H:%M') }}）
+    </li>
+    {% endfor %}
+    {% if not routine_panel.rows and not routine_panel.done_today %}
+    <li class="list-group-item small text-muted">今日の実施予定・完了の入力がまだの定型業務はありません。</li>
+    {% endif %}
+  </ul>
 </div>
 {% endif %}
 
@@ -966,6 +1080,7 @@
 {% endblock %}
 {#=== routine/list.html ===#}
 {% extends "base.html" %}
+{% from "_macros.html" import fmt_date, occurrence_complete_button %}
 {% block title %}定型・定期業務 &middot; {{ app_name }}{% endblock %}
 
 {% block content %}
@@ -978,6 +1093,47 @@
     <a href="{{ url_for('routine.new_routine') }}" class="btn btn-primary"><i class="bi bi-plus-lg"></i> 業務を登録</a>
   </div>
 </div>
+
+{# 未完了の定型業務(リマインドが設定された業務の、実施予定日が今日以前で完了の入力がまだの回。全員分。
+   下の絞り込みには連動しない。リマインドが設定された業務が無ければ表示しない) #}
+{% if pending_panel %}
+<div class="card shadow-sm mb-3 {% if pending_panel.rows %}border-warning{% endif %}">
+  <div class="card-header bg-white fw-bold">
+    <i class="bi bi-bell"></i> 未完了の定型業務
+    <span class="text-muted small fw-normal">（リマインドを設定した業務の、実施予定日が今日以前で完了の入力がまだの回。{{ pending_panel.rows|length }}件）</span>
+  </div>
+  {% if pending_panel.rows %}
+  <div class="table-responsive">
+    <table class="table table-sm table-hover align-middle mb-0 sortable">
+      <thead class="table-light">
+        <tr>
+          <th class="text-nowrap">実施予定日</th>
+          <th class="text-nowrap">経過</th>
+          <th>業務名</th>
+          <th>担当者</th>
+          <th class="text-end" data-nosort>完了の入力</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in pending_panel.rows %}
+        <tr>
+          <td class="text-nowrap" data-sort="{{ row.due.strftime('%Y-%m-%d') }}">{{ fmt_date(row.due) }}</td>
+          <td class="text-nowrap" data-sort="{{ row.due.strftime('%Y-%m-%d') }}">
+            {% if row.is_today %}<span class="badge bg-primary">本日</span>{% else %}<span class="text-danger fw-bold">{{ row.elapsed }}</span>{% endif %}
+          </td>
+          <td><a href="{{ url_for('routine.detail', routine_id=row.routine.id) }}" class="fw-medium">{{ row.routine.name }}</a></td>
+          <td class="text-nowrap">{{ row.routine.assignee.name_label if row.routine.assignee else '―' }}</td>
+          <td class="text-end">{% if row.can_complete %}{{ occurrence_complete_button(row, 'list') }}{% else %}<span class="text-muted small">―</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="card-body small text-muted py-2">完了の入力がまだの定型業務はありません。</div>
+  {% endif %}
+</div>
+{% endif %}
 
 {# ヒト別サマリー(全データ対象。下の絞り込みには連動しない) #}
 <div class="card shadow-sm mb-3">
@@ -1097,7 +1253,7 @@
 {% endblock %}
 {#=== routine/detail.html ===#}
 {% extends "base.html" %}
-{% from "_macros.html" import fmt_datetime %}
+{% from "_macros.html" import fmt_date, fmt_datetime, occurrence_complete_button, occurrence_undo_button %}
 {% block title %}{{ routine.name }} &middot; {{ app_name }}{% endblock %}
 
 {% block content %}
@@ -1158,6 +1314,88 @@
     {% endif %}
   </div>
   {% endif %}
+</div>
+
+{# リマインド(実施日に担当者へメールで知らせ、完了の入力があるまで1日2回リマインドする。設定は編集画面の「リマインド」。
+   アドレスは編集できる人〔担当者・マネージャー〕にだけ表示する) #}
+<div class="card shadow-sm mt-3" id="reminder">
+  <div class="card-header bg-white d-flex justify-content-between align-items-center">
+    <span class="fw-bold"><i class="bi bi-bell"></i> リマインド</span>
+    {% if reminder %}{% if reminder.rem.enabled %}<span class="badge bg-success">オン</span>{% else %}<span class="badge bg-secondary">オフ</span>{% endif %}{% endif %}
+  </div>
+  <div class="card-body">
+    {% if not reminder %}
+    <p class="text-muted small mb-0">
+      リマインドは設定されていません。{% if can_edit %}「編集」の「リマインド」で、実施日と宛先を設定できます（実施日に担当者へメールで知らせ、完了の入力があるまで1日2回リマインドします）。{% endif %}
+    </p>
+    {% else %}
+    {% for p in reminder.problems if p.kind == '担当者' %}
+    <div class="alert alert-warning small py-2">
+      <i class="bi bi-exclamation-triangle"></i> 担当者（{{ p.name }}）は{{ p.reason }}のため、担当者にはリマインドのメールが送られません（追加の宛先には送ります）。
+      {% if p.reason == 'メールアドレス未登録' %}{% if current_user.id == routine.assignee_id %}<a href="{{ url_for('account.email') }}">自分のメールアドレスを登録する</a>{% elif current_user.is_manager %}<a href="{{ url_for('departments.manage') }}">チーム管理で登録する</a>{% endif %}{% endif %}
+    </div>
+    {% endfor %}
+    {% if reminder.rem.enabled and not reminder.sending_enabled %}
+    <div class="alert alert-secondary small py-2">
+      <i class="bi bi-info-circle"></i> システム設定の「定型業務リマインド」で自動送信がオフのため、今はメールは送られません（未完了の回の表示・完了の入力は使えます）。
+    </div>
+    {% endif %}
+    <dl class="row mb-2 small">
+      <dt class="col-sm-3 text-muted">実施日</dt>
+      <dd class="col-sm-9">{{ reminder.rule_text }}</dd>
+      <dt class="col-sm-3 text-muted">開始日</dt>
+      <dd class="col-sm-9">{{ fmt_date(reminder.rem.start_date) }} <span class="text-muted">（この日より前の実施予定日は作りません）</span></dd>
+      {% if reminder.rem.enabled %}
+      <dt class="col-sm-3 text-muted">今後の予定</dt>
+      <dd class="col-sm-9">{% for d in reminder.upcoming %}{{ fmt_date(d) }}（{{ reminder.weekday_labels[d.weekday()] }}）{% if not loop.last %}、{% endif %}{% else %}―{% endfor %}</dd>
+      {% endif %}
+      <dt class="col-sm-3 text-muted">宛先</dt>
+      <dd class="col-sm-9">
+        {% for r in reminder.recipients %}
+        <div>{{ r.kind }}: {{ r.name or 'アドレス' }}{% if can_edit %} <span class="text-muted">&lt;{{ r.address }}&gt;</span>{% endif %}</div>
+        {% endfor %}
+        {% for p in reminder.problems %}
+        <div class="text-danger"><i class="bi bi-exclamation-triangle"></i> {{ p.kind }}: {{ p.name }}（{{ p.reason }}のため送りません）</div>
+        {% endfor %}
+        {% if not reminder.recipients and not reminder.problems %}―{% endif %}
+      </dd>
+      <dt class="col-sm-3 text-muted">最終更新</dt>
+      <dd class="col-sm-9">{{ reminder.rem.updated_by.display_name if reminder.rem.updated_by else '―' }} <span class="text-muted">（{{ fmt_datetime(reminder.rem.updated_at) }}）</span></dd>
+    </dl>
+
+    {% if reminder.rem.enabled %}
+    <h2 class="h6 mt-3">未完了の回</h2>
+    {% if reminder.rows %}
+    <ul class="list-group mb-2">
+      {% for row in reminder.rows %}
+      <li class="list-group-item d-flex justify-content-between align-items-center flex-wrap gap-2">
+        <span>予定日 {{ fmt_date(row.due) }}（{{ reminder.weekday_labels[row.due.weekday()] }}）
+          {% if row.is_today %}<span class="badge bg-primary">本日</span>{% else %}<span class="text-danger fw-bold small">{{ row.elapsed }}</span>{% endif %}</span>
+        {% if row.can_complete %}{{ occurrence_complete_button(row, 'detail') }}{% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="text-muted small">完了の入力がまだの回はありません。</p>
+    {% endif %}
+    {% else %}
+    <p class="text-muted small">リマインドがオフのため、未完了の回の表示とメールの送信は行いません。</p>
+    {% endif %}
+
+    {% if reminder.completed %}
+    <h2 class="h6 mt-3">最近の完了（10件まで）</h2>
+    <ul class="list-group">
+      {% for c in reminder.completed %}
+      <li class="list-group-item d-flex justify-content-between align-items-center flex-wrap gap-2 small">
+        <span><i class="bi bi-check-circle-fill text-success"></i> 予定日 {{ fmt_date(c.occ.due_date) }}（{{ reminder.weekday_labels[c.occ.due_date.weekday()] }}）
+          <span class="text-muted">完了 {{ fmt_datetime(c.occ.completed_at) }}・{{ c.occ.completed_by.display_name if c.occ.completed_by else '（不明）' }}</span></span>
+        {% if current_user.is_manager %}{{ occurrence_undo_button(c.occ, c.key, 'detail') }}{% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+    {% endif %}
+  </div>
 </div>
 {% endblock %}
 {#=== routine/form.html ===#}
@@ -1243,6 +1481,95 @@
         <textarea name="content" class="form-control" rows="5">{{ val('content') }}</textarea>
       </div>
 
+      {# リマインド(実施日に担当者へメールで知らせ、完了の入力があるまで1日2回リマインドする。app.py の 10-4)。
+         rem_mark はこの欄のある画面からの送信の印(無い以前の画面からの保存では、リマインドの設定を変えない) #}
+      <input type="hidden" name="{{ rem_mark }}" value="1">
+      {% if editing %}<input type="hidden" name="reminder_version" value="{{ rem_version }}">{% endif %}
+      <fieldset class="border rounded p-3 mb-3" id="reminder-fields">
+        <legend class="float-none w-auto px-2 fs-6 fw-bold mb-0"><i class="bi bi-bell"></i> リマインド</legend>
+        <div class="form-check form-switch mb-1">
+          <input class="form-check-input" type="checkbox" role="switch" id="rem-enabled" name="rem_enabled" value="1"
+                 {% if rem.enabled %}checked{% endif %}>
+          <label class="form-check-label" for="rem-enabled">実施日に担当者へメールで知らせる（完了の入力があるまで1日2回リマインド）</label>
+        </div>
+        <div class="form-text mb-2">
+          担当者には自動で送ります（担当者のメールアドレスは、ユーザーメニューの「メールアドレス」かチーム管理で登録します）。
+          完了は、定型・定期業務の一覧・詳細・ダッシュボードの「完了」か、メールのリンクから入力します。
+          {% if not rem_ctx.sending_enabled %}<br><span class="text-warning-emphasis"><i class="bi bi-info-circle"></i> システム設定の「定型業務リマインド」で自動送信がオフのため、今はメールは送られません（実施予定日の表示・完了の入力は使えます）。</span>{% endif %}
+        </div>
+        <div class="row g-2 mb-2">
+          <div class="col-md-4">
+            <label class="form-label small mb-1" for="rem-rule-type">繰り返し</label>
+            <select name="rem_rule_type" id="rem-rule-type" class="form-select form-select-sm">
+              {% for key, label in rem_ctx.rule_types %}
+              <option value="{{ key }}" {% if rem.rule_type == key %}selected{% endif %}>{{ label }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="col-md-4" data-rem-rule="weekly monthly dates">
+            <label class="form-label small mb-1" for="rem-holiday-rule">営業日でない日に当たったとき</label>
+            <select name="rem_holiday_rule" id="rem-holiday-rule" class="form-select form-select-sm">
+              {% for key, label in rem_ctx.holiday_rules %}
+              <option value="{{ key }}" {% if rem.holiday_rule == key %}selected{% endif %}>{{ label }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label small mb-1" for="rem-start-date">開始日</label>
+            <input type="date" name="rem_start_date" id="rem-start-date" class="form-control form-control-sm"
+                   value="{{ rem.start_date }}" min="{{ rem_ctx.date_min }}" max="{{ rem_ctx.date_max }}">
+          </div>
+        </div>
+        <div class="mb-2" data-rem-rule="weekly">
+          <div class="small mb-1">曜日（毎週。複数可）</div>
+          {% for label in rem_ctx.weekday_labels %}
+          <div class="form-check form-check-inline">
+            <input class="form-check-input" type="checkbox" name="rem_weekdays" value="{{ loop.index0 }}" id="rem-wd-{{ loop.index0 }}"
+                   {% if loop.index0|string in rem.weekdays %}checked{% endif %}>
+            <label class="form-check-label small" for="rem-wd-{{ loop.index0 }}">{{ label }}</label>
+          </div>
+          {% endfor %}
+        </div>
+        <div class="mb-2" data-rem-rule="monthly">
+          <div class="small mb-1">日（毎月。複数可。その月に無い日〔2月30日など〕は月末）</div>
+          <div class="d-flex flex-wrap gap-1">
+            {% for value, label in rem_ctx.month_days %}
+            <input type="checkbox" class="btn-check" name="rem_month_days" value="{{ value }}" id="rem-md-{{ value }}" autocomplete="off"
+                   {% if value in rem.month_days %}checked{% endif %}>
+            <label class="btn btn-sm btn-outline-primary rem-day" for="rem-md-{{ value }}">{{ label }}</label>
+            {% endfor %}
+          </div>
+        </div>
+        <div class="mb-2" data-rem-rule="dates">
+          <label class="small mb-1" for="rem-dates">指定日（1行に1つ。例: 2026-10-15）</label>
+          <textarea name="rem_dates" id="rem-dates" rows="3" class="form-control form-control-sm">{{ rem.dates }}</textarea>
+        </div>
+        <div class="form-text mb-2">
+          毎営業日は、土日・祝日を除く毎日です。計算した日が土日・祝日のときは「営業日でない日に当たったとき」に従います（最終営業日はそのまま）。
+          開始日より前の日・未来の日の予定は作りません。保存した後に繰り返し・曜日・日・指定日などを変えたときは、今日より前の日の予定を新しいルールで作らないよう、開始日を今日にします（開始日も変えたときは、その日から作ります）。既にある予定（未完了・完了）はそのまま残ります。
+        </div>
+        <div class="row g-2">
+          <div class="col-md-6">
+            <div class="small mb-1">追加の宛先（メンバー。複数可）</div>
+            <div class="border rounded p-2 rem-users">
+              {% for u in rem_choices %}
+              <div class="form-check">
+                <input class="form-check-input" type="checkbox" name="rem_extra_users" value="{{ u.form_key }}" id="rem-user-{{ u.id }}"
+                       {% if u.form_key in rem.extra_keys %}checked{% endif %}>
+                <label class="form-check-label small" for="rem-user-{{ u.id }}">{{ u.display_name }}{% if not u.is_active %}［無効］{% endif %}</label>
+              </div>
+              {% endfor %}
+            </div>
+          </div>
+          <div class="col-md-6">
+            <label class="small mb-1" for="rem-emails">追加の宛先（アドレス。1行に1件）</label>
+            <textarea name="rem_extra_emails" id="rem-emails" rows="4" class="form-control form-control-sm"
+                      placeholder="name@example.com">{{ rem.extra_emails }}</textarea>
+          </div>
+        </div>
+        <div class="form-text">追加の宛先にも、担当者と同じ内容（この業務の本日の実施予定・完了の入力がまだの回）を送ります。宛先ごとに、関係する業務をまとめて1通にします。</div>
+      </fieldset>
+
       <div class="d-flex gap-2">
         <button type="submit" class="btn btn-primary"><i class="bi bi-check-lg"></i> {{ '更新' if editing else '登録' }}</button>
         <a href="{{ url_for('routine.detail', routine_id=routine.id) if editing else url_for('routine.list_routines') }}"
@@ -1252,6 +1579,103 @@
   </div>
 </div>
 {% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/routine-form.js') }}"></script>
+{% endblock %}
+{#=== routine/occurrence.html ===#}
+{# 定型業務の実施予定日1回分(リマインドのメールの「完了の入力」のリンク)。開くだけでは何も変えない(完了はボタンの POST)。
+   app.py の occurrence_page #}
+{% extends "base.html" %}
+{% from "_macros.html" import fmt_date, fmt_datetime, occurrence_complete_button, occurrence_undo_button %}
+{% block title %}{{ routine.name }}（{{ fmt_date(occ.due_date) }}） &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('routine.list_routines') }}">定型・定期業務</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('routine.detail', routine_id=routine.id) }}">詳細</a></li>
+    <li class="breadcrumb-item active">完了の入力</li>
+  </ol>
+</nav>
+
+<div class="card shadow-sm">
+  <div class="card-body">
+    <h1 class="h4 mb-3">{{ routine.name }}</h1>
+    <dl class="row mb-3">
+      <dt class="col-sm-3 text-muted">実施予定日</dt>
+      <dd class="col-sm-9">{{ fmt_date(occ.due_date) }}（{{ weekday_labels[occ.due_date.weekday()] }}）
+        {% if not occ.completed_at %}{% if row.is_today %}<span class="badge bg-primary">本日</span>{% else %}<span class="text-danger fw-bold">{{ row.elapsed }}</span>{% endif %}{% endif %}
+      </dd>
+      <dt class="col-sm-3 text-muted">担当者</dt>
+      <dd class="col-sm-9">{{ routine.assignee.name_label if routine.assignee else '―' }}</dd>
+      <dt class="col-sm-3 text-muted">状態</dt>
+      <dd class="col-sm-9">
+        {% if occ.completed_at %}<span class="badge bg-success">完了</span>
+        {{ fmt_datetime(occ.completed_at) }}（{{ occ.completed_by.display_name if occ.completed_by else '（不明）' }}）
+        {% else %}<span class="badge bg-danger">未完了</span>{% endif %}
+      </dd>
+    </dl>
+    {% if not occ.completed_at %}
+    {% if row.can_complete %}
+    {{ occurrence_complete_button(row, 'occurrence', 'btn') }}
+    <div class="small text-muted mt-2">完了を入力すると、この回のリマインドは送られません。</div>
+    {% else %}
+    <div class="alert alert-info small mb-0">完了を入力できるのは、この業務の担当者とマネージャーだけです。</div>
+    {% endif %}
+    {% if not reminder_enabled %}
+    <div class="small text-muted mt-2">この業務のリマインドは今オフになっています。</div>
+    {% endif %}
+    {% elif current_user.is_manager %}
+    {{ occurrence_undo_button(occ, row.key, 'occurrence') }}
+    {% endif %}
+  </div>
+</div>
+<a href="{{ url_for('routine.detail', routine_id=routine.id) }}" class="btn btn-outline-secondary btn-sm mt-3">業務の詳細へ</a>
+{% endblock %}
+{#=== routine/reminder_mail.html ===#}
+{#- 定型業務リマインドのメールのHTML版(app.py の _reminder_mail で作成。宛先ごとに1通)。
+    メールソフト(Outlook など)で崩れにくいよう、外部CSS・スクリプトは使わず簡単なインラインスタイルだけにする
+    (期限超過通知のメール overdue/mail.html と同じ)。値はすべて自動でエスケープされる。 -#}
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ mail.subject }}</title>
+</head>
+<body style="margin:0;padding:12px;background-color:#ffffff;">
+<div style="font-family:'Meiryo UI',Meiryo,'Yu Gothic UI','Hiragino Sans',sans-serif;font-size:14px;line-height:1.6;color:#212529;word-wrap:break-word;overflow-wrap:break-word;">
+{%- if mail.name %}
+<p style="margin:0 0 12px 0;">{{ mail.name }}さん</p>
+{%- endif %}
+{%- if mail.note %}
+<p style="margin:0 0 12px 0;padding:6px 8px;background-color:#fff3cd;">{{ mail.note }}</p>
+{%- endif %}
+<p style="margin:0 0 4px 0;">{{ mail.intro }}</p>
+<p style="margin:0 0 12px 0;">{{ mail.guide }}</p>
+{%- for title, items, color in [(today_title, mail.today_items, '#0d6efd'), (overdue_title, mail.overdue_items, '#dc3545')] %}
+<p style="margin:18px 0 6px 0;padding:4px 8px;font-size:15px;font-weight:bold;background-color:#eef2f7;border-left:4px solid {{ color }};">■{{ title }}（{{ items|length }}件）</p>
+{%- if not items %}
+<p style="margin:4px 0 4px 12px;color:#6c757d;">{{ none_text }}</p>
+{%- else %}
+<ul style="margin:0 0 6px 0;padding-left:24px;">
+{%- for item in items %}
+<li style="margin:0 0 6px 0;">
+{%- if item.url %}<a href="{{ item.url }}" style="color:#0d6efd;">{{ item.name }}</a>{% else %}{{ item.name }}{% endif %}
+{%- if not item.is_today %} <span style="color:#dc3545;">［予定日 {{ item.due_label }}・{{ item.elapsed }}］</span>{% endif %}
+<span style="color:#6c757d;">（担当: {{ item.assignee }}）</span>
+{%- if item.complete_url %}
+<br><a href="{{ item.complete_url }}" style="color:#198754;">完了の入力</a>
+{%- endif %}</li>
+{%- endfor %}
+</ul>
+{%- endif %}
+{%- endfor %}
+<p style="margin:18px 0 0 0;font-size:12px;color:#6c757d;">{{ mail.footer }}</p>
+</div>
+</body>
+</html>
 {#=== leaves/list.html ===#}
 {% extends "base.html" %}
 {% block title %}年休一覧 &middot; {{ app_name }}{% endblock %}
@@ -4779,6 +5203,7 @@
             <th>氏名</th>
             <th>ログインID</th>
             <th>役割</th>
+            <th>メールアドレス</th>
             <th class="text-end">操作</th>
           </tr>
         </thead>
@@ -4788,6 +5213,17 @@
             <td>{{ u.display_name }}</td>
             <td><code>{{ u.username }}</code></td>
             <td><span class="badge bg-light text-dark">{{ u.role_label }}</span></td>
+            <td>
+              {# 定型業務のリマインドの宛先。空にして保存すると削除。開いたときのアドレスの控え(version)と
+                 ログインID(画面を開いた後の削除・IDの再利用の確認)を一緒に送る #}
+              <form method="post" action="{{ url_for('departments.save_member_email', user_id=u.id) }}" class="d-flex gap-1">
+                <input type="hidden" name="username" value="{{ u.username }}">
+                <input type="hidden" name="version" value="{{ email_versions[u.id] }}">
+                <input type="email" name="email" class="form-control form-control-sm" value="{{ emails.get(u.id, '') }}"
+                       maxlength="{{ email_max }}" placeholder="未登録" aria-label="{{ u.display_name }}のメールアドレス">
+                <button class="btn btn-sm btn-outline-primary text-nowrap">保存</button>
+              </form>
+            </td>
             <td class="text-end">
               {% if u.id == current_user.id %}
               <span class="text-muted small">（自分）</span>
@@ -4834,6 +5270,7 @@
       </div>
     </form>
     <p class="text-muted small mb-0 mt-2"><i class="bi bi-info-circle"></i> 追加したメンバーへのチーム割り当ては、下の「メンバーの紐づけ」で行います。認証は本番LDAPに準拠します。</p>
+    <p class="text-muted small mb-0"><i class="bi bi-envelope"></i> メールアドレスは定型業務のリマインドの宛先です（空にして保存すると削除）。各メンバーもユーザーメニューの「メールアドレス」で自分の分を変更できます。</p>
 
     {% if inactive_members %}
     <hr>
@@ -5398,6 +5835,9 @@
   <div class="tab-pane fade {% if tab == 'analysis' %}show active{% endif %}" id="pane-analysis" role="tabpanel" aria-labelledby="tab-analysis">
     {{ file_error_alert(an) }}{% include "system/_analysis_tab.html" %}
   </div>
+  <div class="tab-pane fade {% if tab == 'reminder' %}show active{% endif %}" id="pane-reminder" role="tabpanel" aria-labelledby="tab-reminder">
+    {{ file_error_alert(rm) }}{% include "system/_reminder_tab.html" %}
+  </div>
 </div>
 {% endblock %}
 
@@ -5938,6 +6378,190 @@
     </div>
   </div>
 </form>
+{#=== system/_reminder_tab.html ===#}
+{# システム設定「定型業務リマインド」タブ(instance/routine_reminder_settings.json に保存)。入力チェックは app.py の
+   parse_reminder_settings_form。状況・プレビューは rm_status(reminder_status_context) #}
+<p class="small text-muted">
+  定型・定期業務のリマインドの自動送信です。業務ごとの実施日・追加の宛先は、各業務の登録・編集の画面の「リマインド」で設定します。
+  実施日に担当者へメールで知らせ、その回の完了の入力があるまで、送信時刻1・2（1日2回）にリマインドします。
+  宛先ごとに、その宛先に関係する業務（本日実施予定・完了の入力がまだのもの）を1通にまとめて送ります。
+  設定は <code>instance/routine_reminder_settings.json</code> に保存され、<code>instance/config.py</code> には保存しません。
+</p>
+{% if rm_status.address_problems %}
+<div class="alert alert-warning small">
+  <i class="bi bi-exclamation-triangle"></i> <strong>送れない宛先があります</strong>（その宛先には送りません。同じ業務のほかの宛先には送ります）:
+  <ul class="mb-1">
+    {% for p in rm_status.address_problems %}
+    <li><a href="{{ url_for('routine.detail', routine_id=p.routine.id) }}">{{ p.routine.name }}</a> — {{ p.kind }}: {{ p.name }}（{{ p.reason }}）</li>
+    {% endfor %}
+  </ul>
+  メールアドレスは<a href="{{ url_for('departments.manage') }}">チーム管理</a>のメンバーの表、または各自のユーザーメニューの「メールアドレス」で登録します。
+</div>
+{% endif %}
+{% if rm_status.link_problem %}
+<div class="alert alert-warning small py-2">
+  <i class="bi bi-exclamation-triangle"></i> リンクの基準URL（<code>APP_BASE_URL</code>）が未設定・不正のため、メールに業務の画面・完了の入力へのリンクを付けられません（業務名だけを載せます）。
+  「基本設定」タブの「リンク」で設定してください。
+</div>
+{% endif %}
+
+<form method="post" action="{{ url_for('system.save_reminder') }}">
+  <input type="hidden" name="version" value="{{ rm.version }}">
+  <div class="card shadow-sm mb-4">
+    <div class="card-header bg-white fw-bold"><i class="bi bi-sliders"></i> 定型業務リマインドの設定</div>
+    <div class="card-body">
+      <div class="form-check form-switch mb-3">
+        <input class="form-check-input" type="checkbox" role="switch" id="reminder-enabled" name="enabled" value="1"
+               {% if rm.settings.enabled %}checked{% endif %}>
+        <label class="form-check-label fw-bold" for="reminder-enabled">自動送信する</label>
+        <div class="form-text">オンにすると、送信時刻1・2に、リマインドを設定した業務の本日の実施予定と完了の入力がまだの回を、担当者・追加の宛先へそのまま送信します（承認の手順はありません）。送るものが無い宛先には送りません。</div>
+      </div>
+      <div class="row g-3">
+        <div class="col-sm-6 col-md-3">
+          <label class="form-label small mb-1" for="reminder-time1">送信時刻1</label>
+          <input type="time" name="time1" id="reminder-time1" class="form-control form-control-sm" value="{{ rm.settings.time1 }}" required>
+        </div>
+        <div class="col-sm-6 col-md-3">
+          <label class="form-label small mb-1" for="reminder-time2">送信時刻2</label>
+          <input type="time" name="time2" id="reminder-time2" class="form-control form-control-sm" value="{{ rm.settings.time2 }}" required>
+        </div>
+        <div class="col-md-6">
+          <div class="form-check form-switch mt-md-4">
+            <input class="form-check-input" type="checkbox" role="switch" id="reminder-business-days" name="business_days_only" value="1"
+                   {% if rm.settings.business_days_only %}checked{% endif %}>
+            <label class="form-check-label" for="reminder-business-days">営業日（土日・祝日以外）だけ送る</label>
+          </div>
+        </div>
+      </div>
+      <div class="form-text mt-3">
+        それぞれの時刻に1日1回送ります（2つの時刻は違う時刻にします）。経過日数は土日祝を除いた営業日で数えます。
+        差出人は「基本設定」タブの差出人（<code>MAIL_FROM</code>）、業務へのリンクは「リンク」の「リンクの基準URL」です。宛先の <code>MAIL_TO</code> / <code>MAIL_CC</code> は使いません。
+      </div>
+    </div>
+    <div class="card-footer bg-white d-flex justify-content-end">
+      <button class="btn btn-primary btn-sm"><i class="bi bi-save"></i> 定型業務リマインドの設定を保存</button>
+    </div>
+  </div>
+</form>
+
+<div class="row g-3 mb-4">
+  {# 次回の自動送信 #}
+  <div class="col-lg-4">
+    <div class="card shadow-sm h-100">
+      <div class="card-header bg-white fw-bold"><i class="bi bi-alarm"></i> 次回の自動送信</div>
+      <div class="card-body small">
+        {% if rm_status.upcoming %}
+        <div class="fs-5 fw-bold">
+          {{ rm_status.upcoming.strftime('%Y/%m/%d') }}（{{ rm_status.weekday_labels[rm_status.upcoming.weekday()] }}）{{ rm_status.upcoming.strftime('%H:%M') }}
+        </div>
+        {% if rm_status.scheduler_stopped %}
+        <div class="text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> 自動送信のスケジューラが動いていません（このフォルダで「flask --app app run」で起動したサーバーがありません）。このままでは、この時刻に送信されません。</div>
+        {% endif %}
+        {% if rm_status.mail_problem %}
+        <div class="text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> {{ rm_status.mail_problem }}</div>
+        {% endif %}
+        {% else %}
+        <div class="fs-5 fw-bold text-muted">停止中</div>
+        <div class="text-muted">「自動送信する」をオンにすると、送信時刻1・2に送信します。</div>
+        {% endif %}
+        <hr>
+        <div class="text-muted">
+          リマインドを設定した業務: {{ rm_status.enabled_count }}件。
+          自動送信は <code>flask --app app run</code> で起動したサーバーが動いている間だけ行われます。サーバーが止まっている間に過ぎた分は、後から送信しません。
+        </div>
+      </div>
+    </div>
+  </div>
+
+  {# 前回の結果(1件だけ。毎回上書き) #}
+  <div class="col-lg-4">
+    <div class="card shadow-sm h-100">
+      <div class="card-header bg-white d-flex justify-content-between align-items-center">
+        <span class="fw-bold"><i class="bi bi-clipboard-check"></i> 前回の結果</span>
+        <a href="{{ url_for('system.settings', tab='reminder') }}" class="btn btn-sm btn-outline-secondary"><i class="bi bi-arrow-clockwise"></i> 更新</a>
+      </div>
+      <div class="card-body small">
+        {% if rm_status.sending %}
+        <div class="alert alert-info py-1 px-2 mb-2">
+          <span class="spinner-border spinner-border-sm" role="status"></span> 送信処理中です。しばらくしてから「更新」を押してください。
+        </div>
+        {% endif %}
+        {% if rm_status.last %}
+        <div class="mb-1">
+          {% if rm_status.last.ok %}<span class="badge bg-success">成功</span>{% else %}<span class="badge bg-danger">失敗</span>{% endif %}
+          <span class="badge bg-light text-dark">{{ rm_status.last.trigger }}</span>
+          <span class="text-muted">{{ rm_status.last.at }}</span>
+        </div>
+        <div class="pre-wrap">{{ rm_status.last.message }}</div>
+        {% else %}
+        <div class="text-muted">まだ送信していません。</div>
+        {% endif %}
+        <hr>
+        <div class="text-muted">自動送信・テスト送信の結果を1件だけ表示します（毎回上書き）。送れなかった宛先・失敗もここに残ります。</div>
+      </div>
+    </div>
+  </div>
+
+  {# テスト送信 #}
+  <div class="col-lg-4">
+    <div class="card shadow-sm h-100">
+      <div class="card-header bg-white fw-bold"><i class="bi bi-envelope"></i> テスト送信</div>
+      <div class="card-body small">
+        <form method="post" action="{{ url_for('system.test_reminder') }}">
+          <button class="btn btn-sm btn-outline-secondary" {% if rm_status.mail_problem or rm_status.sending or rm.file_error %}disabled{% endif %}>
+            <i class="bi bi-envelope"></i> テスト送信（差出人宛て）
+          </button>
+        </form>
+        <div class="text-muted mt-2">
+          今の未完了の回（本日実施予定・完了の入力がまだのもの）をすべて載せた1通を、差出人（<code>MAIL_FROM</code>）宛てに送ります。
+          担当者・追加の宛先には送りません。保存済みの設定で送ります。
+        </div>
+        {% if rm_status.mail_problem %}
+        <div class="text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> {{ rm_status.mail_problem }}</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+{# 今この時点のメールのプレビュー(宛先ごと) #}
+<div class="card shadow-sm mb-4">
+  <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <span class="fw-bold"><i class="bi bi-eye"></i> メールのプレビュー（今この時点の内容）</span>
+    <span class="small">
+      <span class="badge bg-primary">本日実施 {{ rm_status.data.today_count }}件</span>
+      <span class="badge bg-danger">未完了 {{ rm_status.data.overdue_count }}件</span>
+      <span class="badge bg-secondary">宛先 {{ rm_status.previews|length }}件</span>
+    </span>
+  </div>
+  <div class="card-body">
+    {# data は辞書のため、items は data['items'] で取り出す(data.items は辞書のメソッドになる) #}
+    {% if not rm_status.data['items'] %}
+    <p class="text-muted small">今、送る定型業務はありません（本日の実施予定・完了の入力がまだの回がありません）。</p>
+    {% endif %}
+    {% if rm_status.data.unreachable %}
+    <p class="small text-danger"><i class="bi bi-exclamation-triangle"></i> 宛先が1つも無いため送れない回: {{ rm_status.data.unreachable }}件（上の「送れない宛先」を確認してください）</p>
+    {% endif %}
+    {% for mail in rm_status.previews %}
+    <details class="mb-2" {% if loop.first %}open{% endif %}>
+      <summary class="small"><span class="fw-bold">{{ mail.name or mail.address }}</span> &lt;{{ mail.address }}&gt; — {{ mail.subject }}</summary>
+      {# メール本文はスクリプトを実行できない iframe(sandbox)の中に表示する #}
+      <iframe class="overdue-preview border rounded mt-2" title="メールのプレビュー（HTML版）"
+              sandbox="allow-popups allow-popups-to-escape-sandbox" srcdoc="{{ mail.document }}"></iframe>
+      <details class="mt-1">
+        <summary class="small text-muted">テキスト版</summary>
+        <pre class="overdue-preview-text small border rounded mb-0 p-2">{{ mail.text }}</pre>
+      </details>
+    </details>
+    {% endfor %}
+    <details class="mt-3">
+      <summary class="small text-muted">テスト送信の内容（差出人宛て。今の未完了の回をすべて載せます） — {{ rm_status.test_mail.subject }}</summary>
+      <iframe class="overdue-preview border rounded mt-2" title="テスト送信のプレビュー（HTML版）"
+              sandbox="allow-popups allow-popups-to-escape-sandbox" srcdoc="{{ rm_status.test_mail.document }}"></iframe>
+    </details>
+    <div class="small text-muted mt-2">HTMLを表示できないメールソフトではテキスト版が表示されます。件名の件数は、その宛先に送る回の数です。</div>
+  </div>
+</div>
 {#=== static/css/style.css ===#}
 /* 業務管理アプリ 追加スタイル */
 
@@ -6150,6 +6774,15 @@ a:hover {
   background: #fff;
 }
 
+/* 定型業務の「リマインド」の欄: 追加の宛先(メンバー)の一覧はスクロール、毎月の日の選択は幅をそろえる */
+.rem-users {
+  max-height: 12rem;
+  overflow-y: auto;
+}
+.rem-day {
+  min-width: 3.2rem;
+}
+
 /* スキルテスト: 残り時間・選択肢・問題文の選択/印刷の抑止・準備中の表示 */
 .skilltest-timer {
   font-size: 1.75rem;
@@ -6334,6 +6967,40 @@ a:hover {
     document.addEventListener("DOMContentLoaded", init);
   } else {
     init();
+  }
+})();
+{#=== static/js/routine-form.js ===#}
+/* 定型業務の登録・編集の画面(routine/form.html)の「リマインド」の欄用。
+ *
+ * ・選んだ繰り返し(毎営業日・毎週・毎月・指定日)に使う欄だけを表示する(data-rem-rule に、その欄を使う繰り返しを
+ *   空白区切りで書く)。保存されるのは選んだ繰り返しの項目だけ(app.py の parse_reminder_form)。
+ *
+ * JavaScript が無効でも、すべての欄が表示され、保存もできる。
+ */
+(function () {
+  "use strict";
+
+  function setup() {
+    var select = document.getElementById("rem-rule-type");
+    if (!select) return;
+    var parts = document.querySelectorAll("#reminder-fields [data-rem-rule]");
+
+    function update() {
+      var rule = select.value;
+      parts.forEach(function (el) {
+        var rules = (el.getAttribute("data-rem-rule") || "").split(/\s+/);
+        el.classList.toggle("d-none", rules.indexOf(rule) < 0);
+      });
+    }
+
+    select.addEventListener("change", update);
+    update();
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", setup);
+  } else {
+    setup();
   }
 })();
 {#=== static/js/skill-item-form.js ===#}
