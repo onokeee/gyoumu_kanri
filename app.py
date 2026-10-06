@@ -1574,6 +1574,41 @@ def keep_auto_run_key(result, data):
     return result
 
 
+# 1日に複数回の自動送信(定型業務リマインドの送信時刻1・2)で、その日に実行した回(枠)を記録する項目。
+# {"date": "YYYY-MM-DD", "done": ["time1", ...]}。時刻ではなく枠で記録するため、送った後に時刻を変えても
+# その日のうちはもう一度送らない(日付が変わると記録し直す)。
+AUTO_SLOTS_KEY = "auto_slots"
+_AUTO_SLOT_RE = re.compile(r"[a-z0-9_]{1,16}")
+
+
+def _auto_slots_record(value):
+    """AUTO_SLOTS_KEY の値を検証して整える。正しくなければ None。"""
+    if not isinstance(value, dict) or not isinstance(value.get("date"), str):
+        return None
+    day = parse_date(value["date"])
+    done = value.get("done")
+    if day is None or not isinstance(done, list):
+        return None
+    slots = sorted({s for s in done if isinstance(s, str) and _AUTO_SLOT_RE.fullmatch(s)})
+    return {"date": day.isoformat(), "done": slots}
+
+
+def keep_auto_slots(result, data):
+    """設定を整えるときに、その日に実行した枠の記録(AUTO_SLOTS_KEY)を残す(正しくなければ付けない)。"""
+    record = _auto_slots_record(data.get(AUTO_SLOTS_KEY))
+    if record is not None:
+        result[AUTO_SLOTS_KEY] = record
+    return result
+
+
+def auto_slots_done(settings, day):
+    """day に実行済みの枠の集合(記録が別の日・無ければ空)。"""
+    record = _auto_slots_record(settings.get(AUTO_SLOTS_KEY))
+    if record is None or record["date"] != day.isoformat():
+        return set()
+    return set(record["done"])
+
+
 class JsonSettings:
     """画面で編集する設定(instance/ の JSON ファイル1つ)の読み込み・保存。
 
@@ -1665,6 +1700,27 @@ class JsonSettings:
             if current.get(AUTO_RUN_KEY) == key:
                 return False
             current[AUTO_RUN_KEY] = key
+            write_json(self.path(), current)
+            return True
+
+    def claim_auto_slot(self, mark):
+        """1日に複数回の自動送信で、その日の枠 mark(「YYYY-MM-DD 枠」。例「2026-10-09 time1」)を記録する。
+
+        その日に同じ枠を実行済みなら記録せずに False(実行しない)。記録したら True。確認と記録はロックの中で行う。
+        時刻ではなく枠で記録するため、送った後に画面でその枠の時刻を後の時刻に変えても、その日はもう一度送らない
+        (claim_auto_run の印は時刻で、1つしか残せないため使わない)。設定ファイルが読み込めない場合は
+        SettingsFileError を送出する(書き込まない)。
+        """
+        text, _sep, slot = str(mark).partition(" ")
+        day = parse_date(text)
+        if day is None or not _AUTO_SLOT_RE.fullmatch(slot):
+            raise ValueError("自動送信の枠の印が正しくありません: {!r}".format(mark))
+        with self.lock:
+            current = self._load_for_update()
+            done = auto_slots_done(current, day)
+            if slot in done:
+                return False
+            current[AUTO_SLOTS_KEY] = {"date": day.isoformat(), "done": sorted(done | {slot})}
             write_json(self.path(), current)
             return True
 
@@ -2624,7 +2680,7 @@ class RoutineReminder(db.Model):
     @property
     def weekday_list(self):
         """曜日の番号の一覧(0=月〜6=日。正しくない値は除く)。"""
-        return sorted({int(v) for v in self._split(self.weekdays) if v.isdigit() and int(v) <= 6})
+        return sorted({n for n in to_ints(self._split(self.weekdays)) if n <= 6})
 
     @property
     def month_day_list(self):
@@ -16277,8 +16333,8 @@ def _raw_rule_dates(rule, first, last):
                     yield last_business_day_of_month(year, month), False
                 elif value == MONTH_END:
                     yield date(year, month, end), True
-                elif str(value).isdigit() and 1 <= int(value) <= 31:
-                    yield date(year, month, min(int(value), end)), True
+                elif 1 <= (to_int(value) or 0) <= 31:
+                    yield date(year, month, min(to_int(value), end)), True
             year, month = (year + 1, 1) if month == 12 else (year, month + 1)
     elif rule.rule_type == RULE_DATES:
         for d in rule.dates:
@@ -16687,7 +16743,8 @@ def parse_reminder_form(form, choices, today, current_start=None):
     holiday_rule = form.get("rem_holiday_rule") or HOLIDAY_PREV
     values["holiday_rule"] = holiday_rule if holiday_rule in HOLIDAY_RULES else HOLIDAY_PREV
 
-    weekdays = sorted({int(v) for v in form.getlist("rem_weekdays") if str(v).isdigit() and int(v) <= 6})
+    # 「²」のように isdigit() は真でも int() で読めない値は除く(to_ints。500 にしないため)
+    weekdays = sorted({n for n in to_ints(form.getlist("rem_weekdays")) if n <= 6})
     month_days = sort_month_days(form.getlist("rem_month_days"))
     dates, bad_dates = [], []
     for token in _REMINDER_LIST_SPLIT.split(form.get("rem_dates") or ""):
@@ -16855,7 +16912,9 @@ def reminder_recipients_for(routine, rem, users, emails):
     """業務のリマインドの宛先と、送れない宛先。
 
     users: {ユーザーID: User}、emails: {ユーザーID: アドレス}。
-    戻り値: (宛先 [{"address", "name", "kind"}], 送れない宛先 [{"name", "reason", "kind"}])。
+    戻り値: (宛先 [{"address", "name", "kind", "user_id"}], 送れない宛先 [{"name", "reason", "kind"}])。
+    user_id はメンバーのアドレス(ユーザーの登録)ならそのユーザーID、追加の宛先に入力したアドレスなら None
+    (業務の詳細で、ほかの人が登録したアドレスを表示してよいかの判断に使う)。
     担当者・追加の宛先(メンバー)は、有効でメールアドレスがある人だけに送る。無効化された人・アドレスの無い人は
     送れない宛先にする(追加の宛先のアドレスは、そのまま送る)。
     """
@@ -16868,7 +16927,8 @@ def reminder_recipients_for(routine, rem, users, emails):
     elif not emails.get(assignee.id):
         problems.append({"name": assignee.display_name, "reason": "メールアドレス未登録", "kind": "担当者"})
     else:
-        recipients.append({"address": emails[assignee.id], "name": assignee.display_name, "kind": "担当者"})
+        recipients.append({"address": emails[assignee.id], "name": assignee.display_name, "kind": "担当者",
+                           "user_id": assignee.id})
     for user_id in rem.extra_user_id_list:
         user = users.get(user_id)
         if user is None:
@@ -16878,10 +16938,11 @@ def reminder_recipients_for(routine, rem, users, emails):
         elif not emails.get(user_id):
             problems.append({"name": user.display_name, "reason": "メールアドレス未登録", "kind": "追加の宛先"})
         else:
-            recipients.append({"address": emails[user_id], "name": user.display_name, "kind": "追加の宛先"})
+            recipients.append({"address": emails[user_id], "name": user.display_name, "kind": "追加の宛先",
+                               "user_id": user_id})
     for address in rem.extra_email_list:
         if plain_address_ok(address):
-            recipients.append({"address": address, "name": "", "kind": "追加の宛先"})
+            recipients.append({"address": address, "name": "", "kind": "追加の宛先", "user_id": None})
     return recipients, problems
 
 
@@ -16897,6 +16958,9 @@ def reminder_recipients_for(routine, rem, users, emails):
 #   time1 / time2      : 送信の時刻("HH:MM"。既定 "09:00" / "15:00")。それぞれ1日1回
 #   business_days_only : 営業日(土日・祝日以外)だけ送る(既定はオン)
 #   last_result        : 前回の結果(日時・きっかけ・成否・メッセージ)。毎回上書き
+#   auto_slots         : 自動送信でその日に送った枠 {"date": "YYYY-MM-DD", "done": ["time1", "time2"]}
+#                        (スケジューラだけが書き込む。2-3 の AUTO_SLOTS_KEY。時刻ではなく枠で記録するため、
+#                        送った後に時刻を変えても、その日はもう一度送らない)
 
 REMINDER_SETTINGS_FILENAME = "routine_reminder_settings.json"
 REMINDER_SETTINGS_LABEL = "定型業務リマインドの設定ファイル"
@@ -16924,7 +16988,7 @@ def _normalize_reminder_settings(data):
         if at is not None:
             result[key] = at.strftime("%H:%M")
     result["last_result"] = normalize_last_result(data.get("last_result"))
-    return keep_auto_run_key(result, data)
+    return keep_auto_slots(result, data)
 
 
 REMINDER_SETTINGS = JsonSettings(REMINDER_SETTINGS_FILENAME, REMINDER_SETTINGS_LABEL,
@@ -16937,9 +17001,22 @@ REMINDER_LABEL = "定型業務リマインド"
 REMINDER_SAVED_MESSAGE = "定型業務リマインドの設定を保存しました。"
 
 
+REMINDER_SLOTS = ("time1", "time2")  # 送信の枠(送信時刻1・2)。それぞれ1日1回
+
+
+def reminder_send_slots(settings):
+    """送信の枠と時刻 [("HH:MM", 枠)] の一覧(早い順。同じ時刻の枠は先の枠〔time1〕だけ)。"""
+    slots = {}
+    for slot in REMINDER_SLOTS:
+        at = parse_hhmm(settings.get(slot)) if isinstance(settings.get(slot), str) else None
+        if at is not None:
+            slots.setdefault(at.strftime("%H:%M"), slot)
+    return sorted(slots.items())
+
+
 def reminder_send_times(settings):
     """送信の時刻("HH:MM")の一覧(早い順・重複なし)。"""
-    return sorted({settings[key] for key in ("time1", "time2") if parse_hhmm(settings.get(key)) is not None})
+    return [at for at, _slot in reminder_send_slots(settings)]
 
 
 def parse_reminder_settings_form(form):
@@ -16963,30 +17040,38 @@ def reminder_settings_form_context(settings):
 
 
 def reminder_due_key(settings, now):
-    """今が自動送信の実行時刻なら (日付, "HH:MM") を返す。そうでなければ None。
+    """今が自動送信の実行時刻なら (日付, 枠〔"time1" / "time2"〕) を返す。そうでなければ None。
 
     自動送信が有効で、今の時刻(HH:MM)が送信時刻1・2のどちらかと一致し、営業日だけの設定なら今日が営業日のとき。
+    時刻ではなく枠を返す(スケジューラは枠ごとに1日1回だけ実行する。送った後に画面でその枠の時刻を後の時刻に
+    変えても、その日はもう一度送らないように。実行済みの枠は設定ファイルの auto_slots に記録する)。
     """
     if not settings.get("enabled"):
         return None
-    at = now.strftime("%H:%M")
-    if at not in reminder_send_times(settings):
+    slot = dict(reminder_send_slots(settings)).get(now.strftime("%H:%M"))
+    if slot is None:
         return None
     if settings.get("business_days_only") and not is_business_day(now.date()):
         return None
-    return (now.date(), at)
+    return (now.date(), slot)
 
 
 def next_reminder_run(settings, now):
-    """次回の自動送信日時。自動送信が無効なら None。当日の実行時刻の「分」の間は当日の日時を返す。"""
-    times = [parse_hhmm(t) for t in reminder_send_times(settings)]
-    if not settings.get("enabled") or not times:
+    """次回の自動送信日時。自動送信が無効なら None。当日の実行時刻の「分」の間は当日の日時を返す。
+
+    今日すでに送った枠(auto_slots)は、時刻を変えた後でも今日の分には数えない(その日はもう一度送らないため)。
+    """
+    slots = [(parse_hhmm(at), slot) for at, slot in reminder_send_slots(settings)]
+    if not settings.get("enabled") or not slots:
         return None
     floor = now.replace(second=0, microsecond=0)
     day = now.date()
+    done_today = auto_slots_done(settings, day)
     for _ in range(_SEARCH_DAYS):
         if not settings.get("business_days_only") or is_business_day(day):
-            for at in times:
+            for at, slot in slots:
+                if day == now.date() and slot in done_today:
+                    continue
                 candidate = datetime.combine(day, time(at.hour, at.minute))
                 if candidate >= floor:
                     return candidate
@@ -18910,7 +18995,8 @@ def test_reminder():
 #   overdue : 期限超過通知。自動送信が有効で、今日が営業日(土日・祝日以外)で、
 #             今の時刻(HH:MM)が設定と一致したとき
 #   reminder: 定型業務リマインド(10 章)。自動送信が有効で、今の時刻(HH:MM)が送信時刻1・2のどちらかと一致し、
-#             営業日だけの設定なら今日が営業日のとき(時刻ごとに1日1回)
+#             営業日だけの設定なら今日が営業日のとき(送信時刻1・2の枠ごとに1日1回。送った後に時刻を変えても、
+#             その枠はその日はもう一度実行しない)
 #
 # - 起動するのは「flask --app app run」でサーバーとして動かしたときだけ(create_app() の最後で
 #   start_scheduler_once() を呼ぶ。seed / migrate コマンド・テスト・import では起動しない)。
@@ -18918,7 +19004,8 @@ def test_reminder():
 #   ロックを取れた1つのプロセスだけが動かす(12-2)
 # - ジョブごとに、同じ (日付, 時刻) では1回しか実行しない。メモリ上の記録(fired)に加えて、各ジョブの
 #   設定ファイルに最後に実行した印(last_auto_key)を残す(実行時刻の分の中でサーバーを再起動しても、
-#   新しいプロセスがもう一度送らないように)
+#   新しいプロセスがもう一度送らないように)。定型業務リマインドは時刻ではなく (日付, 枠〔time1 / time2〕) で
+#   数え、その日に実行した枠を設定ファイルの auto_slots に残す(JsonSettings.claim_auto_slot)
 # - サーバーが止まっていて実行時刻を過ぎた分は、後から実行しない(取りこぼしの再実行なし)
 # - 実行履歴はDBに残さない(結果は各機能の「前回の結果」に上書き)
 # - 実行はジョブごとに別のスレッドで行う(時間のかかる週報の作成中も、ほかの
@@ -18930,11 +19017,11 @@ CHECK_INTERVAL = 30  # 秒
 # name           : ジョブの名前(実行済みの記録のキー)
 # label          : ログ・メッセージ用の名前
 # load_settings  : 設定を読む(app_context の中で呼ぶ)
-# due_key        : (設定, 今) → 実行時刻なら (日付, "HH:MM")、そうでなければ None
+# due_key        : (設定, 今) → 実行時刻なら (日付, "HH:MM")〔リマインドは (日付, 枠)〕、そうでなければ None
 # run            : (app, 設定, 今) → 実行して成否を返す
 # record_failure : (メッセージ) → 前回の結果に失敗を書く(app_context の中で呼ぶ)
-# claim_run      : (印「YYYY-MM-DD HH:MM」) → 設定ファイルに記録して True。記録済みなら False
-#                  (app_context の中で呼ぶ。JsonSettings.claim_auto_run)
+# claim_run      : (印「YYYY-MM-DD HH:MM」〔リマインドは「YYYY-MM-DD 枠」〕) → 設定ファイルに記録して True。
+#                  記録済みなら False(app_context の中で呼ぶ。JsonSettings.claim_auto_run / claim_auto_slot)
 Job = namedtuple("Job", "name label load_settings due_key run record_failure claim_run")
 
 
@@ -18994,7 +19081,7 @@ JOBS = (
     Job("overdue", "期限超過通知", load_overdue_settings, overdue_due_key,
         _overdue_run, _overdue_failure, OVERDUE_SETTINGS.claim_auto_run),
     Job("reminder", "定型業務リマインド", load_reminder_settings, reminder_due_key,
-        _reminder_run, _reminder_failure, REMINDER_SETTINGS.claim_auto_run),
+        _reminder_run, _reminder_failure, REMINDER_SETTINGS.claim_auto_slot),
 )
 
 _scheduler_start_lock = threading.Lock()
@@ -19031,10 +19118,10 @@ def _check_job(app, job, fired, now, start_thread=True):
     if key is None or key in fired:
         return None
     fired.add(key)
-    # 古い記録は不要(同じ日付・時刻が再び来ることはない)
+    # 古い記録は不要(同じ日付が再び来ることはない)
     for old in [k for k in fired if k[0] < now.date()]:
         fired.discard(old)
-    # 別のプロセス(再起動する前のサーバー)が同じ日付・時刻に実行済みなら実行しない
+    # 別のプロセス(再起動する前のサーバー)が同じ日付・時刻(リマインドは枠)に実行済みなら実行しない
     with app.app_context():
         if not job.claim_run("{} {}".format(key[0].isoformat(), key[1])):
             app.logger.info("%sの自動送信: %s %s は実行済みのため、実行しません", job.label, key[0], key[1])
@@ -19161,7 +19248,8 @@ def start_scheduler_once(app, interval=CHECK_INTERVAL):
 def _standby_scheduler(app, interval):
     """ロックを取れなかったプロセスで、interval 秒ごとにロックを取り直してみる。取れたらスケジューラを起動する。
 
-    同じ (日付, 時刻) の二重の送信は、各ジョブの設定ファイルの印(last_auto_key)で防ぐ(引き継いだ分の中でも)。
+    同じ (日付, 時刻) の二重の送信は、各ジョブの設定ファイルの印(last_auto_key。定型業務リマインドは
+    その日に実行した枠の auto_slots)で防ぐ(引き継いだ分の中でも)。
     """
     wait = threading.Event()
     while True:

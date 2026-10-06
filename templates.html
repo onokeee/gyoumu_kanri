@@ -1317,7 +1317,8 @@
 </div>
 
 {# リマインド(実施日に担当者へメールで知らせ、完了の入力があるまで1日2回リマインドする。設定は編集画面の「リマインド」。
-   アドレスは編集できる人〔担当者・マネージャー〕にだけ表示する) #}
+   アドレスは編集できる人〔担当者・マネージャー〕にだけ表示する。ただし、メンバーが登録したアドレスは、マネージャーと
+   その本人にだけ表示する〔メンバーが自分の業務の追加の宛先にほかの人を選んでも、その人のアドレスは見えない〕) #}
 <div class="card shadow-sm mt-3" id="reminder">
   <div class="card-header bg-white d-flex justify-content-between align-items-center">
     <span class="fw-bold"><i class="bi bi-bell"></i> リマインド</span>
@@ -1352,7 +1353,7 @@
       <dt class="col-sm-3 text-muted">宛先</dt>
       <dd class="col-sm-9">
         {% for r in reminder.recipients %}
-        <div>{{ r.kind }}: {{ r.name or 'アドレス' }}{% if can_edit %} <span class="text-muted">&lt;{{ r.address }}&gt;</span>{% endif %}</div>
+        <div>{{ r.kind }}: {{ r.name or 'アドレス' }}{% if can_edit %}{% if r.user_id is none or current_user.is_manager or r.user_id == current_user.id %} <span class="text-muted">&lt;{{ r.address }}&gt;</span>{% else %} <span class="text-muted">（アドレス登録済み）</span>{% endif %}{% endif %}</div>
         {% endfor %}
         {% for p in reminder.problems %}
         <div class="text-danger"><i class="bi bi-exclamation-triangle"></i> {{ p.kind }}: {{ p.name }}（{{ p.reason }}のため送りません）</div>
@@ -6434,7 +6435,7 @@
         </div>
       </div>
       <div class="form-text mt-3">
-        それぞれの時刻に1日1回送ります（2つの時刻は違う時刻にします）。経過日数は土日祝を除いた営業日で数えます。
+        それぞれの時刻に1日1回送ります（2つの時刻は違う時刻にします。その日に送った後に時刻を変えても、その時刻の分は翌日から送ります）。経過日数は土日祝を除いた営業日で数えます。
         差出人は「基本設定」タブの差出人（<code>MAIL_FROM</code>）、業務へのリンクは「リンク」の「リンクの基準URL」です。宛先の <code>MAIL_TO</code> / <code>MAIL_CC</code> は使いません。
       </div>
     </div>
