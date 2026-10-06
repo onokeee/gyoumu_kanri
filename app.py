@@ -149,7 +149,7 @@ from email.mime.text import MIMEText
 from email.utils import formataddr, formatdate, make_msgid, parseaddr
 from functools import lru_cache, wraps
 from io import BytesIO
-from time import monotonic
+from time import monotonic, sleep
 from typing import Optional
 from urllib.parse import quote, unquote, urlencode, urlsplit
 
@@ -165,6 +165,7 @@ from flask import (
     abort,
     current_app,
     flash as _flask_flash,
+    g,
     has_request_context,
     jsonify,
     make_response,
@@ -259,15 +260,16 @@ class Config(FixedConfig):
     AI_TIMEOUT = 60            # タイムアウト(秒)
 
     # メール送信(SMTP。暗号化・認証なしで送る)。送信サーバーが空ならメール送信は行えない。
-    # 週報・期限超過通知は MAIL_TO / MAIL_CC 宛て、テスト送信は差出人 MAIL_FROM 宛てに送る。
+    # 週報・期限超過通知は MAIL_TO / MAIL_CC 宛て、定型業務リマインドは担当者と業務ごとの追加の宛先、
+    # テスト送信は差出人 MAIL_FROM 宛てに送る。
     MAIL_SMTP_SERVER = ""      # 送信サーバー(ホスト名またはIPアドレス)
     MAIL_SMTP_PORT = 25        # ポート番号
     MAIL_FROM = ""             # 差出人アドレス(テスト送信の宛先にも使う)
     MAIL_TO = []               # 宛先(To)のアドレス一覧
     MAIL_CC = []               # 宛先(Cc)のアドレス一覧
 
-    # メールに載せるリンクの基準URL(他のPCからこのアプリを開くときのURL。末尾の / は不要)。
-    # 空ならメールにリンクを付けない(タスク名だけ)。
+    # メールに載せるリンクの基準URL(期限超過通知・定型業務リマインド。他のPCからこのアプリを開くときのURL。
+    # 末尾の / は不要)。空ならメールにリンクを付けない(タスク名・業務名だけ)。
     APP_BASE_URL = ""
 
 
@@ -333,7 +335,7 @@ AI_MODEL = "gpt-4o-mini"
 AI_TIMEOUT = 60
 
 # -----------------------------------------------------------------------------
-# メール送信(SMTP)  ※週報・期限超過通知の送信に使用
+# メール送信(SMTP)  ※週報・期限超過通知・定型業務リマインドの送信に使用
 # -----------------------------------------------------------------------------
 # 送信は暗号化(STARTTLS)・認証(ログイン)なしで行います。
 # 認証なしで送信できる送信サーバー(中継サーバーなど)を指定してください。
@@ -345,17 +347,18 @@ MAIL_SMTP_PORT = 25
 # 差出人アドレス(テスト送信・メール接続テストは、このアドレス宛てに送ります)
 # 例: MAIL_FROM = "noreply@example.com"
 MAIL_FROM = ""
-# 宛先(To)・同報(Cc)のアドレス一覧(週報・期限超過通知の両方に使います)
+# 宛先(To)・同報(Cc)のアドレス一覧(週報・期限超過通知の両方に使います。
+# 定型業務リマインドは担当者のメールアドレスと、業務ごとの追加の宛先に送ります)
 # 例: MAIL_TO = ["manager@example.com", "team@example.com"]
 MAIL_TO = []
 MAIL_CC = []
 
 # -----------------------------------------------------------------------------
-# メールのリンク  ※期限超過通知に使用
+# メールのリンク  ※期限超過通知・定型業務リマインドに使用
 # -----------------------------------------------------------------------------
-# メールに載せるタスクへのリンクの基準URL
+# メールに載せるタスク・定型業務へのリンクの基準URL
 # (メンバーのPCからこのアプリを開くときのURL。末尾の / は不要)。
-# 空ならメールにはリンクを付けず、タスク名だけを載せます。
+# 空ならメールにはリンクを付けず、タスク名・業務名だけを載せます。
 # 例: APP_BASE_URL = "http://192.0.2.10:8050"
 APP_BASE_URL = ""
 '''
@@ -525,8 +528,9 @@ def _set_value(text, key, value, newline=None):
     if text and not text.endswith(("\n", "\r")):
         text += newline
     # 追記する項目は空行で前の行と区切る(前の項目のまとまり・その説明のコメントの続きにしない。続けて書くと、
-    # 「未使用の設定を削除」で前の項目を削除したときに、その説明のコメントが追記した項目の上に残るため)
-    if text.strip() and not re.search(r"(?:\r\n|\r|\n)[ \t]*(?:\r\n|\r|\n)$", text):
+    # 「未使用の設定を削除」で前の項目を削除したときに、その説明のコメントが追記した項目の上に残るため)。
+    # 末尾が空行かは、CRLF の1つの改行の \r と \n を2つの改行と数えないように確かめる
+    if text.strip() and not re.search(r"(?:\r\n|\r(?!\n)|\n)[ \t]*(?:\r\n|\r|\n)$", text):
         text += newline
     return text + "{} = {}{}".format(key, literal, newline)
 
@@ -649,6 +653,25 @@ _PLAIN_TYPES = (type(None), bool, int, float, str, list, tuple, dict)
 # --------------------------------------------------------------------------- #
 # 書き換えの共通の手順(画面からの更新・項目の行の削除で使う)
 # --------------------------------------------------------------------------- #
+# Windows で置き換え先のファイルをほかのプロセスが開いている間(同じフォルダのほかのサーバー・--debug の
+# 画面を返すプロセスの読み込み・バックアップやウイルス対策のソフトなど)は os.replace が PermissionError
+# (アクセスが拒否されました)になるため、少し待って置き換え直す間隔(秒。合計 約2秒)
+_REPLACE_RETRY_WAITS = (0.05, 0.1, 0.2, 0.3, 0.5, 0.5, 0.5)
+
+
+def _replace_with_retry(src, dst):
+    """os.replace(src, dst)。Windows の一時的な共有違反(PermissionError)のときは少し待って置き換え直す。"""
+    for wait in _REPLACE_RETRY_WAITS:
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if os.name != "nt":
+                raise
+            sleep(wait)
+    os.replace(src, dst)
+
+
 def write_file_atomic(path, data, prefix):
     """data(bytes)を同じフォルダの一時ファイルに書いてから path と置き換える。
 
@@ -662,7 +685,7 @@ def write_file_atomic(path, data, prefix):
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_path, path)
+        _replace_with_retry(tmp_path, path)
     except BaseException:
         try:
             os.remove(tmp_path)
@@ -1121,10 +1144,32 @@ def _unauthorized():
     """
     if prefers_json():
         return jsonify(ok=False, login_required=True, message=LOGIN_EXPIRED_JSON), 401
+    changed_for = g.get("local_password_changed")
+    if changed_for:
+        # 固定ローカル管理者(admin など)のパスワードが、このブラウザでログインした後に変わった(自分の基本設定の
+        # 保存・ほかのマネージャーの変更)。保存のボタンの二度押しの2回目もここに来る(1回目で変わった)ため、
+        # 「ログインの有効期限が切れていた」とは案内せず、パスワードが変わったことを伝える。送信(GET 以外)は
+        # 行っていないことも伝え、ログインの後に期限切れの案内を出さないよう、戻る先は GET で開ける画面にする
+        message = LOCAL_PASSWORD_CHANGED.format(changed_for)
+        next_url = request.url
+        if request.method not in ("GET", "HEAD", "OPTIONS"):
+            message += LOCAL_PASSWORD_CHANGED_POST
+            next_url, _post_only = _page_for_next(request.path)
+        session.pop(DROPPED_REQUEST_KEY, None)
+        flash(message, "warning")
+        return redirect(login_url(login_manager.login_view, next_url=next_url) if next_url
+                        else url_for(login_manager.login_view))
     if request.method not in ("GET", "HEAD", "OPTIONS"):
         session[DROPPED_REQUEST_KEY] = request.path
     flash(login_manager.login_message, login_manager.login_message_category)
     return redirect(login_url(login_manager.login_view, next_url=request.url))
+
+
+# 固定ローカル管理者のパスワードが、ログインした後に変わったときの案内(_unauthorized)。
+# 送信(保存など)のときは2つ目の文を加える(パスワードを変えた保存の二度押しの2回目も、行っていないのはその2回目だけ)
+LOCAL_PASSWORD_CHANGED = "{} のパスワードが変更されたため、ログインし直してください。"
+LOCAL_PASSWORD_CHANGED_POST = ("パスワードの変更の後にこのブラウザから送られた保存・変更は行っていません"
+                               "（パスワードの変更そのものは保存されています）。")
 
 
 # 画面の JavaScript からの呼び出しで、ログインが切れていたときの案内(401 の JSON の message)
@@ -1260,6 +1305,27 @@ def display_app_name(app=None):
 def get_active_users():
     """有効なユーザーを表示名順で取得する(担当者・受信者の選択肢用)。"""
     return User.query.filter_by(is_active=True).order_by(User.display_name).all()
+
+
+def filter_user_choices(selected_ids=(), with_work=None):
+    """一覧の絞り込みの担当者の選択肢: 有効なユーザー(表示名順)の後に、無効化したユーザーのうち
+    選択中の人(selected_ids)と、条件 with_work(業務が残っている人など)に当たる人を表示名順で加える。
+
+    無効化した人は画面で名前に「［無効］」を付ける(User.name_label)。選択中の無効化した人を選択肢に残さないと、
+    絞り込みは効いたまま「すべて」と表示されるため。with_work はマネージャーの画面で、担当の付け替えが
+    必要な業務を探せるようにするための条件(無効化した人に残っているタスク・定型業務)。
+    """
+    users = get_active_users()
+    conditions = []
+    ids = [i for i in selected_ids if i is not None]
+    if ids:
+        conditions.append(User.id.in_(ids))
+    if with_work is not None:
+        conditions.append(with_work)
+    if conditions:
+        users += User.query.filter(User.is_active.is_(False), db.or_(*conditions)) \
+            .order_by(User.display_name).all()
+    return users
 
 
 def set_active_from_form(obj):
@@ -1574,6 +1640,16 @@ def keep_auto_run_key(result, data):
     return result
 
 
+def auto_run_done_on(settings, day):
+    """day(date または「YYYY-MM-DD」)に自動送信を実行済みか(実行の印 AUTO_RUN_KEY の日付で判断する)。
+
+    週報・期限超過通知は1日1回の仕事のため、その日に送った後に時刻を変えても、その日はもう一度送らない。
+    """
+    text = day.isoformat() if isinstance(day, date) else str(day)
+    value = settings.get(AUTO_RUN_KEY)
+    return isinstance(value, str) and parse_date(text) is not None and value.split(" ", 1)[0] == text
+
+
 # 1日に複数回の自動送信(定型業務リマインドの送信時刻1・2)で、その日に実行した回(枠)を記録する項目。
 # {"date": "YYYY-MM-DD", "done": ["time1", ...]}。時刻ではなく枠で記録するため、送った後に時刻を変えても
 # その日のうちはもう一度送らない(日付が変わると記録し直す)。
@@ -1690,14 +1766,15 @@ class JsonSettings:
     def claim_auto_run(self, key):
         """自動送信の実行の印 key(「YYYY-MM-DD HH:MM」)をファイルに記録する(確認と記録をロックの中で行う)。
 
-        戻り値: 記録した(実行してよい)なら True、既に同じ印が記録されている(実行済み)なら False。
+        戻り値: 記録した(実行してよい)なら True、同じ日の印が既に記録されている(その日は実行済み)なら False。
         実行済みの記録がメモリ(スケジューラの fired)だけだと、実行時刻の分の中でサーバーを再起動した
-        ときに、新しいプロセスがもう一度送ってしまうため。設定ファイルが読み込めない場合は
-        SettingsFileError を送出する(書き込まない)。
+        ときに、新しいプロセスがもう一度送ってしまうため。1日1回の仕事(週報・期限超過通知)なので、日付で比べる
+        (その日に送った後に画面で時刻を後の時刻に変えても、その日はもう一度送らない)。設定ファイルが
+        読み込めない場合は SettingsFileError を送出する(書き込まない)。
         """
         with self.lock:
             current = self._load_for_update()
-            if current.get(AUTO_RUN_KEY) == key:
+            if current.get(AUTO_RUN_KEY) == key or auto_run_done_on(current, str(key)[:10]):
                 return False
             current[AUTO_RUN_KEY] = key
             write_json(self.path(), current)
@@ -2173,6 +2250,9 @@ def load_user(user_id):
         mark = session.get(LOCAL_AUTH_KEY)
         if not isinstance(mark, str) or not hmac.compare_digest(
                 mark.encode("utf-8"), _local_credential_mark(user.username).encode("utf-8")):
+            if isinstance(mark, str):
+                # ログインした後にパスワードが変わった(_unauthorized で「ログインの有効期限が切れた」とは別の案内にする)
+                g.local_password_changed = user.username
             return None
     return user
 
@@ -2824,10 +2904,30 @@ _DESCRIPTION_HEADING_KEYS = {
 }
 
 
+# 見出しだけの行の、見出しの語の後ろ(（Lv1〜Lv4）・閉じ括弧・コロンだけなら見出しの行とみなす)
+_HEADING_TAIL = re.compile(r"[ \t　]*(?:（[^）]*）|\([^)]*\))?[ \t　]*[】\]:：]?[ \t　]*$")
+# 見出しと内容を1行に書いた行の、見出しの語の後ろ(「対象範囲：SELECT 文…」「【対象範囲】SELECT 文…」)
+_HEADING_INLINE_TAIL = re.compile(r"[ \t　]*(?:（[^）]*）|\([^)]*\))?[ \t　]*[】\]:：]")
+
+
+def description_heading_keys(text):
+    """スキルの説明に書かれた見出しの集合(_DESCRIPTION_HEADING_KEYS の値)。
+
+    見出しの語で始まる行のうち、語の後ろが見出しの終わり(行末・（…）・閉じ括弧・コロン)のものだけを数える
+    (clean_description_draft と同じ決まり。「対象範囲外の機能は扱わない」「使う道具・言語・ソフトは…」のような
+    本文の行は見出しにしない)。「対象範囲：…」のように見出しと内容を1行に書いた行も見出しとして数える。
+    """
+    found = set()
+    for line in str(text or "").splitlines():
+        known = _DESCRIPTION_HEADING_RE.match(line)
+        if known and (_HEADING_TAIL.match(line, known.end()) or _HEADING_INLINE_TAIL.match(line, known.end())):
+            found.add(_DESCRIPTION_HEADING_KEYS[known.group(1)])
+    return found
+
+
 def description_headings(text):
     """スキルの説明に含まれる見出し(SKILL_DESCRIPTION_HEADINGS のうち、書かれているもの)。"""
-    found = {_DESCRIPTION_HEADING_KEYS[m.group(1)]
-             for m in _DESCRIPTION_HEADING_RE.finditer(str(text or ""))}
+    found = description_heading_keys(text)
     return [heading for heading in SKILL_DESCRIPTION_HEADINGS if heading in found]
 
 
@@ -4383,6 +4483,7 @@ def _render_task_form(task, users, form, selected, version=None):
         outcome_units=OUTCOME_UNITS, task_scales=TASK_SCALES,
         form=form, selected_assignees=selected, version=version,
         can_plan=current_user.is_manager,  # 計画系項目(優先度/日付/規模/担当者)を編集できるか
+        year_min=TASK_YEAR_MIN, year_max=TASK_YEAR_MAX,  # 開始日・期限の欄の min/max
     )
 
 
@@ -4490,6 +4591,36 @@ _STALE_ASSIGNEE = ("担当者の選択に、画面を開いた後に削除・無
 # 開始日が期限より後の日付のときの案内
 _START_AFTER_DUE = "開始日は期限と同じ日か、それより前の日付にしてください。"
 
+# 開始日・期限に入力できる年の範囲(画面の日付の欄の min/max も同じ。年休の取得日と同じ範囲)
+TASK_YEAR_MIN = 2000
+TASK_YEAR_MAX = 2099
+_TASK_DATE_INVALID = "開始日・期限は YYYY-MM-DD の実在する日付（{}年〜{}年）で入力してください。".format(
+    TASK_YEAR_MIN, TASK_YEAR_MAX)
+
+
+def _read_task_dates(task=None):
+    """フォームの開始日・期限を読む。戻り値: (開始日, 期限, 再表示する入力 または None)。
+
+    空欄は未設定(None)。日付として読めない値(ブラウザによっては年を6桁まで入力・送信できる)・範囲外の年は、
+    未設定として保存せず(期限が消えないように)、3つ目に再表示する入力を返す。再表示する入力では、
+    その欄を今の値(登録では空)にする(読めない値は日付の欄に表示されず、そのまま保存すると消えるため)。
+    編集で今の値のまま送られたものは、範囲外の年でもそのまま保存できる。
+    """
+    values, bad = {}, []
+    for name in ("start_date", "due_date"):
+        raw = (request.form.get(name) or "").strip()
+        value = parse_date(raw)
+        current = getattr(task, name) if task is not None else None
+        if raw and (value is None or (value != current and not TASK_YEAR_MIN <= value.year <= TASK_YEAR_MAX)):
+            bad.append((name, current))
+        values[name] = value
+    if not bad:
+        return values["start_date"], values["due_date"], None
+    shown = request.form.copy()
+    for name, current in bad:
+        shown[name] = current.isoformat() if current else ""
+    return None, None, shown
+
 
 def _selected_assignees(users):
     """フォームの assignee_ids(複数。値は「ユーザーID:ログインID」)から担当ユーザーを選ぶ。
@@ -4554,6 +4685,12 @@ def list_tasks():
     scope = request.args.get("scope", "")  # "mine" なら自分の担当のみ
     hide_done = request.args.get("hide_done") == "1"  # 「完了」を除く
     keyword = search_keyword()
+    # 担当者の選択肢: 有効なユーザーと、選択中の無効化したユーザー(マネージャーには未完了のタスクが残っている
+    # 無効化したユーザーも。担当の付け替えのため)。どのユーザーでもない番号は条件に使わない
+    users = filter_user_choices(assignee_ids, User.assigned_tasks.any(Task.status != STATUS_DONE)
+                                if current_user.is_manager else None)
+    known = {u.id for u in users}
+    assignee_ids = [i for i in assignee_ids if i in known]
 
     query = Task.query
 
@@ -4583,7 +4720,7 @@ def list_tasks():
         tasks=tasks,
         # 一覧でその場で状態を変えられるタスク(作成者・担当者・マネージャー。ほかは状態の表示だけ)
         editable_ids={t.id for t in tasks if _can_edit(t)},
-        users=get_active_users(),
+        users=users,
         status_choices=STATUS_CHOICES,
         task_colors=STATUS_COLORS,
         priority_choices=PRIORITY_CHOICES,
@@ -4636,8 +4773,10 @@ def new_task():
         if status == STATUS_DONE and not _outcomes_have_actual(data):
             flash(_COMPLETE_NEEDS_OUTCOME, "danger")
             return _render_task_form(None, users, request.form, sel)
-        start_date = parse_date(request.form.get("start_date"))
-        due_date = parse_date(request.form.get("due_date"))
+        start_date, due_date, shown = _read_task_dates()
+        if shown is not None:
+            flash(_TASK_DATE_INVALID, "danger")
+            return _render_task_form(None, users, shown, sel)
         if start_date and due_date and start_date > due_date:
             flash(_START_AFTER_DUE, "danger")
             return _render_task_form(None, users, request.form, sel)
@@ -4731,8 +4870,10 @@ def edit_task(task_id):
             return _render_task_form(task, users, request.form, sel)
         start_date, due_date, scale = task.start_date, task.due_date, task.scale
         if current_user.is_manager:
-            start_date = parse_date(request.form.get("start_date"))
-            due_date = parse_date(request.form.get("due_date"))
+            start_date, due_date, shown = _read_task_dates(task)
+            if shown is not None:
+                flash(_TASK_DATE_INVALID, "danger")
+                return _render_task_form(task, users, shown, sel)
             scale = _read_scale()
             if start_date and due_date and start_date > due_date:
                 flash(_START_AFTER_DUE, "danger")
@@ -5116,6 +5257,12 @@ def list_routines():
     manual = request.args.get("manual", "")
     scope = request.args.get("scope", "")
     keyword = search_keyword()
+    # 担当者の選択肢: 有効なユーザーと、選択中の無効化したユーザー(マネージャーには定型業務が残っている
+    # 無効化したユーザーも。担当の付け替えのため)。どのユーザーでもない番号は条件に使わない
+    users = filter_user_choices([to_int(assignee_id)], User.id.in_(db.select(RoutineWork.assignee_id))
+                                if current_user.is_manager else None)
+    if to_int(assignee_id) not in {u.id for u in users}:
+        assignee_id = ""
 
     query = RoutineWork.query
     if to_int(assignee_id) is not None:
@@ -5136,7 +5283,7 @@ def list_routines():
     return render_template(
         "routine/list.html",
         routines=routines,
-        users=get_active_users(),
+        users=users,
         manual_choices=MANUAL_CHOICES,
         summary_rows=summary_rows,
         summary_totals=summary_totals,
@@ -5374,12 +5521,21 @@ def _read_leave_form():
     return parse_date(request.form.get("leave_date")), leave_type
 
 
-def _leave_date_error(leave_date):
-    """取得日の誤り(未入力・範囲外)のメッセージ。問題なければ None。"""
+def _leave_date_error(leave_date, current=None):
+    """取得日の誤り(未入力・範囲外・営業日でない日)のメッセージ。問題なければ None。
+
+    土日・祝日(営業日カレンダー 2-4)は登録できない(換算日数・同日の人数に数えないように)。
+    current は編集する年休の今の取得日(以前の版で土日・祝日に登録した年休も、取得日を変えなければ
+    種別の変更などはできるように)。
+    """
     if leave_date is None:
         return "取得日を入力してください。"
     if not LEAVE_YEAR_MIN <= leave_date.year <= LEAVE_YEAR_MAX:
         return "取得日は{}年〜{}年の日付で入力してください。".format(LEAVE_YEAR_MIN, LEAVE_YEAR_MAX)
+    if leave_date != current and not is_business_day(leave_date):
+        reason = holiday_name(leave_date) or ("土曜日" if leave_date.weekday() == 5 else "日曜日")
+        return ("{}は{}のため、年休を登録できません。営業日（月〜金で、祝日・休日でない日）を選んでください。"
+                .format(leave_date.strftime("%Y/%m/%d"), reason))
     return None
 
 
@@ -5504,6 +5660,15 @@ def calendar_view():
         year, month = today.year, today.month
 
     dept_id = to_int(request.args.get("dept", ""))
+    departments = _active_departments()
+    if dept_id is not None and dept_id not in {d.id for d in departments}:
+        # 無効化したチーム: 選択肢に「［無効］」を付けて残す(絞り込みは効いたまま「全体」と表示されないように)。
+        # どのチームでもない番号は条件に使わない
+        stale = db.session.get(Department, dept_id)
+        if stale is None:
+            dept_id = None
+        else:
+            departments.append(stale)
     weeks = _build_weeks(year, month, dept_id)
 
     prev_year, prev_month = (year - 1, 12) if month == 1 else (year, month - 1)
@@ -5515,7 +5680,7 @@ def calendar_view():
         year=year,
         month=month,
         weekday_labels=CALENDAR_WEEKDAY_LABELS,
-        departments=_active_departments(),
+        departments=departments,
         dept_id=dept_id,
         prev=(prev_year, prev_month),
         next=(next_year, next_month),
@@ -5531,8 +5696,24 @@ def calendar_view():
 def list_leaves():
     user_id = request.args.get("user", "")
     scope = request.args.get("scope", "")
-    date_from = parse_date(request.args.get("from"))
-    date_to = parse_date(request.args.get("to"))
+    # 対象者の選択肢: 有効なユーザーと、選択中の無効化したユーザー(「［無効］」付き。選択肢から消えて「すべて」と
+    # 表示されたまま絞り込まないように)。どのユーザーでもない番号は条件に使わない
+    users = filter_user_choices([to_int(user_id)])
+    if to_int(user_id) not in {u.id for u in users}:
+        user_id = ""
+    # 取得日の期間: 日付として読めない値(年が5桁以上など)は使わず、その旨を表示する
+    # (欄にも表示しない。読めない値をそのまま欄に戻すと、絞り込んでいないのに絞り込んだように見えるため)
+    dates, bad = {}, []
+    for name, label in (("from", "以降"), ("to", "以前")):
+        raw = (request.args.get(name) or "").strip()
+        value = parse_date(raw)
+        if raw and value is None:
+            bad.append("取得日({})".format(label))
+        dates[name] = value
+    if bad:
+        flash("期間の日付が正しくないため、{}の条件は使っていません（YYYY-MM-DD の実在する日付で指定してください）。"
+              .format("・".join(bad)), "warning")
+    date_from, date_to = dates["from"], dates["to"]
 
     query = LeaveRequest.query
     if to_int(user_id) is not None:
@@ -5550,14 +5731,15 @@ def list_leaves():
     return render_template(
         "leaves/list.html",
         leaves=leaves,
-        users=get_active_users(),
+        users=users,
         filters={
             "user": user_id,
             "scope": scope,
-            "from": request.args.get("from", ""),
-            "to": request.args.get("to", ""),
+            "from": date_from.isoformat() if date_from else "",
+            "to": date_to.isoformat() if date_to else "",
         },
         total_days=total_days,
+        year_min=LEAVE_YEAR_MIN, year_max=LEAVE_YEAR_MAX,
     )
 
 
@@ -5630,7 +5812,7 @@ def edit_leave(leave_id):
 
     if request.method == "POST":
         leave_date, leave_type = _read_leave_form()
-        error = _leave_date_error(leave_date)
+        error = _leave_date_error(leave_date, current=leave.leave_date)
         if error:
             flash(error, "danger")
             return _render_leave_form(leave, request.form)
@@ -6151,8 +6333,6 @@ ITEM_BACK_POOL = "pool"
 
 # AIの下書きの最大文字数(これより長い部分は切り捨てる)
 DESCRIPTION_DRAFT_MAX = 2000
-# 見出しだけの行の、見出しの語の後ろ(（Lv1〜Lv4）・閉じ括弧・コロンだけなら見出しの行とみなす)
-_HEADING_TAIL = re.compile(r"[ \t　]*(?:（[^）]*）|\([^)]*\))?[ \t　]*[】\]:：]?[ \t　]*$")
 
 
 def _item_back():
@@ -6340,7 +6520,7 @@ def draft_skill_description(name, skill_type, category, current=""):
     if skill_type == SKILL_TECHNICAL:
         missing = [h for h in SKILL_DESCRIPTION_HEADINGS if h not in description_headings(draft)]
     else:
-        found = {_DESCRIPTION_HEADING_KEYS[m.group(1)] for m in _DESCRIPTION_HEADING_RE.finditer(draft)}
+        found = description_heading_keys(draft)
         missing = [h for h, _b in description_outline(skill_type)
                    if (DESC_LEVELS if h.startswith("レベルごとの目安") else h) not in found]
     if missing:
@@ -6929,6 +7109,13 @@ def _build_gantt(today, only_user_id=None):
     ghide = request.args.get("ghide") == "1"
     # 個人ダッシュボードは本人固定(担当者フィルタは出さない)
     gassignee = "" if only_user_id is not None else request.args.get("gassignee", "")
+    gusers = []
+    if only_user_id is None:
+        # 担当者の選択肢: 有効なユーザーと、選択中の無効化したユーザー・未完了のタスクが残っている無効化した
+        # ユーザー(担当の付け替えのため。ガントはマネージャーの画面)。どのユーザーでもない番号は条件に使わない
+        gusers = filter_user_choices([to_int(gassignee)], User.assigned_tasks.any(Task.status != STATUS_DONE))
+        if to_int(gassignee) not in {u.id for u in gusers}:
+            gassignee = ""
 
     gtotal_days = (gto - gfrom).days + 1
 
@@ -7025,8 +7212,10 @@ def _build_gantt(today, only_user_id=None):
         "gsort": gsort, "gdir": gdir, "ghide": ghide, "gassignee": gassignee,
         "gticks": gticks, "gtoday_left": gtoday_left,
         "status_colors": STATUS_COLORS,
-        "gusers": [] if only_user_id is not None else get_active_users(),
+        "gusers": gusers,
         "gpersonal": only_user_id is not None,
+        # 凡例の「完了」: 「完了」を非表示にしても、完了の後に戻したタスクの棒に完了の色の区間があれば出す
+        "gdone_shown": any(seg["status"] == STATUS_DONE for g in gantt for seg in g["segments"]),
     }
 
 
@@ -7530,11 +7719,26 @@ def _fmt(v):
         # Excel(xlsx)に入れられない文字(貼り付けた文書の改行 U+000B などの制御文字・U+FFFE/U+FFFF など)は除く
         # (1文字でも残っていると出力全体が作成できないため。改行・タブは残す)
         v = CONTROL_CHARS.sub("", v)
-        if len(v) > XLSX_CELL_MAX:
+        if len(v) * 2 > XLSX_CELL_MAX and _utf16_len(v) > XLSX_CELL_MAX:
             # Excel のセルの上限を超える部分は省略する(何も書かずに切り捨てられないよう、印を付ける)
-            v = v[:XLSX_CELL_MAX - len(XLSX_TRUNCATED_MARK)] + XLSX_TRUNCATED_MARK
+            v = _cut_utf16(v, XLSX_CELL_MAX - _utf16_len(XLSX_TRUNCATED_MARK)) + XLSX_TRUNCATED_MARK
         return v
     return v
+
+
+def _utf16_len(text):
+    """Excel が数える文字数(UTF-16 の単位。絵文字など U+10000 以上の文字は 2 と数える)。"""
+    return len(text) + sum(1 for ch in text if ord(ch) > 0xFFFF)
+
+
+def _cut_utf16(text, limit):
+    """先頭から UTF-16 の単位で limit までの部分(U+10000 以上の文字を途中で分けない)。"""
+    units = 0
+    for index, ch in enumerate(text):
+        units += 2 if ord(ch) > 0xFFFF else 1
+        if units > limit:
+            return text[:index]
+    return text
 
 
 def _xlsx_response(sheets, filename):
@@ -7546,11 +7750,15 @@ def _xlsx_response(sheets, filename):
         ws.append(list(headers))
         for cell in ws[1]:
             cell.font = Font(bold=True)
-        for row in rows:
-            ws.append([_fmt(c) for c in row])
+        for row_index, row in enumerate(rows, start=2):  # 1行目は見出し
+            values = [_fmt(c) for c in row]
+            ws.append(values)
             # openpyxl は「=」で始まる文字列を数式として保存するため、文字列として書き出す
-            # (タスク名・コメント・AIが作った問題文や選択肢などが数式として計算されないように)
-            for cell in ws[ws.max_row]:
+            # (タスク名・コメント・AIが作った問題文や選択肢などが数式として計算されないように)。
+            # 追加した行のセルは行番号で取り出す(ws.max_row・ws[行] は書いたすべてのセルを数えるため、
+            # 行ごとに使うと行の数の2乗の時間がかかる)
+            for column in range(1, len(values) + 1):
+                cell = ws.cell(row=row_index, column=column)
                 if cell.data_type == "f" and isinstance(cell.value, str):
                     cell.data_type = "s"
         ws.freeze_panes = "A2"
@@ -7919,7 +8127,8 @@ def period_label(start, end):
 def next_weekly_run(settings, now):
     """設定から次回の自動実行日時を求める。自動送信が無効・時刻不正なら None。
 
-    当日の実行時刻の「分」の間はまだ実行中とみなし、当日の日時を返す。
+    当日の実行時刻の「分」の間はまだ実行中とみなし、当日の日時を返す。今日の分を既に自動送信した
+    (実行の印 last_auto_key が今日)ときは、時刻を後の時刻に変えていても今日は送らないため、次の週の日時を返す。
     """
     if not settings.get("enabled"):
         return None
@@ -7929,7 +8138,8 @@ def next_weekly_run(settings, now):
     weekday = settings.get("weekday", 0)
     days_ahead = (weekday - now.weekday()) % 7
     candidate = datetime.combine(now.date() + timedelta(days=days_ahead), time(at.hour, at.minute))
-    if candidate < now.replace(second=0, microsecond=0):
+    if candidate < now.replace(second=0, microsecond=0) or \
+            (candidate.date() == now.date() and auto_run_done_on(settings, now.date())):
         candidate += timedelta(days=7)
     return candidate
 
@@ -9451,7 +9661,8 @@ def next_overdue_run(settings, now):
     """次回の自動送信日時(次の営業日の設定時刻)。自動送信が無効・時刻不正なら None。
 
     今日が営業日で、まだ設定時刻を過ぎていなければ今日。
-    当日の実行時刻の「分」の間はまだ実行中とみなし、当日の日時を返す。
+    当日の実行時刻の「分」の間はまだ実行中とみなし、当日の日時を返す。今日の分を既に自動送信した
+    (実行の印 last_auto_key が今日)ときは、時刻を後の時刻に変えていても今日は送らないため、次の営業日にする。
     """
     if not settings.get("enabled"):
         return None
@@ -9459,7 +9670,7 @@ def next_overdue_run(settings, now):
     if at is None:
         return None
     candidate = datetime.combine(now.date(), time(at.hour, at.minute))
-    if candidate < now.replace(second=0, microsecond=0):
+    if candidate < now.replace(second=0, microsecond=0) or auto_run_done_on(settings, now.date()):
         candidate += timedelta(days=1)
     for _ in range(_SEARCH_DAYS):
         if is_business_day(candidate.date()):
@@ -10367,14 +10578,24 @@ _FORBIDDEN_CHOICE = re.compile(
     re.IGNORECASE,
 )
 
-# 重複判定で無視する文字(空白・句読点・括弧・引用符など)
-_IGNORABLE = re.compile(r"[\s、。，．,.!！?？・:：;；「」『』（）()\[\]【】{}<>＜＞\"'`“”‘’]+")
+# 重複判定で無視する文字: 日本語の句読点・中黒・かぎ括弧・引用符だけ(NFKC の後に残る全角の記号)。
+# 英字の大文字・小文字と、ASCII の記号(< > = ! ( ) [ ] . , など。全角の（）＜＞！などは NFKC で ASCII になる)は
+# 区別する(演算子・優先順位・大文字小文字の違いを問う問題・選択肢を、同じものとして捨てないように)
+_IGNORABLE = re.compile(r"[、。・「」『』【】〔〕〈〉《》“”‘’]+")
+# 日本語の文字(ASCII 以外)の前後の空白(「Python で」と「Pythonで」を同じにする。ASCII どうしの間の空白は
+# 1つにまとめて残す。「a - -b」と「a --b」のように意味が変わることがあるため)
+_SPACE_NEAR_WIDE = re.compile(r"\s+(?=[^\x00-\x7f])|(?<=[^\x00-\x7f])\s+")
 
 
 def normalize_text(text):
-    """重複判定用に文章を正規化する(NFKC・小文字化・空白と句読点の除去)。"""
-    value = unicodedata.normalize("NFKC", str(text or "")).lower()
-    return _IGNORABLE.sub("", value)
+    """重複判定用に文章を正規化する(NFKC で全角・半角をそろえ、空白をまとめ、日本語の句読点・括弧を除く)。
+
+    問題の重複(プール・1回の受験の中)と、1問の4つの選択肢が互いに異なるかの確認に使う。英字の大文字・小文字と
+    ASCII の記号・演算子・括弧は区別する(「x < 5」と「x > 5」、「True」と「true」は別の選択肢)。
+    """
+    value = unicodedata.normalize("NFKC", str(text or ""))
+    value = _SPACE_NEAR_WIDE.sub("", _IGNORABLE.sub("", value))
+    return re.sub(r"\s+", " ", value).strip()
 
 
 def model_label():
@@ -11123,6 +11344,9 @@ def start_attempt(user, skill):
             existing = in_progress_attempt(user.id)
             if existing is not None:
                 return StartOutcome(existing, True, None)
+            if not is_test_taker(db.session.get(User, user.id)):
+                # 問題を準備している間に、受験者がマネージャーになった・無効化された(受験できない人の受験を作らない)
+                return StartOutcome(None, False, "スキルテストを受験できるのは、有効なメンバーだけです。")
             if not is_testable(skill):
                 # 問題を準備している間に、マネージャーがスキルを無効化した
                 return StartOutcome(None, False, "このスキルはスキルテストの対象外です（有効なテクニカルスキルだけが対象）。")
@@ -12551,8 +12775,11 @@ def progress_comment_issue(text):
         return "記載が空"
     if _GENERIC_PROGRESS_PATTERN.fullmatch(plain):
         return "具体的な内容がない（「{}」のような定型の言葉だけ）".format(one_line(text, 20))
-    if len(plain) < PROGRESS_SHORT_CHARS and not re.search(r"\d", plain):
-        return "記載が短い（{}文字。何をどこまで進めたかが分からない）".format(len(plain))
+    # 文字数は見える文字で数える(空白・改行と絵文字・顔文字だけを除く。_plain は言葉を比べるための正規化で、
+    # 長音「ー」・括弧・「・」なども除くため、「サーバーのアップデート」が短く数えられてしまう)
+    length = _text_length(_strip_symbols(str(text or "")))
+    if length < PROGRESS_SHORT_CHARS and not re.search(r"\d", plain):
+        return "記載が短い（{}文字。何をどこまで進めたかが分からない）".format(length)
     return None
 
 
@@ -13336,6 +13563,15 @@ def overdue_days_label(item):
     return "{}営業日".format(item["overdue_days"])
 
 
+def _analysis_date(d, data):
+    """推奨アクション・AI に送る候補とチームの材料の日付(分析の基準の日時と同じ年は mm/dd、それ以外は yyyy/mm/dd)。
+
+    期限超過のタスク・未完了のタスクのコメントは1年以上前のこともあるため、今年の日付と読まれないよう年を付ける
+    (期限超過通知の _date_label と同じ書き方)。
+    """
+    return _date_label(d, data.get("now") or _now())
+
+
 def _action_candidates(data):
     progress = data["progress"]
     skills = data["skills"]
@@ -13353,10 +13589,10 @@ def _action_candidates(data):
             _ask(item, "と期限超過の見通し（新しい期限・残りの作業）を確認する",
                  "担当者を決めて、期限超過の見通しを確認する"),
             _task_target(item),
-            "期限（{}）を過ぎて未完了（{}）。".format(item["due_date"].strftime("%m/%d"), item["status"]),
+            "期限（{}）を過ぎて未完了（{}）。".format(_analysis_date(item["due_date"], data), item["status"]),
             ["期限超過 " + overdue_days_label(item),
              "優先度 {}".format(item["priority"]),
-             "最後の進捗記載: {}".format(last["at"].strftime("%m/%d") if last else "なし")])
+             "最後の進捗記載: {}".format(_analysis_date(last["at"], data) if last else "なし")])
     # マネージャーのコメント: 1つのタスクに要フォローのコメントが複数あっても推奨アクションは1件にする
     # (同じやること・同じ対象が並んで、ほかのタスクの枠を使わないように)。点数は最も高いコメントの点数
     mc_by_task = {}
@@ -13372,7 +13608,7 @@ def _action_candidates(data):
                 _ask(item, "と、コメントで求めた対応{}の進め方を確認する".format(
                     "（{}）".format(rest) if rest else ""), "担当者を決めて、コメントへの対応を依頼する"),
                 "{} {}さんのコメント「{}」への対応が「{}」（AIの判定）。".format(
-                    item["at"].strftime("%m/%d"), item["author"], one_line(item["body"], 40),
+                    _analysis_date(item["at"], data), item["author"], one_line(item["body"], 40),
                     item["judgement"]),
                 ["コメントから {}営業日".format(item["age_days"]), "判定 {}".format(item["judgement"]),
                  "状態 {}".format(item["status"])])
@@ -13381,7 +13617,7 @@ def _action_candidates(data):
                 80 + min(item["elapsed_days"] or 0, 20) / 2.0,
                 _ask(item, "に、コメントへの返信・対応を確認する", "担当者を決めて、コメントへの対応を依頼する"),
                 "{} {}さんのコメント「{}」に担当者の返信がない。".format(
-                    item["at"].strftime("%m/%d"), item["author"], one_line(item["body"], 40)),
+                    _analysis_date(item["at"], data), item["author"], one_line(item["body"], 40)),
                 ["経過 {}営業日".format(item["elapsed_days"]), "状態 {}".format(item["status"])])
         mc_by_task.setdefault(item["task_id"], []).append((candidate, item))
     for entries in mc_by_task.values():
@@ -13389,7 +13625,7 @@ def _action_candidates(data):
         if len(entries) > 1:
             others = [i for _c, i in entries if i is not item]
             reason += "ほかにも要フォローのコメントが{}件ある（{}）。".format(len(others), "、".join(
-                "{}「{}」".format(i["at"].strftime("%m/%d"), one_line(i["body"], 20)) for i in others))
+                "{}「{}」".format(_analysis_date(i["at"], data), one_line(i["body"], 20)) for i in others))
             numbers = numbers + ["要フォローのコメント {}件".format(len(entries))]
         add("manager_comment", score, title, _task_target(item), reason, numbers)
     for item in progress["stale"]:
@@ -13408,7 +13644,7 @@ def _action_candidates(data):
             _ask(item, "と着手の予定を確認する", "担当者を決めて、着手の予定を立てる"),
             _task_target(item),
             "期限（{}）まで残り{}営業日なのに未着手。".format(
-                item["due_date"].strftime("%m/%d"), item["days_left"]),
+                _analysis_date(item["due_date"], data), item["days_left"]),
             ["残り {}営業日（しきい値 {}営業日）".format(item["days_left"], progress["due_soon_days"])])
     for item in progress["hold"]:
         days = item["hold_days"] or 0
@@ -14012,7 +14248,8 @@ def _items_text(data, group, items, chunk):
     lines.append("進捗記載（{}が期間内に書いたもの）:".format(group["label"]) + ("" if items["progress"] else " なし"))
     for cid in items["progress"]:
         rule = rule_progress.get(cid)
-        lines.append("  C{}{}{}".format(cid, "（ルールの指摘: {}）".format(rule["reason"]) if rule else "",
+        # 指摘の理由には記載の本文の一部(「…」のような定型の言葉だけ)が入るため、本文と同じく記号を置き換えて1行にする
+        lines.append("  C{}{}{}".format(cid, "（ルールの指摘: {}）".format(_inline(rule["reason"])) if rule else "",
                                         _sent_note(cid, chunk)))
     if items["memo_mc"]:
         lines.append("経過メモ（分けて送っているタスクのマネージャーのコメント。判定はそのタスクの最後の回で頼みます）:")
@@ -14387,7 +14624,7 @@ def team_material_sections(data, candidates, hidden_candidates):
     for i in mc["follow"]:
         ai = i.get("ai") or {}
         lines.append("  T{}「{}」（担当 {}）: {} {}さん「{}」 → {}{} ／ コメントから {}営業日".format(
-            i["task_id"], _inline(i["title"]), _inline(i["assignee_names"]) or "なし", i["at"].strftime("%m/%d"),
+            i["task_id"], _inline(i["title"]), _inline(i["assignee_names"]) or "なし", _analysis_date(i["at"], data),
             _inline(i["author"]), _inline(i["body"]), i["judgement"],
             "（残っている対応: {}）".format(_inline(ai.get("remaining"))) if ai.get("remaining") else "",
             i["age_days"]))
@@ -15052,7 +15289,12 @@ class AnalysisRun:
         if len(chunks) > 1 and len(failed) == len(chunks):
             # 分けて送った材料を1回も読めなかった: 所見は作らない(材料が無いものとして所見を作らせない)
             self.done += 1  # 予定に数えていた所見の呼び出しの分(進み具合の表示を最後まで進める)
-            self.unread(label, "材料をすべて読み込めなかったため、所見を作っていません。")
+            if self.aborted:
+                # 途中で中止した: 行わなかった呼び出しとして、中止の「未読込」1件にまとめる(中止の案内の
+                # 「残り N 回の呼び出しは行っていません」の N に数える)
+                self.unread(label, self.aborted)
+            else:
+                self.unread(label, "材料をすべて読み込めなかったため、所見を作っていません。")
         elif len(chunks) != 1:
             unread_note = ""
             if failed:
@@ -15088,8 +15330,10 @@ class AnalysisRun:
             out.append("成果の記載があいまい: {}件".format(vague))
         progress = sum(1 for k in self.result["progress_comments"]
                        if int(k) in group["progress_ids"])
-        # 読み込めなかった記載は判定していないため、分母に数えない
-        judged_ids = group["progress_ids"] - self.unread_comment_ids
+        # 判定できなかった記載(その人の記載を判定する回が読み込めなかったもの)は分母に数えない。
+        # 全体の読めなかったコメント(unread_comment_ids)では比べない: 共同担当のタスクで、ほかの担当者の回が
+        # 失敗しても、この人の記載はこの人の回で判定しているため(項目ごとの未読込の表示と同じ unjudged_progress_ids)
+        judged_ids = group["progress_ids"] - self.unjudged_progress_ids
         unread_progress = len(group["progress_ids"]) - len(judged_ids)
         if judged_ids:
             out.append("進捗記載の書き直し推奨: {}件（期間内の記載のうち判定した {}件のうち{}）".format(
@@ -15482,7 +15726,7 @@ def _target_numbers(target, data):
             return []
         numbers = ["状態 {}".format(t["status"])]
         if t["due_date"]:
-            numbers.append("期限 {}".format(t["due_date"].strftime("%m/%d")))
+            numbers.append("期限 {}".format(_analysis_date(t["due_date"], data)))
         return numbers
     if kind == "person":
         row = next((r for r in data["abilities"]["rows"] if r["user_id"] == target_id), None)
@@ -19004,8 +19248,11 @@ def test_reminder():
 #   ロックを取れた1つのプロセスだけが動かす(12-2)
 # - ジョブごとに、同じ (日付, 時刻) では1回しか実行しない。メモリ上の記録(fired)に加えて、各ジョブの
 #   設定ファイルに最後に実行した印(last_auto_key)を残す(実行時刻の分の中でサーバーを再起動しても、
-#   新しいプロセスがもう一度送らないように)。定型業務リマインドは時刻ではなく (日付, 枠〔time1 / time2〕) で
-#   数え、その日に実行した枠を設定ファイルの auto_slots に残す(JsonSettings.claim_auto_slot)
+#   新しいプロセスがもう一度送らないように)。週報・期限超過通知は1日1回の仕事のため、印の日付で比べる
+#   (その日に送った後に時刻を後の時刻に変えても、その日はもう一度送らない)。定型業務リマインドは時刻ではなく
+#   (日付, 枠〔time1 / time2〕) で数え、その日に実行した枠を設定ファイルの auto_slots に残す(JsonSettings.claim_auto_slot)
+# - 印を設定ファイルに書けなかったとき(Windows でほかのプロセスがファイルを開いていた など)は実行せず、
+#   実行済みの記録(fired)にも入れない(同じ分の次の確認でもう一度試す。印は記録済みなら実行しないため二重には送らない)
 # - サーバーが止まっていて実行時刻を過ぎた分は、後から実行しない(取りこぼしの再実行なし)
 # - 実行履歴はDBに残さない(結果は各機能の「前回の結果」に上書き)
 # - 実行はジョブごとに別のスレッドで行う(時間のかかる週報の作成中も、ほかの
@@ -19021,7 +19268,8 @@ CHECK_INTERVAL = 30  # 秒
 # run            : (app, 設定, 今) → 実行して成否を返す
 # record_failure : (メッセージ) → 前回の結果に失敗を書く(app_context の中で呼ぶ)
 # claim_run      : (印「YYYY-MM-DD HH:MM」〔リマインドは「YYYY-MM-DD 枠」〕) → 設定ファイルに記録して True。
-#                  記録済みなら False(app_context の中で呼ぶ。JsonSettings.claim_auto_run / claim_auto_slot)
+#                  記録済み(週報・期限超過通知はその日の印があれば)なら False(app_context の中で呼ぶ。
+#                  JsonSettings.claim_auto_run / claim_auto_slot)
 Job = namedtuple("Job", "name label load_settings due_key run record_failure claim_run")
 
 
@@ -19117,15 +19365,30 @@ def _check_job(app, job, fired, now, start_thread=True):
     key = job.due_key(settings, now)
     if key is None or key in fired:
         return None
-    fired.add(key)
     # 古い記録は不要(同じ日付が再び来ることはない)
     for old in [k for k in fired if k[0] < now.date()]:
         fired.discard(old)
     # 別のプロセス(再起動する前のサーバー)が同じ日付・時刻(リマインドは枠)に実行済みなら実行しない
     with app.app_context():
-        if not job.claim_run("{} {}".format(key[0].isoformat(), key[1])):
-            app.logger.info("%sの自動送信: %s %s は実行済みのため、実行しません", job.label, key[0], key[1])
+        try:
+            claimed = job.claim_run("{} {}".format(key[0].isoformat(), key[1]))
+        except Exception as exc:
+            # 実行の印を設定ファイルに書けなかった(Windows でほかのプロセスがファイルを開いていた など)。
+            # 実行済みの記録(fired)に入れず、同じ分の次の確認(約30秒後)でもう一度試す(claim_run は記録済みなら
+            # False を返すため、二重には送らない)。前回の結果にも残す(次の確認で実行できれば、その結果で上書き)
+            app.logger.exception("%sの自動送信: 実行の印を記録できなかったため、実行していません（次の確認でもう一度試します）",
+                                 job.label)
+            try:
+                slot = {"time1": "送信時刻1", "time2": "送信時刻2"}.get(key[1], key[1])
+                job.record_failure("自動送信の実行の印を設定ファイルに記録できなかったため、{} {} の分を実行していません"
+                                   "（同じ分のうちにもう一度試します）: {}".format(key[0].strftime("%Y/%m/%d"), slot, exc))
+            except Exception:
+                app.logger.exception("%sの前回の結果を保存できませんでした", job.label)
             return None
+    fired.add(key)
+    if not claimed:
+        app.logger.info("%sの自動送信: %s %s は実行済みのため、実行しません", job.label, key[0], key[1])
+        return None
 
     if not start_thread:
         _execute(app, job, settings, now)
@@ -20001,14 +20264,25 @@ def seed_command():
         # --- サンプル年休(承認なし・単一取得日。まだ無ければ作成) ---
         if LeaveRequest.query.count() == 0:
             today = date.today()
+
+            def business_day_from(day):
+                """day(土日・祝日なら、その後の最初の営業日。年休は営業日だけ登録できるため)。"""
+                while not is_business_day(day):
+                    day += timedelta(days=1)
+                return day
+
+            same_day = business_day_from(today + timedelta(days=2))
+            # 田中の2件目は1件目より後の日(連休で同じ日にならないように)
+            later = business_day_from(max(today + timedelta(days=6), same_day + timedelta(days=1)))
             leaves = [
                 # 同日にチームBが3名 → カレンダーで同日上限超の警告色を確認できる
-                LeaveRequest(user_id=user_map["yamada"].id, leave_date=today + timedelta(days=2), leave_type=LEAVE_FULL),
-                LeaveRequest(user_id=user_map["tanaka"].id, leave_date=today + timedelta(days=2), leave_type=LEAVE_FULL),
-                LeaveRequest(user_id=user_map["leader"].id, leave_date=today + timedelta(days=2), leave_type=LEAVE_FULL),
+                LeaveRequest(user_id=user_map["yamada"].id, leave_date=same_day, leave_type=LEAVE_FULL),
+                LeaveRequest(user_id=user_map["tanaka"].id, leave_date=same_day, leave_type=LEAVE_FULL),
+                LeaveRequest(user_id=user_map["leader"].id, leave_date=same_day, leave_type=LEAVE_FULL),
                 # 別日
-                LeaveRequest(user_id=user_map["suzuki"].id, leave_date=today + timedelta(days=4), leave_type=LEAVE_FULL),
-                LeaveRequest(user_id=user_map["tanaka"].id, leave_date=today + timedelta(days=6), leave_type=LEAVE_AM),
+                LeaveRequest(user_id=user_map["suzuki"].id, leave_date=business_day_from(today + timedelta(days=4)),
+                             leave_type=LEAVE_FULL),
+                LeaveRequest(user_id=user_map["tanaka"].id, leave_date=later, leave_type=LEAVE_AM),
             ]
             for lv in leaves:
                 db.session.add(lv)

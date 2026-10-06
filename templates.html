@@ -683,7 +683,7 @@
           <div class="form-check">
             <input class="form-check-input" type="checkbox" name="assignee" value="{{ u.id }}" id="as{{ u.id }}"
                    {% if u.id in filters.assignees %}checked{% endif %}>
-            <label class="form-check-label small" for="as{{ u.id }}">{{ u.display_name }}</label>
+            <label class="form-check-label small" for="as{{ u.id }}">{{ u.name_label }}</label>
           </div>
         </div>
         {% endfor %}
@@ -991,12 +991,12 @@
         </div>
         <div class="col-md-6 mb-3">
           <label class="form-label">開始日{% if not can_plan %} <span class="text-muted small">（マネージャーのみ）</span>{% endif %}</label>
-          <input type="date" name="start_date" class="form-control" {% if not can_plan %}disabled{% endif %}
+          <input type="date" name="start_date" class="form-control" min="{{ year_min }}-01-01" max="{{ year_max }}-12-31" {% if not can_plan %}disabled{% endif %}
                  value="{% if form and can_plan %}{{ form.get('start_date','') }}{% elif task and task.start_date %}{{ task.start_date.strftime('%Y-%m-%d') }}{% endif %}">
         </div>
         <div class="col-md-6 mb-3">
           <label class="form-label">期限{% if not can_plan %} <span class="text-muted small">（マネージャーのみ）</span>{% endif %}</label>
-          <input type="date" name="due_date" class="form-control" {% if not can_plan %}disabled{% endif %}
+          <input type="date" name="due_date" class="form-control" min="{{ year_min }}-01-01" max="{{ year_max }}-12-31" {% if not can_plan %}disabled{% endif %}
                  value="{% if form and can_plan %}{{ form.get('due_date','') }}{% elif task and task.due_date %}{{ task.due_date.strftime('%Y-%m-%d') }}{% endif %}">
         </div>
         <div class="col-md-6 mb-3">
@@ -1193,7 +1193,7 @@
       <select name="assignee" class="form-select form-select-sm">
         <option value="">すべて</option>
         {% for u in users %}
-        <option value="{{ u.id }}" {% if filters.assignee == u.id|string %}selected{% endif %}>{{ u.display_name }}</option>
+        <option value="{{ u.id }}" {% if filters.assignee == u.id|string %}selected{% endif %}>{{ u.name_label }}</option>
         {% endfor %}
       </select>
     </div>
@@ -1697,17 +1697,17 @@
       <select name="user" class="form-select form-select-sm">
         <option value="">すべて</option>
         {% for u in users %}
-        <option value="{{ u.id }}" {% if filters.user == u.id|string %}selected{% endif %}>{{ u.display_name }}</option>
+        <option value="{{ u.id }}" {% if filters.user == u.id|string %}selected{% endif %}>{{ u.name_label }}</option>
         {% endfor %}
       </select>
     </div>
     <div class="col-6 col-md-3">
       <label class="form-label small mb-1">取得日(以降)</label>
-      <input type="date" name="from" value="{{ filters.from }}" class="form-control form-control-sm">
+      <input type="date" name="from" value="{{ filters.from }}" min="{{ year_min }}-01-01" max="{{ year_max }}-12-31" class="form-control form-control-sm">
     </div>
     <div class="col-6 col-md-3">
       <label class="form-label small mb-1">取得日(以前)</label>
-      <input type="date" name="to" value="{{ filters.to }}" class="form-control form-control-sm">
+      <input type="date" name="to" value="{{ filters.to }}" min="{{ year_min }}-01-01" max="{{ year_max }}-12-31" class="form-control form-control-sm">
     </div>
     <div class="col-4 col-md-2 form-check ms-2 mb-2">
       <input class="form-check-input" type="checkbox" name="scope" value="mine" id="mine" {% if filters.scope == 'mine' %}checked{% endif %}>
@@ -1781,7 +1781,7 @@
     <select name="dept" class="form-select form-select-sm" onchange="this.form.submit()" style="width:auto;">
       <option value="">全体</option>
       {% for d in departments %}
-      <option value="{{ d.id }}" {% if dept_id == d.id %}selected{% endif %}>{{ d.name }}</option>
+      <option value="{{ d.id }}" {% if dept_id == d.id %}selected{% endif %}>{{ d.name }}{% if not d.is_active %}［無効］{% endif %}</option>
       {% endfor %}
     </select>
   </form>
@@ -1915,6 +1915,7 @@
         <label class="form-label">取得日 <span class="text-danger">*</span></label>
         <input type="date" name="leave_date" class="form-control" required min="{{ year_min }}-01-01" max="{{ year_max }}-12-31"
                value="{% if form %}{{ form.get('leave_date','') }}{% elif leave %}{{ leave.leave_date.strftime('%Y-%m-%d') }}{% endif %}">
+        <div class="form-text">土日・祝日（振替休日を含む）は登録できません。</div>
       </div>
 
       <div class="mb-3">
@@ -4121,7 +4122,7 @@
       <select name="gassignee" class="form-select form-select-sm">
         <option value="">すべて</option>
         {% for u in gusers %}
-        <option value="{{ u.id }}" {% if gassignee == u.id|string %}selected{% endif %}>{{ u.display_name }}</option>
+        <option value="{{ u.id }}" {% if gassignee == u.id|string %}selected{% endif %}>{{ u.name_label }}</option>
         {% endfor %}
       </select>
     </div>
@@ -4141,7 +4142,7 @@
   <span class="badge bg-{{ status_colors['進行中'] }}">進行中</span>
   <span class="badge bg-{{ status_colors['未着手'] }}">未着手(待ち)</span>
   <span class="badge bg-{{ status_colors['保留'] }} text-dark">保留</span>
-  {% if not ghide %}<span class="badge bg-{{ status_colors['完了'] }}">完了</span>{% endif %}
+  {% if not ghide or gdone_shown %}<span class="badge bg-{{ status_colors['完了'] }}">完了</span>{% endif %}
   <span class="ms-2 text-danger"><i class="bi bi-lightning-charge-fill"></i> 期限超過(未完了)</span>
   <span class="ms-2"><span class="gantt-mark d-inline-block position-static"></span> 進捗記載(マウスオーバーで内容)</span>
 </div>
