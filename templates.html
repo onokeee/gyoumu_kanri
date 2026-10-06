@@ -208,7 +208,8 @@
 {% endblock %}
 {#=== errors/http_error.html ===#}
 {# 権限が無い(403)・ページが見つからない(404)・画面として開けない URL(405)・内部エラー(500)の画面。heading / message は app.py の HTTP_ERROR_PAGES(または abort の説明)。
-   confirm_url があれば、続けるためのボタンも表示する(ほかのサイトから開かれたスキルテストの出題・ログアウト。check_same_origin) #}
+   confirm_url があれば、続けるためのボタンも表示する(ほかのサイトから開かれた・送り元が分からないスキルテストの出題・ログアウト。
+   check_same_origin。confirm_post なら POST のフォームのボタン) #}
 {% extends "base.html" %}
 {% block title %}{{ heading }} &middot; {{ app_name }}{% endblock %}
 
@@ -219,7 +220,8 @@
       <h1 class="h5"><i class="bi bi-exclamation-triangle"></i> {{ heading }}</h1>
       <p class="mb-0">{{ message }}</p>
     </div>
-    {% if confirm_url %}<a href="{{ confirm_url }}" class="btn btn-primary me-2">{{ confirm_label }}</a>
+    {% if confirm_url and confirm_post %}<form method="post" action="{{ confirm_url }}" class="d-inline"><button type="submit" class="btn btn-primary me-2">{{ confirm_label }}</button></form>
+    {% elif confirm_url %}<a href="{{ confirm_url }}" class="btn btn-primary me-2">{{ confirm_label }}</a>
     {% endif %}<a href="{{ url_for('main.dashboard') }}" class="btn btn-outline-secondary">トップへ</a>
   </div>
 </div>
@@ -2338,7 +2340,7 @@
             <button class="btn btn-outline-secondary btn-sm" disabled>再受験の間隔中</button>
             {% else %}
             <form method="post" action="{{ url_for('skilltest.start', skill_id=row.skill.id) }}" class="d-inline skilltest-start"
-                  data-confirm="「{{ row.skill.name }}」のテストを始めます。全{{ rules.total }}問・約{{ rules.minutes }}分です。始めると時間は進み続けます（画面を閉じても止まりません）。よろしいですか？">
+                  data-confirm="「{{ row.skill.name }}」のテストを始めます。全{{ rules.total }}問・{{ rules.duration }}です。始めると時間は進み続けます（画面を閉じても止まりません）。よろしいですか？">
               <button class="btn btn-success btn-sm"><i class="bi bi-pencil-square"></i> 受験する</button>
             </form>
             {% endif %}
@@ -2360,7 +2362,7 @@
       <li>1回のテストで1つのスキルを確認します。問題は4択で全{{ rules.total }}問
         （{% for r in rules.rows %}Lv{{ r.level }} {{ r.count }}問{% if not loop.last %}・{% endif %}{% endfor %}）。
         やさしい問題（Lv1）から順に出題します。</li>
-      <li>1問ずつの制限時間があります（{% for r in rules.rows %}Lv{{ r.level }} {{ r.limit }}秒{% if not loop.last %}・{% endif %}{% endfor %}。合計 約{{ rules.minutes }}分）。
+      <li>1問ずつの制限時間があります（{% for r in rules.rows %}Lv{{ r.level }} {{ r.limit }}秒{% if not loop.last %}・{% endif %}{% endfor %}。合計 {{ rules.duration }}）。
         0秒になると、その時点で選んでいる選択肢で自動的に送信して次の問題へ進みます（未選択なら時間切れ＝不正解）。ページを再読み込みしても残り時間は戻りません。</li>
       <li>1問ずつ回答し、<span class="fw-bold">前の問題には戻れません</span>。選択肢の並びは受験ごとに変わります。</li>
       <li>途中で画面を閉じた場合は、開き直すと続きから再開します。ただし開始から 約{{ rules.deadline_minutes }}分を過ぎると自動で終了し、未回答の問題は不正解として採点します。</li>
@@ -2410,7 +2412,7 @@
           <td class="small text-nowrap">
             {% if a.is_in_progress %}―
             {% elif a.applied %}<span class="badge bg-success">登録</span> Lv{{ a.prev_level }} → Lv{{ a.new_level }}
-            {% else %}<span class="text-muted">変更なし（Lv{{ a.prev_level }}）</span>{% endif %}
+            {% else %}<span class="text-muted">変更なし（Lv{{ a.prev_level }}）</span>{% if a.not_applied_note %}<br><span class="text-warning-emphasis" title="{{ a.not_applied_note }}">対象外のため未登録</span>{% endif %}{% endif %}
           </td>
           <td class="text-end">
             {% if a.is_in_progress %}
@@ -2557,7 +2559,7 @@
             {% if (attempt.result_level or 0) <= (attempt.prev_level or 0) %}
             テストの結果が今の到達度より高くないため、到達度は変更していません（下がることはありません）。
             {% else %}
-            スキル管理の対象外のため、到達度は登録していません。
+            {{ attempt.not_applied_note }}
             {% endif %}
           </div>
           {% endif %}
@@ -2724,7 +2726,7 @@
           <td class="small text-nowrap">
             {% if a.is_in_progress %}―
             {% elif a.applied %}<span class="badge bg-success">自動登録</span> Lv{{ a.prev_level }} → Lv{{ a.new_level }}
-            {% else %}<span class="text-muted">変更なし（Lv{{ a.prev_level }}）</span>{% endif %}
+            {% else %}<span class="text-muted">変更なし（Lv{{ a.prev_level }}）</span>{% if a.not_applied_note %}<br><span class="text-warning-emphasis" title="{{ a.not_applied_note }}">対象外のため未登録</span>{% endif %}{% endif %}
           </td>
           <td class="text-end {% if a.blur_count %}text-danger fw-bold{% endif %}" data-sort="{{ a.blur_count }}">{{ a.blur_count }}</td>
           <td class="text-end" data-sort="{{ a.reused_count }}">{{ a.reused_count }}</td>
@@ -2781,7 +2783,7 @@
           <dd class="col-7">
             {% if attempt.is_in_progress %}―
             {% elif attempt.applied %}<span class="badge bg-success">自動登録</span> Lv{{ attempt.prev_level }} → Lv{{ attempt.new_level }}
-            {% else %}変更なし（Lv{{ attempt.prev_level }}）{% endif %}
+            {% else %}変更なし（Lv{{ attempt.prev_level }}）{% endif %}{% if attempt.not_applied_note %}<div class="text-muted">{{ attempt.not_applied_note }}</div>{% endif %}
           </dd>
           <dt class="col-5 text-muted">画面から離れた回数</dt>
           <dd class="col-7 {% if attempt.blur_count %}text-danger fw-bold{% endif %}">{{ attempt.blur_count }} 回</dd>
@@ -3329,7 +3331,7 @@
   </div>
   <div class="card-footer bg-white small text-muted">
     <i class="bi bi-info-circle"></i> <strong>フルタイム≒{{ load_full }}h/月を基準</strong>（負荷: 低 &lt;{{ (load_full/2)|int }} ／ 中 &lt;{{ load_full }} ／ 高 ≥{{ load_full }}）。<strong>余力＝{{ load_full }}h/月−合計</strong>（マイナスは超過）。<br>
-    タスクの規模（実働工数の目安）を開始〜期限の期間で月あたりに配分し、定型・定期業務の月間工数と合算。複数担当は均等割り。能力差は「規模の選択（担当者基準）」で織り込み。規模未設定のタスクは工数0で件数のみ計上。合計の行の件数・期限超過はタスクの数（複数担当のタスクも1件）。
+    タスクの規模（実働工数の目安）を開始〜期限の期間で月あたりに配分し、定型・定期業務の月間工数と合算。複数担当は均等割り。能力差は「規模の選択（担当者基準）」で織り込み。規模未設定のタスクは工数0で件数のみ計上。合計の行の件数・期限超過は、有効な担当者がいるタスクの数（複数担当のタスクも1件。未割当のタスクと、担当者が全員無効化されたタスクは含みません）。
   </div>
 </div>
 
@@ -4188,10 +4190,10 @@
   </div>
 </div>
 
-{# 課題・相談(AI が未完了のタスクのコメントから抜き出したもの) #}
+{# 課題・相談(AI が未完了のタスクと期間内に完了したタスクのコメントから抜き出したもの) #}
 {% if ai.applied %}
 <div class="card shadow-sm mb-3" id="issues">
-  <div class="card-header bg-white fw-bold"><i class="bi bi-stars text-info"></i> 課題・相談（AIが未完了のタスクのコメントから抽出・{{ (p.issues_ai or [])|length }} 件）</div>
+  <div class="card-header bg-white fw-bold"><i class="bi bi-stars text-info"></i> 課題・相談（AIが未完了・期間内に完了したタスクのコメントから抽出・{{ (p.issues_ai or [])|length }} 件）</div>
   <div class="table-responsive" style="max-height:320px; overflow-y:auto;">
     <table class="table table-sm align-middle mb-0 small">
       <thead class="table-light"><tr><th>タスク</th><th class="text-nowrap">担当</th><th class="text-nowrap">種類</th><th>内容</th><th class="text-nowrap">根拠</th></tr></thead>
@@ -4295,7 +4297,7 @@
   </div>
   {% endif %}
   <div class="card-footer bg-white small text-muted">
-    <i class="bi bi-info-circle"></i> 対象は、未完了のタスクへのマネージャーのコメント（全期間）と、期間内に書かれたコメントです（そのタスクの担当者でもあるマネージャーの記載は除く）。
+    <i class="bi bi-info-circle"></i> 対象は、未完了のタスクと期間内に完了したタスクへのマネージャーのコメント（全期間）と、期間内に書かれたコメントです（そのタスクの担当者でもあるマネージャーの記載は除く）。
     後に担当者のコメントが無いものを「返信なし」とし、経過はコメントが書かれてからの営業日数です。返信があるコメントは、AIがマネージャーの求めたこと（指示・質問・依頼）を読み取り、後のコメントと状態の変更から「対応済み」「一部対応」「未対応」を判定します（「AIで分析」の後）。
     要フォローは「返信なし」「未対応」「一部対応」です。
   </div>
@@ -5524,14 +5526,7 @@
         </table>
       </div>
       {% if cfg.unused and cfg.can_save %}
-      <div class="d-flex flex-wrap justify-content-end align-items-center gap-2 mt-2">
-        <span class="text-muted">未使用の項目の行（すぐ上の説明のコメントを含む）を <code>instance/config.py</code> から削除します。変更前の内容は <code>instance/config.py.bak</code> に残します。</span>
-        {# 削除は別のフォーム(下の unused-config-form)で送る(基本設定の入力は保存しない) #}
-        <button type="submit" form="unused-config-form" class="btn btn-sm btn-outline-danger"
-                onclick="return confirm('未使用の設定（{{ cfg.unused|join('、') }}）の行を instance/config.py から削除します。\n変更前の内容は instance/config.py.bak に残します。よろしいですか？');">
-          <i class="bi bi-trash"></i> 未使用の設定を削除
-        </button>
-      </div>
+      <p class="text-muted mt-2 mb-0">未使用の項目は、下の「基本設定を保存」の後にある「未使用の設定を削除」で <code>instance/config.py</code> から削除できます。</p>
       {% endif %}
     </div>
   </div>
@@ -5543,9 +5538,21 @@
   </div>
 </form>
 {% if cfg.unused and cfg.can_save %}
-<form method="post" action="{{ url_for('system.remove_unused') }}" id="unused-config-form">
-  <input type="hidden" name="version" value="{{ cfg.version }}">
-</form>
+{# 未使用の設定の削除は、基本設定のフォームの外の別のフォームで送る(入力中の基本設定は送らない・保存しない) #}
+<div class="card shadow-sm mb-4">
+  <div class="card-body small">
+    <form method="post" action="{{ url_for('system.remove_unused') }}" id="unused-config-form">
+      <input type="hidden" name="version" value="{{ cfg.version }}">
+      <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
+        <span class="text-muted">「その他」の <span class="badge bg-secondary">未使用</span> の項目（{{ cfg.unused|join('、') }}）の行（すぐ上の説明のコメントを含む）を <code>instance/config.py</code> から削除します。変更前の内容は <code>instance/config.py.bak</code> に残します。<strong>入力中で保存していない基本設定の変更は保存されません</strong>（先に「基本設定を保存」を押してください）。</span>
+        <button type="submit" form="unused-config-form" class="btn btn-sm btn-outline-danger"
+                onclick="return confirm('未使用の設定（{{ cfg.unused|join('、') }}）の行を instance/config.py から削除します。\n変更前の内容は instance/config.py.bak に残します。\n入力中で保存していない基本設定の変更は保存されません（先に「基本設定を保存」を押してください）。\nよろしいですか？');">
+          <i class="bi bi-trash"></i> 未使用の設定を削除
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
 {% endif %}
 
 {# 接続テスト(保存済みの設定を使う。入力中の値は使わない) #}
@@ -5805,7 +5812,7 @@
   <div class="card shadow-sm mb-3">
     <div class="card-header bg-white fw-bold d-flex justify-content-between flex-wrap gap-2">
       <span><i class="bi bi-list-ol"></i> 出題（レベルごと）</span>
-      <span class="small fw-normal text-muted">{% set saved_st = st.saved or st %}保存済みの設定: 全{{ saved_st.plan_total }}問・合計 約{{ saved_st.plan_minutes }}分</span>
+      <span class="small fw-normal text-muted">{% set saved_st = st.saved or st %}保存済みの設定: 全{{ saved_st.plan_total }}問・合計 {{ saved_st.plan_duration }}</span>
     </div>
     <div class="table-responsive">
       <table class="table align-middle mb-0">
