@@ -4090,6 +4090,9 @@ def send_mail(subject, text, html=None, attachments=(), to=None, cc=None, test=F
 # (IDを問わず)LOGIN_FAILURE_IP_LIMIT 回、LOGIN_FAILURE_WINDOW 秒の間に失敗すると、LOGIN_LOCK_SECONDS 秒の間、
 # その送信元からそのID(またはすべてのID)のログインを断る(総当たりの防止。数はプロセスのメモリに持つため、
 # サーバーを再起動すると消える)。admin のログインの失敗と、制限したことはログに残す(パスワードは残さない)。
+# 認証の前に、制限中かどうかの確認と「確認中の試行」の数えを同じ鍵の中で行い、失敗の数と確認中の試行の数の
+# 合計が上限に届いていれば、パスワードを確かめずに断る(同時に多くの要求を送られても、LDAP などの認証に
+# 問い合わせる回数が上限を超えないように)。確認中の試行は、認証の後(成功・失敗・認証サーバーの例外)に外す。
 
 auth_bp = Blueprint("auth", __name__)
 
@@ -4117,8 +4120,11 @@ LOGIN_FAILURE_WINDOW = 600
 LOGIN_LOCK_SECONDS = 600
 LOGIN_LOCKED_MESSAGE = ("ログインに続けて失敗したため、しばらくログインできません（約{}分後にもう一度お試しください。"
                         "パスワードが分からないときはマネージャーに連絡してください）。")
+LOGIN_BUSY_MESSAGE = ("同じIDまたは同じ端末からのログインの確認が重なっているため、いまはログインできません"
+                      "（少し時間をおいてからもう一度お試しください。パスワードが分からないときはマネージャーに連絡してください）。")
 _login_failures = {}   # {キー: [失敗した時刻(monotonic)]}
 _login_locks = {}      # {キー: 制限が終わる時刻(monotonic)}
+_login_pending = {}    # {キー: 認証を確かめている途中の試行の数}
 _login_failures_lock = threading.Lock()
 
 
@@ -4234,39 +4240,75 @@ def _login_failure_keys(username):
     return [("id", address, username.lower()), ("ip", address)]
 
 
-def login_locked_seconds(username):
-    """この送信元・このIDのログインを制限している残りの秒数(制限していなければ 0)。"""
-    now = monotonic()
+def _locked_seconds(keys, now):
+    """keys のログインを制限している残りの秒数(制限していなければ 0)。_login_failures_lock の中で呼ぶ。"""
     left = 0.0
-    with _login_failures_lock:
-        for key in _login_failure_keys(username):
-            until = _login_locks.get(key)
-            if until is None:
-                continue
-            if until <= now:
-                del _login_locks[key]
-            else:
-                left = max(left, until - now)
+    for key in keys:
+        until = _login_locks.get(key)
+        if until is None:
+            continue
+        if until <= now:
+            del _login_locks[key]
+        else:
+            left = max(left, until - now)
     return int(math.ceil(left))
 
 
-def record_login_failure(username):
-    """ログインの失敗を数える。制限を始めたら True。"""
+def begin_login_attempt(username):
+    """認証の前に呼ぶ。戻り値: (断る理由, 残りの秒数)。断らないときは (None, 0) で、確認中の試行として数える
+    (認証の後に、結果にかかわらず end_login_attempt で必ず外す)。
+
+    制限中なら ("locked", 残りの秒数)。失敗の数(LOGIN_FAILURE_WINDOW 秒の間)と確認中の試行の数の合計が、IDごと・
+    送信元ごとの上限に届いているなら ("busy", 0)(確認中の試行がすべて失敗すると制限を始めるため、それ以上は
+    パスワードを確かめない。同時に送られた要求で、認証に問い合わせる回数が上限を超えないように)。
+    制限中かどうかの確認と数えは、同じ鍵の中で行う。
+    """
+    now = monotonic()
+    keys = _login_failure_keys(username)
+    with _login_failures_lock:
+        left = _locked_seconds(keys, now)
+        if left:
+            return "locked", left
+        for key, limit in zip(keys, (LOGIN_FAILURE_LIMIT, LOGIN_FAILURE_IP_LIMIT)):
+            recent = sum(1 for t in _login_failures.get(key, ()) if now - t < LOGIN_FAILURE_WINDOW)
+            if recent + _login_pending.get(key, 0) >= limit:
+                return "busy", 0
+        for key in keys:
+            _login_pending[key] = _login_pending.get(key, 0) + 1
+    return None, 0
+
+
+def end_login_attempt(username, failed):
+    """begin_login_attempt で数えた確認中の試行を外す。failed(パスワードが違った)なら失敗として数える
+    (同じ鍵の中で)。戻り値: 失敗を数えて制限を始めたら True。"""
+    with _login_failures_lock:
+        for key in _login_failure_keys(username):
+            count = _login_pending.get(key, 0) - 1
+            if count > 0:
+                _login_pending[key] = count
+            else:
+                _login_pending.pop(key, None)
+        return _record_login_failure(username) if failed else False
+
+
+def _record_login_failure(username):
+    """ログインの失敗を数える(_login_failures_lock の中で呼ぶ)。制限を始めたら True。"""
     now = monotonic()
     locked = False
-    with _login_failures_lock:
-        for key, limit in zip(_login_failure_keys(username), (LOGIN_FAILURE_LIMIT, LOGIN_FAILURE_IP_LIMIT)):
-            times = [t for t in _login_failures.get(key, ()) if now - t < LOGIN_FAILURE_WINDOW]
-            times.append(now)
-            if len(times) >= limit:
-                _login_locks[key] = now + LOGIN_LOCK_SECONDS
-                times = []
-                locked = True
-            _login_failures[key] = times
-        if len(_login_failures) > 10000:
-            # 古い記録を消す(いろいろなIDで失敗されても、メモリを増やし続けない)
-            for key in [k for k, v in _login_failures.items() if not v or now - v[-1] >= LOGIN_FAILURE_WINDOW]:
-                del _login_failures[key]
+    for key, limit in zip(_login_failure_keys(username), (LOGIN_FAILURE_LIMIT, LOGIN_FAILURE_IP_LIMIT)):
+        times = [t for t in _login_failures.get(key, ()) if now - t < LOGIN_FAILURE_WINDOW]
+        times.append(now)
+        if len(times) >= limit:
+            _login_locks[key] = now + LOGIN_LOCK_SECONDS
+            times = []
+            locked = True
+        _login_failures[key] = times
+    if len(_login_failures) > 10000:
+        # 古い記録を消す(いろいろなIDで失敗されても、メモリを増やし続けない)
+        for key in [k for k, v in _login_failures.items() if not v or now - v[-1] >= LOGIN_FAILURE_WINDOW]:
+            del _login_failures[key]
+        for key in [k for k, until in _login_locks.items() if until <= now]:
+            del _login_locks[key]
     return locked
 
 
@@ -4451,26 +4493,38 @@ def login():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
-        locked = login_locked_seconds(username)
-        if locked:
+        refused, locked = begin_login_attempt(username)
+        if refused == "locked":
             # 続けて失敗した送信元・ID(総当たりの防止)。パスワードは確かめない
             flash(LOGIN_LOCKED_MESSAGE.format(max(1, int(math.ceil(locked / 60)))), "danger")
+            return render_template("auth/login.html", username=username)
+        if refused:
+            # 確認中の試行と失敗の数が上限に届いている(同時に多く送られた)。パスワードは確かめない
+            # (ログには残さない。確認中の試行が失敗して制限を始めたときに残す)
+            flash(LOGIN_BUSY_MESSAGE, "danger")
             return render_template("auth/login.html", username=username)
 
         # ① 本人確認: 固定ローカル管理者は instance/config.py で、
         #    それ以外は ldap_client.py の authenticate()(LDAP＋固定ローカル)で確認する
         #    (本番の ldap_client.py は LDAP認証API に問い合わせる。止まっている・つながらないときの例外は
         #    内部エラーの画面にせず、ログイン画面で案内する。パスワードはログに出さない)
+        #    確認中の試行(begin_login_attempt)は、結果にかかわらず end_login_attempt で外す
+        #    (認証サーバーの例外・結果の形の誤りは、失敗として数えない)
+        failed = False
         try:
-            checked, info = _check_config_admin(username, password)
-            if not checked:
-                import ldap_client  # 本番環境ごとに差し替えるファイル(使うときに読み込む)
+            try:
+                checked, info = _check_config_admin(username, password)
+                if not checked:
+                    import ldap_client  # 本番環境ごとに差し替えるファイル(使うときに読み込む)
 
-                info = ldap_client.authenticate(username, password)
-        except Exception:
-            current_app.logger.exception("ログインの認証で例外が発生しました（ログインID: %s）", username)
-            flash(LOGIN_BACKEND_ERROR, "danger")
-            return render_template("auth/login.html", username=username)
+                    info = ldap_client.authenticate(username, password)
+            except Exception:
+                current_app.logger.exception("ログインの認証で例外が発生しました（ログインID: %s）", username)
+                flash(LOGIN_BACKEND_ERROR, "danger")
+                return render_template("auth/login.html", username=username)
+            failed = info is None
+        finally:
+            locked_now = end_login_attempt(username, failed)
         if info is not None and (not isinstance(info, dict) or not isinstance(info.get("username"), str)
                                  or not info["username"].strip()):
             # ldap_client.py の authenticate() の戻り値の形が違う(辞書でない・ログインIDが無い)。内部エラーの
@@ -4482,7 +4536,7 @@ def login():
         if info is None:
             if username == ADMIN_USERNAME:
                 current_app.logger.warning("admin のログインに失敗しました（送信元: %s）", request.remote_addr)
-            if record_login_failure(username):
+            if locked_now:
                 current_app.logger.warning("ログインに続けて失敗したため、%d秒の間ログインを制限します（ログインID: %s、送信元: %s）",
                                            LOGIN_LOCK_SECONDS, username, request.remote_addr)
                 flash(LOGIN_LOCKED_MESSAGE.format(max(1, LOGIN_LOCK_SECONDS // 60)), "danger")
@@ -14353,11 +14407,17 @@ def task_allowed_numbers(t, facts, parts):
     (登録・期限・コメントの日時や、T12・C345 のような ID の数字は数量として認めない)。
     日付・時刻は、材料にあるもの(見出しの日時を含む)を日付・時刻として書いたときだけ認める。
     """
+    return AllowedNumbers(task_written_text(t, facts), "\n".join(p["text"] for p in parts))
+
+
+def task_written_text(t, facts):
+    """そのタスクの、利用者が書いた本文(タイトル・説明・コメントの本文・成果)とアプリの計算
+    (task_allowed_numbers で数量として認める部分。登録・期限・コメントの日時と ID は含めない)。"""
     o = t["outcome"]
     content = [t["title"], t["description"]] + [c["body"] for c in t["comments"]] + [
         o["quant_estimate_label"] or "", o["quant_actual_label"] or "",
         o["quant_note"], o["qual_estimate"], o["qual_actual"]] + list(facts.get(t["id"]) or [])
-    return AllowedNumbers("\n".join(content), "\n".join(p["text"] for p in parts))
+    return "\n".join(content)
 
 
 def _split_text(text, size):
@@ -14993,6 +15053,11 @@ def skills_messages(chunk, index, count):
     return _analysis_messages("\n".join(lines))
 
 
+# チームのまとめの材料のうち、アプリが計算した数値だけの部分(利用者の本文・AI の文・候補の日付が無い。
+# 「/」「:」の2つの数〔目安超過 3/5件 など〕を数量としても認める。AnalysisRun.written)
+TEAM_NUMBER_SECTIONS = ("period", "progress", "outputs")
+
+
 def team_material_sections(data, candidates, hidden_candidates):
     """チームのまとめの材料を部分ごとに作る(AI の判定を反映した集計 data から)。
 
@@ -15188,7 +15253,11 @@ def team_messages(material_lines):
 #     通さないように)。ただし材料の本文に「/」「:」で区切って書かれた2つの数(12/20 件・3/5 ページ・9/10・
 #     1:30 など。日付・時刻とも分数・時間とも読める)は、その数値を数量としても認める(「20件中12件」「1時間30分」
 #     のような言い換えを ◯ にしないように。見出しの日時と、日付に続けて書いた時刻〔2026/10/01 17:45・
-#     10/01 17:45。コメントの見出しなどの日時〕は日付・時刻としてだけ認める)。
+#     10/01 17:45。コメントの見出しなどの日時〕は日付・時刻としてだけ認める)。各人・所見・チームのまとめ
+#     (要約を含む)の呼び出しは材料の全体を確かめるため、「/」「:」の2つの数を数量としても認めるのは、利用者が
+#     書いた本文(タスクのタイトル・説明・コメント・成果)とアプリが計算した【数値】にも同じ数が書かれているものだけ
+#     (AnalysisRun.written。推奨アクションの候補・要フォローのコメントの日付「期限（10/13）」「09/15」や、
+#     AI が書いた文〔所見・分かったこと・経過メモ・要約〕にだけある「10/01」などは日付としてだけ認める)。
 #     T12・C345 のような ID は数値として扱わない(置き換えない)。
 #     書き直し案・課題・コメントの判定は、そのタスクのタイトル・説明・コメントの本文・成果・アプリの計算に
 #     ある数量だけを使ってよい(task_allowed_numbers。登録・期限などの日時は日付としてだけ認める)
@@ -15286,20 +15355,27 @@ class AllowedNumbers:
     「2026年10月」は日付としてだけ)。日付に続けて書いた時刻(「2026/10/01 17:45」「10/01 17:45」。コメントの
     見出しなどの日時。各人・所見・スキル・チームの呼び出しでは材料の全体を content として渡す)は、その時刻と
     月日を日付・時刻としてだけ認める(見出しの「17:45」で「45時間」「17件」を通さないように)。
+
+    written: content の「/」「:」で区切った2つの数のうち、数量としても認めるもの(_fraction_key の集合。
+    利用者が書いた本文・アプリの計算にあるもの。AnalysisRun.written)。None なら content のものをすべて認める
+    (content が利用者の本文とアプリの計算だけのとき。task_allowed_numbers)。材料の全体を content として渡すときに、
+    アプリが書いた日付(推奨アクションの候補の「期限（10/13）」など)や AI の文の「10/01」を数量にしないため。
+    fractions: 数量としても認めた「/」「:」の2つの数(_fraction_key の集合。written を作るのに使う)。
     """
 
-    def __init__(self, content="", context=""):
+    def __init__(self, content="", context="", written=None):
         self.quantities = set()
+        self.fractions = set()     # 数量としても認めた「/」「:」の2つの数(_fraction_key)
         self.dates = set()         # (年, 月, 日)
         self.month_days = set()    # (月, 日)
         self.year_months = set()   # (年, 月)
         self.months = set()        # 月(材料の日付・年月・月にある月。「10月」だけの字句に使う)
         self.years = set()
         self.times = set()         # (時, 分)
-        self._scan(content, True)
+        self._scan(content, True, written)
         self._scan(context, False)
 
-    def _scan(self, text, quantities):
+    def _scan(self, text, quantities, written=None):
         text = str(text or "")
         items = [(match, _date_token(match)) for match in _NUMBER_TOKEN.finditer(text)]
         for index, (match, token) in enumerate(items):
@@ -15311,8 +15387,12 @@ class AllowedNumbers:
             if (quantities and (kind == "hm" or (kind in ("md", "ym") and _SLASH.search(match.group(0))))
                     and not _in_stamp(text, items, index)):
                 # 「12/20 件」「1:30」: 分数・件数・所要時間としても書かれる(数量としても認める)。
-                # 日付に続けて書いた時刻(2026/10/01 17:45 など)は日時なので、日付・時刻としてだけ
-                self.quantities.update(_norm_number(m) for m in _NUMBER.findall(match.group(0)))
+                # 日付に続けて書いた時刻(2026/10/01 17:45 など)は日時なので、日付・時刻としてだけ。
+                # written があるときは、利用者の本文・アプリの計算にも同じ数が書かれているものだけ
+                key = _fraction_key(match)
+                if written is None or key in written:
+                    self.fractions.add(key)
+                    self.quantities.update(_norm_number(m) for m in _NUMBER.findall(match.group(0)))
             if kind == "ymd":
                 _k, y, mo, d = token
                 self.dates.add((y, mo, d))
@@ -15357,6 +15437,12 @@ class AllowedNumbers:
     def covers(self, text):
         """文の数値がすべて材料にあるか。"""
         return mask_numbers(text, self)[1] == 0
+
+
+def _fraction_key(match):
+    """「/」「:」で区切った2つの数の字句(12/20・１２／２０・1:30 など)を比べる形にする。(区切り, 数値, …)"""
+    return ("/" if _SLASH.search(match.group(0)) else ":",) + tuple(
+        _norm_number(m) for m in _NUMBER.findall(match.group(0)))
 
 
 def _in_stamp(text, items, index):
@@ -15501,6 +15587,7 @@ class AnalysisRun:
         self.asked_progress_ids = set()
         self.asked_mc_ids = set()
         self.task_numbers = {}
+        self.facts = None     # タスクごとのアプリの計算(_analysis_task_facts。written で使う)
         # 「◯」にした数(画面に出す文の分だけ。保存する場所ごとに数え、最後に合計を masked_numbers にする。
         # 同じ項目の結果を後の応答で上書きしたときも、二重に数えない)
         self.masks = {}
@@ -15621,11 +15708,32 @@ class AnalysisRun:
         """line_pairs の文だけ(◯にした数は数えない。画面に出さない材料用)。"""
         return [text for text, _n in self.line_pairs(value, allowed, limit)]
 
+    def written(self, task_ids, *app_texts):
+        """材料の全体を確かめる呼び出し(各人・所見・チームのまとめ・その要約)で、「/」「:」で区切った2つの数
+        (12/20 件・3/5 ページ・1:30 など)を数量としても認めてよいもの(AllowedNumbers の written)。
+
+        task_ids のタスクの利用者が書いた本文(タイトル・説明・コメントの本文・成果)・アプリの計算と、app_texts
+        (アプリが計算した【数値】など。日付は日付としてだけ読む)にあるもの。アプリが書いた日付(推奨アクションの
+        候補の「期限（10/13）」・要フォローのコメントの「09/15」)や、AI が書いた文(所見・分かったこと・経過メモ・
+        要約)にだけある「/」「:」の数は含めない(9-6)。
+        """
+        if self.facts is None:
+            self.facts = _analysis_task_facts(self.data)
+        tasks = self.data["tasks"]
+        keys = set()
+        for task_id in task_ids:
+            numbers = self.task_numbers.get(task_id)
+            if numbers is None and task_id in tasks:
+                numbers = AllowedNumbers(task_written_text(tasks[task_id], self.facts))
+            if numbers is not None:
+                keys |= numbers.fractions
+        return keys | AllowedNumbers("\n".join(app_texts)).fractions
+
     # ------------------------------------------------------------------ 実行
     def execute(self):
         data = self.data
         budget = data["settings"]["chunk_chars"]
-        facts = _analysis_task_facts(data)
+        facts = self.facts = _analysis_task_facts(data)
         groups, owner = analysis_groups(data)
         plans = []
         for group in groups:
@@ -15713,7 +15821,10 @@ class AnalysisRun:
                 continue
             self.read_tasks.update(chunk["keys"])
             self.read_comment_ids |= chunk["comment_ids"]
-            allowed = AllowedNumbers(material)
+            # 材料の全体(経過メモ・前の回の AI のメモを含む)。「/」「:」の2つの数は、この回のタスクの本文と
+            # この人の【数値】にあるものだけを数量としても認める
+            allowed = AllowedNumbers(material, written=self.written(
+                chunk["keys"], person_numbers_text(self.data, group["key"]) if is_person else ""))
             self.take_chunk(parsed, items)
             self.take_memos(parsed, items, carry)
             notes_by_chunk.append(self.lines(parsed.get("notes"), allowed))
@@ -15739,14 +15850,19 @@ class AnalysisRun:
                 unread_note = "{}回のうち{}回分の材料を読み込めませんでした（{}）。その部分のタスク・コメントは所見に使えません".format(
                     len(chunks), len(failed), "、".join(
                         "{}回目: {}".format(k, "・".join("T{}".format(x) for x in keys) or "―") for k, keys in failed))
-            messages, material = findings_messages(self.data, group, notes, self.judged_counts(group),
+            judged = self.judged_counts(group)
+            messages, material = findings_messages(self.data, group, notes, judged,
                                                    self.data["settings"]["chunk_chars"],
                                                    has_tasks=bool(chunks), unread_note=unread_note)
             parsed, error = self.call(label, messages)
             if parsed is None:
                 self.unread(label, error)
             else:
-                findings, findings_masked = self.take_findings(parsed.get("findings"), AllowedNumbers(material))
+                # 材料は【数値】と、各回の材料を AI が読んだ結果(分かったこと)。「/」「:」の2つの数は、この人の
+                # タスクの本文と【数値】・判定の件数にあるものだけを数量としても認める(AI の文の日付を数量にしない)
+                allowed = AllowedNumbers(material, written=self.written(
+                    group["task_ids"], person_numbers_text(self.data, group["key"]), *judged))
+                findings, findings_masked = self.take_findings(parsed.get("findings"), allowed)
         self.masks[("findings", group["key"])] = findings_masked if findings else 0
         member = next((m for m in self.data["members"] if m["id"] == group["key"]), {})
         self.result["persons"][str(group["key"])] = dict(
@@ -15944,8 +16060,13 @@ class AnalysisRun:
         sections = team_material_sections(merged, [("A{}".format(i), c) for i, c in enumerate(shown, 1)],
                                           len(ranked) - len(shown))
         material = [line for _name, lines in sections for line in lines]
+        # 「/」「:」の2つの数は、利用者が書いた本文(すべてのタスク)とアプリが計算した数値(チームの集計・各人の
+        # 【数値】)にあるものだけを数量としても認める(候補・要フォローのコメントの日付、AI の文の日付は日付としてだけ)
+        written = self.written(list(data["tasks"]), *(
+            [line for name, lines in sections if name in TEAM_NUMBER_SECTIONS for line in lines]
+            + [person_numbers_text(merged, row["user_id"]) for row in merged["abilities"]["rows"]]))
         if len("\n".join(material)) > budget:
-            material, shown = self.team_digest(merged, sections, ranked, budget)
+            material, shown = self.team_digest(merged, sections, ranked, budget, written)
         candidates = [("A{}".format(i), c) for i, c in enumerate(shown, 1)]
         messages = team_messages(material)
         parsed, error = self.call("チームのまとめと推奨アクション", messages)
@@ -15954,7 +16075,7 @@ class AnalysisRun:
             self.unread("チームのまとめと推奨アクション", error)
             self.result["actions"] = _jsonable_actions(fallback)
             return
-        allowed = AllowedNumbers("\n".join(material))
+        allowed = AllowedNumbers("\n".join(material), written=written)
         summary = parsed.get("summary") if isinstance(parsed.get("summary"), dict) else {}
         pairs = {key: self.line_pairs(summary.get(key), allowed, 3) for key, _label in SUMMARY_KEYS}
         self.masks[("team",)] = sum(n for items in pairs.values() for _text, n in items)
@@ -15973,8 +16094,10 @@ class AnalysisRun:
             self.result["errors"].append("推奨アクション: AIの応答に使える推奨アクションが無かったため、ルールで選びました。")
             self.result["actions"] = _jsonable_actions(fallback)
 
-    def team_digest(self, merged, sections, ranked, budget):
+    def team_digest(self, merged, sections, ranked, budget, written=None):
         """チームのまとめの材料が長いとき: 詳細な一覧を分けて要約し、数値・要約・候補・ID の材料を作る。
+
+        written: 「/」「:」の2つの数を数量としても認めるもの(run_team の written。AllowedNumbers の written)。
 
         要約がまだ長いときは、要約の要点をさらに要約する(TEAM_DIGEST_ROUNDS 回まで)。候補は入りきる数まで
         (少なくとも TEAM_MIN_CANDIDATES 件。AI は候補に無い対象も ID で加えられる)にし、残りの件数を書く。
@@ -16016,7 +16139,7 @@ class AnalysisRun:
                     self.unread(label, error)
                     failed_keys.update(chunk["keys"])
                     continue
-                allowed = AllowedNumbers(chunk["text"])
+                allowed = AllowedNumbers(chunk["text"], written=written)
                 for key, _label in SUMMARY_KEYS:
                     for text in self.lines(parsed.get(key), allowed, TEAM_DIGEST_POINTS):
                         if text not in points[key]:
