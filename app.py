@@ -15187,7 +15187,8 @@ def team_messages(material_lines):
 #     10:00 など)は材料にある日付・時刻として書かれたときだけ認める(日時や ID の数字が、たまたま同じ数量を
 #     通さないように)。ただし材料の本文に「/」「:」で区切って書かれた2つの数(12/20 件・3/5 ページ・9/10・
 #     1:30 など。日付・時刻とも分数・時間とも読める)は、その数値を数量としても認める(「20件中12件」「1時間30分」
-#     のような言い換えを ◯ にしないように。見出しの日時は日付・時刻としてだけ認める)。
+#     のような言い換えを ◯ にしないように。見出しの日時と、日付に続けて書いた時刻〔2026/10/01 17:45・
+#     10/01 17:45。コメントの見出しなどの日時〕は日付・時刻としてだけ認める)。
 #     T12・C345 のような ID は数値として扱わない(置き換えない)。
 #     書き直し案・課題・コメントの判定は、そのタスクのタイトル・説明・コメントの本文・成果・アプリの計算に
 #     ある数量だけを使ってよい(task_allowed_numbers。登録・期限などの日時は日付としてだけ認める)
@@ -15223,6 +15224,9 @@ _NUMBER_TOKEN = re.compile(
     r"|(?P<num>{d}+(?:[.,．，]{d}+)*)".format(d=_D, nb=_NB, na=_NA))
 # 「/」で区切った字句(10/02・2026/10 など)。材料の日付に無いときは、分数(3/5 など)として数値ごとに確かめる
 _SLASH = re.compile("[/／]")
+# 日付と、続けて書いた時刻の間(改行を除く空白と曜日だけ)。「2026/10/01 17:45」「10/01（水） 17:45」のような日時
+# (コメントの見出し・登録・状態の変更などの日時)の時刻と月日は、日付・時刻としてだけ認める(数量にしない)
+_STAMP_GAP = re.compile(r"[^\S\n]*(?:[（(][月火水木金土日][）)])?[^\S\n]*")
 
 
 def _extract_json_object(text):
@@ -15279,7 +15283,9 @@ class AllowedNumbers:
     日付・時刻として書かれたときだけ認める(context は見出しの日時などの、数量としては認めない部分)。
     ただし content の「/」「:」で区切った2つの数(12/20・3/5・2026/10・1:30 など。分数・件数・所要時間とも
     読める)は、日付・時刻のほかに、その数値を数量としても認める(年月日の3つの数〔2026/10/02〕・「10月2日」・
-    「2026年10月」は日付としてだけ)。
+    「2026年10月」は日付としてだけ)。日付に続けて書いた時刻(「2026/10/01 17:45」「10/01 17:45」。コメントの
+    見出しなどの日時。各人・所見・スキル・チームの呼び出しでは材料の全体を content として渡す)は、その時刻と
+    月日を日付・時刻としてだけ認める(見出しの「17:45」で「45時間」「17件」を通さないように)。
     """
 
     def __init__(self, content="", context=""):
@@ -15294,15 +15300,18 @@ class AllowedNumbers:
         self._scan(context, False)
 
     def _scan(self, text, quantities):
-        for match in _NUMBER_TOKEN.finditer(str(text or "")):
-            token = _date_token(match)
+        text = str(text or "")
+        items = [(match, _date_token(match)) for match in _NUMBER_TOKEN.finditer(text)]
+        for index, (match, token) in enumerate(items):
             if token is None:
                 if quantities:
                     self.quantities.update(_norm_number(m) for m in _NUMBER.findall(match.group(0)))
                 continue
             kind = token[0]
-            if quantities and (kind == "hm" or (kind in ("md", "ym") and _SLASH.search(match.group(0)))):
-                # 「12/20 件」「1:30」: 分数・件数・所要時間としても書かれる(数量としても認める)
+            if (quantities and (kind == "hm" or (kind in ("md", "ym") and _SLASH.search(match.group(0))))
+                    and not _in_stamp(text, items, index)):
+                # 「12/20 件」「1:30」: 分数・件数・所要時間としても書かれる(数量としても認める)。
+                # 日付に続けて書いた時刻(2026/10/01 17:45 など)は日時なので、日付・時刻としてだけ
                 self.quantities.update(_norm_number(m) for m in _NUMBER.findall(match.group(0)))
             if kind == "ymd":
                 _k, y, mo, d = token
@@ -15348,6 +15357,23 @@ class AllowedNumbers:
     def covers(self, text):
         """文の数値がすべて材料にあるか。"""
         return mask_numbers(text, self)[1] == 0
+
+
+def _in_stamp(text, items, index):
+    """items(_NUMBER_TOKEN の一致と _date_token の組のリスト)の index 番目が、日時(日付に続けて書いた時刻)の
+    時刻か、時刻が続く月日か(2026/10/01 17:45 の 17:45・10/01 17:45 の 10/01 と 17:45)。"""
+    match, token = items[index]
+    if token[0] == "hm":
+        if index == 0:
+            return False
+        before, prev = items[index - 1]
+        return (prev is not None and prev[0] in ("ymd", "md")
+                and _STAMP_GAP.fullmatch(text, before.end(), match.start()) is not None)
+    if token[0] == "md" and index + 1 < len(items):
+        after, nxt = items[index + 1]
+        return (nxt is not None and nxt[0] == "hm"
+                and _STAMP_GAP.fullmatch(text, match.end(), after.start()) is not None)
+    return False
 
 
 def mask_numbers(text, allowed):
