@@ -195,7 +195,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import DatabaseError, IntegrityError
 from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.exc import StaleDataError
-from werkzeug.exceptions import HTTPException, MethodNotAllowed
+from werkzeug.exceptions import BadRequestKeyError, HTTPException, MethodNotAllowed
 from werkzeug.routing import IntegerConverter, RequestRedirect
 
 
@@ -1161,7 +1161,11 @@ def _unauthorized():
                         else url_for(login_manager.login_view))
     if request.method not in ("GET", "HEAD", "OPTIONS"):
         session[DROPPED_REQUEST_KEY] = request.path
-    flash(login_manager.login_message, login_manager.login_message_category)
+    if g.get("login_expired"):
+        # ログインしてから LOGIN_LIFETIME_HOURS 時間が過ぎた(load_user)
+        flash(LOGIN_LIFETIME_EXPIRED.format(LOGIN_LIFETIME_HOURS), "warning")
+    else:
+        flash(login_manager.login_message, login_manager.login_message_category)
     return redirect(login_url(login_manager.login_view, next_url=request.url))
 
 
@@ -1582,14 +1586,14 @@ def read_json(path, label):
     """設定ファイルを読む。無ければ None、あるのに読めなければ SettingsFileError。
 
     label はエラーメッセージに使う設定の名前(例: 「週報の設定ファイル」)。
-    エディタで保存したときに付く BOM は無視する。
+    エディタで保存したときに付く BOM は無視する。入れ子が深すぎる内容(RecursionError)も読めないファイルとする。
     """
     try:
         with open(path, encoding="utf-8-sig") as f:
             return json.load(f)
     except FileNotFoundError:
         return None
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         raise SettingsFileError(
             "{}（instance/{}）を読み込めません。"
             "ファイルを修正するか削除してください: {}".format(
@@ -2254,6 +2258,14 @@ def load_user(user_id):
                 # ログインした後にパスワードが変わった(_unauthorized で「ログインの有効期限が切れた」とは別の案内にする)
                 g.local_password_changed = user.username
             return None
+    if has_request_context():
+        # ログインのセッションの印(5-1)が、ログアウト・無効化などで消されていない・有効期限の中か
+        # (ログアウトした後に控えたクッキーを使わせない。印の無い以前の形式のセッションも復元しない)
+        state = login_session_state(user)
+        if state != LOGIN_SESSION_OK:
+            if state == LOGIN_SESSION_EXPIRED:
+                g.login_expired = True
+            return None
     return user
 
 
@@ -2723,7 +2735,8 @@ class RoutineWork(db.Model):
 
 
 # 定型業務のリマインド(10 章)。業務ごとの実施日のルールと宛先(routine_reminders。1業務に1行)と、
-# 実施予定日ごとの完了の記録(routine_occurrences。1業務・1日に1行)。どちらも新しいテーブル
+# 実施予定日ごとの完了の記録(routine_occurrences。1業務・1日に1行)と、追加の宛先(アドレス)をマネージャーが
+# 保存した記録(routine_reminder_email_checks。1業務に1行)。どれも新しいテーブル
 # (routine_works は変えない)。業務を削除するときは一緒に削除する(5-4)。
 #
 # routine_reminders の値の書き方(すべて文字列):
@@ -2782,6 +2795,24 @@ class RoutineReminder(db.Model):
 
     def __repr__(self):
         return f"<RoutineReminder {self.routine_id}>"
+
+
+class RoutineReminderEmailCheck(db.Model):
+    """リマインドの追加の宛先(アドレス)を、マネージャーが保存した記録(1業務に1行。新しいテーブル)。
+
+    追加の宛先(アドレス)を設定・変更できるのはマネージャーだけで、送るのは、今のアドレスがマネージャーの
+    保存したもの(emails)と同じときだけ(以前の版でメンバーが入力したアドレスは、マネージャーが保存するまで
+    送らない。10-4 の reminder_emails_checked)。routine_reminders は変えない。
+    """
+    __tablename__ = "routine_reminder_email_checks"
+
+    routine_id = db.Column(db.Integer, db.ForeignKey("routine_works.id"), primary_key=True)
+    emails = db.Column(db.Text)        # マネージャーが保存したときの追加の宛先(アドレス。1行に1件)
+    checked_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    checked_at = db.Column(db.DateTime, default=datetime.now)
+
+    def __repr__(self):
+        return f"<RoutineReminderEmailCheck {self.routine_id}>"
 
 
 class RoutineOccurrence(db.Model):
@@ -2891,9 +2922,11 @@ SKILL_DESCRIPTION_LEVELS = (1, 2, 3, 4)
 # スキルテストの対象外の区分(コンセプチュアル・ヒューマン)の説明の見出し。説明はマネージャーが到達度を
 # 判断する基準なので、テストの言葉(出題・問う)を使わず、「レベルごとの目安」は到達尺度のすべてのレベルで書く
 DESC_OUTSIDE = "対象外の内容"
-# 説明の中の見出しの行(行頭の「■」「#」「【」などは省略可。「レベルごとの目安」は後ろの（Lv1〜Lv4）も省略可)
+# 説明の中の見出しの行(行頭の「■」「#」「【」などは省略可。「レベルごとの目安」は後ろの（Lv1〜Lv4）も省略可。
+# 見出しの前の番号「1.」「１．」「1)」「(1)」「（1）」「1、」も省略可。「### 1. 対象範囲」「■1. 対象範囲」も見出しにする)
 _DESCRIPTION_HEADING_RE = re.compile(
     r"^[ \t\u3000]*(?:[■□◆◇●○#＃]+|【|\[)?[ \t\u3000]*"
+    r"(?:(?:[0-9０-９]+[.．)）、]|[(（][0-9０-９]+[)）])[ \t\u3000]*)?"
     r"(対象範囲|使う道具・言語・ソフト|レベルごとの目安|出題しない範囲|対象外の内容)", re.MULTILINE)
 _DESCRIPTION_HEADING_KEYS = {
     "対象範囲": DESC_SCOPE,
@@ -2916,9 +2949,11 @@ def description_heading_keys(text):
     見出しの語で始まる行のうち、語の後ろが見出しの終わり(行末・（…）・閉じ括弧・コロン)のものだけを数える
     (clean_description_draft と同じ決まり。「対象範囲外の機能は扱わない」「使う道具・言語・ソフトは…」のような
     本文の行は見出しにしない)。「対象範囲：…」のように見出しと内容を1行に書いた行も見出しとして数える。
+    Markdown の太字の「**」は除いて読む(clean_description_draft と同じ。「**1. 対象範囲**」も見出し)。
     """
     found = set()
     for line in str(text or "").splitlines():
+        line = line.replace("**", "")
         known = _DESCRIPTION_HEADING_RE.match(line)
         if known and (_HEADING_TAIL.match(line, known.end()) or _HEADING_INLINE_TAIL.match(line, known.end())):
             found.add(_DESCRIPTION_HEADING_KEYS[known.group(1)])
@@ -3698,16 +3733,39 @@ def mail_envelope(items):
     return list(envelope.values())
 
 
+def smtp_port_value(raw):
+    """MAIL_SMTP_PORT の値を読む。戻り値: (ポート, 誤りの説明 または None)。
+
+    空(None・"")は既定の 25。1〜65535 の整数(数字だけの文字列も可)でなければ誤り(そのときのポートは画面に出す
+    元の値。送信には使わない)。instance/config.py を直接編集した値は画面の入力チェックを通らないため、ここで
+    確かめる(範囲外の数は smtplib が 65536 で割った余りのポートに接続してしまい、読めない値を黙って 25 にすると
+    違うポートに送るため)。
+    """
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return 25, None
+    port = None
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        port = raw
+    elif isinstance(raw, float) and raw.is_integer():
+        port = int(raw)
+    elif isinstance(raw, str) and raw.strip().isascii() and raw.strip().isdigit():
+        port = int(raw.strip())
+    if port is not None and 1 <= port <= 65535:
+        return port, None
+    shown = str(raw)
+    shown = shown if len(shown) <= 30 else shown[:29] + "…"
+    return shown, ("送信サーバーのポート番号（MAIL_SMTP_PORT）が正しくありません（「{}」。1〜65535 の整数で指定します）。"
+                   "システム設定の「基本設定」タブで設定してください。".format(shown))
+
+
 def mail_settings():
-    """現在のメール設定(画面の読み取り専用表示にも使う)。"""
+    """現在のメール設定(画面の読み取り専用表示にも使う)。port_error はポート番号の誤り(無ければ None)。"""
     config = current_app.config
-    try:
-        port = int(config.get("MAIL_SMTP_PORT") or 25)
-    except (TypeError, ValueError):
-        port = 25
+    port, port_error = smtp_port_value(config.get("MAIL_SMTP_PORT"))
     return {
         "server": str(config.get("MAIL_SMTP_SERVER") or "").strip(),
         "port": port,
+        "port_error": port_error,
         "mail_from": str(config.get("MAIL_FROM") or "").strip(),
         "to": mail_addresses(config.get("MAIL_TO")),
         "cc": mail_addresses(config.get("MAIL_CC")),
@@ -3747,7 +3805,8 @@ def check_mail_settings(test=False, to=None, to_label="宛先（MAIL_TO）"):
     if missing:
         return "メールの設定が不足しています: {}。システム設定の「基本設定」タブで設定してください。".format(
             "、".join(missing))
-    return None
+    # ポート番号が正しくない(instance/config.py を直接編集した値など): 違うポートに接続しないよう送らない
+    return values["port_error"]
 
 
 def _build_message(text, html, attachments):
@@ -4017,10 +4076,221 @@ def send_mail(subject, text, html=None, attachments=(), to=None, cc=None, test=F
 # 先に確認する(設定が空のときだけ ldap_client.py の判定に任せる)。
 # ADMIN_PASSWORD はシステム設定の「基本設定」タブからも変更でき、保存するとすぐに有効になる
 # (ログインのたびに current_app.config から読む)。
+#
+# ログインのセッションの印と有効期限: ログインの状態はブラウザのクッキー(Flask のセッション)にあるため、
+# そのままではログアウトした後も、控えたクッキーで(別のブラウザ・別の PC からでも)使えてしまう。ログインの
+# たびにランダムな印を作ってセッションと instance/login_sessions.json(Git 管理外)に残し、要求のたびに
+# (load_user)印がファイルにあり、ログインから LOGIN_LIFETIME_HOURS 時間以内かを確かめる。ログアウト・
+# メンバーの無効化/削除・別のIDでのログインのときに印を消す(無効化したメンバーを復帰しても、前のクッキーは
+# 使えない)。DB は使わない(既存のテーブルを変えない)。
+#   login_sessions.json の形: {"ユーザーID:ログインID": {"印": ログインした日時(UNIX 秒)}}
+#   1人あたり LOGIN_SESSIONS_PER_USER 件まで(古いものから消す)。期限を過ぎた印はログインのときに消す。
+#   ファイルが無い・読めないときは、すべてのログインを無効とする(ログインするとファイルを作り直す)。
+# ログインの失敗の制限: 同じ送信元(IP アドレス)・同じIDで LOGIN_FAILURE_LIMIT 回、または同じ送信元で
+# (IDを問わず)LOGIN_FAILURE_IP_LIMIT 回、LOGIN_FAILURE_WINDOW 秒の間に失敗すると、LOGIN_LOCK_SECONDS 秒の間、
+# その送信元からそのID(またはすべてのID)のログインを断る(総当たりの防止。数はプロセスのメモリに持つため、
+# サーバーを再起動すると消える)。admin のログインの失敗と、制限したことはログに残す(パスワードは残さない)。
 
 auth_bp = Blueprint("auth", __name__)
 
 ADMIN_USERNAME = "admin"
+
+# ログインのセッションの印を残すセッションのキーと、ログインの有効期限(ログインしてからの時間)
+SESSION_TOKEN_KEY = "login_token"
+LOGIN_LIFETIME_HOURS = 12
+LOGIN_SESSIONS_FILENAME = "login_sessions.json"
+LOGIN_SESSIONS_LABEL = "ログインの記録"
+LOGIN_SESSIONS_PER_USER = 100   # ログアウトせずにブラウザを閉じた分も期限まで残るため、多めにする
+LOGIN_SESSION_OK = "ok"
+LOGIN_SESSION_EXPIRED = "expired"
+LOGIN_SESSION_INVALID = "invalid"
+LOGIN_LIFETIME_EXPIRED = "ログインしてから{}時間が過ぎたため、ログインし直してください。"
+LOGIN_RECORD_ERROR = ("ログインの記録（instance/login_sessions.json）を保存できなかったため、ログインできませんでした。"
+                      "しばらくしてからもう一度お試しください（解決しない場合はマネージャーに連絡してください）。")
+_login_sessions_lock = threading.RLock()
+_login_sessions_cache = {}   # {ファイルのパス: ((更新日時, 大きさ), 読んだ内容)}
+
+# ログインの失敗の制限(上の説明)
+LOGIN_FAILURE_LIMIT = 5
+LOGIN_FAILURE_IP_LIMIT = 30
+LOGIN_FAILURE_WINDOW = 600
+LOGIN_LOCK_SECONDS = 600
+LOGIN_LOCKED_MESSAGE = ("ログインに続けて失敗したため、しばらくログインできません（約{}分後にもう一度お試しください。"
+                        "パスワードが分からないときはマネージャーに連絡してください）。")
+_login_failures = {}   # {キー: [失敗した時刻(monotonic)]}
+_login_locks = {}      # {キー: 制限が終わる時刻(monotonic)}
+_login_failures_lock = threading.Lock()
+
+
+def _login_sessions_path():
+    return os.path.join(current_app.instance_path, LOGIN_SESSIONS_FILENAME)
+
+
+def _epoch_now():
+    return int(datetime.now().timestamp())
+
+
+def _read_login_sessions(path):
+    """login_sessions.json の内容(整えたもの)。無い・読めないときは {}(ファイルが変わっていなければ読み直さない)。"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {}
+    stamp = (st.st_mtime_ns, st.st_size)
+    cached = _login_sessions_cache.get(path)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    try:
+        data = read_json(path, LOGIN_SESSIONS_LABEL)
+    except SettingsFileError as exc:
+        current_app.logger.warning("%s（すべてのログインを無効として扱います）", exc)
+        data = None
+    clean = {}
+    if isinstance(data, dict):
+        for key, tokens in data.items():
+            if isinstance(key, str) and isinstance(tokens, dict):
+                kept = {t: at for t, at in tokens.items()
+                        if isinstance(t, str) and isinstance(at, int) and not isinstance(at, bool)}
+                if kept:
+                    clean[key] = kept
+    _login_sessions_cache[path] = (stamp, clean)
+    return clean
+
+
+def _update_login_sessions(change):
+    """login_sessions.json を読み、change(内容の辞書を書き換える関数)を適用して書き込む。書けなければ OSError。"""
+    path = _login_sessions_path()
+    with _login_sessions_lock:
+        data = copy.deepcopy(_read_login_sessions(path))
+        change(data)
+        write_json(path, data)
+        _login_sessions_cache.pop(path, None)
+
+
+def issue_login_session(user):
+    """ログインの印を作って記録し、印を返す(ログインのとき。セッションの SESSION_TOKEN_KEY に入れる)。"""
+    token = secrets.token_urlsafe(24)
+    now = _epoch_now()
+    oldest = now - LOGIN_LIFETIME_HOURS * 3600
+
+    def change(data):
+        for key in list(data):
+            data[key] = {t: at for t, at in data[key].items() if at > oldest}
+            if not data[key]:
+                del data[key]
+        tokens = data.setdefault(user.get_id(), {})
+        tokens[token] = now
+        for old, _at in sorted(tokens.items(), key=lambda item: item[1])[:max(len(tokens) - LOGIN_SESSIONS_PER_USER, 0)]:
+            del tokens[old]
+
+    _update_login_sessions(change)
+    return token
+
+
+def login_session_state(user):
+    """このセッションの印が有効か: LOGIN_SESSION_OK / LOGIN_SESSION_EXPIRED(有効期限切れ) / LOGIN_SESSION_INVALID。"""
+    token = session.get(SESSION_TOKEN_KEY)
+    if not isinstance(token, str) or not token:
+        return LOGIN_SESSION_INVALID
+    at = (_read_login_sessions(_login_sessions_path()).get(user.get_id()) or {}).get(token)
+    if at is None:
+        return LOGIN_SESSION_INVALID
+    if _epoch_now() - at > LOGIN_LIFETIME_HOURS * 3600:
+        return LOGIN_SESSION_EXPIRED
+    return LOGIN_SESSION_OK
+
+
+def _revoke_login_sessions(user_key, token=None):
+    """ログインの印を消す(token が None ならその人のすべて)。書けなくても止めない(ログに残す)。"""
+    def change(data):
+        if token is None:
+            data.pop(user_key, None)
+            return
+        tokens = data.get(user_key) or {}
+        tokens.pop(token, None)
+        if not tokens:
+            data.pop(user_key, None)
+
+    try:
+        _update_login_sessions(change)
+    except OSError:
+        current_app.logger.exception("ログインの記録（instance/login_sessions.json）を更新できませんでした")
+
+
+def end_login_session():
+    """このブラウザのログインの印を消す(ログアウト・別のIDでのログインの前に呼ぶ)。"""
+    key, token = session.get("_user_id"), session.pop(SESSION_TOKEN_KEY, None)
+    if isinstance(key, str) and isinstance(token, str):
+        _revoke_login_sessions(key, token)
+
+
+def revoke_user_sessions(user):
+    """その人のすべてのログインの印を消す(メンバーの無効化・削除のとき。ほかのブラウザのログインも終わる)。"""
+    _revoke_login_sessions(user.get_id())
+
+
+def _login_failure_keys(username):
+    address = request.remote_addr or ""
+    return [("id", address, username.lower()), ("ip", address)]
+
+
+def login_locked_seconds(username):
+    """この送信元・このIDのログインを制限している残りの秒数(制限していなければ 0)。"""
+    now = monotonic()
+    left = 0.0
+    with _login_failures_lock:
+        for key in _login_failure_keys(username):
+            until = _login_locks.get(key)
+            if until is None:
+                continue
+            if until <= now:
+                del _login_locks[key]
+            else:
+                left = max(left, until - now)
+    return int(math.ceil(left))
+
+
+def record_login_failure(username):
+    """ログインの失敗を数える。制限を始めたら True。"""
+    now = monotonic()
+    locked = False
+    with _login_failures_lock:
+        for key, limit in zip(_login_failure_keys(username), (LOGIN_FAILURE_LIMIT, LOGIN_FAILURE_IP_LIMIT)):
+            times = [t for t in _login_failures.get(key, ()) if now - t < LOGIN_FAILURE_WINDOW]
+            times.append(now)
+            if len(times) >= limit:
+                _login_locks[key] = now + LOGIN_LOCK_SECONDS
+                times = []
+                locked = True
+            _login_failures[key] = times
+        if len(_login_failures) > 10000:
+            # 古い記録を消す(いろいろなIDで失敗されても、メモリを増やし続けない)
+            for key in [k for k, v in _login_failures.items() if not v or now - v[-1] >= LOGIN_FAILURE_WINDOW]:
+                del _login_failures[key]
+    return locked
+
+
+def clear_login_failures(username):
+    """ログインできたら、この送信元・このIDの失敗の数を消す。"""
+    with _login_failures_lock:
+        _login_failures.pop(_login_failure_keys(username)[0], None)
+
+
+def no_store_when_logged_in(response):
+    """after_request: ログイン中の画面・ファイル(静的ファイルを除く)をブラウザに残さない(Cache-Control: no-store)。
+
+    共用の PC で、前の人がログアウトした後に、ブラウザの「戻る」でマネージャーの画面などがキャッシュから
+    表示されないように。画面ごとに Cache-Control を付けている応答(スキルテストの出題など)はそのまま。
+    """
+    if request.endpoint == "static" or "Cache-Control" in response.headers:
+        return response
+    try:
+        logged_in = current_user.is_authenticated
+    except Exception:  # ログインを確かめられない(DB に接続できないなど)ときは、残さない側にする
+        logged_in = True
+    if logged_in:
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def _check_config_admin(username, password):
@@ -4172,6 +4442,7 @@ def login():
         if not posted or posted == current_user.username:
             return _redirect_after_login()
         previous = current_user.display_name
+        end_login_session()
         logout_user()
         session.pop(DROPPED_REQUEST_KEY, None)
         session.pop(LOCAL_AUTH_KEY, None)
@@ -4180,6 +4451,11 @@ def login():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
+        locked = login_locked_seconds(username)
+        if locked:
+            # 続けて失敗した送信元・ID(総当たりの防止)。パスワードは確かめない
+            flash(LOGIN_LOCKED_MESSAGE.format(max(1, int(math.ceil(locked / 60)))), "danger")
+            return render_template("auth/login.html", username=username)
 
         # ① 本人確認: 固定ローカル管理者は instance/config.py で、
         #    それ以外は ldap_client.py の authenticate()(LDAP＋固定ローカル)で確認する
@@ -4204,7 +4480,14 @@ def login():
             flash(LOGIN_BACKEND_ERROR, "danger")
             return render_template("auth/login.html", username=username)
         if info is None:
-            flash("IDまたはパスワードが正しくありません。", "danger")
+            if username == ADMIN_USERNAME:
+                current_app.logger.warning("admin のログインに失敗しました（送信元: %s）", request.remote_addr)
+            if record_login_failure(username):
+                current_app.logger.warning("ログインに続けて失敗したため、%d秒の間ログインを制限します（ログインID: %s、送信元: %s）",
+                                           LOGIN_LOCK_SECONDS, username, request.remote_addr)
+                flash(LOGIN_LOCKED_MESSAGE.format(max(1, LOGIN_LOCK_SECONDS // 60)), "danger")
+            else:
+                flash("IDまたはパスワードが正しくありません。", "danger")
             return render_template("auth/login.html", username=username)
 
         if info.get("source") == "local":
@@ -4220,7 +4503,15 @@ def login():
                 )
                 return render_template("auth/login.html", username=username)
 
+        try:
+            token = issue_login_session(user)
+        except OSError:
+            current_app.logger.exception("ログインの記録（instance/login_sessions.json）を保存できませんでした")
+            flash(LOGIN_RECORD_ERROR, "danger")
+            return render_template("auth/login.html", username=username)
+        clear_login_failures(username)
         login_user(user)
+        session[SESSION_TOKEN_KEY] = token
         if is_local_account(user.username):
             session[LOCAL_AUTH_KEY] = _local_credential_mark(user.username)
         else:
@@ -4323,6 +4614,7 @@ def logout():
     # またログアウトしてしまうため)。
     # GET はナビのリンク(このアプリの画面から開いたもの)用。送り元の分からない GET は check_same_origin が
     # 案内の画面にし、そのボタン(POST。送り元は Origin で確かめる)でログアウトする
+    end_login_session()  # このブラウザのログインの印を消す(控えたクッキーをログアウトの後に使わせない)
     logout_user()
     session.pop(DROPPED_REQUEST_KEY, None)  # ログインが切れた状態で送った操作の印も消す
     session.pop(LOCAL_AUTH_KEY, None)  # 固定ローカル管理者のパスワードの印も消す
@@ -4483,8 +4775,26 @@ def _render_task_form(task, users, form, selected, version=None):
         outcome_units=OUTCOME_UNITS, task_scales=TASK_SCALES,
         form=form, selected_assignees=selected, version=version,
         can_plan=current_user.is_manager,  # 計画系項目(優先度/日付/規模/担当者)を編集できるか
-        year_min=TASK_YEAR_MIN, year_max=TASK_YEAR_MAX,  # 開始日・期限の欄の min/max
+        date_bounds=_task_date_bounds(task),  # 開始日・期限の欄の min/max
     )
+
+
+def _task_date_bounds(task):
+    """開始日・期限の欄の (min, max)。{欄の名前: (min, max)}(YYYY-MM-DD)。
+
+    既定は TASK_YEAR_MIN〜TASK_YEAR_MAX 年。以前の版で保存した範囲外の日付(2100-03-31 など)のタスクは、その欄の
+    範囲を今の日付まで広げる(ブラウザの入力チェックで送信できず、ほかの項目も保存できなくなるため。
+    サーバーは今の値のままなら保存し、ほかの範囲外の日付は受け付けない〔_read_task_dates〕)。
+    """
+    low, high = date(TASK_YEAR_MIN, 1, 1), date(TASK_YEAR_MAX, 12, 31)
+    bounds = {}
+    for name in ("start_date", "due_date"):
+        current = getattr(task, name) if task is not None else None
+        lo, hi = low, high
+        if current is not None:
+            lo, hi = min(lo, current), max(hi, current)
+        bounds[name] = (lo.isoformat(), hi.isoformat())
+    return bounds
 
 
 # 編集画面で、画面を開いた後のほかの操作の変更を確かめる項目(名前は画面の表示)
@@ -4707,8 +5017,8 @@ def list_tasks():
         query = query.filter(db.or_(Task.title.ilike(like, escape=_LIKE_ESCAPE),
                                     Task.description.ilike(like, escape=_LIKE_ESCAPE)))
 
-    # 未完了→期限が近い順、その後に完了タスク
-    tasks = query.order_by(
+    # 未完了→期限が近い順、その後に完了タスク(担当者はまとめて読む。行ごとに読みに行かない)
+    tasks = query.options(selectinload(Task.assignees)).order_by(
         (Task.status == STATUS_DONE).asc(),
         Task.due_date.is_(None).asc(),
         Task.due_date.asc(),
@@ -5162,11 +5472,17 @@ def _render_routine_form(routine, users, form=None, version=None, rem_state=None
             rem_state = reminder_state_from_form(form)
         else:
             rem_state = reminder_state_from_values(reminder_values(rem), reminder_today(), choices)
+    if not current_user.is_manager:
+        # 追加の宛先(アドレス)はマネージャーだけが設定・変更できる(メンバーの画面は今の値を読み取り専用で出す)
+        rem_state = dict(rem_state, extra_emails=reminder_values(rem)["extra_emails"])
     return render_template(
         "routine/form.html", routine=routine, users=users,
         freq_choices=FREQ_UNIT_CHOICES, manual_choices=MANUAL_CHOICES, form=form, version=version,
         rem=rem_state, rem_version=rem_version, rem_choices=choices, rem_ctx=reminder_form_context(),
         rem_mark=REMINDER_FORM_MARK,
+        # 追加の宛先(アドレス): メンバーは読み取り専用。確認待ち(以前の版でメンバーが入力し、まだ送っていない)か
+        rem_emails_locked=not current_user.is_manager,
+        rem_emails_pending=rem is not None and not reminder_emails_checked(rem),
     )
 
 
@@ -5314,7 +5630,9 @@ def new_routine():
         today = reminder_today()
         rem_values = None
         if request.form.get(REMINDER_FORM_MARK):
-            rem_values, rem_errors = parse_reminder_form(request.form, reminder_extra_user_choices(None), today)
+            rem_values, rem_errors = parse_reminder_form(
+                request.form, reminder_extra_user_choices(None), today,
+                kept_emails=None if current_user.is_manager else "")
             errors += rem_errors
         if errors:
             for e in errors:
@@ -5324,7 +5642,10 @@ def new_routine():
         db.session.flush()
         notes = []
         if rem_values is not None:
-            _rem, notes = save_routine_reminder(rw.id, None, rem_values, current_user.id, today)
+            _rem, notes = save_routine_reminder(rw.id, None, rem_values, current_user.id, today,
+                                                by_manager=current_user.is_manager)
+            if not current_user.is_manager and reminder_emails_ignored(request.form, ""):
+                notes.append(_REMINDER_EMAILS_MANAGER_ONLY)
         commit_submitted("routine", url_for("routine.detail", routine_id=rw.id))
         flash("定型・定期業務を登録しました。", "success")
         for note in notes:
@@ -5375,8 +5696,9 @@ def edit_routine(routine_id):
         # 「リマインド」の欄(10-4)。この欄の無い以前の画面からの保存では、リマインドの設定を変えない
         rem_values = None
         if request.form.get(REMINDER_FORM_MARK):
-            rem_values, rem_errors = parse_reminder_form(request.form, rem_choices, today,
-                                                         current_start=rem_current["start_date"])
+            rem_values, rem_errors = parse_reminder_form(
+                request.form, rem_choices, today, current_start=rem_current["start_date"],
+                kept_emails=None if current_user.is_manager else rem_current["extra_emails"])
             errors += rem_errors
         if errors:
             db.session.rollback()  # フォームの値を反映した内容は保存しない
@@ -5406,7 +5728,10 @@ def edit_routine(routine_id):
                 rem_version=field_versions(rem_current, REMINDER_VERSION_KEYS))
         notes = []
         if rem_values is not None:
-            _rem, notes = save_routine_reminder(rw.id, rem, rem_values, current_user.id, today)
+            _rem, notes = save_routine_reminder(rw.id, rem, rem_values, current_user.id, today,
+                                                by_manager=current_user.is_manager)
+            if not current_user.is_manager and reminder_emails_ignored(request.form, rem_current["extra_emails"]):
+                notes.append(_REMINDER_EMAILS_MANAGER_ONLY)
         db.session.commit()
         flash("定型・定期業務を更新しました。", "success")
         for note in notes:
@@ -5607,6 +5932,7 @@ def _build_weeks(year, month, dept_id=None):
     ).all()
 
     # チームフィルタ
+    dept = None
     if dept_id:
         dept = db.session.get(Department, dept_id)
         member_ids = {u.id for u in dept.users} if dept else set()
@@ -5627,7 +5953,8 @@ def _build_weeks(year, month, dept_id=None):
             day_leaves = by_date.get(d, [])
             off_ids = {lv.user_id for lv in day_leaves}
             if dept_id:
-                warn = len(off_ids) > LEAVE_DAILY_LIMIT
+                # 無効化したチームは判定しない(絞り込まないカレンダー・登録の案内〔_is_overbooked〕と同じ基準)
+                warn = dept is not None and dept.is_active and len(off_ids) > LEAVE_DAILY_LIMIT
             else:
                 warn = any(
                     len(off_ids & mids) > LEAVE_DAILY_LIMIT
@@ -6024,6 +6351,8 @@ def list_skills():
         level_colors=SKILL_LEVEL_COLORS,
         proficient=SKILL_PROFICIENT_LEVEL,
         can_edit=current_user.is_manager,
+        # 表に出す区分の、無効にしたスキル項目の数(有効な項目が無いときの案内を「まだありません」にしない)
+        inactive_count=Skill.query.filter(Skill.skill_type.in_(view_types), Skill.is_active.is_(False)).count(),
     )
 
 
@@ -6783,7 +7112,8 @@ def _build_workload(today, users):
     # 合計の件数用(複数担当でも1件と数える)。表の行の人(有効な担当者)がいるタスクだけを数える
     # (未割当のタスク・担当者が全員無効化されたタスクは含まない。画面の説明も同じ)
     open_ids, overdue_ids = set(), set()
-    for t in Task.query.filter(Task.status != STATUS_DONE).all():
+    # 担当者はまとめて読む(タスクごとに読みに行かない)
+    for t in Task.query.filter(Task.status != STATUS_DONE).options(selectinload(Task.assignees)).all():
         assignees = [u for u in t.assignees if u.id in load]
         n = len(assignees)
         if n == 0:
@@ -6876,6 +7206,8 @@ def _build_activity(today, users, include_unassigned=True):
             TaskComment.created_at >= datetime.combine(act_from, time.min),
             TaskComment.created_at <= datetime.combine(act_to, time.max),
         )
+        # コメントごとにタスク・担当者・記載者を読みに行かないよう、まとめて読む(タスクが多いときの速さ)
+        .options(selectinload(TaskComment.task).selectinload(Task.assignees), selectinload(TaskComment.user))
         .order_by(TaskComment.created_at.asc())  # タスク内は時系列(古い→新しい)
         .all()
     )
@@ -6928,6 +7260,28 @@ def _build_activity(today, users, include_unassigned=True):
     return {"activity_rows": rows, "act_from": act_from, "act_to": act_to}
 
 
+def _outcome_tasks(ofrom, oto, only_user_id=None):
+    """成果の集計(_build_outcomes)に使うタスク(ID の順。担当者もまとめて読む)。
+
+    成果の記載(定量の見込み・実績の値、定性の見込み・実績)があるタスクのうち、期限(未設定なら開始日)が
+    ofrom〜oto のものと、期限・開始日が無いもの(集計対象外の件数に数える)。only_user_id を渡すと、その人が
+    担当のタスクだけ。すべてのタスクを読んで Python で選ぶと、タスクの数に比例して遅くなるため SQL で選ぶ
+    (選ぶ条件は今までの Python の判定と同じ。集計の結果は変わらない)。
+    """
+    def written(column):
+        return db.and_(column.isnot(None), column != "")
+
+    basis = func.coalesce(Task.due_date, Task.start_date)
+    query = Task.query.filter(
+        db.or_(Task.outcome_quant_estimate.isnot(None), Task.outcome_quant_actual.isnot(None),
+               written(Task.outcome_qual_estimate), written(Task.outcome_qual_actual)),
+        db.or_(basis.is_(None), basis.between(ofrom, oto)),
+    )
+    if only_user_id is not None:
+        query = query.filter(Task.assignees.any(User.id == only_user_id))
+    return query.options(selectinload(Task.assignees)).order_by(Task.id).all()
+
+
 def _build_outcomes(today, users, only_user_id=None):
     """成果(見込み・実績)をヒト別・全体で集計する。
 
@@ -6967,11 +7321,7 @@ def _build_outcomes(today, users, only_user_id=None):
     no_unit = 0      # 数値はあるが単位未選択で金額/時間に振り分けられないタスク
     counted = set()  # 合計の件数用(複数担当でも1件と数える)
 
-    for t in Task.query.all():
-        # 個人ダッシュボードでは自分が担当のタスクだけを対象にする
-        if only_user_id is not None and not any(u.id == only_user_id for u in t.assignees):
-            continue
-
+    for t in _outcome_tasks(ofrom, oto, only_user_id):
         basis = t.due_date or t.start_date
         if basis is None:
             if (t.outcome_quant_estimate is not None
@@ -7082,6 +7432,24 @@ def _limit_gantt_period(gfrom, gto):
     return gfrom, gto, limited
 
 
+def _gantt_details(task_ids, chunk=500):
+    """ガントの棒を描くタスクの状態の変更・コメント(記載者も)をまとめて読む。
+
+    戻り値: ({タスクID: [状態の変更(changed_at の順)]}, {タスクID: [コメント(created_at の順)]})。
+    並びは Task.status_changes / Task.comments と同じ(同じ日時のものは ID の順)。
+    """
+    changes, comments = {}, {}
+    for i in range(0, len(task_ids), chunk):
+        part = task_ids[i:i + chunk]
+        for ch in (TaskStatusChange.query.filter(TaskStatusChange.task_id.in_(part))
+                   .order_by(TaskStatusChange.task_id, TaskStatusChange.changed_at, TaskStatusChange.id)):
+            changes.setdefault(ch.task_id, []).append(ch)
+        for c in (TaskComment.query.filter(TaskComment.task_id.in_(part)).options(selectinload(TaskComment.user))
+                  .order_by(TaskComment.task_id, TaskComment.created_at, TaskComment.id)):
+            comments.setdefault(c.task_id, []).append(c)
+    return changes, comments
+
+
 def _build_gantt(today, only_user_id=None):
     """全タスクのガントチャート用データを組み立てる(ダッシュボード内蔵・全画面で共用)。
 
@@ -7133,8 +7501,19 @@ def _build_gantt(today, only_user_id=None):
     elif to_int(gassignee) is not None:
         gquery = gquery.filter(Task.assignees.any(User.id == to_int(gassignee)))
 
+    # 担当者はまとめて読む。状態の変更・コメントは、棒が期間に入るタスクの分だけをまとめて読む
+    # (タスクごとに読みに行くと、タスクの数に比例して遅くなるため)
+    gtasks = gquery.options(selectinload(Task.assignees)).all()
+    shown_ids = []
+    for t in gtasks:
+        s = t.start_date or t.due_date
+        e = t.due_date or t.start_date
+        if s and e and min(s, e) <= gto and max(s, e) >= gfrom:
+            shown_ids.append(t.id)
+    changes_of, comments_of = _gantt_details(shown_ids)
+
     gantt = []
-    for t in gquery.all():
+    for t in gtasks:
         s = t.start_date or t.due_date
         e = t.due_date or t.start_date
         segments = []
@@ -7144,7 +7523,7 @@ def _build_gantt(today, only_user_id=None):
             vs = max(a, gfrom)
             ve = min(b, gto)
             if vs <= ve:
-                changes = list(t.status_changes)  # changed_at 昇順
+                changes = changes_of.get(t.id, [])  # changed_at 昇順
 
                 def status_at(d, _changes=changes, _task=t):
                     st = None
@@ -7174,7 +7553,7 @@ def _build_gantt(today, only_user_id=None):
                         segments.append({"left": left_of(seg_s), "width": width_of(days), "status": st})
 
                 # 進捗記載(コメント)の印は、棒が可視のときのみ棒の上に打つ
-                for c in t.comments:
+                for c in comments_of.get(t.id, []):
                     cd = c.created_at.date()
                     if gfrom <= cd <= gto:
                         marks.append({
@@ -7504,6 +7883,7 @@ def delete_member(user_id):
         user.departments = []
         user.is_active = False
         db.session.commit()
+        revoke_user_sessions(user)  # ログイン中のブラウザも終わる(復帰しても前のクッキーは使えない)
         message = (f"「{name}」は業務データがあるため無効化しました（ログインできなくなり、"
                    "担当者の選択肢・一覧から外れます）。")
         if open_tasks or routines:
@@ -7516,8 +7896,10 @@ def delete_member(user_id):
         user.departments = []
         # メールアドレスと、定型業務のリマインドの追加の宛先からも除く(IDが次に追加した人に再利用されるため。10-3)
         forget_user_for_reminders(user.id)
+        user_key = user.get_id()
         db.session.delete(user)
         db.session.commit()
+        _revoke_login_sessions(user_key)
         flash(f"メンバー「{name}」を削除しました。", "success")
     return redirect(url_for("departments.manage"))
 
@@ -7780,7 +8162,8 @@ def _xlsx_response(sheets, filename):
 # 各メニューのシート定義(現在データ＋履歴データ)
 # --------------------------------------------------------------------------- #
 def _tasks_sheets():
-    tasks = Task.query.order_by(Task.id).all()
+    # 担当者・登録者はまとめて読む(行ごとに読みに行かない)
+    tasks = Task.query.options(selectinload(Task.assignees), selectinload(Task.creator)).order_by(Task.id).all()
     t_headers = [
         "ID", "タイトル", "ステータス", "優先度", "開始日", "期限", "規模",
         "担当者", "登録者", "成果定量-見込み", "単位", "成果定量-実績", "単位",
@@ -8315,7 +8698,8 @@ def _normalize_weekly_settings(data):
     at = parse_hhmm(data.get("time")) if isinstance(data.get("time"), str) else None
     if at is not None:
         result["time"] = at.strftime("%H:%M")
-    if data.get("period_rule") in PERIOD_RULES:
+    # 文字列のときだけ比べる(手で直した一覧・辞書などは、ハッシュできず TypeError になるため)
+    if isinstance(data.get("period_rule"), str) and data["period_rule"] in PERIOD_RULES:
         result["period_rule"] = data["period_rule"]
     ids = data.get("target_user_ids")
     names = data.get("target_usernames")
@@ -12410,7 +12794,8 @@ def analysis_period(args, today):
     戻り値: {kind, days, start, end, start_dt, end_dt, label, business_days, error}
       kind  : "7" / "14" / "30" / "90" / "range"
       start / end : 期間の最初と最後の日(両端を含む)。範囲の指定で今日より後の日は今日にする
-      error : 指定が正しくないときのメッセージ(そのときは直近30日)。ANALYSIS_MIN_DATE より前の日も誤りとする
+      error : 指定が正しくないときのメッセージ(そのときは直近30日)。ANALYSIS_MIN_DATE より前の日、
+              すべてが今日より後の期間(開始日が今日より後。今日だけの1日に置き換えずに知らせる)も誤りとする
       note  : 直近N日の指定と一緒に、表示の期間と違う開始日・終了日が送られたときの案内(日付は使わない)。
               画面の期間のフォームは、開いたときの日付(shown_from / shown_to)も送る。日付の欄がそのまま
               (前の期間の日付)なら、利用者は日付を指定していないので案内しない
@@ -12427,6 +12812,9 @@ def analysis_period(args, today):
         elif min(start, end) < ANALYSIS_MIN_DATE:
             error = "期間の開始日・終了日は{}以降の日付を指定してください（直近{}日で表示しています）。".format(
                 ANALYSIS_MIN_DATE.strftime("%Y/%m/%d"), ANALYSIS_DEFAULT_DAYS)
+        elif min(start, end) > today:
+            error = ("期間の開始日が今日（{}）より後です。今日より後の期間は分析できません"
+                     "（直近{}日で表示しています）。".format(today.strftime("%Y/%m/%d"), ANALYSIS_DEFAULT_DAYS))
         else:
             if end < start:
                 start, end = end, start
@@ -14110,10 +14498,13 @@ def _chunk_items(data, group, chunk, owner, carry=None):
     分けて送るタスク(chunk["split"])は、判定(マネージャーのコメント・成果)をそのタスクの最後の回だけで頼み、
     それより前の回では、これまでに送ったマネージャーのコメントの経過メモ(memo_mc)と成果の事実メモ(memo_facts)を頼む。
     進捗記載の判定は、その記載の最後の部分を送る回だけで頼む(長い記載の本文を分けて送るときに、同じ記載を
-    いくつもの回で頼まない。前の回で送った部分は【前の回までに分かったこと】で渡す。前の回が失敗したときは頼まない)。
+    いくつもの回で頼まない。前の回で送った部分は【前の回までに分かったこと】で渡す。その記載の前の部分を送った回が
+    失敗したときは頼まない〔同じタスクのほかの部分の回だけが失敗したときは頼む〕。頼まなかった記載は
+    "skipped_progress" に入れる〔呼び出し側で「未読込」にする〕)。
     carry: {タスクID: {"seen": 前の回までに送ったコメントID, "memos": {コメントID: メモ}, "facts": メモ,
-                       "pieces": 送った回数, "failed": 前の回が失敗したか}}(AnalysisRun.run_group が更新する)
-    戻り値: {"issues", "mc", "outcomes", "progress", "memo_mc", "memo_facts", "split"}
+                       "pieces": 送った回数, "failed": 前の回が失敗したか,
+                       "failed_comments": 失敗した回で送ったコメントID}}(AnalysisRun.run_group が更新する)
+    戻り値: {"issues", "mc", "outcomes", "progress", "skipped_progress", "memo_mc", "memo_facts", "split"}
     """
     carry = carry or {}
     tasks = data["tasks"]
@@ -14122,13 +14513,20 @@ def _chunk_items(data, group, chunk, owner, carry=None):
     mine = [task_id for task_id in chunk["keys"] if owner.get(task_id) == group["key"]]
     comment_task = {c["id"]: task_id for task_id in chunk["keys"] for c in tasks[task_id]["comments"]}
     cont, rest = chunk.get("comment_cont", set()), chunk.get("comment_rest", set())
+
+    def earlier_part_failed(cid):
+        # 前の回から続いている記載: その記載の前の部分を送った回が失敗した(記録が無いときも頼まない)
+        state = carry.get(comment_task.get(cid))
+        return state is None or cid in state.get("failed_comments", ())
+
+    progress = sorted(cid for cid in chunk["comment_ids"] if cid in group["progress_ids"] and cid not in cont)
+    skipped = [cid for cid in progress if cid in rest and earlier_part_failed(cid)]
     items = {
         # 課題・相談を抜き出すのは、未完了のタスクと期間内に完了したタスク
         "issues": [task_id for task_id in mine if tasks[task_id]["is_open"] or tasks[task_id]["completed_in"]],
         "mc": [], "outcomes": [],
-        "progress": sorted(cid for cid in chunk["comment_ids"] if cid in group["progress_ids"]
-                           and cid not in cont
-                           and not (cid in rest and (carry.get(comment_task.get(cid)) or {}).get("failed", True))),
+        "progress": [cid for cid in progress if cid not in skipped],
+        "skipped_progress": skipped,
         "memo_mc": [], "memo_facts": [], "split": [],
     }
     for task_id in mine:
@@ -14306,8 +14704,10 @@ def _carry_text(data, items, chunk, carry, body, memo_max):
     lines = []
     for task_id in [t for t in chunk["keys"] if t in chunk["split"]]:
         state = carry.get(task_id)
-        if not state or state.get("failed"):
+        if not state:
             continue
+        # 前の回が失敗したタスク: マネージャーのコメント・成果は判定を頼まない(items に無い)が、前の部分を送った回が
+        # 読めた進捗記載は判定を頼むため、その本文は渡す
         t = tasks[task_id]
         comments = {c["id"]: c for c in t["comments"]}
         block = []
@@ -14785,7 +15185,10 @@ def team_messages(material_lines):
 #   - 材料に無い数値は「◯」に置き換える(AI に数値を創作させない。置き換えた数を結果に残す)。
 #     数量(件数・時間・金額など)は材料の本文・【数値】にある数値だけを認め、日付・時刻(10/02・2026年10月・
 #     10:00 など)は材料にある日付・時刻として書かれたときだけ認める(日時や ID の数字が、たまたま同じ数量を
-#     通さないように)。T12・C345 のような ID は数値として扱わない(置き換えない)。
+#     通さないように)。ただし材料の本文に「/」「:」で区切って書かれた2つの数(12/20 件・3/5 ページ・9/10・
+#     1:30 など。日付・時刻とも分数・時間とも読める)は、その数値を数量としても認める(「20件中12件」「1時間30分」
+#     のような言い換えを ◯ にしないように。見出しの日時は日付・時刻としてだけ認める)。
+#     T12・C345 のような ID は数値として扱わない(置き換えない)。
 #     書き直し案・課題・コメントの判定は、そのタスクのタイトル・説明・コメントの本文・成果・アプリの計算に
 #     ある数量だけを使ってよい(task_allowed_numbers。登録・期限などの日時は日付としてだけ認める)
 #   - 推奨アクションの対象は、候補(ref)か、実在するタスク・メンバー・スキル・業務の ID だけ。
@@ -14874,6 +15277,9 @@ class AllowedNumbers:
 
     content の数値は数量として認める(日付・時刻・ID の数字は除く)。content と context の日付・時刻・年は、
     日付・時刻として書かれたときだけ認める(context は見出しの日時などの、数量としては認めない部分)。
+    ただし content の「/」「:」で区切った2つの数(12/20・3/5・2026/10・1:30 など。分数・件数・所要時間とも
+    読める)は、日付・時刻のほかに、その数値を数量としても認める(年月日の3つの数〔2026/10/02〕・「10月2日」・
+    「2026年10月」は日付としてだけ)。
     """
 
     def __init__(self, content="", context=""):
@@ -14895,6 +15301,9 @@ class AllowedNumbers:
                     self.quantities.update(_norm_number(m) for m in _NUMBER.findall(match.group(0)))
                 continue
             kind = token[0]
+            if quantities and (kind == "hm" or (kind in ("md", "ym") and _SLASH.search(match.group(0)))):
+                # 「12/20 件」「1:30」: 分数・件数・所要時間としても書かれる(数量としても認める)
+                self.quantities.update(_norm_number(m) for m in _NUMBER.findall(match.group(0)))
             if kind == "ymd":
                 _k, y, mo, d = token
                 self.dates.add((y, mo, d))
@@ -15251,7 +15660,9 @@ class AnalysisRun:
         carry = {}    # 分けて送っているタスクの、前の回までのメモ(_chunk_items の説明)
         for index, chunk in enumerate(chunks, 1):
             items = _chunk_items(self.data, group, chunk, owner, carry)
-            self.asked_progress_ids.update(items["progress"])
+            # 前の部分を送った回が失敗したため判定を頼めない進捗記載は「未読込」(項目ごと)にする
+            self.unjudged_progress_ids.update(items["skipped_progress"])
+            self.asked_progress_ids.update(items["progress"] + items["skipped_progress"])
             self.asked_mc_ids.update(i["comment_id"] for i in items["mc"])
             with_findings = is_person and len(chunks) == 1
             messages, material = person_chunk_messages(self.data, group, chunk, index, len(chunks), items,
@@ -15260,11 +15671,12 @@ class AnalysisRun:
             parsed, error = self.call(label, messages)
             for task_id in chunk["split"]:
                 state = carry.setdefault(task_id, {"seen": set(), "memos": {}, "facts": "", "pieces": 0,
-                                                   "failed": False})
+                                                   "failed": False, "failed_comments": set()})
                 state["seen"] |= chunk["comment_ids"]
                 state["pieces"] += 1
                 if parsed is None:
                     state["failed"] = True
+                    state["failed_comments"] |= chunk["comment_ids"]
             if parsed is None:
                 self.unread(label, error, chunk["keys"], chunk["comment_ids"])
                 failed.append((index, list(chunk["keys"])))
@@ -16417,6 +16829,9 @@ def analysis_dashboard():
         state_unread=AI_STATE_UNREAD,
         state_changed=AI_STATE_CHANGED,
         state_new=AI_STATE_NEW,
+        # 表のコメントの日付(推奨アクションと同じく、分析の基準の日時と違う年は yyyy/mm/dd。1年以上前の
+        # 期限超過・未完了のタスクのコメントを、今年の日付と読まれないように)
+        date_label=lambda d: _analysis_date(d, data),
     )
 
 
@@ -16801,6 +17216,7 @@ def delete_routine_reminder_rows(routine_id):
     """業務を削除するときに、その業務のリマインドの設定と実施予定日の行を削除する(commit は呼び出し側)。"""
     RoutineOccurrence.query.filter_by(routine_id=routine_id).delete(synchronize_session=False)
     RoutineReminder.query.filter_by(routine_id=routine_id).delete(synchronize_session=False)
+    RoutineReminderEmailCheck.query.filter_by(routine_id=routine_id).delete(synchronize_session=False)
     forget_occurrence_progress(routine_id)
 
 
@@ -16880,18 +17296,24 @@ def forget_user_for_reminders(user_id):
         if user_id in ids:
             rem.extra_user_ids = ",".join(str(i) for i in ids if i != user_id)
         if rem.updated_by_id == user_id:
+            # 以前の版でマネージャーが保存した追加の宛先(アドレス)は、最終更新者を消す前に確認の記録へ移す
+            carry_over_email_check(rem)
             rem.updated_by_id = None
+    for check in RoutineReminderEmailCheck.query.filter_by(checked_by_id=user_id).all():
+        check.checked_by_id = None
 
 
 # =============================================================================
 # 10-4. リマインド: 業務ごとの設定(定型業務の画面の「リマインド」)
 # =============================================================================
 # 業務ごとのリマインドの設定(routine_reminders)の入力チェックと保存。定型業務の登録・編集の画面の
-# 「リマインド」の欄で入力する(権限は業務の登録・編集と同じ。5-4)。
+# 「リマインド」の欄で入力する(権限は業務の登録・編集と同じ。5-4)。ただし追加の宛先(アドレス)を設定・変更
+# できるのはマネージャーだけ(メンバーは追加の宛先〔メンバー〕だけを選べる。アドレスは user_emails のもの)。
 #
 #   parse_reminder_form(form, choices, today)  入力を確かめる → (保存する値, 誤りの一覧)
 #   save_routine_reminder(...)                 保存する(変更前の内容と比べて、予定の作り方を変えたときの扱いも行う)
 #   reminder_state_from_values / _from_form    画面の欄に出す値
+#   reminder_emails_checked(rem)               追加の宛先(アドレス)を送ってよいか(マネージャーが保存したものか)
 #
 # - 「リマインドする」がオフで、まだ設定の行が無い業務は、何も保存しない(何かを選んで保存したときは、オフのまま保存する)
 # - 選んだ繰り返しの項目だけを保存する(毎週なら曜日だけ。ほかの繰り返しの日・指定日は空にする)
@@ -16899,11 +17321,17 @@ def forget_user_for_reminders(user_id):
 #   オンにしたときは、開始日を今日にする(今日より前の日の予定を新しいルールで作らないように。同じ保存で開始日も
 #   変えたときは、入力した開始日のまま)。変える前のルールの今日までの回は、変える前に作っておく
 # - 「リマインド」の欄の無い以前の画面からの保存では、リマインドの設定を変えない(REMINDER_FORM_MARK)
+# - 追加の宛先(アドレス)は、メンバーの保存では今の値のまま(画面の欄も読み取り専用)。送るのは、今のアドレスを
+#   マネージャーが保存したものだけ(routine_reminder_email_checks。以前の版でメンバーが入力したアドレスは、
+#   マネージャーが保存するまで送らず、業務の詳細・システム設定に「マネージャーの確認待ち」と表示する)。
+#   ログインできる人なら誰でも、会社の差出人で任意の社外のアドレスへ繰り返し送れてしまわないように
 
 # この欄のある画面からの送信の印(hidden)
 REMINDER_FORM_MARK = "rem_shown"
-# 追加の宛先(アドレス)の最大件数
-REMINDER_EXTRA_EMAILS_MAX = 50
+# 追加の宛先(アドレス)の最大件数(1業務あたり。設定できるのはマネージャーだけ)
+REMINDER_EXTRA_EMAILS_MAX = 10
+# 確認の記録をまだ読んでいないことの印(reminder_emails_checked の引数の既定値)
+_CHECK_NOT_LOADED = object()
 
 # 編集画面で、画面を開いた後のほかの操作の変更を確かめる項目(名前は画面の表示)
 REMINDER_VERSION_FIELDS = (
@@ -16955,6 +17383,76 @@ def reminder_extra_user_choices(rem):
     return users
 
 
+def _email_lines(text):
+    """追加の宛先(アドレス)の比べる形(1行に1件。前後の空白を除き、大文字・小文字を区別しない)。"""
+    return [line.strip().lower() for line in str(text or "").splitlines() if line.strip()]
+
+
+def reminder_email_check_of(rem):
+    """追加の宛先(アドレス)をマネージャーが保存した記録(無ければ None)。"""
+    return db.session.get(RoutineReminderEmailCheck, rem.routine_id) if rem is not None else None
+
+
+def _legacy_emails_checked(rem):
+    """確認の記録の無い行(以前の版で保存した行)の追加の宛先(アドレス)を、マネージャーが保存したとみなすか
+    (最後に保存した人がマネージャーなら、その人が欄のアドレスごと保存している)。"""
+    updater = db.session.get(User, rem.updated_by_id) if rem.updated_by_id is not None else None
+    return updater is not None and updater.is_manager
+
+
+def reminder_emails_checked(rem, check=_CHECK_NOT_LOADED):
+    """追加の宛先(アドレス)を送ってよいか: 今のアドレスがマネージャーの保存したものと同じか(アドレスが無ければ True)。
+
+    check はその業務の確認の記録(読み込み済みなら渡す。None は記録が無い)。
+    """
+    if not rem.extra_email_list:
+        return True
+    if check is _CHECK_NOT_LOADED:
+        check = reminder_email_check_of(rem)
+    if check is not None:
+        return _email_lines(check.emails) == _email_lines(rem.extra_emails)
+    return _legacy_emails_checked(rem)
+
+
+def carry_over_email_check(rem):
+    """以前の版で保存した行で、マネージャーが保存したとみなせる追加の宛先(アドレス)を、確認の記録に移す。
+
+    最終更新者が変わる(メンバーの保存・最終更新者の削除)前に呼ぶ。commit は呼び出し側。
+    """
+    if rem is None or not rem.extra_email_list or reminder_email_check_of(rem) is not None:
+        return
+    if _legacy_emails_checked(rem):
+        db.session.add(RoutineReminderEmailCheck(routine_id=rem.routine_id, emails=rem.extra_emails,
+                                                 checked_by_id=rem.updated_by_id,
+                                                 checked_at=rem.updated_at or datetime.now()))
+
+
+def _record_email_check(routine_id, emails, user_id):
+    """マネージャーが保存した追加の宛先(アドレス)を記録する(アドレスが無ければ記録を消す。commit は呼び出し側)。"""
+    check = db.session.get(RoutineReminderEmailCheck, routine_id)
+    if not emails:
+        if check is not None:
+            db.session.delete(check)
+        return
+    if check is None:
+        check = RoutineReminderEmailCheck(routine_id=routine_id)
+        db.session.add(check)
+    check.emails = emails
+    check.checked_by_id = user_id
+    check.checked_at = datetime.now()
+
+
+def reminder_emails_ignored(form, current_emails):
+    """メンバーの保存で、追加の宛先(アドレス)の欄に今と違う値が送られたか(古い画面・画面を通さない送信。保存しない)。"""
+    typed = [t.lower() for t in _REMINDER_LIST_SPLIT.split(form.get("rem_extra_emails") or "") if t]
+    return bool(typed) and typed != _email_lines(current_emails)
+
+
+# メンバーが追加の宛先(アドレス)を送ったときの案内(保存はしない)
+_REMINDER_EMAILS_MANAGER_ONLY = ("リマインドの追加の宛先（アドレス）を設定・変更できるのはマネージャーのみです"
+                                 "（入力されたアドレスは保存していません。追加の宛先〔メンバー〕は選べます）。")
+
+
 def _parse_reminder_day(token):
     """指定日・開始日の1つ(YYYY-MM-DD・YYYY/MM/DD。全角の数字も可)。範囲外・読めなければ None。"""
     text = unicodedata.normalize("NFKC", str(token or "")).strip().replace("/", "-")
@@ -16971,13 +17469,15 @@ def _shown_values(values, limit=5):
     return "、".join(shown) + (" ほか{}件".format(len(values) - limit) if len(values) > limit else "")
 
 
-def parse_reminder_form(form, choices, today, current_start=None):
+def parse_reminder_form(form, choices, today, current_start=None, kept_emails=None):
     """「リマインド」の欄の入力を確かめる。戻り値: (保存する値〔reminder_values と同じ形〕, 誤りの一覧)。
 
     choices は追加の宛先(メンバー)の選択肢(reminder_extra_user_choices)。値は「ユーザーID:ログインID」で、
     この中の人だけを受け付ける。開始日が空なら今日。開始日を今日から REMINDER_PAST_DAYS_MAX 日より前にはできない
     (過去の回をまとめて作り、未完了のリマインドが大量に送られないように)。保存済みの開始日(current_start)のままなら
     確かめない(前から設定してある業務のほかの項目を直せるように)。
+    kept_emails を渡す(メンバーの保存)と、追加の宛先(アドレス)は入力を使わずにその値のままにする
+    (設定・変更できるのはマネージャーだけ)。
     """
     errors = []
     values = dict(REMINDER_DEFAULTS)
@@ -17043,6 +17543,9 @@ def parse_reminder_form(form, choices, today, current_start=None):
                       "選択し直してください。")
     values["extra_user_ids"] = ",".join(str(i) for i in sorted({u.id for u in chosen}))
 
+    if kept_emails is not None:
+        values["extra_emails"] = kept_emails
+        return values, errors
     addresses, bad, seen = [], [], set()
     for token in _REMINDER_LIST_SPLIT.split(form.get("rem_extra_emails") or ""):
         if not token:
@@ -17057,7 +17560,8 @@ def parse_reminder_form(form, choices, today, current_start=None):
         errors.append("リマインドの追加の宛先（アドレス）の形式が正しくありません: {}"
                       "（name@example.com の形で、1行に1件ずつ入力してください）。".format(_shown_values(bad)))
     elif len(addresses) > REMINDER_EXTRA_EMAILS_MAX:
-        errors.append("リマインドの追加の宛先（アドレス）は{}件までです。".format(REMINDER_EXTRA_EMAILS_MAX))
+        errors.append("リマインドの追加の宛先（アドレス）は1業務に{}件までです（{}件あります）。".format(
+            REMINDER_EXTRA_EMAILS_MAX, len(addresses)))
     values["extra_emails"] = "\n".join(addresses)
     return values, errors
 
@@ -17068,10 +17572,12 @@ def _reminder_is_blank(values):
             and not any(values[k] for k in ("weekdays", "month_days", "dates", "extra_user_ids", "extra_emails")))
 
 
-def save_routine_reminder(routine_id, rem, values, user_id, today):
+def save_routine_reminder(routine_id, rem, values, user_id, today, by_manager=False):
     """業務ごとの設定を保存する(commit は呼び出し側)。戻り値: (設定の行 または None, 画面に出す案内の一覧)。
 
-    rem は今の設定の行(無ければ None)、values は parse_reminder_form の値。
+    rem は今の設定の行(無ければ None)、values は parse_reminder_form の値。by_manager はマネージャーの保存か
+    (マネージャーの保存では、追加の宛先〔アドレス〕をマネージャーが保存したものとして記録する。確認待ちの
+    アドレスは、ほかに変えた項目が無くても、保存すると送る対象にする)。
     """
     notes = []
     old = reminder_values(rem) if rem is not None else None
@@ -17080,8 +17586,10 @@ def save_routine_reminder(routine_id, rem, values, user_id, today):
             return None, notes
         rem = RoutineReminder(routine_id=routine_id)
         db.session.add(rem)
-    elif old == values:
+    elif old == values and not (by_manager and not reminder_emails_checked(rem)):
         return rem, notes
+    else:
+        carry_over_email_check(rem)  # 最終更新者が変わる前に(以前の版でマネージャーが保存したアドレス)
     new = dict(values)
     if old is not None:
         rule_changed = any(old[key] != new[key] for key in REMINDER_RULE_KEYS)
@@ -17099,6 +17607,8 @@ def save_routine_reminder(routine_id, rem, values, user_id, today):
     for key in REMINDER_VERSION_KEYS:
         setattr(rem, key, new[key])
     rem.updated_by_id = user_id
+    if by_manager:
+        _record_email_check(routine_id, new["extra_emails"], user_id)
     return rem, notes
 
 
@@ -17143,6 +17653,7 @@ def reminder_form_context():
         "date_min": REMINDER_DATE_MIN.isoformat(),
         "date_max": REMINDER_DATE_MAX.isoformat(),
         "sending_enabled": load_reminder_settings()["enabled"],
+        "emails_max": REMINDER_EXTRA_EMAILS_MAX,
     }
 
 
@@ -17150,6 +17661,10 @@ def upcoming_due_dates(rem, today, count=5):
     """今日より後の実施予定日(最大 count 件。約1年先まで)。"""
     first = max(today + _ONE_DAY, rem.start_date or today)
     return reminder_due_dates(reminder_rule_of(rem), first, first + timedelta(days=400))[:count]
+
+
+# 送らない追加の宛先(アドレス)の理由(以前の版でメンバーが入力し、まだマネージャーが保存していないもの)
+REMINDER_EMAILS_PENDING = "マネージャーの確認待ち"
 
 
 def reminder_recipients_for(routine, rem, users, emails):
@@ -17160,7 +17675,8 @@ def reminder_recipients_for(routine, rem, users, emails):
     user_id はメンバーのアドレス(ユーザーの登録)ならそのユーザーID、追加の宛先に入力したアドレスなら None
     (業務の詳細で、ほかの人が登録したアドレスを表示してよいかの判断に使う)。
     担当者・追加の宛先(メンバー)は、有効でメールアドレスがある人だけに送る。無効化された人・アドレスの無い人は
-    送れない宛先にする(追加の宛先のアドレスは、そのまま送る)。
+    送れない宛先にする。追加の宛先のアドレスは、マネージャーが保存したもの(reminder_emails_checked)だけを送り、
+    確認待ちのものは送れない宛先(「アドレス N件」・マネージャーの確認待ち)にする。
     """
     recipients, problems = [], []
     assignee = routine.assignee
@@ -17184,9 +17700,13 @@ def reminder_recipients_for(routine, rem, users, emails):
         else:
             recipients.append({"address": emails[user_id], "name": user.display_name, "kind": "追加の宛先",
                                "user_id": user_id})
-    for address in rem.extra_email_list:
-        if plain_address_ok(address):
-            recipients.append({"address": address, "name": "", "kind": "追加の宛先", "user_id": None})
+    addresses = [a for a in rem.extra_email_list if plain_address_ok(a)]
+    if addresses and not reminder_emails_checked(rem):
+        problems.append({"name": "アドレス {}件".format(len(addresses)), "reason": REMINDER_EMAILS_PENDING,
+                         "kind": "追加の宛先"})
+        return recipients, problems
+    for address in addresses:
+        recipients.append({"address": address, "name": "", "kind": "追加の宛先", "user_id": None})
     return recipients, problems
 
 
@@ -17629,6 +18149,7 @@ def reminder_status_context(app):
         "previews": [dict(mail, document=_preview_document(mail["html"])) for mail in data["mails"]],
         "test_mail": dict(test_mail, document=_preview_document(test_mail["html"])),
         "address_problems": reminder_address_problems(),
+        "emails_pending_reason": REMINDER_EMAILS_PENDING,
         "enabled_count": RoutineReminder.query.filter(RoutineReminder.enabled.is_(True)).count(),
         "sending": reminder_is_sending(),
     }
@@ -17701,6 +18222,7 @@ def routine_reminder_panel(routine, today, user):
             current_app.logger.warning("定型業務の実施予定日を作成できませんでした", exc_info=True)
     users = {u.id: u for u in User.query.all()}
     recipients, problems = reminder_recipients_for(routine, rem, users, user_email_map())
+    pending_emails = [] if reminder_emails_checked(rem) else [a for a in rem.extra_email_list if plain_address_ok(a)]
     completed = (RoutineOccurrence.query.filter(RoutineOccurrence.routine_id == routine.id,
                                                 RoutineOccurrence.completed_at.isnot(None))
                  .order_by(RoutineOccurrence.due_date.desc(), RoutineOccurrence.id.desc()).limit(10).all())
@@ -17709,6 +18231,8 @@ def routine_reminder_panel(routine, today, user):
         "rule_text": describe_reminder_rule(reminder_rule_of(rem)),
         "recipients": recipients,
         "problems": problems,
+        # 確認待ちの追加の宛先(アドレス。編集できる人にだけ表示する)
+        "pending_emails": pending_emails,
         "rows": occurrence_rows(pending_occurrences(today, routine_id=routine.id), today, user) if rem.enabled else [],
         "completed": [{"occ": occ, "key": occ.row_key} for occ in completed],
         "upcoming": upcoming_due_dates(rem, today) if rem.enabled else [],
@@ -18553,8 +19077,9 @@ def _apply_live(app, file_values):
 
 
 # 画面から保存した instance/config.py の版(file_version)を、同じフォルダで動いているほかのサーバー(プロセス)に
-# 知らせるファイル(instance/ の中)。同じフォルダで2つ以上のサーバーを起動したとき・--debug の見張る側の
-# プロセス(自動送信)にも、画面で保存した値を反映するために使う(refresh_live_config)。
+# 知らせるファイル(instance/ の中)。同じフォルダで2つ以上のサーバーを起動したとき・--debug の親のプロセス
+# (サーバーを起動し直すだけのプロセス。自動送信はここで動く。ファイルの変更の見張りと画面の表示は、親が起動し直す
+# サーバーのプロセスが行う)にも、画面で保存した値を反映するために使う(refresh_live_config)。
 # 直接の編集(この印の版と違う)は、今までどおりサーバーの再起動で反映する(書きかけのファイルを読まないように)
 CONFIG_SAVED_SIGNAL = "config_saved.json"
 # このプロセスの実行中の設定に反映済みの instance/config.py の版(app.extensions のキー)
@@ -18591,7 +19116,7 @@ def refresh_live_config(app):
     try:
         with open(_config_signal_path(app.instance_path), "rb") as f:
             signal = json.loads(f.read().decode("utf-8")).get("version")
-    except (OSError, ValueError, AttributeError):
+    except (OSError, ValueError, AttributeError, RecursionError):
         return []
     if signal != version:
         return []
@@ -19253,6 +19778,9 @@ def test_reminder():
 #   (日付, 枠〔time1 / time2〕) で数え、その日に実行した枠を設定ファイルの auto_slots に残す(JsonSettings.claim_auto_slot)
 # - 印を設定ファイルに書けなかったとき(Windows でほかのプロセスがファイルを開いていた など)は実行せず、
 #   実行済みの記録(fired)にも入れない(同じ分の次の確認でもう一度試す。印は記録済みなら実行しないため二重には送らない)
+# - 印を記録したら、実行の前に「前回の結果」に「自動送信を開始しました…完了の記録がありません」を書いておく
+#   (実行が終われば本当の結果で上書きする)。実行の途中でサーバーが止まった・再起動したときも、その分を
+#   実行しなかったことが画面で分かるように(印は残るため、その分をもう一度送ることはない)
 # - サーバーが止まっていて実行時刻を過ぎた分は、後から実行しない(取りこぼしの再実行なし)
 # - 実行履歴はDBに残さない(結果は各機能の「前回の結果」に上書き)
 # - 実行はジョブごとに別のスレッドで行う(時間のかかる週報の作成中も、ほかの
@@ -19358,6 +19886,14 @@ def _execute(app, job, settings, now):
             app.logger.exception("%sの前回の結果を保存できませんでした", job.label)
 
 
+def _auto_started_message(key):
+    """自動送信を始めたときに前回の結果に書いておく文(実行が終われば上書きされる)。key は due_key の戻り値。"""
+    slot = {"time1": "送信時刻1", "time2": "送信時刻2"}.get(key[1], key[1])
+    return ("自動送信を開始しました（{} {} の分。開始 {}）。完了の記録がありません（処理中か、処理の途中で"
+            "サーバーが停止・再起動したなどで中断した可能性があります。中断した分は自動では送り直しません）。".format(
+                key[0].strftime("%Y/%m/%d"), slot, datetime.now().strftime("%H:%M")))
+
+
 def _check_job(app, job, fired, now, start_thread=True):
     """1つのジョブの確認。実行を始めた場合はそのスレッド(start_thread=False なら True)を返す。"""
     with app.app_context():
@@ -19389,6 +19925,12 @@ def _check_job(app, job, fired, now, start_thread=True):
     if not claimed:
         app.logger.info("%sの自動送信: %s %s は実行済みのため、実行しません", job.label, key[0], key[1])
         return None
+    with app.app_context():
+        try:
+            # 実行の途中でサーバーが止まったときの記録(実行が終われば本当の結果で上書きされる)
+            job.record_failure(_auto_started_message(key))
+        except Exception:
+            app.logger.exception("%sの前回の結果を保存できませんでした", job.label)
 
     if not start_thread:
         _execute(app, job, settings, now)
@@ -19458,7 +20000,9 @@ def _acquire_scheduler_lock(instance_path):
     """instance/scheduler.lock のロックを取る(待たない)。取れた(既に持っている)なら True。
 
     flask run --debug では自動再読み込み(reloader)のために2つのプロセスがアプリを作るため、
-    ロックを取れた1つのプロセスだけがスケジューラを動かす(同じ仕事を2回実行しないように)。
+    ロックを取れた1つのプロセスだけがスケジューラを動かす(同じ仕事を2回実行しないように。先にアプリを作る
+    親のプロセス〔サーバーを起動し直すだけ。ファイルの変更の見張りと画面の表示は、親が起動するサーバーの
+    プロセスが行い、変更のたびに起動し直される〕がロックを取る)。
     ロックはプロセスが終わると OS が外す。
     """
     global _scheduler_lock_file
@@ -19837,6 +20381,9 @@ FORM_MEMORY_DEFAULT = 500_000
 # 403・404・405・500 の画面の見出しと案内(英語の既定の画面の代わり。errors/http_error.html)。
 # abort(403, description="見出し\n案内") のように説明を付けたときは、その見出し・案内を表示する
 HTTP_ERROR_PAGES = {
+    400: ("送信された内容を受け付けられませんでした",
+          "画面を開いた後に画面が変わった・古い画面から送った・送信の形が正しくないなどのため、処理できませんでした"
+          "（保存・変更・送信は行っていません）。画面を開き直して、画面のボタンから操作してください。"),
     403: ("この画面を開く権限がありません",
           "マネージャーだけが使える画面・操作などは、メンバーのアカウントでは開けません。"
           "必要な場合はマネージャーに依頼してください。"),
@@ -20045,14 +20592,18 @@ def create_app():
         limit = app.config.get("MAX_FORM_MEMORY_SIZE") or FORM_MEMORY_DEFAULT
         return render_template("errors/too_large.html", limit_bytes=int(limit)), 413
 
-    # 権限が無い(403)・ページが無い(404。削除されたタスクへのメールのリンクなど)・画面として開けない
-    # URL(405)も、英語の既定の画面ではなく日本語で案内する(状態コードはそのまま)
+    # 送信の内容が正しくない(400。選択肢に無い action・古いフォームなど)・権限が無い(403)・ページが無い
+    # (404。削除されたタスクへのメールのリンクなど)・画面として開けない URL(405)も、英語の既定の画面ではなく
+    # 日本語で案内する(状態コードはそのまま)
+    @app.errorhandler(400)
     @app.errorhandler(403)
     @app.errorhandler(404)
     @app.errorhandler(405)
     def http_error(error):
         heading, message = HTTP_ERROR_PAGES[error.code]
         custom = getattr(error, "description", None)
+        if isinstance(error, BadRequestKeyError):
+            custom = None  # フォームの項目が無い(--debug では英語の KeyError の説明が付くため使わない)
         if custom and custom != type(error).description:
             # abort(コード, description="見出し\n案内" または "案内") で、画面ごとの説明を付けたもの
             if "\n" in custom:
@@ -20088,6 +20639,7 @@ def create_app():
     app.before_request(limit_streamed_body)
     app.before_request(check_same_origin)
     app.after_request(frame_options)
+    app.after_request(no_store_when_logged_in)
 
     app.cli.add_command(seed_command)
     app.cli.add_command(migrate_command)
@@ -20365,6 +20917,8 @@ def seed_command():
 #   3. DBにだけ残っている未使用列は、そのまま放置(読み書きしないので無害)
 # --check は確認だけ(不足しているテーブル・列を表示し、テーブルの作成・列の追加をしない)。
 # --db は既にある DB ファイルだけを対象にする(パスの誤りで新しい DB を作らない)。
+# どの場合も最後に「結果:」の行を表示する。不足が残っている(--check で不足がある・NOT NULL の列を追加できなかった)
+# ときは終了コード 1(スクリプトから「最新」と「不足あり」を見分けられるように)。最新なら 0。
 #
 # 既存データは一切削除・変更しない。何度実行しても安全(冪等)。
 def collect_changes(insp):
@@ -20462,6 +21016,25 @@ def migrate_command(check_only, db_path):
             getattr(exc, "orig", None) or exc.__class__.__name__, db_path or "instance/app.db"))
 
 
+def _missing_text(tables, columns):
+    """不足しているテーブル・列の短い一覧(「テーブル a, b ／ 列 tasks.priority」)。"""
+    parts = []
+    if tables:
+        parts.append("テーブル {}".format(", ".join(tables)))
+    if columns:
+        parts.append("列 {}".format(", ".join("{}.{}".format(t, c) for t, c, _ddl, _nullable in columns)))
+    return " ／ ".join(parts)
+
+
+def _migrate_result(tables, columns):
+    """migrate の最後の「結果:」の行を表示する。不足が残っていれば終了コード 1 で終わる。"""
+    if not tables and not columns:
+        print("\n結果: OK（モデル定義と一致しました）")
+        return
+    print("\n結果: ★まだ不足があります: {}".format(_missing_text(tables, columns)))
+    raise click.exceptions.Exit(1)
+
+
 def migrate_run_hint(db_path):
     """--check の後に表示する、実際に追加するときのコマンド(--db を付けて確認したときは同じ --db を付ける)。
 
@@ -20497,7 +21070,7 @@ def _migrate(app, check_only, db_path=None):
                 print("不足している列はありません。")
                 print("\n--check のため変更していません。"
                       "実行するには: {}".format(migrate_run_hint(db_path)))
-                print("\n結果: ★まだ不足があります: テーブル {}".format(", ".join(missing_tables)))
+                _migrate_result(missing_tables, [])
                 return
             print("不足している列はありません。DBは最新の状態です。")
         else:
@@ -20508,6 +21081,7 @@ def _migrate(app, check_only, db_path=None):
             if check_only:
                 print("\n--check のため変更していません。"
                       "実行するには: {}".format(migrate_run_hint(db_path)))
+                _migrate_result(missing_tables, missing_columns)
                 return
 
             added, skipped = 0, []
@@ -20533,8 +21107,7 @@ def _migrate(app, check_only, db_path=None):
             for table, col in extras:
                 print("  - {}.{}".format(table, col))
 
-        # 最終確認
+        # 最終確認(--check で不足が無いとき・追加した後。NOT NULL の列を追加できなかったときは終了コード 1)
         insp2 = inspect(db.engine)
-        _, still_missing = collect_changes(insp2)
-        print("\n結果:", "OK（モデル定義と一致しました）" if not still_missing
-              else "★まだ不足があります: {}".format(still_missing))
+        still_tables, still_missing = collect_changes(insp2)
+        _migrate_result(still_tables, still_missing)

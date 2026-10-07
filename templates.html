@@ -991,12 +991,12 @@
         </div>
         <div class="col-md-6 mb-3">
           <label class="form-label">開始日{% if not can_plan %} <span class="text-muted small">（マネージャーのみ）</span>{% endif %}</label>
-          <input type="date" name="start_date" class="form-control" min="{{ year_min }}-01-01" max="{{ year_max }}-12-31" {% if not can_plan %}disabled{% endif %}
+          <input type="date" name="start_date" class="form-control" min="{{ date_bounds.start_date[0] }}" max="{{ date_bounds.start_date[1] }}" {% if not can_plan %}disabled{% endif %}
                  value="{% if form and can_plan %}{{ form.get('start_date','') }}{% elif task and task.start_date %}{{ task.start_date.strftime('%Y-%m-%d') }}{% endif %}">
         </div>
         <div class="col-md-6 mb-3">
           <label class="form-label">期限{% if not can_plan %} <span class="text-muted small">（マネージャーのみ）</span>{% endif %}</label>
-          <input type="date" name="due_date" class="form-control" min="{{ year_min }}-01-01" max="{{ year_max }}-12-31" {% if not can_plan %}disabled{% endif %}
+          <input type="date" name="due_date" class="form-control" min="{{ date_bounds.due_date[0] }}" max="{{ date_bounds.due_date[1] }}" {% if not can_plan %}disabled{% endif %}
                  value="{% if form and can_plan %}{{ form.get('due_date','') }}{% elif task and task.due_date %}{{ task.due_date.strftime('%Y-%m-%d') }}{% endif %}">
         </div>
         <div class="col-md-6 mb-3">
@@ -1357,7 +1357,8 @@
         {% endfor %}
         {% for p in reminder.problems %}
         <div class="text-danger"><i class="bi bi-exclamation-triangle"></i> {{ p.kind }}: {{ p.name }}（{{ p.reason }}のため送りません）</div>
-        {% endfor %}
+        {% endfor %}{% if reminder.pending_emails %}{# 確認待ちの追加の宛先(アドレス)。アドレスは編集できる人にだけ表示する #}
+        <div class="small text-muted">追加の宛先（アドレス）は、マネージャーが設定・保存したものだけに送ります。以前の版でメンバーが入力したアドレスは、マネージャーがこの業務の「編集」で保存するまで送りません{% if can_edit %}（{% for a in reminder.pending_emails %}&lt;{{ a }}&gt;{% if not loop.last %}、{% endif %}{% endfor %}）{% endif %}。</div>{% endif %}
         {% if not reminder.recipients and not reminder.problems %}―{% endif %}
       </dd>
       <dt class="col-sm-3 text-muted">最終更新</dt>
@@ -1563,9 +1564,11 @@
             </div>
           </div>
           <div class="col-md-6">
-            <label class="small mb-1" for="rem-emails">追加の宛先（アドレス。1行に1件）</label>
-            <textarea name="rem_extra_emails" id="rem-emails" rows="4" class="form-control form-control-sm"
+            <label class="small mb-1" for="rem-emails">追加の宛先（アドレス。1行に1件・{{ rem_ctx.emails_max }}件まで）</label>
+            {# メンバー: 読み取り専用(name の無い欄。保存しても今の値のまま) #}{% if rem_emails_locked %}<textarea id="rem-emails" rows="4" class="form-control form-control-sm" disabled>{{ rem.extra_emails }}</textarea>
+            <div class="form-text" id="rem-emails-note"><i class="bi bi-lock"></i> 追加の宛先（アドレス）を設定・変更できるのはマネージャーのみです。メンバーは左の「追加の宛先（メンバー）」を選べます（アドレスはその人のメールアドレス）。{% if rem_emails_pending %}<br><span class="text-danger">今のアドレスはマネージャーの確認待ちのため、送っていません（マネージャーが保存すると送ります）。</span>{% endif %}</div>{% else %}<textarea name="rem_extra_emails" id="rem-emails" rows="4" class="form-control form-control-sm"
                       placeholder="name@example.com">{{ rem.extra_emails }}</textarea>
+            <div class="form-text" id="rem-emails-note">追加の宛先（アドレス）を設定・変更できるのはマネージャーのみです（メンバーの画面では読み取り専用）。保存したアドレスには、この業務のリマインドを送ります（宛先を確かめてから保存してください）。{% if rem_emails_pending %}<br><span class="text-danger"><i class="bi bi-exclamation-triangle"></i> 今のアドレスは以前の版でメンバーが入力したもので、マネージャーの確認待ちのため送っていません。この画面で保存すると、欄のアドレスに送ります（不要なアドレスは消してから保存してください）。</span>{% endif %}</div>{% endif %}
           </div>
         </div>
         <div class="form-text">追加の宛先にも、担当者と同じ内容（この業務の本日の実施予定・完了の入力がまだの回）を送ります。宛先ごとに、関係する業務をまとめて1通にします。</div>
@@ -1833,7 +1836,8 @@
   <span class="badge bg-primary">全休</span>
   <span class="badge bg-info">半休</span>
   <span class="ms-2"><span class="leave-weekend-swatch"></span> 土日(休日)</span>
-  <span class="ms-2 text-danger"><i class="bi bi-people-fill"></i> 同じチームで同日{{ daily_limit }}名超</span>
+  <span class="ms-2 text-danger"><i class="bi bi-people-fill"></i> 同じチームで同日{{ daily_limit }}名超</span>{% for d in departments if d.id == dept_id and not d.is_active %}
+  <span class="ms-2">（無効化したチームは、同じ日に休む人数を判定しません）</span>{% endfor %}
 </div>
 {% endblock %}
 {#=== leaves/detail.html ===#}
@@ -2077,7 +2081,7 @@
         {% endfor %}
         {% endfor %}
         {% if ns.rows == 0 %}
-        <tr><td colspan="{{ ncols }}" class="text-muted py-4">{% if is_all %}スキル項目はまだありません。{% else %}この区分のスキル項目はまだありません。{% endif %}{% if can_edit %}「スキル項目の管理」から追加してください。{% endif %}</td></tr>
+        <tr><td colspan="{{ ncols }}" class="text-muted py-4">{# 「スキル項目の管理」のボタンはヒトの列を出すときだけのため、案内にリンクを付ける #}{% if inactive_count %}{% if is_all %}有効なスキル項目がありません{% else %}この区分の有効なスキル項目がありません{% endif %}（無効にした項目が{{ inactive_count }}件あります{% if can_edit %}。<a href="{{ url_for('skills.items') }}">スキル項目の管理</a>で有効にできます{% endif %}）。{% else %}{% if is_all %}スキル項目はまだありません。{% else %}この区分のスキル項目はまだありません。{% endif %}{% if can_edit %}<a href="{{ url_for('skills.items') }}">「スキル項目の管理」</a>から追加してください。{% endif %}{% endif %}</td></tr>
         {% endif %}
       </tbody>
     </table>
@@ -4171,13 +4175,13 @@
         </div>
       </div>
       {# タスク行 #}
-      {% for g in gantt %}
+      {# 週の目盛りと今日の線は全行で同じため、1回だけ作って各行に入れる(タスクが多いときの速さ。出力は同じ) #}{% set row_ticks %}{% for tick in gticks %}<div class="gantt-tick" style="left:{{ tick.left }}%;"></div>{% endfor %}
+          {% if gtoday_left is not none %}<div class="gantt-today" style="left:{{ gtoday_left }}%;"></div>{% endif %}{% endset %}{% for g in gantt %}
       <div class="gantt-row">
         <div class="gantt-c-task"><a href="{{ url_for('tasks.detail', task_id=g.task.id) }}" title="{{ g.task.title }}">{{ g.task.title }}</a></div>
         <div class="gantt-c-assignee" title="{{ g.task.assignee_labels }}">{{ g.task.assignee_labels or '未割当' }}</div>
         <div class="gantt-timeline">
-          {% for tick in gticks %}<div class="gantt-tick" style="left:{{ tick.left }}%;"></div>{% endfor %}
-          {% if gtoday_left is not none %}<div class="gantt-today" style="left:{{ gtoday_left }}%;"></div>{% endif %}
+          {{ row_ticks }}
           {#- 棒は日ごとの状態の色。最後の区間の文字は今の状態(期限の後に完了した・表示期間の後に変わったタスクは「→ 現在 …」) #}
           {% for seg in g.segments %}{% set now_differs = loop.last and seg.status != g.task.status %}
           <div class="gantt-seg bg-{{ status_colors[seg.status] }}"
@@ -4233,9 +4237,9 @@
 <span class="badge bg-{{ r.status_color }}">{{ r.status }}</span>
 {%- endmacro %}
 
-{# 最後の記載(日付・記載者・本文の先頭) #}
+{# 最後の記載(日付・記載者・本文の先頭)。日付は date_label(分析の基準の日時と同じ年は mm/dd、それ以外は yyyy/mm/dd) #}
 {% macro last_comment(c) -%}
-  {%- if c -%}<span class="text-muted text-nowrap">{{ c.at.strftime('%m/%d') }} {{ c.author }}：</span><span class="pre-wrap">{{ c.text }}</span>
+  {%- if c -%}<span class="text-muted text-nowrap">{{ date_label(c.at) }} {{ c.author }}：</span><span class="pre-wrap">{{ c.text }}</span>
   {%- else -%}<span class="text-muted">記載なし</span>{%- endif -%}
 {%- endmacro %}
 
@@ -4630,7 +4634,7 @@
           <td class="text-nowrap">{{ i.assignee_names or '未割当' }}</td>
           <td class="text-nowrap"><span class="badge {{ 'bg-warning text-dark' if i.kind == '課題' else 'bg-info text-dark' }}">{{ i.kind }}</span></td>
           <td class="pre-wrap">{{ i.text }}{% if i.changed %} {{ ai_state_badge(state_changed) }}{% endif %}</td>
-          <td class="text-nowrap text-muted">{% if i.source %}{{ i.source.at.strftime('%m/%d') if i.source.at else '' }} {{ i.source.author }}{% else %}―{% endif %}</td>
+          <td class="text-nowrap text-muted">{% if i.source %}{{ date_label(i.source.at) if i.source.at else '' }} {{ i.source.author }}{% else %}―{% endif %}</td>
         </tr>
         {% else %}
         <tr><td colspan="5" class="text-muted">AIが抜き出した課題・相談はありません。</td></tr>
@@ -4683,7 +4687,7 @@
         <tr>
           <td>{{ task_cell(r) }}</td>
           <td class="text-nowrap">{{ r.assignee_names or '未割当' }}</td>
-          <td><span class="text-muted text-nowrap">{{ r.at.strftime('%m/%d') }} {{ r.author }}：</span><span class="pre-wrap">{{ r.body }}</span></td>
+          <td><span class="text-muted text-nowrap">{{ date_label(r.at) }} {{ r.author }}：</span><span class="pre-wrap">{{ r.body }}</span></td>
           <td class="text-nowrap"><span class="badge {{ 'bg-danger' if r.judgement in ('返信なし', '未対応') else 'bg-warning text-dark' }}">{{ r.judgement }}</span></td>
           {% if ai.applied %}
           <td class="pre-wrap">{% if r.ai and (r.ai.remaining or r.ai.request) %}<div>{{ r.ai.remaining or r.ai.request }}</div>{% elif not r.ai_state %}―{% endif %}{{ ai_state_badge(r.ai_state) }}</td>
@@ -4708,7 +4712,7 @@
             {% for r in mc['items'] + mc.ai_acks %}
             <tr>
               <td>{{ task_cell(r) }}</td>
-              <td><span class="text-muted text-nowrap">{{ r.at.strftime('%m/%d') }} {{ r.author }}：</span><span class="pre-wrap">{{ r.body }}</span></td>
+              <td><span class="text-muted text-nowrap">{{ date_label(r.at) }} {{ r.author }}：</span><span class="pre-wrap">{{ r.body }}</span></td>
               <td class="text-nowrap"><span class="badge {{ 'bg-success' if r.judgement == '対応済み' else ('bg-secondary' if r.judgement in ('対応不要（AI判定）', '未判定') else ('bg-danger' if r.judgement in ('返信なし', '未対応') else 'bg-warning text-dark')) }}">{{ r.judgement }}</span>
                 {{ ai_state_badge(r.ai_state) }}</td>
               <td class="pre-wrap">{{ r.ai.request if r.ai and r.ai.request else '―' }}</td>
@@ -5109,7 +5113,7 @@
         <tr>
           <td>{{ task_cell(r) }}</td>
           <td class="text-nowrap">{{ r.name }}</td>
-          <td><span class="text-muted text-nowrap">{{ r.at.strftime('%m/%d') }}：</span><span class="pre-wrap">{{ r.body }}</span></td>
+          <td><span class="text-muted text-nowrap">{{ date_label(r.at) }}：</span><span class="pre-wrap">{{ r.body }}</span></td>
           <td>{{ r.reason }}{% if r.ai and r.ai.reason and not r.reason.startswith('AIの判定') %}<div class="text-info-emphasis"><i class="bi bi-stars"></i> {{ r.ai.reason }}</div>{% endif %}</td>
           {% if ai.applied %}
           <td>{% if r.suggestion %}{{ suggestion_cell('progress-suggestion-' ~ r.comment_id, r.suggestion) }}
@@ -6397,7 +6401,8 @@
     <li><a href="{{ url_for('routine.detail', routine_id=p.routine.id) }}">{{ p.routine.name }}</a> — {{ p.kind }}: {{ p.name }}（{{ p.reason }}）</li>
     {% endfor %}
   </ul>
-  メールアドレスは<a href="{{ url_for('departments.manage') }}">チーム管理</a>のメンバーの表、または各自のユーザーメニューの「メールアドレス」で登録します。
+  メールアドレスは<a href="{{ url_for('departments.manage') }}">チーム管理</a>のメンバーの表、または各自のユーザーメニューの「メールアドレス」で登録します。{% if rm_status.address_problems|selectattr('reason', 'equalto', rm_status.emails_pending_reason)|list %}
+  「マネージャーの確認待ち」の追加の宛先（アドレス）は、以前の版でメンバーが入力したものです。マネージャーがその業務の「編集」で宛先を確かめて保存すると送ります。{% endif %}
 </div>
 {% endif %}
 {% if rm_status.link_problem %}
