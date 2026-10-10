@@ -144,7 +144,7 @@ from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr, formatdate, make_msgid, parseaddr
-from functools import lru_cache, wraps
+from functools import lru_cache, partial, wraps
 from io import BytesIO
 from time import monotonic, sleep
 from typing import Optional
@@ -1671,13 +1671,23 @@ def business_days_ago(past_date, today):
     return count
 
 
+def elapsed_business_days(past_date, today):
+    """past_date から today までに経過した営業日の数(メールの「N日前（土日祝除く）」「N営業日経過」用)。
+
+    today が土日祝(手動の送信・テスト送信・プレビュー・画面)のときは、直前の営業日とその後の土日祝を1日として
+    数える(「0日前」にせず、1通の中で単位をそろえ、古い記載ほど日数が大きくなるように)。
+    """
+    return business_days_ago(past_date, today) + (0 if is_business_day(today) else 1)
+
+
 # =============================================================================
 # 2-5. 画面の権限の確認(マネージャーだけの画面)
 # =============================================================================
 # マネージャーだけが使える画面の確認(未ログインはログイン画面へ、メンバーは 403)。
-#   managers_only    : Blueprint 全体に付ける before_request(スキル管理・データ出力・週報・
-#                      期限超過通知・システム設定)
-#   manager_required : 画面の関数ごとに付けるデコレーター(マネージャーダッシュボード・AI分析・チーム管理)
+#   managers_only      : Blueprint 全体に付ける before_request
+#   managers_blueprint : managers_only を付けた Blueprint を作る(スキル管理・データ出力・週報・
+#                        期限超過通知・システム設定)
+#   manager_required   : 画面の関数ごとに付けるデコレーター(マネージャーダッシュボード・AI分析・チーム管理)
 # 画面ごとの細かい権限(タスクの編集は担当者も可など)は、各画面の節にある。
 
 
@@ -1705,6 +1715,13 @@ def manager_required(view):
         return view(*args, **kwargs)
 
     return login_required(checked)
+
+
+def managers_blueprint(name, url_prefix):
+    """マネージャーだけの画面の Blueprint(未ログインはログイン画面へ、メンバーは 403。managers_only)。"""
+    bp = Blueprint(name, __name__, url_prefix=url_prefix)
+    bp.before_request(managers_only)
+    return bp
 
 
 # =============================================================================
@@ -1782,13 +1799,15 @@ class MailJob:
         app.logger.exception("%sの作成・送信に失敗しました", self.label)
         return "{}の作成中にエラーが発生しました: {}".format(self.label, exc)
 
-    def deliver(self, app, trigger, body, prefix=""):
+    def deliver(self, app, trigger, body, prefix="", check_test=None):
         """送信の本体(lock を持った状態で呼ぶ)。app_context の中で body() → (成否, メッセージ) を実行し、
         成否にかかわらず「前回の結果」(prefix + メッセージ)を上書きする。戻り値: {"ok", "message"}。
-        例外は外に出さず、失敗として記録する。"""
+        例外は外に出さず、失敗として記録する。check_test(テスト送信か)を渡すと、送信できない設定なら
+        時間のかかる作成(AI の呼び出しなど)の前に止める(4-2 の check_mail_settings)。"""
         with app.app_context():
             try:
-                ok, message = body()
+                problem = None if check_test is None else check_mail_settings(test=check_test)
+                ok, message = (False, problem) if problem else body()
             except Exception as exc:
                 if self.rollback:
                     db.session.rollback()
@@ -5987,7 +6006,7 @@ def cancel_leave(leave_id):
 # カテゴリと到達尺度から、4つの見出し(SKILL_DESCRIPTION_HEADINGS)で説明の下書きをAIに作らせ、
 # 入力欄に入れるだけ(保存はしない。マネージャーが確認して「更新」「追加」を押したときに保存される)。
 
-skills_bp = Blueprint("skills", __name__, url_prefix="/skills")
+skills_bp = managers_blueprint("skills", "/skills")  # マネージャーのみ(2-5)
 
 # スキルマップの「全スキル」タブ用の擬似区分値(全区分をまとめて表示)
 SKILL_TYPE_ALL = "all"
@@ -5995,9 +6014,6 @@ SKILL_TYPE_ALL = "all"
 # スキルマップの横軸に表示できる列(ヒト / 業務。両方同時表示も可)
 AXIS_PERSON = "person"
 AXIS_OPERATION = "operation"
-
-
-skills_bp.before_request(managers_only)
 
 
 def _skill_users():
@@ -7850,8 +7866,7 @@ def save_memberships():
 # 各メニューのデータ(現在データ＋履歴データ)を openpyxl で xlsx 化し、
 # 添付ファイルとしてダウンロードさせる。読み取り専用(DBは変更しない)。
 
-export_bp = Blueprint("export", __name__, url_prefix="/export")
-export_bp.before_request(managers_only)
+export_bp = managers_blueprint("export", "/export")  # マネージャーのみ(2-5)
 
 
 # Excel の1つのセルに入る文字数の上限と、それを超える値の末尾に付ける印
@@ -8278,15 +8293,38 @@ def period_label(start, end):
     return "{}〜{}".format(start.strftime("%Y/%m/%d"), end.strftime("%Y/%m/%d"))
 
 
+def enabled_send_time(settings):
+    """自動送信が有効なら設定の送信時刻("time")を datetime.time で返す。無効・時刻が不正なら None。"""
+    if not settings.get("enabled"):
+        return None
+    return parse_hhmm(settings.get("time"))
+
+
+def send_time_due(settings, now):
+    """今が自動送信の実行時刻(有効で、時刻 "HH:MM" が一致)なら、その "HH:MM"。そうでなければ None。
+
+    週報・期限超過通知のスケジューラの判定(12-1 の Job.due_key)で共通に使う。
+    """
+    at = enabled_send_time(settings)
+    hhmm = now.strftime("%H:%M")
+    return hhmm if at is not None and at.strftime("%H:%M") == hhmm else None
+
+
+def weekly_due_key(settings, now):
+    """今が週報の実行時刻(設定の曜日・時刻)なら (日付, "HH:MM") を返す。そうでなければ None。"""
+    hhmm = send_time_due(settings, now)
+    if hhmm is None or now.weekday() != settings["weekday"]:
+        return None
+    return (now.date(), hhmm)
+
+
 def next_weekly_run(settings, now):
     """設定から次回の自動実行日時を求める。自動送信が無効・時刻不正なら None。
 
     当日の実行時刻の「分」の間はまだ実行中とみなし、当日の日時を返す。今日の分を既に自動送信した
     (実行の印 last_auto_key が今日)ときは、時刻を後の時刻に変えていても今日は送らないため、次の週の日時を返す。
     """
-    if not settings.get("enabled"):
-        return None
-    at = parse_hhmm(settings.get("time"))
+    at = enabled_send_time(settings)
     if at is None:
         return None
     weekday = settings.get("weekday", 0)
@@ -8465,7 +8503,6 @@ WEEKLY_SETTINGS = JsonSettings("weekly_settings.json", "週報の設定ファイ
 WEEKLY_EDITABLE_KEYS = WEEKLY_SETTINGS.editable          # 画面から保存できる項目(last_result は送信処理だけが書き込む)
 load_weekly_settings = WEEKLY_SETTINGS.load              # 現在の設定(読み込めなければ既定値)
 save_weekly_settings = WEEKLY_SETTINGS.save              # 画面で編集した項目を保存する
-set_weekly_last_result = WEEKLY_SETTINGS.set_last_result  # 前回の結果を上書きする
 
 
 def is_weekly_target(settings, user):
@@ -8487,9 +8524,6 @@ def is_weekly_target(settings, user):
 #   settings_with_input(cur, v)   入力エラーで再表示するとき、保存済みの設定に入力中の値を重ねる
 #                                 (期限超過通知の設定フォームでも使う)
 #   weekly_form_context(settings) フォームの表示に使う値
-
-WEEKLY_LABEL = "週報"
-WEEKLY_SAVED_MESSAGE = "週報の設定を保存しました。"
 
 
 def _text(form, name, single_line=False):
@@ -8670,8 +8704,8 @@ def _task_facts(task, start, end, today=None):
         "due_date": due,
         # 開始日・期限の表記(期間の終わりと同じ年は mm/dd、違う年は yyyy/mm/dd。前の年からの期限超過が
         # 数日の遅れに見えないように。期限超過通知と同じ書き方)
-        "start_label": _year_aware_label(task.start_date, end),
-        "due_label": _year_aware_label(due, end),
+        "start_label": _date_label(task.start_date, end),
+        "due_label": _date_label(due, end),
         "scale_label": task.scale_label or "",
         # 担当者の表示名(無効化された人は「［無効］」付き。タスクの一覧・期限超過通知と同じく、担当の
         # 付け替えが必要なことが分かるように)。人数の集計には assignee_ids を使う
@@ -8880,8 +8914,9 @@ def _mmdd(d):
     return d.strftime("%m/%d") if d else "―"
 
 
-def _year_aware_label(d, ref):
-    """開始日・期限の表記: ref(期間の終わり)と同じ年は mm/dd、違う年は yyyy/mm/dd。None は ―。"""
+def _date_label(d, ref):
+    """日付の短い表記: ref(期間の終わり・今日)と同じ年は mm/dd、違う年は yyyy/mm/dd。None は ―
+    (週報の開始日・期限、期限超過通知・AI分析の日付で共通)。"""
     if not d:
         return "―"
     return d.strftime("%m/%d") if d.year == ref.year else d.strftime("%Y/%m/%d")
@@ -9406,6 +9441,8 @@ DELIVER_DOWNLOAD = "download"
 DELIVER_TEST = "test"
 DELIVER_SEND = "send"
 DELIVER_CHOICES = (DELIVER_DOWNLOAD, DELIVER_TEST, DELIVER_SEND)
+# 画面の「今すぐ作成/送信」の送信の action → (前回の結果に残すきっかけ, 案内の表示名)。週報・期限超過通知で共通
+SEND_ACTIONS = {DELIVER_TEST: (TRIGGER_TEST, "テスト送信"), DELIVER_SEND: (TRIGGER_MANUAL, "本番の宛先への送信")}
 
 # 添付する Word ファイルの MIME タイプ
 DOCX_MAINTYPE = "application"
@@ -9480,10 +9517,6 @@ def _deliver_weekly(app, start, end, trigger, deliver, send_date):
     result = {"filename": None, "data": None}
 
     def body():
-        # 送信できない設定なら、時間のかかる作成(AI呼び出し)の前に止める
-        problem = check_mail_settings(test=test)
-        if problem:
-            return False, problem
         built, users, written = _build_weekly(app, start, end, send_date)
         result.update(built)
         ok, send_message = send_mail(
@@ -9492,7 +9525,7 @@ def _deliver_weekly(app, start, end, trigger, deliver, send_date):
         return ok, _weekly_summary(written, users, send_message)
 
     prefix = "期間 {}〜{}: ".format(start.strftime("%m/%d"), end.strftime("%m/%d"))
-    return dict(result, **WEEKLY_JOB.deliver(app, trigger, body, prefix=prefix))
+    return dict(result, **WEEKLY_JOB.deliver(app, trigger, body, prefix=prefix, check_test=test))
 
 
 def run_weekly(app, start, end, trigger, deliver, send_date=None):
@@ -9545,9 +9578,7 @@ def start_weekly_background(app, start, end, trigger, deliver, send_date=None):
 # メールの送信サーバー・宛先、AIの接続先・キーはシステム設定の「基本設定」タブ
 # (instance/settings.json)で変更する(この画面では状況だけを表示する)。
 
-weekly_bp = Blueprint("weekly", __name__, url_prefix="/weekly")
-# 週報の画面・作成はマネージャーのみ(未ログインはログイン画面へ。2-5)
-weekly_bp.before_request(managers_only)
+weekly_bp = managers_blueprint("weekly", "/weekly")  # マネージャーのみ(2-5)
 
 DOCX_MIMETYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 # 「今すぐ作成」で指定できる期間の上限(日数)
@@ -9557,9 +9588,10 @@ RUN_MAX_DAYS = 366
 RUN_LAST_DAY = date.max - timedelta(days=DUE_SOON_DAYS + 1)
 
 
-def mail_feature_context(job, settings, upcoming):
-    """週報・期限超過通知の画面に共通の表示(設定・次回の自動送信・前回の結果・メールの設定状況・送信中か)。"""
-    return {
+def mail_feature_context(job, settings, upcoming, test_only=False):
+    """週報・期限超過通知の画面と定型業務リマインドのタブに共通の表示(設定・次回の自動送信・前回の結果・
+    メールの設定状況・送信中か)。test_only は宛先を DB から決める機能(リマインド)で、送信サーバー・差出人だけを確かめる。"""
+    context = {
         "settings": settings,
         "settings_error": job.store.load_error(),
         "upcoming": upcoming,
@@ -9567,11 +9599,31 @@ def mail_feature_context(job, settings, upcoming):
         "scheduler_stopped": upcoming is not None and scheduler_is_stopped(current_app),
         "weekday_labels": WEEKDAY_LABELS,
         "last": settings["last_result"],
-        "mail": mail_settings(),
-        "mail_problem": check_mail_settings(test=False),
-        "test_problem": check_mail_settings(test=True),
+        "mail_problem": check_mail_settings(test=test_only),
         "sending": job.is_sending(),
     }
+    if not test_only:
+        context.update(mail=mail_settings(), test_problem=check_mail_settings(test=True))
+    return context
+
+
+def send_started_response(started, index_endpoint, message):
+    """画面から送信を始めた結果の案内(別の送信を処理中で始められなかったときはその旨)をして、機能の画面に戻る。"""
+    if started:
+        flash(message, "info")
+    else:
+        flash(SENDING_BUSY_MESSAGE, "warning")
+    return redirect(url_for(index_endpoint))
+
+
+def legacy_settings_route(bp, tab):
+    """旧URL POST /<機能>/settings(設定の保存。設定はシステム設定に移した)を、システム設定の保存へ 307 で転送する
+    (フォームの内容はそのまま届き、保存後はシステム設定のそのタブに戻る)。"""
+    bp.add_url_rule("/settings", "save_settings", lambda: redirect(url_for("system.save_" + tab), code=307),
+                    methods=["POST"])
+
+
+legacy_settings_route(weekly_bp, "weekly")
 
 
 def _render_weekly(settings):
@@ -9602,15 +9654,6 @@ def _render_weekly(settings):
 @weekly_bp.route("/", endpoint="index")
 def weekly_index():
     return _render_weekly(load_weekly_settings())
-
-
-@weekly_bp.route("/settings", methods=["POST"], endpoint="save_settings")
-def weekly_save_settings():
-    """旧URL(設定の保存)。設定はシステム設定に移したため、そちらの保存へ転送する。
-
-    307 で転送するのでフォームの内容はそのまま届き、保存後はシステム設定の「週報」タブに戻る。
-    """
-    return redirect(url_for("system.save_weekly"), code=307)
 
 
 @weekly_bp.route("/preview")
@@ -9680,19 +9723,11 @@ def weekly_run_now():
             return redirect(url_for("weekly.index"))
         return _docx_response(result["data"], result["filename"], start, end)
 
-    if action == DELIVER_TEST:
-        trigger, label = TRIGGER_TEST, "テスト送信"
-    else:
-        trigger, label = TRIGGER_MANUAL, "本番の宛先への送信"
-
-    if not start_weekly_background(app, start, end, trigger, action):
-        flash(SENDING_BUSY_MESSAGE, "warning")
-        return redirect(url_for("weekly.index"))
-
-    flash("{}を開始しました（期間 {}）。結果は「前回の結果」に表示されます"
-          "（作成に数十秒〜数分かかる場合があります。画面を再読み込みして確認してください）。"
-          .format(label, period_label(start, end)), "info")
-    return redirect(url_for("weekly.index"))
+    trigger, label = SEND_ACTIONS[action]
+    return send_started_response(
+        start_weekly_background(app, start, end, trigger, action), "weekly.index",
+        "{}を開始しました（期間 {}）。結果は「前回の結果」に表示されます"
+        "（作成に数十秒〜数分かかる場合があります。画面を再読み込みして確認してください）。".format(label, period_label(start, end)))
 
 
 # #############################################################################
@@ -9729,18 +9764,11 @@ _SEARCH_DAYS = 31
 
 
 def overdue_due_key(settings, now):
-    """今が自動送信の実行時刻なら (日付, "HH:MM") を返す。そうでなければ None。
-
-    自動送信が有効で、今日が営業日で、今の時刻(HH:MM)が設定と一致するとき。
-    """
-    if not settings.get("enabled"):
+    """今が自動送信の実行時刻(有効で、時刻が一致し、今日が営業日)なら (日付, "HH:MM") を返す。そうでなければ None。"""
+    hhmm = send_time_due(settings, now)
+    if hhmm is None or not is_business_day(now.date()):
         return None
-    at = parse_hhmm(settings.get("time"))
-    if at is None or now.strftime("%H:%M") != at.strftime("%H:%M"):
-        return None
-    if not is_business_day(now.date()):
-        return None
-    return (now.date(), at.strftime("%H:%M"))
+    return (now.date(), hhmm)
 
 
 def next_overdue_run(settings, now):
@@ -9750,9 +9778,7 @@ def next_overdue_run(settings, now):
     当日の実行時刻の「分」の間はまだ実行中とみなし、当日の日時を返す。今日の分を既に自動送信した
     (実行の印 last_auto_key が今日)ときは、時刻を後の時刻に変えていても今日は送らないため、次の営業日にする。
     """
-    if not settings.get("enabled"):
-        return None
-    at = parse_hhmm(settings.get("time"))
+    at = enabled_send_time(settings)
     if at is None:
         return None
     candidate = datetime.combine(now.date(), time(at.hour, at.minute))
@@ -9805,7 +9831,6 @@ OVERDUE_SETTINGS = JsonSettings(
 OVERDUE_EDITABLE_KEYS = OVERDUE_SETTINGS.editable          # 画面から保存できる項目(last_result は送信処理だけが書き込む)
 load_overdue_settings = OVERDUE_SETTINGS.load              # 現在の設定(読み込めなければ既定値)
 save_overdue_settings = OVERDUE_SETTINGS.save              # 画面で編集した項目を保存する
-set_overdue_last_result = OVERDUE_SETTINGS.set_last_result  # 前回の結果を上書きする
 
 
 # =============================================================================
@@ -9821,9 +9846,6 @@ set_overdue_last_result = OVERDUE_SETTINGS.set_last_result  # 前回の結果を
 #   settings_with_input(cur, v)    入力エラーで再表示するとき、保存済みの設定に入力中の値を重ねる
 #                                  (週報の設定フォーム(6-3)と共通)
 #   overdue_form_context(settings) フォームの表示に使う値
-
-OVERDUE_LABEL = "期限超過通知"
-OVERDUE_SAVED_MESSAGE = "期限超過通知の設定を保存しました。"
 
 
 def parse_overdue_form(form):
@@ -9880,8 +9902,9 @@ SECTION_DEFS = (
 )
 UNASSIGNED_LABEL = "担当者なし"
 NO_COMMENT = "コメントなし"
-OVERDUE_NONE_TEXT = "該当なし"
+MAIL_NONE_TEXT = "該当なし"  # 一覧に載せるものが無いとき(定型業務リマインドのメールと共通)
 COMMENT_TEXT_MAX = 200
+LINK_PROBLEM_NOTE = "リンクなし（APP_BASE_URL 未設定・不正）"  # 前回の結果に残す、リンクを付けられなかったときの印
 
 _COMMENT_LINE_BREAKS = re.compile(r"[\r\n\t\v\f]+")
 _SPACES = re.compile(r" {2,}")
@@ -9914,40 +9937,28 @@ def link_base():
     return raw.rstrip("/"), None
 
 
-def task_path(task_id, row_key=None):
-    """タスク詳細画面のパス(例: /tasks/12?t=…)。リクエストの外でも作れるよう URL マップから作る。
+def app_path(endpoint, values):
+    """画面のパス(例: /tasks/12?t=…)。リクエストの外(自動送信のスレッド)でも作れるよう URL マップから作る。"""
+    return current_app.url_map.bind("localhost").build(endpoint, values)
 
-    row_key(Task.row_key)を付けると、そのタスクが削除された後に同じIDが別のタスクに使われても、
-    リンクは別のタスクを開かずに 404 になる(5-3 の task_detail)。
-    """
-    adapter = current_app.url_map.bind("localhost")
+
+def task_path(task_id, row_key=None):
+    """タスク詳細画面のパス。row_key(Task.row_key)を付けると、そのタスクが削除された後に同じIDが
+    別のタスクに使われても、リンクは別のタスクを開かずに 404 になる(5-3 の task_detail)。"""
     values = {"task_id": task_id}
     if row_key:
         values["t"] = row_key
-    return adapter.build("tasks.detail", values)
+    return app_path("tasks.detail", values)
 
 
 # --------------------------------------------------------------------------- #
-# 表記の小道具
+# 表記の小道具(日付の短い表記は 6-4 の _date_label)
 # --------------------------------------------------------------------------- #
-def _date_label(d, today):
-    """日付の短い表記(今年は mm/dd、それ以外は yyyy/mm/dd)。"""
-    if d.year == today.year:
-        return d.strftime("%m/%d")
-    return d.strftime("%Y/%m/%d")
-
-
 def _age_label(d, today):
-    """コメントの経過日数(営業日)。今日(以降)なら「本日」。
-
-    今日が土日祝(手動の送信・テスト送信・プレビュー)のときは、直前の営業日とその後の土日祝の記載を
-    「1日前（土日祝除く）」として、営業日で数える(「0日前」にしない。1通の中で単位をそろえ、
-    古い記載ほど日数が大きくなるように)。
-    """
+    """コメントの経過日数(営業日。2-4 の elapsed_business_days)。今日(以降)なら「本日」。"""
     if d >= today:
         return "本日"
-    days = business_days_ago(d, today) + (0 if is_business_day(today) else 1)
-    return "{}日前（土日祝除く）".format(days)
+    return "{}日前（土日祝除く）".format(elapsed_business_days(d, today))
 
 
 def one_line(text, limit=COMMENT_TEXT_MAX):
@@ -10067,7 +10078,8 @@ def _intro(data):
         data["today"].strftime("%Y/%m/%d"), data["counts"]["active"], data["counts"]["hold"])
 
 
-def _footer():
+def mail_footer():
+    """メールの末尾の文(期限超過通知・定型業務リマインドで共通)。"""
     return "※このメールは{}から送信しています。".format(display_app_name())
 
 
@@ -10081,7 +10093,7 @@ def build_overdue_text(data):
     for section in data["sections"]:
         lines.append(section_heading(section))
         if not section["groups"]:
-            lines.append(OVERDUE_NONE_TEXT)
+            lines.append(MAIL_NONE_TEXT)
         for group in section["groups"]:
             lines.append(group["label"])
             for task in group["tasks"]:
@@ -10093,7 +10105,7 @@ def build_overdue_text(data):
                 lines.append("　{}{}".format(name, task["meta"]))
                 lines.extend("　　" + c for c in (comments or [NO_COMMENT]))
         lines.append("")
-    lines.append(_footer())
+    lines.append(mail_footer())
     return "\n".join(lines)
 
 
@@ -10104,9 +10116,9 @@ def build_overdue_html(data, subject):
         data=data,
         subject=subject,
         intro=_intro(data),
-        footer=_footer(),
+        footer=mail_footer(),
         heading=section_heading,
-        none_text=OVERDUE_NONE_TEXT,
+        none_text=MAIL_NONE_TEXT,
         no_comment=NO_COMMENT,
     )
 
@@ -10152,33 +10164,26 @@ _overdue_send_lock = threading.Lock()
 OVERDUE_JOB = MailJob("期限超過通知", _overdue_send_lock, OVERDUE_SETTINGS, "overdue-send")
 
 
-def build_overdue_mail(today=None):
-    """保存済みの設定(表示するコメント件数)で、今日の時点のメールの内容を作る。"""
-    settings = load_overdue_settings()
-    return build_overdue_content(today or date.today(), settings["comment_count"])
-
-
 def _overdue_summary(mail, send_message):
     """前回の結果に残す短いメッセージ。"""
     parts = [send_message.rstrip("。"),
              "未着手・進行中 {}件／保留 {}件".format(mail["counts"]["active"], mail["counts"]["hold"])]
     if mail["link_problem"]:
-        parts.append("リンクなし（APP_BASE_URL 未設定・不正）")
+        parts.append(LINK_PROBLEM_NOTE)
     return " ／ ".join(parts)
 
 
 def _deliver_overdue(app, trigger, test, today):
     """送信の本体(_overdue_send_lock を持った状態で呼ぶ)。成否にかかわらず「前回の結果」を上書きする。"""
     def body():
-        problem = check_mail_settings(test)
-        if problem:
-            return False, problem
-        mail = build_overdue_mail(today)
-        # 宛先は週報と同じ MAIL_TO・MAIL_CC(テスト送信は差出人だけ)
+        # 保存済みの設定(表示するコメント件数)で今日の時点の内容を作り、週報と同じ MAIL_TO・MAIL_CC に送る
+        # (テスト送信は差出人だけ)
+        settings = load_overdue_settings()
+        mail = build_overdue_content(today or date.today(), settings["comment_count"])
         ok, send_message = send_mail(mail["subject"], mail["text"], html=mail["html"], test=test)
         return ok, _overdue_summary(mail, send_message)
 
-    return OVERDUE_JOB.deliver(app, trigger, body)
+    return OVERDUE_JOB.deliver(app, trigger, body, check_test=test)
 
 
 def run_overdue(app, trigger, test=False, today=None):
@@ -10216,9 +10221,7 @@ def start_overdue_background(app, trigger, test=False):
 # メールの送信サーバー・宛先・リンクの基準URL(APP_BASE_URL)はシステム設定の「基本設定」タブ
 # (instance/settings.json)で変更する(この画面では状況だけを表示する)。
 
-overdue_bp = Blueprint("overdue", __name__, url_prefix="/overdue")
-# 期限超過通知の画面・送信はマネージャーのみ(未ログインはログイン画面へ。2-5)
-overdue_bp.before_request(managers_only)
+overdue_bp = managers_blueprint("overdue", "/overdue")  # マネージャーのみ(2-5)
 
 
 def _preview_document(html):
@@ -10250,37 +10253,24 @@ def overdue_index():
     return _render_overdue(load_overdue_settings())
 
 
-@overdue_bp.route("/settings", methods=["POST"], endpoint="save_settings")
-def overdue_save_settings():
-    """旧URL(設定の保存)。設定はシステム設定に移したため、そちらの保存へ転送する。
-
-    307 で転送するのでフォームの内容はそのまま届き、保存後はシステム設定の「期限超過通知」タブに戻る。
-    """
-    return redirect(url_for("system.save_overdue"), code=307)
+legacy_settings_route(overdue_bp, "overdue")  # 旧URL POST /overdue/settings → システム設定の保存(6-8)
 
 
 @overdue_bp.route("/run", methods=["POST"], endpoint="run_now")
 def overdue_run_now():
     action = request.form.get("action", "")
-    if action == DELIVER_TEST:
-        trigger, label, test = TRIGGER_TEST, "テスト送信", True
-    elif action == DELIVER_SEND:
-        trigger, label, test = TRIGGER_MANUAL, "本番の宛先への送信", False
-    else:
+    if action not in SEND_ACTIONS:
         abort(400)
+    trigger, label = SEND_ACTIONS[action]
 
     # 既定値(コメント件数など)で送らない
     if settings_unreadable(OVERDUE_SETTINGS, "期限超過通知の設定ファイルを読み込めないため、送信できません。{}"):
         return redirect(url_for("overdue.index"))
 
     app = current_app._get_current_object()
-    if not start_overdue_background(app, trigger, test=test):
-        flash(SENDING_BUSY_MESSAGE, "warning")
-        return redirect(url_for("overdue.index"))
-
-    flash("{}を開始しました。結果は「前回の結果」に表示されます"
-          "（画面を再読み込みして確認してください）。".format(label), "info")
-    return redirect(url_for("overdue.index"))
+    return send_started_response(
+        start_overdue_background(app, trigger, test=action == DELIVER_TEST), "overdue.index",
+        "{}を開始しました。結果は「前回の結果」に表示されます（画面を再読み込みして確認してください）。".format(label))
 
 
 # #############################################################################
@@ -10440,9 +10430,6 @@ def skilltest_plan(settings, levels):
 #   parse_skilltest_form(form)       フォームの入力を検証する → (保存する値, エラーメッセージの一覧)
 #   skilltest_with_input(cur, v)     入力エラーで再表示するとき、保存済みの設定に入力中の値を重ねる
 #   skilltest_form_context(settings) フォームの表示に使う値
-
-SKILLTEST_LABEL = "スキルテスト"
-SKILLTEST_SAVED_MESSAGE = "スキルテストの設定を保存しました（受験中・受験済みのテストには影響しません）。"
 
 
 def parse_skilltest_form(form):
@@ -12277,9 +12264,6 @@ def admin_settings():
 #                        チームのまとめの材料が長いときは、詳細な一覧を先に分けて要約してから送る
 # ファイルが無い・読み込めない場合は既定値を使う(読み込めないファイルは上書きしない)。
 
-AI_ANALYSIS_LABEL = "AI分析"
-AI_ANALYSIS_SAVED_MESSAGE = "AI分析の設定を保存しました。"
-
 DUE_SOON_DAYS_MIN, DUE_SOON_DAYS_MAX = 1, 30
 STALE_DAYS_MIN, STALE_DAYS_MAX = 1, 60
 CHUNK_CHARS_MIN, CHUNK_CHARS_MAX = 2000, 100000
@@ -13526,7 +13510,7 @@ def _analysis_date(d, data):
     """推奨アクション・AI に送る候補とチームの材料の日付(分析の基準の日時と同じ年は mm/dd、それ以外は yyyy/mm/dd)。
 
     期限超過のタスク・未完了のタスクのコメントは1年以上前のこともあるため、今年の日付と読まれないよう年を付ける
-    (期限超過通知の _date_label と同じ書き方)。
+    (週報・期限超過通知の _date_label と同じ書き方)。
     """
     return _date_label(d, data.get("now") or _now())
 
@@ -16712,15 +16696,10 @@ def describe_reminder_rule(rule):
 
 
 def elapsed_label(due, today):
-    """実施予定日からの経過(今日なら「本日」、過ぎていれば「N営業日経過」)。
-
-    今日が土日祝のとき(営業日以外にも送る設定・テスト送信・画面)は、期限超過通知の経過日数(7-4 の
-    _age_label)と同じく、直前の営業日とその後の土日祝を「1営業日経過」として数える。
-    """
+    """実施予定日からの経過(今日なら「本日」、過ぎていれば「N営業日経過」。2-4 の elapsed_business_days)。"""
     if due >= today:
         return "本日"
-    days = business_days_ago(due, today) + (0 if is_business_day(today) else 1)
-    return "{}営業日経過".format(days)
+    return "{}営業日経過".format(elapsed_business_days(due, today))
 
 
 # =============================================================================
@@ -17406,10 +17385,6 @@ REMINDER_SETTINGS = JsonSettings(
     keep_auto_slots)
 load_reminder_settings = REMINDER_SETTINGS.load              # 現在の設定(読み込めなければ既定値)
 save_reminder_settings = REMINDER_SETTINGS.save              # 画面で編集した項目を保存する
-set_reminder_last_result = REMINDER_SETTINGS.set_last_result  # 前回の結果を上書きする
-
-REMINDER_LABEL = "定型業務リマインド"
-REMINDER_SAVED_MESSAGE = "定型業務リマインドの設定を保存しました。"
 
 
 def reminder_send_slots(settings):
@@ -17496,23 +17471,20 @@ def next_reminder_run(settings, now):
 
 REMINDER_TODAY_TITLE = "本日実施予定"
 REMINDER_OVERDUE_TITLE = "【リマインド】未完了"
-REMINDER_NONE_TEXT = "該当なし"
 
 
 def routine_path(routine_id, row_key=None):
-    """定型業務の詳細画面のパス(例: /routine/3?r=…)。リクエストの外でも作れるよう URL マップから作る。
-
-    row_key を付けると、その業務が削除された後に同じIDが別の業務に使われても、リンクは別の業務を開かずに 404 になる。
-    """
+    """定型業務の詳細画面のパス(例: /routine/3?r=…。7-4 の app_path)。row_key を付けると、その業務が削除された後に
+    同じIDが別の業務に使われても、リンクは別の業務を開かずに 404 になる。"""
     values = {"routine_id": routine_id}
     if row_key:
         values["r"] = row_key
-    return current_app.url_map.bind("localhost").build("routine.detail", values)
+    return app_path("routine.detail", values)
 
 
 def occurrence_path(occ_id, row_key):
     """実施予定日1回分の画面(完了の入力)のパス(例: /routine/occurrences/5?o=…)。"""
-    return current_app.url_map.bind("localhost").build("routine.occurrence", {"occ_id": occ_id, "o": row_key})
+    return app_path("routine.occurrence", {"occ_id": occ_id, "o": row_key})
 
 
 def _due_label(d):
@@ -17556,11 +17528,11 @@ def _reminder_mail(address, name, items, now, base, note=""):
                   if base else
                   "実施したら、このアプリの定型・定期業務の画面で「完了」を入力してください（入力すると、その回のリマインドは止まります）。"),
         "note": note,
-        "footer": "※このメールは{}から送信しています。".format(display_app_name()),
+        "footer": mail_footer(),
     }
     mail["text"] = build_reminder_text(mail)
     mail["html"] = render_template("routine/reminder_mail.html", mail=mail, today_title=REMINDER_TODAY_TITLE,
-                                   overdue_title=REMINDER_OVERDUE_TITLE, none_text=REMINDER_NONE_TEXT)
+                                   overdue_title=REMINDER_OVERDUE_TITLE, none_text=MAIL_NONE_TEXT)
     return mail
 
 
@@ -17575,7 +17547,7 @@ def build_reminder_text(mail):
     for title, items in ((REMINDER_TODAY_TITLE, mail["today_items"]), (REMINDER_OVERDUE_TITLE, mail["overdue_items"])):
         lines.append("■{}（{}件）".format(title, len(items)))
         if not items:
-            lines.append(REMINDER_NONE_TEXT)
+            lines.append(MAIL_NONE_TEXT)
         for item in items:
             if item["is_today"]:
                 lines.append("・{}（担当: {}）".format(item["name"], item["assignee"]))
@@ -17710,7 +17682,7 @@ def _send_reminder_mails(data):
         parts.append("送れない宛先: " + "、".join(
             "{}（{}・{}・{}件）".format(p["name"], p["kind"], p["reason"], p["count"]) for p in data["problems"]))
     if data["link_problem"]:
-        parts.append("リンクなし（APP_BASE_URL 未設定・不正）")
+        parts.append(LINK_PROBLEM_NOTE)
     if failures:
         parts.append("失敗: " + "、".join(failures))
     ok = not failures and sent > 0
@@ -17749,30 +17721,25 @@ def try_run_routine_reminders(app, trigger, now=None, test=False):
     return REMINDER_JOB.try_run(lambda: _deliver_reminders(app, trigger, now, test))
 
 
-def reminder_status_context(app):
-    """システム設定の「定型業務リマインド」タブの状況の表示(次回の送信・前回の結果・注意・プレビュー)。"""
+def reminder_status_context():
+    """システム設定の「定型業務リマインド」タブの状況の表示(次回の送信・前回の結果・注意・プレビュー。6-8 の
+    mail_feature_context に加えて、送れない宛先・宛先ごとのプレビュー・テスト送信の1通)。"""
     settings = load_reminder_settings()
     now = _now()
     refresh_occurrences_for_page(now.date())
     data = collect_reminder_mails(now.date(), now)
     upcoming = next_reminder_run(settings, datetime.now())
     test_mail = build_reminder_test_mail(data)
-    return {
-        "settings": settings,
-        "upcoming": upcoming,
-        "scheduler_stopped": upcoming is not None and scheduler_is_stopped(app),
-        "weekday_labels": WEEKDAY_LABELS,
-        "last": settings["last_result"],
-        "mail_problem": check_mail_settings(test=True),
-        "link_problem": data["link_problem"],
-        "data": data,
-        "previews": [dict(mail, document=_preview_document(mail["html"])) for mail in data["mails"]],
-        "test_mail": dict(test_mail, document=_preview_document(test_mail["html"])),
-        "address_problems": reminder_address_problems(),
-        "emails_pending_reason": REMINDER_EMAILS_PENDING,
-        "enabled_count": RoutineReminder.query.filter(RoutineReminder.enabled.is_(True)).count(),
-        "sending": REMINDER_JOB.is_sending(),
-    }
+    return dict(
+        mail_feature_context(REMINDER_JOB, settings, upcoming, test_only=True),
+        link_problem=data["link_problem"],
+        data=data,
+        previews=[dict(mail, document=_preview_document(mail["html"])) for mail in data["mails"]],
+        test_mail=dict(test_mail, document=_preview_document(test_mail["html"])),
+        address_problems=reminder_address_problems(),
+        emails_pending_reason=REMINDER_EMAILS_PENDING,
+        enabled_count=RoutineReminder.query.filter(RoutineReminder.enabled.is_(True)).count(),
+    )
 
 
 # =============================================================================
@@ -18992,7 +18959,7 @@ def config_form_context(app, state=None, errors=None):
 # タブごとに別のフォーム・保存ボタンを持ち、保存後は同じタブに戻る(?tab= で開くタブを指定)。
 # 入力に誤りがあれば何も保存せず、入力中の内容(秘密の値は除く)を残して同じタブを再表示する。
 
-system_bp = Blueprint("system", __name__, url_prefix="/system")
+system_bp = managers_blueprint("system", "/system")  # マネージャーのみ(2-5)
 
 TAB_CONFIG = "config"
 TAB_WEEKLY = "weekly"
@@ -19015,48 +18982,30 @@ TAB_KEYS = tuple(key for key, _label, _icon in TABS)
 # 機能ごとの設定(画面のJSONファイル)の扱い方
 #   label         : ログに出す機能の名前
 #   saved_message : 保存したときのメッセージ
-#   load / save   : 設定の読み込み・保存
+#   store         : 設定ファイル(2-3 の JsonSettings。読み込み・保存・読み込めないときの表示)
 #   parse         : フォームの入力の検証 → (保存する値, エラーメッセージの一覧)
 #   with_input    : 入力エラーで再表示するとき、保存済みの設定に入力中の値を重ねる
 #   context       : フォームの表示に使う値
-SettingsFeature = namedtuple(
-    "SettingsFeature", "label saved_message load save parse with_input context")
+#   file_note     : 設定ファイルが読み込めないあいだの動き(タブに表示する)
+SettingsFeature = namedtuple("SettingsFeature", "label saved_message store parse with_input context file_note")
 
 # タブ → 機能ごとの設定
 FEATURES = {
     TAB_WEEKLY: SettingsFeature(
-        WEEKLY_LABEL, WEEKLY_SAVED_MESSAGE, load_weekly_settings, save_weekly_settings,
-        parse_weekly_form, settings_with_input, weekly_form_context),
+        "週報", "週報の設定を保存しました。", WEEKLY_SETTINGS, parse_weekly_form, settings_with_input,
+        weekly_form_context, "週報は自動送信されず、週報の画面から作成・送信もできません"),
     TAB_OVERDUE: SettingsFeature(
-        OVERDUE_LABEL, OVERDUE_SAVED_MESSAGE, load_overdue_settings, save_overdue_settings,
-        parse_overdue_form, settings_with_input, overdue_form_context),
+        "期限超過通知", "期限超過通知の設定を保存しました。", OVERDUE_SETTINGS, parse_overdue_form, settings_with_input,
+        overdue_form_context, "期限超過通知は自動送信されず、期限超過通知の画面から送信もできません"),
     TAB_SKILLTEST: SettingsFeature(
-        SKILLTEST_LABEL, SKILLTEST_SAVED_MESSAGE, load_skilltest_settings,
-        save_skilltest_settings, parse_skilltest_form, skilltest_with_input,
-        skilltest_form_context),
+        "スキルテスト", "スキルテストの設定を保存しました（受験中・受験済みのテストには影響しません）。", SKILLTEST_SETTINGS,
+        parse_skilltest_form, skilltest_with_input, skilltest_form_context, "スキルテストは既定値の設定で動きます"),
     TAB_ANALYSIS: SettingsFeature(
-        AI_ANALYSIS_LABEL, AI_ANALYSIS_SAVED_MESSAGE, load_ai_analysis_settings,
-        save_ai_analysis_settings, parse_ai_analysis_form, settings_with_input,
-        ai_analysis_form_context),
+        "AI分析", "AI分析の設定を保存しました。", AI_ANALYSIS_SETTINGS, parse_ai_analysis_form, settings_with_input,
+        ai_analysis_form_context, "AI分析は既定値の設定で動きます"),
     TAB_REMINDER: SettingsFeature(
-        REMINDER_LABEL, REMINDER_SAVED_MESSAGE, load_reminder_settings, save_reminder_settings,
-        parse_reminder_settings_form, settings_with_input, reminder_settings_form_context),
-}
-
-# タブ → 設定ファイル(読み込めないときの表示に使う)と、読み込めないあいだの動き
-SETTINGS_STORES = {
-    TAB_WEEKLY: WEEKLY_SETTINGS,
-    TAB_OVERDUE: OVERDUE_SETTINGS,
-    TAB_SKILLTEST: SKILLTEST_SETTINGS,
-    TAB_ANALYSIS: AI_ANALYSIS_SETTINGS,
-    TAB_REMINDER: REMINDER_SETTINGS,
-}
-SETTINGS_FILE_ERROR_NOTES = {
-    TAB_WEEKLY: "週報は自動送信されず、週報の画面から作成・送信もできません",
-    TAB_OVERDUE: "期限超過通知は自動送信されず、期限超過通知の画面から送信もできません",
-    TAB_SKILLTEST: "スキルテストは既定値の設定で動きます",
-    TAB_ANALYSIS: "AI分析は既定値の設定で動きます",
-    TAB_REMINDER: "定型業務リマインドは自動送信されず、テスト送信もできません",
+        "定型業務リマインド", "定型業務リマインドの設定を保存しました。", REMINDER_SETTINGS, parse_reminder_settings_form,
+        settings_with_input, reminder_settings_form_context, "定型業務リマインドは自動送信されず、テスト送信もできません"),
 }
 
 # AI接続テストで送る問い合わせ(短く、応答も短くなるもの)
@@ -19064,9 +19013,6 @@ AI_TEST_MESSAGES = [
     {"role": "user", "content": "接続テストです。「OK」とだけ返してください。"},
 ]
 AI_REPLY_MAX = 80
-
-# システム設定はマネージャーのみ(未ログインはログイン画面へ。2-5)
-system_bp.before_request(managers_only)
 
 
 def _tab_url(tab):
@@ -19087,16 +19033,16 @@ def _render_system_settings(tab, status=200, config_state=None, config_errors=No
     versions = versions or {}
     contexts = {}
     for key, feature in FEATURES.items():
-        saved = feature.load()
+        saved = feature.store.load()
         settings = inputs[key] if key in inputs else saved
         contexts[key] = feature.context(settings)
-        contexts[key]["version"] = versions.get(key) or SETTINGS_STORES[key].version(saved)
+        contexts[key]["version"] = versions.get(key) or feature.store.version(saved)
         if key in inputs:
             # 入力中の値で再表示するとき、「保存済みの設定」の表示には保存済みの値を使う
-            contexts[key]["saved"] = feature.context(feature.load())
+            contexts[key]["saved"] = feature.context(feature.store.load())
         # 設定ファイルが壊れている(読み込めない)ときは、タブにその旨を出す(表示は既定値。保存はできない)
-        contexts[key]["file_error"] = SETTINGS_STORES[key].load_error()
-        contexts[key]["file_error_note"] = SETTINGS_FILE_ERROR_NOTES[key]
+        contexts[key]["file_error"] = feature.store.load_error()
+        contexts[key]["file_error_note"] = feature.file_note
     return render_template(
         "system/settings.html",
         tab=tab,
@@ -19108,7 +19054,7 @@ def _render_system_settings(tab, status=200, config_state=None, config_errors=No
         an=contexts[TAB_ANALYSIS],
         rm=contexts[TAB_REMINDER],
         # 定型業務リマインドの状況(次回の送信・前回の結果・送れない宛先・プレビュー)
-        rm_status=reminder_status_context(app),
+        rm_status=reminder_status_context(),
     ), status
 
 
@@ -19221,14 +19167,14 @@ _SETTINGS_EDITED_ELSEWHERE = ("画面を開いた後に、ほかの操作（別�
 
 
 def _save_feature(tab):
-    """機能の設定を保存する(入力チェックは FEATURES の各機能の関数、保存先は SETTINGS_STORES)。
+    """機能の設定を保存する(入力チェック・保存先は FEATURES の各機能の parse・store)。
 
     画面を開いた後にほかの操作(別のタブ・別のマネージャー)で変わった設定を、古い画面の値で上書きしない
     (フォームの hidden の version。JsonSettings.save_checked)。重なったときは保存せず、変わった項目を
     今の設定にし、ほかの項目は入力中の値のまま再表示する(その画面からもう一度保存できる)。
     """
     feature = FEATURES[tab]
-    store = SETTINGS_STORES[tab]
+    store = feature.store
     sent_version = request.form.get("version")
     values, errors = feature.parse(request.form)
     if errors:
@@ -19236,7 +19182,7 @@ def _save_feature(tab):
             flash(message, "danger")
         # 入力中の内容を残したまま再表示する(保存はしない。控えは開いたときのまま)
         return _render_system_settings(tab, status=400,
-                                       inputs={tab: feature.with_input(feature.load(), values)},
+                                       inputs={tab: feature.with_input(store.load(), values)},
                                        versions={tab: sent_version})
     try:
         saved, changed = store.save_checked(values, sent_version)
@@ -19244,11 +19190,11 @@ def _save_feature(tab):
         current_app.logger.exception("%sの設定を保存できませんでした", feature.label)
         flash("設定を保存できませんでした: {}".format(exc), "danger")
         return _render_system_settings(tab, status=500,
-                                       inputs={tab: feature.with_input(feature.load(), values)},
+                                       inputs={tab: feature.with_input(store.load(), values)},
                                        versions={tab: sent_version})
     if saved is None:
         flash(_SETTINGS_EDITED_ELSEWHERE.format(feature.label), "warning")
-        current = feature.load()
+        current = store.load()
         kept = {key: value for key, value in values.items() if key not in changed}
         return _render_system_settings(tab, status=409,
                                        inputs={tab: feature.with_input(copy.deepcopy(current), kept)},
@@ -19257,29 +19203,9 @@ def _save_feature(tab):
     return redirect(_tab_url(tab))
 
 
-@system_bp.route("/settings/weekly", methods=["POST"])
-def save_weekly():
-    return _save_feature(TAB_WEEKLY)
-
-
-@system_bp.route("/settings/overdue", methods=["POST"])
-def save_overdue():
-    return _save_feature(TAB_OVERDUE)
-
-
-@system_bp.route("/settings/skilltest", methods=["POST"])
-def save_skilltest():
-    return _save_feature(TAB_SKILLTEST)
-
-
-@system_bp.route("/settings/analysis", methods=["POST"])
-def save_analysis():
-    return _save_feature(TAB_ANALYSIS)
-
-
-@system_bp.route("/settings/reminder", methods=["POST"])
-def save_reminder():
-    return _save_feature(TAB_REMINDER)
+# POST /system/settings/<タブ>(エンドポイント system.save_<タブ>)で、そのタブの設定を保存する
+for _tab in FEATURES:
+    system_bp.add_url_rule("/settings/" + _tab, "save_" + _tab, partial(_save_feature, _tab), methods=["POST"])
 
 
 @system_bp.route("/settings/reminder/test", methods=["POST"])
@@ -19350,32 +19276,20 @@ CHECK_INTERVAL = 30  # 秒
 Job = namedtuple("Job", "name label load_settings due_key run record_failure claim_run")
 
 
-# --------------------------------------------------------------------------- #
-# 週報
-# --------------------------------------------------------------------------- #
-def _weekly_due_key(settings, now):
-    """今が週報の実行時刻なら (日付, "HH:MM") を返す。そうでなければ None。"""
-    if not settings["enabled"]:
-        return None
-    if now.weekday() != settings["weekday"] or now.strftime("%H:%M") != settings["time"]:
-        return None
-    return (now.date(), settings["time"])
-
-
 def _weekly_run(app, settings, now):
     start, end = period_for(now.date(), settings["period_rule"])
     return run_weekly(app, start, end, TRIGGER_AUTO, DELIVER_SEND, send_date=now.date())["ok"]
 
 
 JOBS = (
-    Job("weekly", "週報", load_weekly_settings, _weekly_due_key, _weekly_run,
-        lambda message: set_weekly_last_result(TRIGGER_AUTO, False, message), WEEKLY_SETTINGS.claim_auto_run),
+    Job("weekly", "週報", load_weekly_settings, weekly_due_key, _weekly_run,
+        partial(WEEKLY_SETTINGS.set_last_result, TRIGGER_AUTO, False), WEEKLY_SETTINGS.claim_auto_run),
     Job("overdue", "期限超過通知", load_overdue_settings, overdue_due_key,
         lambda app, settings, now: run_overdue(app, TRIGGER_AUTO, test=False, today=now.date())["ok"],
-        lambda message: set_overdue_last_result(TRIGGER_AUTO, False, message), OVERDUE_SETTINGS.claim_auto_run),
+        partial(OVERDUE_SETTINGS.set_last_result, TRIGGER_AUTO, False), OVERDUE_SETTINGS.claim_auto_run),
     Job("reminder", "定型業務リマインド", load_reminder_settings, reminder_due_key,
         lambda app, settings, now: run_routine_reminders(app, TRIGGER_AUTO, now=now)["ok"],
-        lambda message: set_reminder_last_result(TRIGGER_AUTO, False, message), REMINDER_SETTINGS.claim_auto_slot),
+        partial(REMINDER_SETTINGS.set_last_result, TRIGGER_AUTO, False), REMINDER_SETTINGS.claim_auto_slot),
 )
 
 _scheduler_start_lock = threading.Lock()
