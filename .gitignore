@@ -6,7 +6,9 @@ __pycache__/
 venv/
 env/
 
-# Flask instance (SQLiteデータベース・設定ファイル config.py・画面で編集する設定 *.json・自動送信のロック scheduler.lock などを格納)
+# Flask instance (SQLiteデータベース app.db・画面で設定した値 settings.json・画面で編集する設定 *.json・
+# 自動送信のロック scheduler.lock・SECRET_KEY の生成のロック settings.lock・旧版の設定ファイル config.py などを格納)。
+# ※プロジェクト直下の config.py(環境ごとの設定の初期値)は Git で管理する(実際のパスワード・キーは書かない)
 instance/
 
 # 旧バージョンのローカル設定ファイル(アプリは使わない。flask コマンドは python-dotenv があると自動で読み込むため、

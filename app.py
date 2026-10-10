@@ -3,28 +3,29 @@
 Python のコードはすべてこの app.py にまとめている。ほかのファイル:
   templates.html   画面テンプレート(Jinja2)・CSS・JavaScript(セクションごとに区切って1ファイル)
   ldap_client.py   LDAP認証(本番環境ごとに差し替えるファイル)
-  instance/        DB(app.db)・環境ごとの設定(config.py)・画面で編集する設定(*.json)。Git管理外。
-                   config.py が無ければ初回の起動時に自動作成する
+  config.py        環境ごとの設定の初期値(Git管理下。公開リポジトリのため実際のパスワード・キーは書かず、
+                   サーバーの上でだけ書き換えるか、システム設定の画面で設定する)
+  instance/        DB(app.db)・画面で設定した値(settings.json)・画面で編集する設定(*.json)。Git管理外
 
 起動(サーバー。定期メール〔週報・期限超過通知・定型業務リマインド〕の自動送信もこのときだけ行う):
   flask --app app run --port 8050                  このPCだけで使う
   flask --app app run --host 0.0.0.0 --port 8050   同じネットワーク(LAN)の他のPCからも使う
 開発・動作確認(自分のPCだけ。.py を変更すると自動で再起動する。自動送信は1つのプロセスだけが行う):
-  flask --app app run --port 8050 --debug --exclude-patterns "*/instance/*"
-  (--exclude-patterns を付けないと、システム設定の画面で instance/config.py を保存するたびに再起動する)
+  flask --app app run --port 8050 --debug
 コマンド:
   flask --app app seed                             初期データ(ダミーユーザー・サンプル)の投入
   flask --app app migrate [--check] [--db パス]     既存DBを最新のモデル定義に合わせる
+  flask --app app import-old-config [--path パス]   旧版の instance/config.py の値を instance/settings.json に取り込む
 
 動作確認で差し替える関数(呼び出すたびにこのモジュールから探すので、app._now = ... で差し替えられる):
   _now()            スキルテストの時刻・AI分析の基準の日時・定型業務のリマインドの今日(2-2)
-  _call_chat_api()  AI(ChatGPT互換API)の呼び出し(4-1。独自APIへの移行もここだけを書き換える)
+  _call_chat_api()  AI(ChatGPT互換API)の呼び出し(4-1。別の仕様のAPIへの移行もここだけを書き換える)
 
 目次(章は「# ####」、節は「# ====」の見出しで始まる):
-  1. 設定(既定値・instance/config.py)
-      1-1. 設定の既定値(Config)
-      1-2. instance/config.py の見本(自動作成に使う)
-      1-3. instance/config.py の自動作成・読み込み・画面からの更新
+  1. 設定(config.py の初期値・instance/settings.json の画面の設定)
+      1-1. 固定設定と環境ごとの設定の項目(Config)
+      1-2. 初期値(config.py)の読み込み
+      1-3. 画面で設定した値(instance/settings.json)の読み書きと、有効な値
   2. 共通の部品
       2-1. Flask 拡張(DB・ログイン管理)
       2-2. 小さなヘルパー関数
@@ -106,13 +107,12 @@ Python のコードはすべてこの app.py にまとめている。ほかの�
   13. アプリの組み立て
       13-1. 画面テンプレート・静的ファイル(templates.html)
       13-2. create_app(アプリの作成)
-  14. flask コマンド(seed / migrate)
+  14. flask コマンド(seed / migrate / import-old-config)
       14-1. seed: 初期データの投入
       14-2. migrate: 既存DBを最新のモデル定義に合わせる
+      14-3. import-old-config: 旧版の instance/config.py の取り込み
 """
-import ast
 import calendar
-import codecs
 import copy
 import hashlib
 import hmac
@@ -121,15 +121,12 @@ import json
 import logging
 import math
 import os
-import pathlib
 import posixpath
 import random
 import re
 import secrets
-import shutil
 import smtplib
 import socket
-import sqlite3
 import statistics
 import sys
 import tempfile
@@ -200,24 +197,26 @@ from werkzeug.routing import IntegerConverter, RequestRedirect
 
 
 # #############################################################################
-# 1. 設定(既定値・instance/config.py)
+# 1. 設定(config.py の初期値・instance/settings.json の画面の設定)
 # #############################################################################
+# 環境ごとの設定(秘密鍵・管理者パスワード・LDAP/AI/メールの接続先など)は、2つの層から決まる:
+#   初期値    : app.py と同じフォルダの config.py(Git管理下。リポジトリに同梱。1-2)
+#   画面の設定: instance/settings.json(システム設定の「基本設定」タブで保存した値。Git管理外。1-3)
+# 有効な値 = settings.json にその項目があればその値(空でも)、無ければ config.py の値。
+# コードの中には既定値を持たない(「入力が無ければ○○を使う」はしない)。config.py にも settings.json にも
+# 無い・空の項目は「未設定」として扱う(AI は使えない・メールは送れない などの案内を出し、外部へは接続しない)。
+# 旧版の instance/config.py は読まない(flask --app app import-old-config で settings.json に取り込める。14-3)。
 
 
 # =============================================================================
-# 1-1. 設定の既定値(Config)
+# 1-1. 固定設定と環境ごとの設定の項目(Config)
 # =============================================================================
-# このクラスには、アプリ固有の固定設定と、環境ごとに変わる設定の「既定値(空・中立の値)」だけを
-# 置く。ここに実際のパスワードやキーは書かない。
+# このクラスには、アプリ固有の固定設定(FixedConfig)と、環境ごとに変わる設定の「項目」だけを置く。
+# ここに実際のパスワードやキー、既定値は書かない。
 #
-# 実際の値(秘密鍵・管理者パスワード・LDAP/AI/メールの接続先など)は instance/config.py に記入する。
-# instance/config.py はDB(instance/app.db)と同じフォルダにあり、Git管理外。無ければ初回起動時に
-# 下の見本(CONFIG_TEMPLATE)をもとに自動作成される(ensure_instance_config)。
-#
-# create_app() はこのクラスの値を読み込んだあと、instance/config.py の値で上書きする。
-# instance/config.py に書かれていない項目は、ここの既定値が使われる。
-# 環境ごとの設定の項目を追加したら、見本(CONFIG_TEMPLATE)と、システム設定の画面の項目の定義
-# (FIELDS)にも追加すること(定義の無い項目は画面の「その他」に読み取り専用で表示される)。
+# 実際の値は config.py(初期値)と instance/settings.json(画面の設定)から読む(load_config_layers。1-3)。
+# 環境ごとの設定の項目を追加したら、ENV_KEYS・Config・config.py・システム設定の画面の項目の定義(FIELDS。11-1)に
+# 追加すること(FIELDS に定義の無い config.py の項目は、画面の「その他」に読み取り専用で表示される)。
 class FixedConfig:
     """アプリ固有の固定設定(環境によらず共通)。"""
 
@@ -238,351 +237,63 @@ class FixedConfig:
     MAX_CONTENT_LENGTH = 1_000_000
 
 
+# 環境ごとの設定の項目(キー)。システム設定の画面の項目の定義(FIELDS。11-1)と同じ並び
+ENV_KEYS = (
+    "SECRET_KEY", "ADMIN_PASSWORD",
+    "LDAP_API_URL",
+    "AI_API_URL", "AI_API_KEY", "AI_MODEL", "AI_TIMEOUT",
+    "MAIL_SMTP_SERVER", "MAIL_SMTP_PORT", "MAIL_FROM", "MAIL_TO", "MAIL_CC",
+    "APP_BASE_URL",
+)
+
+
 class Config(FixedConfig):
-    """環境ごとの設定(既定値)。実際の値は instance/config.py で上書きする。"""
+    """環境ごとの設定の項目(値の置き場ではない)。
 
-    # セッション暗号化に使う秘密鍵。
-    # 空のままなら起動のたびにランダムな鍵を生成する(再起動するとログアウトされる)。
+    ここにあるのは、項目が無いときに「未設定」と読めるための空の値(""・None・[])だけで、既定値ではない。
+    実際の値は config.py(初期値)と instance/settings.json(画面の設定)から読む(1-2・1-3)。
+    """
+
+    # セッション暗号化に使う秘密鍵(どちらの層にも無ければ、起動時に1回だけ生成して settings.json に保存する)
     SECRET_KEY = ""
-
-    # 固定ローカル管理者(admin)のパスワード。空なら admin の確認は ldap_client.py の authenticate() に任せる
-    # (同梱の ldap_client.py には admin 用の既定の固定パスワードがあり、それでログインできるようになる)。
+    # 固定ローカル管理者(admin)のパスワード(空なら admin の確認は ldap_client.py の authenticate() に任せる)
     ADMIN_PASSWORD = ""
-
-    # LDAP-API のエンドポイント(本番のLDAP認証APIに差し替える際に使用)。
+    # LDAP-API のエンドポイント
     LDAP_API_URL = ""
-
-    # ChatGPT(OpenAI互換)API(週報の文章整形・スキルテストの問題作成・スキルの説明の下書き・AI分析)。
-    # URLとキーがどちらも空ならAIは使わない。
-    AI_API_URL = ""            # 空なら OpenAI公式のエンドポイントを使う
-    AI_API_KEY = ""            # APIキー(キー不要の独自APIなら空のまま)
-    AI_MODEL = "gpt-4o-mini"   # 使用するモデル名
-    AI_TIMEOUT = 60            # タイムアウト(秒)
-
-    # メール送信(SMTP。暗号化・認証なしで送る)。送信サーバーが空ならメール送信は行えない。
-    # 週報・期限超過通知は MAIL_TO / MAIL_CC 宛て、定型業務リマインドは担当者と業務ごとの追加の宛先、
-    # テスト送信は差出人 MAIL_FROM 宛てに送る。
-    MAIL_SMTP_SERVER = ""      # 送信サーバー(ホスト名またはIPアドレス)
-    MAIL_SMTP_PORT = 25        # ポート番号
-    MAIL_FROM = ""             # 差出人アドレス(テスト送信の宛先にも使う)
-    MAIL_TO = []               # 宛先(To)のアドレス一覧
-    MAIL_CC = []               # 宛先(Cc)のアドレス一覧
-
-    # メールに載せるリンクの基準URL(期限超過通知・定型業務リマインド。他のPCからこのアプリを開くときのURL。
-    # 末尾の / は不要)。空ならメールにリンクを付けない(タスク名・業務名だけ)。
+    # ChatGPT互換(OpenAI互換の形式)API。接続先(AI_API_URL)とモデル名(AI_MODEL)の両方が無ければ AI は使わない
+    AI_API_URL = ""
+    AI_API_KEY = ""
+    AI_MODEL = ""
+    AI_TIMEOUT = None
+    # メール送信(SMTP)。送信サーバー・ポート番号・差出人が無ければメールは送れない
+    MAIL_SMTP_SERVER = ""
+    MAIL_SMTP_PORT = None
+    MAIL_FROM = ""
+    MAIL_TO = []
+    MAIL_CC = []
+    # メールに載せるリンクの基準URL
     APP_BASE_URL = ""
 
 
 # =============================================================================
-# 1-2. instance/config.py の見本(自動作成に使う)
+# 1-2. 初期値(config.py)の読み込み
 # =============================================================================
-# instance/config.py が無い状態で起動すると、この内容で作成する(ensure_instance_config)。
-# そのとき SECRET_KEY と ADMIN_PASSWORD にはランダムな値を入れる。
-# ここ(Git管理下)には実際のパスワード・キー・アドレスを書かないこと。
-CONFIG_TEMPLATE = '''\
-# =============================================================================
-# 業務管理システム 環境ごとの設定ファイル
-#
-# ・実際に使われるのは instance/config.py (DBと同じフォルダ。Git管理外)です。
-# ・instance/config.py が無い状態で起動すると、app.py の見本(CONFIG_TEMPLATE)をもとに
-#   自動作成されます。そのとき SECRET_KEY と ADMIN_PASSWORD にはランダムな値が自動で入ります。
-#   (既にある instance/config.py が上書きされることはありません)
-# ・値を変更したら、サーバーを再起動すると反映されます。
-# ・マネージャーは画面（システム設定の「基本設定」タブ）からも変更できます。
-#   画面で保存すると、変更した項目の行だけが書き換わり、変更前の内容は config.py.bak に残ります
-#   （SECRET_KEY 以外は、保存するとすぐに反映されます）。
-# ・ここに書かれていない項目は app.py の既定値(Config)が使われます。
-# ・書式は Python です。文字列は "..." で囲み、アドレスの一覧は [...] で書きます。
-# =============================================================================
+# app.py と同じフォルダの config.py(Git管理下。リポジトリに同梱)が、環境ごとの設定の初期値。
+# 起動(flask --app app run)・seed / migrate の開始時に読み、無い・読めないときは止める(ConfigLoadError。
+# コードの中の値で動かすことはしない)。アプリがこのファイルを書き換えることは無い。
+# 公開リポジトリのため、実際のパスワード・キー・アドレスはコミットしない(サーバーの上でだけ書き換えるか、
+# システム設定の画面で設定する)。
 
-# -----------------------------------------------------------------------------
-# セキュリティ
-# -----------------------------------------------------------------------------
-# セッション暗号化に使う秘密鍵(長いランダムな文字列)。
-# 自動作成時にランダムな値が入ります。変更すると全員がログアウトされます。
-# 空のままだと起動のたびに一時的な鍵が使われます(再起動でログアウト)。
-SECRET_KEY = ""
-
-# 固定ローカル管理者(ID: admin)のパスワード。
-# 自動作成時にランダムな値が入ります。必要に応じて変更してください。
-# 空にすると、admin のログイン可否は ldap_client.py の authenticate() に任されます
-# (同梱の ldap_client.py では、admin 用の既定の固定パスワードでログインできるようになります)。
-ADMIN_PASSWORD = ""
-
-# -----------------------------------------------------------------------------
-# LDAP認証
-# -----------------------------------------------------------------------------
-# LDAP認証APIのエンドポイント(本番でLDAPに接続する場合に記入)。
-# 例: "https://auth.example.com/ldap/auth"
-LDAP_API_URL = ""
-
-# -----------------------------------------------------------------------------
-# ChatGPT(OpenAI互換)API  ※週報の文章整形・スキルテストの問題作成・スキルの説明の下書き・AI分析に使用
-# -----------------------------------------------------------------------------
-# AI分析では、メンバーの名前・タスクの内容・すべての進捗の記載(コメント)をこの接続先に送ります。
-# AI_API_URL と AI_API_KEY がどちらも空なら、AIは使いません(週報はルールベースで作成、
-# スキルテストは問題プールにある問題だけで出題、スキルの説明の「AIで下書き」は使えず、
-# AI分析はアプリの集計とルールの推奨アクションだけ)。
-# ・OpenAI公式を使う場合      : AI_API_KEY にAPIキーを記入(AI_API_URL は空でよい)
-# ・OpenAI互換の独自APIの場合 : AI_API_URL にエンドポイントを記入
-#                               (キーが不要なら AI_API_KEY は空のままでよい)
-# 例: AI_API_URL = "https://api.example.com/v1/chat/completions"
-AI_API_URL = ""
-AI_API_KEY = ""
-# 使用するモデル名(独自APIの場合は利用可能なモデル名に変更)
-AI_MODEL = "gpt-4o-mini"
-# 応答待ちのタイムアウト(秒)
-AI_TIMEOUT = 60
-
-# -----------------------------------------------------------------------------
-# メール送信(SMTP)  ※週報・期限超過通知・定型業務リマインドの送信に使用
-# -----------------------------------------------------------------------------
-# 送信は暗号化(STARTTLS)・認証(ログイン)なしで行います。
-# 認証なしで送信できる送信サーバー(中継サーバーなど)を指定してください。
-# 送信サーバー(ホスト名またはIPアドレス)。空ならメール送信は行えません。
-# 例: MAIL_SMTP_SERVER = "smtp.example.com"
-MAIL_SMTP_SERVER = ""
-# ポート番号(一般的には 25。送信サーバーの指定に合わせる)
-MAIL_SMTP_PORT = 25
-# 差出人アドレス(テスト送信・メール接続テストは、このアドレス宛てに送ります)
-# 例: MAIL_FROM = "noreply@example.com"
-MAIL_FROM = ""
-# 宛先(To)・同報(Cc)のアドレス一覧(週報・期限超過通知の両方に使います。
-# 定型業務リマインドは担当者のメールアドレスと、業務ごとの追加の宛先に送ります)
-# 例: MAIL_TO = ["manager@example.com", "team@example.com"]
-MAIL_TO = []
-MAIL_CC = []
-
-# -----------------------------------------------------------------------------
-# メールのリンク  ※期限超過通知・定型業務リマインドに使用
-# -----------------------------------------------------------------------------
-# メールに載せるタスク・定型業務へのリンクの基準URL
-# (メンバーのPCからこのアプリを開くときのURL。末尾の / は不要)。
-# 空ならメールにはリンクを付けず、タスク名・業務名だけを載せます。
-# 例: APP_BASE_URL = "http://192.0.2.10:8050"
-APP_BASE_URL = ""
-'''
+INITIAL_CONFIG_FILENAME = "config.py"
+INITIAL_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), INITIAL_CONFIG_FILENAME)
 
 
-# =============================================================================
-# 1-3. instance/config.py の自動作成・読み込み・画面からの更新
-# =============================================================================
-# 環境ごとの設定ファイル(instance/config.py)の自動作成・読み込み・画面からの更新。
-#
-# 環境によって変わる値(秘密鍵・管理者パスワード・LDAP/AI/メールの接続先など)は、
-# すべて instance/config.py の1か所にまとめる。instance/ はDB(app.db)と同じ
-# フォルダで Git管理外のため、パスワードやキーがリポジトリに入ることはない。
-#
-# ■ 自動作成(ensure_instance_config)
-# prepare_instance()(アプリの起動時・seed / migrate コマンド)は ensure_instance_config() を呼ぶ。
-#   - instance/config.py が既にあれば何もしない(決して上書きしない)
-#   - 無ければ、見本(CONFIG_TEMPLATE)をもとに作成する(一時ファイルに全部書いてから名前を付ける。
-#     作成できなければ起動・コマンドを止める〔既定値のまま動かさない〕)
-#       ・SECRET_KEY     : ランダムな値(secrets.token_hex(32))
-#       ・ADMIN_PASSWORD : ランダムな値(secrets.token_urlsafe(12))。導入先ごとに異なる
-#       ・AI_API_URL / AI_API_KEY / AI_MODEL :
-#           旧「AI接続設定」画面で保存した値がDBに残っていれば、1回だけ引き継ぐ
-#           (DBは読み取り専用で開き、一切書き込まない。失敗したら引き継がない)
-# 作成時はファイルの場所だけを1行表示する(パスワードやキーの値は表示しない)。
-#
-# ■ 読み込み(read_config)
-# ファイルを Flask の from_pyfile と同じ方法で評価し、大文字の名前の値を返す。
-#
-# ■ 画面からの更新(update_config。システム設定の「基本設定」タブで使う)
-#   1. 変更する項目の `KEY = ...` の値の部分だけを置き換える(無い項目は末尾に追記)。
-#      コメント・知らない項目・書式(改行コードを含む)はそのまま残す(値の部分は全体を書き直すため、
-#      複数行に分けて書いた一覧は1行になり、[ ] の中のコメントは消える)
-#   2. 先頭付近の「# 最終更新: ...」の行を1行だけ更新する(無ければ追加)
-#   3. 新しい内容が Python として正しく、期待どおりの値になることを確かめる
-#      (変更しない項目の値が変わっていないことも確かめる)
-#   4. 元のファイルを instance/config.py.bak にコピーしてから、
-#      一時ファイルに書いて置き換える(os.replace。書き込み途中で壊れたファイルを残さない)
-#   同時に保存されても壊れないよう、共通のロック(config_file_lock)で直列化する。
-#   エラーメッセージには設定値(パスワード・キーなど)を含めない。
-#
-# ■ 項目の行の削除(remove_config_keys。基本設定タブの「未使用の設定を削除」で使う)
-#   指定した項目の `KEY = ...` の行を削除する。行のすぐ上に続くコメント(その項目の説明)は、
-#   説明している項目(コメントの下に続けて書かれた行)がすべて削除されるときだけ一緒に削除する。
-#   確認・バックアップ(config.py.bak)・置き換え・ロックは画面からの更新と同じ。
+class ConfigLoadError(click.ClickException):
+    """起動・コマンドの開始時に設定(config.py・instance/settings.json)を読み込めない(メッセージに設定値は含めない)。
 
-CONFIG_FILENAME = "config.py"
-BACKUP_SUFFIX = ".bak"
-
-# 画面から更新したときに書く見出しコメント(1行だけ。毎回置き換える)
-HEADER_PREFIX = "# 最終更新:"
-# 自動作成したファイルの先頭の行(ファイル全体の見出しの一部。未使用の設定の削除で消さない)
-CREATED_PREFIX = "# 自動作成:"
-
-# 読み込み・更新を直列化するロック(画面からの保存が同時に行われても壊れないように)
-config_file_lock = threading.RLock()
-
-_UTF8_BOM = "﻿"
-# Python の構文で行の区切りになる改行(\r\n / \r / \n)。ast の行番号と同じ数え方で分ける
-_LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+$")
-_CODING_RE = re.compile(r"^[ \t\f]*#.*?coding[:=]")
-# 文字コードの指定(PEP 263。1〜2行目のコメント)
-_CODING_DECL_RE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
-
-
-class ConfigFileError(Exception):
-    """instance/config.py を読み込めない・安全に更新できない(メッセージに設定値は含めない)。"""
-
-
-class ConfigConflictError(ConfigFileError):
-    """画面を開いた後に、ほかの保存や直接の編集で instance/config.py が変わっていた。"""
-
-
-# --------------------------------------------------------------------------- #
-# 値の書き方と、`KEY = ...` の置き換え
-# --------------------------------------------------------------------------- #
-def format_value(value):
-    """設定ファイルに書く値の表記(文字列は repr()、一覧はリスト表記)。
-
-    文字列は repr() で書き出すので、引用符や改行などを含んでも安全に記述できる。
+    click の例外にして、「flask --app app run / seed / migrate」が Python の例外の表示(誤りの行の内容、
+    つまりパスワードやキーの値を含む)ではなく、日本語のメッセージ「Error: ...」を表示して終わるようにする。
     """
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return repr(value)
-    if isinstance(value, (list, tuple)):
-        return "[" + ", ".join(format_value(item) for item in value) + "]"
-    raise TypeError("設定ファイルに書けない種類の値です: {}".format(type(value).__name__))
-
-
-def _split_lines(text):
-    """行に分ける(行末の改行を含む)。ast の行番号と同じ区切り方。"""
-    return _LINE_RE.findall(text)
-
-
-def _binds(node, key):
-    """文 node の中で key に代入しているか(入れ子の文も含む)。"""
-    for child in ast.walk(node):
-        if isinstance(child, ast.Name) and child.id == key and isinstance(child.ctx, ast.Store):
-            return True
-        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) \
-                and child.name == key:
-            return True
-        if isinstance(child, (ast.Import, ast.ImportFrom)):
-            for alias in child.names:
-                if (alias.asname or alias.name.split(".")[0]) == key:
-                    return True
-    return False
-
-
-def _value_node(tree, key):
-    """最後に key を決めているトップレベルの文が単純な `KEY = 値` なら、その値の式を返す。
-
-    `KEY = 値`(注釈付きを含む)以外の形(条件付き・複数代入・+= など)で最後に決まる場合や、
-    どこでも代入していない場合は None(呼び出し側は末尾に追記する)。
-    """
-    found = None
-    for stmt in tree.body:
-        if not _binds(stmt, key):
-            continue
-        found = None
-        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 \
-                and isinstance(stmt.targets[0], ast.Name) and stmt.targets[0].id == key:
-            found = stmt.value
-        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) \
-                and stmt.target.id == key and stmt.value is not None:
-            found = stmt.value
-    return found
-
-
-def _char_index(lines, starts, lineno, col_offset):
-    """ast の (行番号, UTF-8 のバイト位置) を、本文の文字位置に変換する。"""
-    line = lines[lineno - 1]
-    prefix = line.encode("utf-8")[:col_offset].decode("utf-8", "ignore")
-    return starts[lineno - 1] + len(prefix)
-
-
-def _newline_of(text):
-    """ファイルで使われている改行コード(既定は \\n)。"""
-    match = re.search(r"\r\n|\r|\n", text)
-    return match.group(0) if match else "\n"
-
-
-def _set_value(text, key, value, newline=None):
-    """設定ファイルの本文で `KEY = ...` の値の部分を置き換える(無ければ末尾に追記)。
-
-    値は format_value() で書き出す(文字列は repr()、一覧はリスト表記)。
-    行末のコメントや前後の行、ほかの項目はそのまま残す(値の部分は全体を置き換えるため、複数行の一覧は
-    1行になり、[ ] の中のコメントは消える)。
-    本文が Python として解釈できない場合や、単純な `KEY = 値` で決まっていない場合は
-    末尾に `KEY = 値` を追記する(後の代入が優先されるため)。
-    """
-    newline = newline or _newline_of(text)
-    literal = format_value(value)
-    try:
-        node = _value_node(ast.parse(text), key)
-    except SyntaxError:
-        node = None
-    if node is not None:
-        lines = _split_lines(text)
-        starts, position = [], 0
-        for line in lines:
-            starts.append(position)
-            position += len(line)
-        begin = _char_index(lines, starts, node.lineno, node.col_offset)
-        end = _char_index(lines, starts, node.end_lineno, node.end_col_offset)
-        return text[:begin] + literal + text[end:]
-
-    if text and not text.endswith(("\n", "\r")):
-        text += newline
-    # 追記する項目は空行で前の行と区切る(前の項目のまとまり・その説明のコメントの続きにしない。続けて書くと、
-    # 「未使用の設定を削除」で前の項目を削除したときに、その説明のコメントが追記した項目の上に残るため)。
-    # 末尾が空行かは、CRLF の1つの改行の \r と \n を2つの改行と数えないように確かめる
-    if text.strip() and not re.search(r"(?:\r\n|\r(?!\n)|\n)[ \t]*(?:\r\n|\r|\n)$", text):
-        text += newline
-    return text + "{} = {}{}".format(key, literal, newline)
-
-
-def _refresh_header(text, line, newline):
-    """「# 最終更新: ...」の行を置き換える(無ければ先頭に追加。文字コード指定の行の後ろ)。"""
-    lines = _split_lines(text)
-    for index, current in enumerate(lines):
-        if current.startswith(HEADER_PREFIX):
-            ending = current[len(current.rstrip("\r\n")):] or newline
-            lines[index] = line + ending
-            return "".join(lines)
-    insert_at = 0
-    while insert_at < min(2, len(lines)) and (
-            lines[insert_at].startswith("#!") or _CODING_RE.match(lines[insert_at])):
-        insert_at += 1
-    lines.insert(insert_at, line + newline)
-    return "".join(lines)
-
-
-def _clean_label(text):
-    """見出しコメントに入れる文字列(文字・数字と . _ @ - だけ。ほかは _ にする)。
-
-    「:」「=」を残さないので、コメントが文字コードの指定(# coding: ...)と解釈されることはない。
-    """
-    text = re.sub(r"[\x00-\x1f\x7f]", "", str(text or "")).strip()
-    return re.sub(r"[^\w.@\-]", "_", text)[:64] or "不明"
-
-
-def _declared_encoding(text):
-    """1〜2行目の文字コードの指定(# coding: ...)。無ければ None。"""
-    for line in _split_lines(text)[:2]:
-        match = _CODING_DECL_RE.match(line)
-        if match:
-            return match.group(1)
-    return None
-
-
-# --------------------------------------------------------------------------- #
-# 読み込み
-# --------------------------------------------------------------------------- #
-def config_path(instance_path):
-    return os.path.join(instance_path, CONFIG_FILENAME)
-
-
-def file_version(path):
-    """ファイルの版(更新日時とサイズ)。内容から作らないので、設定値の推測には使えない。"""
-    try:
-        stat = os.stat(path)
-    except OSError:
-        return "none"
-    return "{}-{}".format(stat.st_mtime_ns, stat.st_size)
 
 
 def evaluate(text, filename):
@@ -596,48 +307,114 @@ def evaluate(text, filename):
     return {name: value for name, value in vars(module).items() if name.isupper()}
 
 
-def read_config(instance_path):
-    """instance/config.py を読み込む。
+def _config_error_line(exc, path):
+    """設定ファイルの評価の例外 exc から、ファイルの中の行番号を探す(分からなければ None)。"""
+    if isinstance(exc, SyntaxError) and exc.lineno:
+        return exc.lineno
+    line = None
+    tb = exc.__traceback__
+    target = os.path.normcase(os.path.abspath(path))
+    while tb is not None:
+        filename = tb.tb_frame.f_code.co_filename
+        if filename and os.path.normcase(os.path.abspath(filename)) == target:
+            line = tb.tb_lineno
+        tb = tb.tb_next
+    return line
 
-    戻り値: {"path", "exists", "text", "values", "version", "bom"}
-    ファイルが無ければ exists=False・values={}。読めない・評価できない場合は ConfigFileError。
+
+def read_config_file(path, label):
+    """設定ファイル(Python の書式)を読んで、大文字の名前の値の辞書を返す。
+
+    label はメッセージに使うファイルの呼び名(例: 「config.py」「instance/config.py」)。
+    無ければ FileNotFoundError。開けない・書式の誤り・評価できないときは ConfigLoadError
+    (Python の例外の表示〔誤りの行の内容=設定値〕ではなく、場所・行番号・例外の種類だけの日本語のメッセージ)。
     """
-    path = config_path(instance_path)
-    version = file_version(path)
     try:
         with open(path, "rb") as f:
             raw = f.read()
     except FileNotFoundError:
-        return {"path": path, "exists": False, "text": "", "values": {},
-                "version": version, "bom": False}
+        raise
     except OSError as exc:
-        raise ConfigFileError("instance/{} を開けません（{}）。".format(
-            CONFIG_FILENAME, exc.__class__.__name__)) from exc
+        raise ConfigLoadError("設定ファイル {} を開けません（{}。ファイル: {}）。".format(
+            label, exc.__class__.__name__, path)) from None
     try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ConfigFileError("instance/{} を UTF-8 として読み込めません。".format(
-            CONFIG_FILENAME)) from exc
-    bom = text.startswith(_UTF8_BOM)
-    if bom:
-        text = text[len(_UTF8_BOM):]
-    try:
-        values = evaluate(raw, path)  # 起動時(from_pyfile)と同じく、ファイルの内容(bytes)を評価する
-    except SyntaxError as exc:
-        raise ConfigFileError("instance/{} の {} 行目に書式の誤りがあります。".format(
-            CONFIG_FILENAME, exc.lineno)) from exc
-    except Exception as exc:
-        raise ConfigFileError("instance/{} を評価できません（{}）。".format(
-            CONFIG_FILENAME, exc.__class__.__name__)) from exc
-    return {"path": path, "exists": True, "text": text, "values": values,
-            "version": version, "bom": bom}
+        return evaluate(raw, path)
+    except Exception as exc:  # 設定ファイルの評価の例外すべて(書式の誤り・未定義の名前など)
+        line = _config_error_line(exc, path)
+        where = " の {} 行目".format(line) if line else " "
+        raise ConfigLoadError(
+            "設定ファイル {}{}に誤りがあるため、読み込めません（{}。ファイル: {}）。"
+            "その行の書式（文字列は \"...\" で囲む、アドレスの一覧は [...] で書く など）を直してから、"
+            "もう一度実行してください。".format(label, where, exc.__class__.__name__, path)) from None
 
 
-def _is_utf8(name):
+def read_initial_config(path=None):
+    """config.py(初期値)を読む。戻り値: 大文字の名前の値の辞書。無い・読めなければ ConfigLoadError。"""
+    path = path or INITIAL_CONFIG_PATH
     try:
-        return codecs.lookup(name).name == "utf-8"
-    except LookupError:
-        return False
+        return read_config_file(path, INITIAL_CONFIG_FILENAME)
+    except FileNotFoundError:
+        raise ConfigLoadError(
+            "設定ファイル {0} がありません（{1}）。app.py と同じフォルダに {0}（環境ごとの設定の初期値。"
+            "リポジトリに同梱）を置いてから、もう一度実行してください。初期値が無い状態では起動しません。".format(
+                INITIAL_CONFIG_FILENAME, path)) from None
+
+
+# =============================================================================
+# 1-3. 画面で設定した値(instance/settings.json)の読み書きと、有効な値
+# =============================================================================
+# システム設定の「基本設定」タブで保存した値の置き場(instance/settings.json。DB と同じフォルダ。Git管理外)。
+#   {"values": {項目: 値, ...}, "updated_at": "YYYY-MM-DD HH:MM", "updated_by": "保存した人", "version": 整数}
+#   - values にある項目は、空("")でも有効な値になる(config.py の値を使わない)。無い項目は config.py の値
+#   - version は保存のたびに1増える(画面を開いた後にほかの保存があったかの確認に使う)
+# 書くのは、基本設定タブの保存(11-2)・SECRET_KEY の自動生成(_ensure_secret_key。13-2)・
+# flask --app app import-old-config(14-3)だけ。一時ファイルに書いてから置き換える(write_file_atomic)。
+# 読めないファイル(壊れた JSON・形式の違い・項目の種類に合わない型の値〔数の SECRET_KEY など。使うときに 500 になる〕)は
+# SettingsStoreError(画面にはその旨と項目の名前を表示して保存できなくする。起動時は ConfigLoadError で止める。
+# 上書きはしない。settings_type_problems)。
+#
+# 有効な値(effective_values)= settings.json の値、無ければ config.py の値、どちらにも無ければ Config の空の値。
+# 起動時(load_config_layers)と、画面で保存した直後(SECRET_KEY 以外。_apply_live)に app.config に反映する。
+# 同じフォルダのほかのサーバー(プロセス)の保存は、要求のたび・自動送信の前に settings.json の版(更新日時と
+# サイズ)を見て反映する(refresh_live_config。11-2)。
+
+SETTINGS_FILENAME = "settings.json"
+# 旧版の環境ごとの設定ファイル(instance/config.py)。もう読まない(import-old-config で取り込むだけ)
+OLD_CONFIG_FILENAME = "config.py"
+# settings.json の updated_by: SECRET_KEY の自動生成・旧版の設定の取り込み
+UPDATED_BY_AUTO = "自動生成"
+UPDATED_BY_IMPORT = "移行"
+# 旧版の instance/config.py があるときの起動時の案内
+OLD_CONFIG_HINT = "旧版の instance/config.py があります。flask --app app import-old-config で取り込めます"
+
+# 読み込み・保存を直列化するロック(画面からの保存が同時に行われても壊れないように)
+settings_store_lock = threading.RLock()
+
+# config.py(初期値)の値の控え(app.extensions のキー)
+INITIAL_VALUES_KEY = "config_initial"
+# このプロセスの実行中の設定に反映済みの instance/settings.json の版(file_version。app.extensions のキー)
+SETTINGS_LIVE_VERSION_KEY = "settings_live_version"
+
+
+class SettingsStoreError(Exception):
+    """instance/settings.json を読み込めない・保存できない(メッセージに設定値は含めない)。"""
+
+
+class SettingsConflictError(SettingsStoreError):
+    """画面を開いた後に、ほかの保存で instance/settings.json が変わっていた。"""
+
+
+def settings_path(instance_path):
+    return os.path.join(instance_path, SETTINGS_FILENAME)
+
+
+def file_version(path):
+    """ファイルの版(更新日時とサイズ)。内容から作らないので、設定値の推測には使えない。"""
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return "none"
+    return "{}-{}".format(stat.st_mtime_ns, stat.st_size)
 
 
 def same_value(a, b):
@@ -647,11 +424,22 @@ def same_value(a, b):
     return type(a) is type(b) and a == b
 
 
-_PLAIN_TYPES = (type(None), bool, int, float, str, list, tuple, dict)
+def _clean_label(text):
+    """updated_by に書く文字列(文字・数字と . _ @ - だけ。ほかは _ にする)。"""
+    text = re.sub(r"[\x00-\x1f\x7f]", "", str(text or "")).strip()
+    return re.sub(r"[^\w.@\-]", "_", text)[:64] or "不明"
+
+
+def _notice(message):
+    """起動時のお知らせを1行表示する(表示できない環境でも起動は止めない)。"""
+    try:
+        print(message, flush=True)
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- #
-# 書き換えの共通の手順(画面からの更新・項目の行の削除で使う)
+# ファイルの置き換え(画面で編集する設定の JSON〔2-3〕でも使う)
 # --------------------------------------------------------------------------- #
 # Windows で置き換え先のファイルをほかのプロセスが開いている間(同じフォルダのほかのサーバー・--debug の
 # 画面を返すプロセスの読み込み・バックアップやウイルス対策のソフトなど)は os.replace が PermissionError
@@ -694,414 +482,165 @@ def write_file_atomic(path, data, prefix):
         raise
 
 
-def _read_for_change(instance_path, expected_version):
-    """書き換える前に instance/config.py を読む(config_file_lock の中で呼ぶ)。
+# --------------------------------------------------------------------------- #
+# instance/settings.json の読み書き
+# --------------------------------------------------------------------------- #
+def _type_ok(field_type, value):
+    """設定値 value が項目の種類 field_type(11-1 の TYPE_*)として読める型か。None(null)はどの項目でも「未設定」。"""
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return False
+    if field_type == TYPE_INT:
+        # ポート番号・タイムアウト: 整数のほか、旧版から取り込んだ 60.0・"30" のような値も読める(smtp_port_value・
+        # positive_int_value が範囲・形を確かめる)
+        return isinstance(value, (int, float, str))
+    if field_type == TYPE_ADDRESSES:
+        # アドレスの一覧: 文字列の一覧(「,」「;」区切りの文字列も可。mail_addresses)
+        if isinstance(value, str):
+            return True
+        return isinstance(value, (list, tuple)) and all(isinstance(item, str) for item in value)
+    return isinstance(value, str)  # 文字列の項目(URL・アドレス・モデル名・パスワード・鍵)
 
-    expected_version を渡すと、ファイルの版がそれと違う場合は ConfigConflictError。
-    文字コードの指定(coding)が UTF-8 でない場合は ConfigFileError(画面からは書き換えない)。
+
+def settings_type_problems(values):
+    """values(settings.json の values、または config.py の値)のうち、基本設定の項目(FIELDS)で種類に合わない型の
+    値の項目の名前の一覧(値は含めない)。
+
+    数の SECRET_KEY・辞書の MAIL_TO のような値は、使うときに例外(500)になるため、読み込みのときにファイルの誤りとして
+    止める(黙って別の値に置き換えることはしない)。FIELDS に無い項目は確かめない。
     """
-    current = read_config(instance_path)
-    if not current["exists"]:
-        raise ConfigFileError(
-            "instance/{} がありません。サーバーを再起動すると自動作成されます。"
-            "ファイルは変更していません。".format(CONFIG_FILENAME))
-    if expected_version is not None and current["version"] != expected_version:
-        raise ConfigConflictError(
-            "画面を開いた後に instance/{} が更新されています。".format(CONFIG_FILENAME))
-    declared = _declared_encoding(current["text"])
-    if declared is not None and not _is_utf8(declared):
-        raise ConfigFileError(
-            "instance/{} の文字コードの指定（coding）が UTF-8 ではないため、画面から更新できません。"
-            "ファイルは変更していません。ファイルを直接編集してください。".format(CONFIG_FILENAME))
-    return current
+    return [key for key, value in values.items()
+            if key in FIELD_MAP and not _type_ok(FIELD_MAP[key].type, value)]
 
 
-def _stamp(text, action, username, now, newline):
-    """「# 最終更新: 日時（画面から<action>: 変更した人）」の行を付け直す。"""
-    stamp = (now or datetime.now()).strftime("%Y-%m-%d %H:%M")
-    return _refresh_header(
-        text, "{} {}（画面から{}: {}）".format(HEADER_PREFIX, stamp, action, _clean_label(username)),
-        newline)
+def read_settings(instance_path):
+    """instance/settings.json(画面の設定)を読む。
 
-
-def _encode_config(text, bom):
-    """書き込むバイト列(元のファイルに BOM があれば付け直す)。"""
-    data = text.encode("utf-8")
-    if bom:
-        data = _UTF8_BOM.encode("utf-8") + data
-    return data
-
-
-def _evaluate_new(data, path, stage):
-    """書き換え後の内容(書き込むバイト列そのもの)を、起動時の from_pyfile と同じ方法で評価する。
-
-    stage はエラーメッセージに使う「更新後」「削除後」。評価できなければ ConfigFileError。
+    戻り値: {"path", "exists", "values", "version", "updated_at", "updated_by", "file_version"}
+    ファイルが無ければ exists=False・values={}・version=0。あるのに読めない(開けない・JSON でない・形式が違う)
+    場合は SettingsStoreError(上書きを防ぐため、呼び出し側は保存しない)。
     """
+    path = settings_path(instance_path)
+    version = file_version(path)
     try:
-        ast.parse(data)
-        return evaluate(data, path)
-    except Exception as exc:
-        raise ConfigFileError("{}の instance/{} を確認できませんでした（{}）。"
-                              "ファイルは変更していません。".format(
-                                  stage, CONFIG_FILENAME, exc.__class__.__name__)) from exc
-
-
-def _other_keys_changed(old_values, new_values, targets):
-    """書き換えの対象(targets)ではないのに、値が変わってしまった項目(書き方のために起きる)。"""
-    return [key for key, old in old_values.items()
-            if key not in targets and isinstance(old, _PLAIN_TYPES)
-            and (key not in new_values or not same_value(new_values[key], old))]
-
-
-def _unsafe_error(keys, verb):
-    """書き方のために画面から安全に書き換えられないときのエラー(verb は「更新」「削除」)。"""
-    return ConfigFileError(
-        "instance/{} の書き方のため、画面から安全に{}できませんでした（{}）。"
-        "ファイルは変更していません。ファイルを直接編集してください。".format(
-            CONFIG_FILENAME, verb, "、".join(sorted(set(keys)))))
-
-
-def _save_config_file(path, data, backup):
-    """元のファイルを instance/config.py.bak にコピーして(backup が真のとき)、data に置き換える。"""
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        if backup:
-            shutil.copy2(path, path + BACKUP_SUFFIX)
-        write_file_atomic(path, data, ".config_")
+        with open(path, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return {"path": path, "exists": False, "values": {}, "version": 0,
+                "updated_at": "", "updated_by": "", "file_version": version}
     except OSError as exc:
-        raise ConfigFileError("instance/{} を保存できませんでした（{}）。".format(
-            CONFIG_FILENAME, exc.__class__.__name__)) from exc
-
-
-# --------------------------------------------------------------------------- #
-# 画面からの更新
-# --------------------------------------------------------------------------- #
-def update_config(instance_path, changes, username, expected_version=None, now=None):
-    """instance/config.py の項目を書き換える(changes = {KEY: 新しい値})。
-
-    expected_version を渡すと、ファイルの版がそれと違う場合は ConfigConflictError
-    (画面を開いた後に別の保存・直接の編集があった)。
-    戻り値: 書き換え後のファイルの値(大文字の名前の辞書)。
-    失敗した場合は ConfigFileError(ファイルは変更しない)。
-    """
-    with config_file_lock:
-        current = _read_for_change(instance_path, expected_version)
-        path = current["path"]
-        text = current["text"]
-        newline = _newline_of(text)
-        for key, value in changes.items():
-            text = _set_value(text, key, value, newline)
-        text = _stamp(text, "変更", username, now, newline)
-        data = _encode_config(text, current["bom"])
-
-        # 新しい内容が正しく、期待どおりの値になることを確かめてから置き換える
-        values = _evaluate_new(data, path, "更新後")
-        wrong = [key for key, value in changes.items()
-                 if key not in values or not same_value(values[key], value)]
-        wrong += _other_keys_changed(current["values"], values, changes)
-        if wrong:
-            raise _unsafe_error(wrong, "更新")
-
-        _save_config_file(path, data, backup=current["exists"])
-        return values
-
-
-# --------------------------------------------------------------------------- #
-# 項目の行の削除
-# --------------------------------------------------------------------------- #
-def _single_target(stmt):
-    """単純な `KEY = 値`(注釈付きを含む)なら KEY、それ以外の形なら None。"""
-    if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 \
-            and isinstance(stmt.targets[0], ast.Name):
-        return stmt.targets[0].id
-    if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
-        return stmt.target.id
-    return None
-
-
-def _owns_lines(stmt, lines):
-    """文 stmt の行に、ほかの文が無いか(行ごと削除してよいか)。行末のコメントはかまわない。"""
-    first = lines[stmt.lineno - 1]
-    before = first.encode("utf-8")[:stmt.col_offset].decode("utf-8", "ignore")
-    last = lines[stmt.end_lineno - 1]
-    after = last.encode("utf-8")[stmt.end_col_offset:].decode("utf-8", "ignore").strip()
-    return not before.strip() and (not after or after.startswith("#"))
-
-
-def _lines_to_remove(lines, tree, keys):
-    """削除する行(0始まりの行番号の集合)と、行ごと削除できない項目の一覧を返す。"""
-    statements = tree.body
-    covered = set()
-    for stmt in statements:
-        covered.update(range(stmt.lineno - 1, stmt.end_lineno))
-    targets, blocked = set(), []
-    for index, stmt in enumerate(statements):
-        bound = [key for key in keys if _binds(stmt, key)]
-        if not bound:
-            continue
-        if _single_target(stmt) in keys and _owns_lines(stmt, lines):
-            targets.add(index)
-        else:
-            blocked.extend(bound)
-    if blocked or not targets:
-        return set(), blocked
-
-    # 空行・コメントを挟まずに続けて書かれた文のまとまりごとに処理する
-    runs, run = [], []
-    for index, stmt in enumerate(statements):
-        if run and stmt.lineno != statements[run[-1]].end_lineno + 1:
-            runs.append(run)
-            run = []
-        run.append(index)
-    if run:
-        runs.append(run)
-
-    remove = set()
-    for run in runs:
-        hit = [index for index in run if index in targets]
-        if not hit:
-            continue
-        for index in hit:
-            stmt = statements[index]
-            remove.update(range(stmt.lineno - 1, stmt.end_lineno))
-        if len(hit) != len(run):
-            continue  # ほかの項目と一緒に書かれている(上のコメントはそちらの説明でもあるので残す)
-        # まとまりのすぐ上に続くコメントの行(その項目の説明)も削除する。ただし、上が空行か文で区切られている
-        # ときだけ(ファイルの先頭から続くコメント〔ファイル全体の見出し・自動作成の記録〕の直下に書かれた項目は、
-        # 項目の行だけを削除し、見出しは残す)
-        line_no = statements[run[0]].lineno - 2
-        comment_lines, separated = [], False
-        while line_no >= 0:
-            if line_no in covered:
-                separated = True
-                break
-            current = lines[line_no]
-            stripped = current.strip()
-            if not stripped:
-                separated = True
-                break
-            if (not stripped.startswith("#") or current.startswith((HEADER_PREFIX, CREATED_PREFIX))
-                    or (line_no < 2 and (current.startswith("#!") or _CODING_RE.match(current)))):
-                break
-            comment_lines.append(line_no)
-            line_no -= 1
-        if separated:
-            remove.update(comment_lines)
-
-    # 削除した部分の前後がどちらも空行(またはファイルの末尾)になる場合は、空行を1つにまとめる
-    def blank(i):
-        return not lines[i].strip()
-
-    for start in sorted(remove):
-        if start - 1 in remove or start == 0 or not blank(start - 1):
-            continue
-        end = start
-        while end + 1 in remove:
-            end += 1
-        if end + 1 >= len(lines) or blank(end + 1):
-            remove.add(start - 1)
-    return remove, []
-
-
-def remove_config_keys(instance_path, keys, username, expected_version=None, now=None):
-    """instance/config.py から項目 keys の行(`KEY = 値`)を削除する。
-
-    expected_version を渡すと、ファイルの版がそれと違う場合は ConfigConflictError。
-    戻り値: (削除した項目(ファイルに出てくる順), 削除後のファイルの値)。
-    削除する行が無ければ ([], 今の値) を返す(ファイルは変更しない)。
-    単純な `KEY = 値` 以外の形で書かれた項目がある場合や、削除後の内容を確認できない場合は
-    ConfigFileError(ファイルは変更しない)。
-    """
-    keys = set(keys)
-    with config_file_lock:
-        current = _read_for_change(instance_path, expected_version)
-        path = current["path"]
-        if not current["exists"]:
-            return [], {}
-
-        text = current["text"]
-        try:
-            tree = ast.parse(text)
-        except SyntaxError as exc:
-            raise ConfigFileError("instance/{} の {} 行目に書式の誤りがあります。".format(
-                CONFIG_FILENAME, exc.lineno)) from exc
-        lines = _split_lines(text)
-        remove, blocked = _lines_to_remove(lines, tree, keys)
-        if blocked:
-            raise _unsafe_error(blocked, "削除")
-        if not remove:
-            return [], current["values"]
-
-        removed = [key for key in current["values"] if key in keys]
-        newline = _newline_of(text)
-        text = "".join(line for index, line in enumerate(lines) if index not in remove)
-        text = _stamp(text, "未使用の設定を削除", username, now, newline)
-        data = _encode_config(text, current["bom"])
-
-        # 削除後の内容が正しく、削除した項目だけが無くなっていることを確かめてから置き換える
-        values = _evaluate_new(data, path, "削除後")
-        wrong = [key for key in keys if key in values]
-        wrong += _other_keys_changed(current["values"], values, keys)
-        if wrong:
-            raise _unsafe_error(wrong, "削除")
-
-        _save_config_file(path, data, backup=True)
-        return removed, values
-
-
-# --------------------------------------------------------------------------- #
-# 自動作成
-# --------------------------------------------------------------------------- #
-def _read_old_ai_settings(db_path):
-    """旧「AI接続設定」画面の値(ai_settings テーブル)を読み取り専用で取得する。
-
-    DB・テーブル・行が無い場合や、読み取りに失敗した場合は空の辞書を返す。
-    """
-    if not os.path.isfile(db_path):
-        return {}
+        raise SettingsStoreError("instance/{} を開けません（{}）。".format(
+            SETTINGS_FILENAME, exc.__class__.__name__)) from exc
     try:
-        uri = pathlib.Path(db_path).resolve().as_uri() + "?mode=ro"
-        conn = sqlite3.connect(uri, uri=True)
-        try:
-            found = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_settings'"
-            ).fetchone()
-            if found is None:
-                return {}
-            row = conn.execute(
-                "SELECT api_url, api_key, model FROM ai_settings ORDER BY id LIMIT 1"
-            ).fetchone()
-        finally:
-            conn.close()
-    except Exception:
-        return {}
-    if row is None:
-        return {}
+        data = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise SettingsStoreError(
+            "instance/{} を読み込めません（{}）。ファイルを直すか、名前を変えて（画面の設定を捨てて）ください。".format(
+                SETTINGS_FILENAME, exc.__class__.__name__)) from exc
+    if not isinstance(data, dict) or not isinstance(data.get("values"), dict):
+        raise SettingsStoreError(
+            "instance/{} の形式が正しくありません（{{\"values\": {{...}}}} の形ではありません）。"
+            "ファイルを直すか、名前を変えて（画面の設定を捨てて）ください。".format(SETTINGS_FILENAME))
+    values = {key: value for key, value in data["values"].items() if isinstance(key, str)}
+    bad = settings_type_problems(values)
+    if bad:
+        raise SettingsStoreError(
+            "instance/{} の {} の値の型が正しくありません（文字列の項目は \"...\"、アドレスの一覧は [...]、"
+            "ポート番号・タイムアウトは整数）。ファイルを直すか、名前を変えて（画面の設定を捨てて）ください。".format(
+                SETTINGS_FILENAME, "、".join(bad)))
+    number = data.get("version")
+    if not isinstance(number, int) or isinstance(number, bool) or number < 0:
+        number = 0
+    return {"path": path, "exists": True, "values": values, "version": number,
+            "updated_at": str(data.get("updated_at") or ""), "updated_by": str(data.get("updated_by") or ""),
+            "file_version": version}
 
+
+def write_settings(instance_path, values, username, expected_version=None):
+    """instance/settings.json の値を values(全項目)に置き換える。戻り値: 書いた内容(辞書)。
+
+    expected_version を渡すと、今のファイルの version がそれと違う場合は SettingsConflictError
+    (画面を開いた後にほかの保存があった)。読めないファイルは上書きしない(SettingsStoreError)。
+    書けなければ OSError(メッセージに設定値は含めない)。
+    """
+    with settings_store_lock:
+        current = read_settings(instance_path)
+        if expected_version is not None and current["version"] != expected_version:
+            raise SettingsConflictError("画面を開いた後に instance/{} が更新されています。".format(SETTINGS_FILENAME))
+        data = {
+            "values": dict(values),
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "updated_by": _clean_label(username),
+            "version": current["version"] + 1,
+        }
+        os.makedirs(instance_path, exist_ok=True)
+        text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+        write_file_atomic(current["path"], text.encode("utf-8"), ".settings_")
+        return data
+
+
+# --------------------------------------------------------------------------- #
+# 有効な値(初期値と画面の設定の重ね合わせ)
+# --------------------------------------------------------------------------- #
+def effective_values(initial, overrides):
+    """各項目(ENV_KEYS)の有効な値。画面の設定(overrides)にあればその値、無ければ初期値(initial)、
+    どちらにも無ければ Config の空の値。"""
     values = {}
-    for key, value in zip(("AI_API_URL", "AI_API_KEY", "AI_MODEL"), row):
-        value = (value or "").strip() if isinstance(value, str) else ""
-        if value:
-            values[key] = value
+    for key in ENV_KEYS:
+        if key in overrides:
+            values[key] = overrides[key]
+        elif key in initial:
+            values[key] = initial[key]
+        else:
+            values[key] = getattr(Config, key)
     return values
 
 
-# 旧「AI接続設定」画面の値(ai_settings テーブル)を instance/config.py に引き継いだ印のファイル(instance/ の中)。
-# 引き継ぎは1回だけにする(この印がある・config.py.bak がある〔画面から保存したことがある〕ときは引き継がない)。
-# config.py を作り直したときに、画面で消した APIキーなどが古い値で戻らないように
-LEGACY_AI_MARKER = "legacy_ai_imported.json"
+def initial_values(app):
+    """起動時に読んだ config.py(初期値)の値(大文字の名前の辞書)。"""
+    return app.extensions.get(INITIAL_VALUES_KEY) or {}
 
 
-def _legacy_ai_done(instance_path):
-    """旧「AI接続設定」の値を、以前に引き継いだ(または引き継ぐべきでない)か。"""
-    return (os.path.exists(os.path.join(instance_path, LEGACY_AI_MARKER))
-            or os.path.exists(config_path(instance_path) + BACKUP_SUFFIX))
+def apply_values(app, values, keys=ENV_KEYS):
+    """values の項目(keys)を実行中のアプリの設定(app.config)に入れる。値が変わった項目を返す。"""
+    changed = []
+    for key in keys:
+        if key not in values:
+            continue
+        if not same_value(app.config.get(key), values[key]):
+            changed.append(key)
+        app.config[key] = values[key]
+    return changed
 
 
-def _mark_legacy_ai_done(instance_path, keys):
-    """旧「AI接続設定」の値を引き継いだ印を残す(項目の名前と日時だけ。値は書かない)。"""
-    data = {"imported_at": datetime.now().strftime("%Y-%m-%d %H:%M"), "keys": list(keys)}
-    try:
-        write_file_atomic(os.path.join(instance_path, LEGACY_AI_MARKER),
-                          json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"), ".legacy_ai_")
-    except OSError as exc:
-        _notice("旧「AI接続設定」の引き継ぎの印を保存できませんでした: {} ({})".format(LEGACY_AI_MARKER, exc))
+def load_config_layers(app):
+    """起動・seed / migrate の開始時に、config.py(初期値)と instance/settings.json(画面の設定)を読んで
+    app.config に入れる。戻り値: settings.json の読み込みの結果(read_settings)。
 
-
-def _build_content(db_path, legacy=None):
-    """新しく作る instance/config.py の内容を組み立てる。
-
-    legacy は旧「AI接続設定」画面から引き継ぐ値(None なら db_path の ai_settings テーブルから読む)。
+    config.py が無い・読めない、settings.json があるのに読めないときは ConfigLoadError で止める
+    (コードの中の値のまま動かすことはしない。ADMIN_PASSWORD が空になり、admin のログインを ldap_client.py の
+    固定のパスワードに任せることになるため)。
     """
-    text = CONFIG_TEMPLATE
-    values = {
-        "SECRET_KEY": secrets.token_hex(32),
-        "ADMIN_PASSWORD": secrets.token_urlsafe(12),
-    }
-    # 旧画面のAI接続設定を引き継ぐ(空の項目は見本の値のまま。1回だけ: ensure_instance_config)
-    values.update(_read_old_ai_settings(db_path) if legacy is None else legacy)
-
-    for key, value in values.items():
-        text = _set_value(text, key, value)
-
-    header = CREATED_PREFIX + " {}(app.py の見本 CONFIG_TEMPLATE をもとに作成)\n".format(
-        datetime.now().strftime("%Y/%m/%d %H:%M")
-    )
-    return header + text
-
-
-def _notice(message):
-    """起動時のお知らせを1行表示する(表示できない環境でも起動は止めない)。"""
-    try:
-        print(message, flush=True)
-    except Exception:
-        pass
-
-
-def _create_file_exclusive(path, data):
-    """path が無いときだけ、内容 data(bytes)のファイルを作る(既にあれば FileExistsError。上書きしない)。
-
-    同じフォルダの一時ファイルに全部書いてから新しい名前を付ける(書き込みの途中で失敗しても、途中までの
-    ファイルを path に残さない。失敗したら一時ファイルを消して例外をそのまま送出する)。
-    名前はハードリンク(os.link)で付け、同時に別のプロセスが作成していても上書きしない。ハードリンクを
-    作れないファイルシステムでは、無いことを確かめてから置き換える。
-    """
-    fd, tmp_path = tempfile.mkstemp(prefix=".config_new_", suffix=".tmp", dir=os.path.dirname(path))
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        try:
-            os.link(tmp_path, path)
-        except FileExistsError:
-            raise
-        except OSError:
-            if os.path.exists(path):
-                raise FileExistsError(path) from None
-            os.replace(tmp_path, path)
-    finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-
-
-def ensure_instance_config(instance_path):
-    """instance/config.py が無ければ作成する。作成した場合は True を返す。
-
-    既にある場合は何もしない(内容の確認・上書きもしない)。
-    作成に失敗した場合(フォルダの書き込みの権限が無い・ディスクの空きが無いなど)は、ConfigLoadError で止める
-    (既定値のまま起動すると ADMIN_PASSWORD が空になり、admin のログインを ldap_client.py の固定のパスワードに
-    任せることになるため。書式の誤りのとき〔load_instance_config〕と同じ扱い)。書き込みの途中で失敗しても、
-    途中までのファイルは残さない(次の起動でもう一度作成する)。
-    """
-    path = config_path(instance_path)
-    if os.path.exists(path):
-        return False
-
-    # 旧「AI接続設定」の値は1回だけ引き継ぐ(以前に引き継いだ・画面から保存したことがあるフォルダでは引き継がない)
-    legacy = {} if _legacy_ai_done(instance_path) else \
-        _read_old_ai_settings(os.path.join(instance_path, "app.db"))
-    content = _build_content(os.path.join(instance_path, "app.db"), legacy)
-    try:
-        _create_file_exclusive(path, content.encode("utf-8"))
-    except FileExistsError:
-        return False  # 同時に別のプロセスが作成した(その内容を使う)
-    except OSError as exc:
+    initial = read_initial_config()
+    bad = settings_type_problems(initial)
+    if bad:
+        # 数の SECRET_KEY・辞書の MAIL_TO のような値は、使うときに例外(500)になるため起動のときに止める(項目の名前だけ表示)
         raise ConfigLoadError(
-            "設定ファイル instance/{} を作成できませんでした（{}: {}。ファイル: {}）。既定値のままでは起動しません"
-            "（admin のパスワードが空になるため）。フォルダの書き込みの権限・ディスクの空きを確認してから、"
-            "もう一度実行してください。".format(CONFIG_FILENAME, exc.__class__.__name__,
-                                            exc.strerror or exc, path)) from None
-
-    _notice("設定ファイルを作成しました（管理者パスワード等はこのファイルで確認・変更）: {}"
-            .format(path))
-    if legacy:
-        _mark_legacy_ai_done(instance_path, legacy)
-        _notice("以前の「AI接続設定」画面の値を引き継ぎました（{}。引き継ぐのはこの1回だけです）。"
-                .format("・".join(legacy)))
-    return True
+            "設定ファイル {} の {} の値の型が正しくありません（文字列は \"...\" で囲む、アドレスの一覧は [...] で書く、"
+            "ポート番号・タイムアウトは整数）。直してから、もう一度実行してください。".format(
+                INITIAL_CONFIG_FILENAME, "、".join(bad)))
+    app.extensions[INITIAL_VALUES_KEY] = initial
+    app.config.update(initial)  # FIELDS に無い項目(固定設定の上書きなど)も from_pyfile と同じように入れる
+    try:
+        store = read_settings(app.instance_path)
+    except SettingsStoreError as exc:
+        raise ConfigLoadError(
+            "画面で設定した値のファイル instance/{} を読み込めません（{}）。ファイルを直すか、名前を変えて"
+            "（画面の設定を捨てて）から、もう一度実行してください。".format(SETTINGS_FILENAME, exc)) from None
+    app.extensions[SETTINGS_LIVE_VERSION_KEY] = store["file_version"]
+    apply_values(app, effective_values(initial, store["values"]))
+    return store
 
 
 # #############################################################################
@@ -3424,41 +2963,69 @@ class SkillTestAnswer(db.Model):
 # だけを書き換える。呼び出し側は `ai_chat()` の戻り値の形 (text, error) にしか
 # 依存していないので、他のコードは変更不要。
 #
-# 接続設定は instance/config.py に記入する(コードには書かない。
-# システム設定の「基本設定」タブからも変更でき、保存するとすぐに反映される):
-#   AI_API_URL  : エンドポイント(空なら OpenAI公式 AI_DEFAULT_API_URL)
-#   AI_API_KEY  : APIキー(キー不要の独自APIなら空でよい)
-#   AI_MODEL    : モデル名
-#   AI_TIMEOUT  : タイムアウト(秒)
-# AI_API_KEY と AI_API_URL がどちらも空なら機能は自動的に無効(ai_is_configured() が False)
-# になり、呼び出し側はAIを使わない動きになる(週報はルールベースの文章、
-# スキルテストは問題プールにある問題だけで出題、AI分析はコードの集計とルールの推奨アクションだけ)。
+# 接続設定は config.py(初期値)とシステム設定の「基本設定」タブ(instance/settings.json)から読む(1。コードには
+# 書かず、既定の接続先・モデル名も持たない。画面で保存するとすぐに反映される):
+#   AI_API_URL  : エンドポイント(http:// または https:// の URL。必須)
+#   AI_MODEL    : モデル名(必須)
+#   AI_TIMEOUT  : 応答待ちのタイムアウト(秒。1以上の整数。必須)
+#   AI_API_KEY  : APIキー(任意。あるときだけ Authorization ヘッダに付ける)
+# 接続先・モデル名・タイムアウトのどれかが無ければ機能は無効(ai_is_configured() が False)になり、どこにも接続せず、
+# 呼び出し側はAIを使わない動きになる(週報はルールベースの文章、スキルテストは問題プールにある問題だけで出題、
+# スキルの説明の「AIで下書き」は使えず、AI分析はコードの集計とルールの推奨アクションだけ)。画面には
+# AI_NOT_CONFIGURED_MESSAGE を表示する。アプリが自分で外部の(社外の)AI の接続先を選ぶことは無い。
 # APIキーは画面・ログ・エラーメッセージのどこにも表示しない。
 
-AI_DEFAULT_API_URL = "https://api.openai.com/v1/chat/completions"
-AI_DEFAULT_MODEL = "gpt-4o-mini"
-AI_DEFAULT_TIMEOUT = 60
+# AI が未設定(接続先・モデル名・タイムアウトのどれかが無い)のときに、すべての AI の機能で表示する案内
+AI_NOT_CONFIGURED_MESSAGE = "AIの接続先（AI_API_URL）とモデル名（AI_MODEL）をシステム設定で設定してください"
+
+
+def positive_int_value(raw):
+    """設定値を1以上の整数として読む(数字だけの文字列・整数の値の float も可)。読めなければ None。"""
+    number = None
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        number = raw
+    elif isinstance(raw, float) and raw.is_integer():
+        number = int(raw)
+    elif isinstance(raw, str) and raw.strip().isascii() and raw.strip().isdigit():
+        number = int(raw.strip())
+    return number if number is not None and number >= 1 else None
+
+
+def _http_url_usable(url):
+    """接続に使える URL か(http:// または https:// で、ホスト名がある)。"""
+    try:
+        parts = urlsplit(url)
+        return parts.scheme.lower() in ("http", "https") and bool(parts.hostname)
+    except ValueError:
+        return False
 
 
 def _ai_settings():
-    """現在の接続設定(instance/config.py の値。未記入の項目は Config の既定値)。"""
+    """現在の接続設定(有効な値。current_app.config から読む。timeout は読めなければ None)。"""
     config = current_app.config
-    try:
-        timeout = int(config.get("AI_TIMEOUT") or AI_DEFAULT_TIMEOUT)
-    except (TypeError, ValueError):
-        timeout = AI_DEFAULT_TIMEOUT
     return {
         "api_url": str(config.get("AI_API_URL") or "").strip(),
         "api_key": str(config.get("AI_API_KEY") or "").strip(),
-        "model": str(config.get("AI_MODEL") or "").strip() or AI_DEFAULT_MODEL,
-        "timeout": timeout if timeout > 0 else AI_DEFAULT_TIMEOUT,
+        "model": str(config.get("AI_MODEL") or "").strip(),
+        "timeout": positive_int_value(config.get("AI_TIMEOUT")),
     }
 
 
 def ai_is_configured():
-    """ChatGPT-APIが使える設定になっているか(キーまたはURLが記入済み)。"""
+    """AI が使える設定になっているか(接続先の URL・モデル名・タイムアウトがすべてある)。"""
     values = _ai_settings()
-    return bool(values["api_key"] or values["api_url"])
+    return _http_url_usable(values["api_url"]) and bool(values["model"]) and values["timeout"] is not None
+
+
+def ai_missing_label():
+    """AI が未設定のときの案内(AI_NOT_CONFIGURED_MESSAGE。タイムアウトだけが原因ならその旨を添える)。"""
+    values = _ai_settings()
+    message = AI_NOT_CONFIGURED_MESSAGE
+    if _http_url_usable(values["api_url"]) and values["model"] and values["timeout"] is None:
+        message += "（タイムアウト（AI_TIMEOUT）が 1 以上の整数ではありません）"
+    return message
 
 
 def url_has_userinfo(url):
@@ -3485,12 +3052,9 @@ def _endpoint_label(url):
 def ai_status_label():
     """画面表示用の状態文言(APIキーや接続先URLの詳細は表示しない)。"""
     if not ai_is_configured():
-        return ("未設定（システム設定の「基本設定」タブで AI_API_KEY "
-                "または AI_API_URL を設定すると使えます）")
+        return "未設定（{}）".format(ai_missing_label())
     values = _ai_settings()
-    label = "接続先: {} ／ モデル: {}".format(
-        _endpoint_label(values["api_url"] or AI_DEFAULT_API_URL), values["model"]
-    )
+    label = "接続先: {} ／ モデル: {}".format(_endpoint_label(values["api_url"]), values["model"])
     if url_has_userinfo(values["api_url"]):
         label += "（AI_API_URL に ID・パスワードが含まれているため使えません）"
     return label
@@ -3526,7 +3090,7 @@ def _call_chat_api(messages):
     例外はそのまま送出し、呼び出し元の ai_chat() で文言に変換する。
     """
     values = _ai_settings()
-    url = values["api_url"] or AI_DEFAULT_API_URL
+    url = values["api_url"]  # 有効な値だけを使う(既定の接続先は無い。未設定なら ai_chat() がここまで来させない)
 
     payload = {
         "model": values["model"],
@@ -3574,8 +3138,7 @@ def ai_chat(messages):
 def _ai_chat(messages):
     """ai_chat の本体(応答の本文・エラーメッセージは、まだ使えない文字を除いていない)。"""
     if not ai_is_configured():
-        return None, ("ChatGPT-APIが未設定です。システム設定の「基本設定」タブで AI_API_KEY"
-                      "（独自APIの場合は AI_API_URL）を設定してください。")
+        return None, ai_missing_label() + "。"
 
     values = _ai_settings()
     api_key = values["api_key"]
@@ -3668,10 +3231,9 @@ def parse_json_reply(text, opener, closer):
 # =============================================================================
 # メール送信(SMTP)の共通部品。週報・期限超過通知など、どの機能からも使う。
 #
-# 送信サーバー・差出人・宛先はすべて instance/config.py に記入する
-# (MAIL_SMTP_SERVER / MAIL_SMTP_PORT / MAIL_FROM / MAIL_TO / MAIL_CC)。
-# システム設定の「基本設定」タブからも変更でき、保存するとすぐに反映される
-# (値は送信のたびに current_app.config から読む)。
+# 送信サーバー・ポート番号・差出人・宛先は config.py(初期値)とシステム設定の「基本設定」タブ(instance/settings.json)
+# から読む(MAIL_SMTP_SERVER / MAIL_SMTP_PORT / MAIL_FROM / MAIL_TO / MAIL_CC。1)。画面で保存するとすぐに反映される
+# (値は送信のたびに current_app.config から読む)。ポート番号にも既定値は無い(無ければ送らない)。
 #
 # send_mail(subject, text, html=None, attachments=(), to=None, cc=None, test=False):
 #   text        : 本文(text/plain・UTF-8)
@@ -3733,16 +3295,21 @@ def mail_envelope(items):
     return list(envelope.values())
 
 
+# 送信サーバーのポート番号が未設定のときの案内
+SMTP_PORT_MISSING_MESSAGE = ("送信サーバーのポート番号（MAIL_SMTP_PORT）が未設定です。"
+                             "システム設定の「基本設定」タブで設定してください。")
+
+
 def smtp_port_value(raw):
     """MAIL_SMTP_PORT の値を読む。戻り値: (ポート, 誤りの説明 または None)。
 
-    空(None・"")は既定の 25。1〜65535 の整数(数字だけの文字列も可)でなければ誤り(そのときのポートは画面に出す
-    元の値。送信には使わない)。instance/config.py を直接編集した値は画面の入力チェックを通らないため、ここで
-    確かめる(範囲外の数は smtplib が 65536 で割った余りのポートに接続してしまい、読めない値を黙って 25 にすると
-    違うポートに送るため)。
+    空(None・"")は未設定(既定の 25 などに置き換えない。送らない)。1〜65535 の整数(数字だけの文字列も可)で
+    なければ誤り(そのときのポートは画面に出す元の値。送信には使わない)。config.py を直接編集した値は画面の
+    入力チェックを通らないため、ここで確かめる(範囲外の数は smtplib が 65536 で割った余りのポートに接続して
+    しまい、読めない値を黙って別のポートにすると違うポートに送るため)。
     """
     if raw is None or (isinstance(raw, str) and not raw.strip()):
-        return 25, None
+        return "", SMTP_PORT_MISSING_MESSAGE
     port = None
     if isinstance(raw, int) and not isinstance(raw, bool):
         port = raw
@@ -3805,7 +3372,7 @@ def check_mail_settings(test=False, to=None, to_label="宛先（MAIL_TO）"):
     if missing:
         return "メールの設定が不足しています: {}。システム設定の「基本設定」タブで設定してください。".format(
             "、".join(missing))
-    # ポート番号が正しくない(instance/config.py を直接編集した値など): 違うポートに接続しないよう送らない
+    # ポート番号が無い・正しくない(config.py を直接編集した値など): 違うポートに接続しないよう送らない
     return values["port_error"]
 
 
@@ -3944,7 +3511,7 @@ SMTP_HINT_SILENT = ("接続はできましたが、送信サーバーから応�
 
 # 差出人・宛先に半角英数字以外の文字を含むアドレスがあるときのメッセージ({} はそのアドレス)
 NON_ASCII_ADDRESS_MESSAGE = ("差出人・宛先に半角英数字以外の文字を含むアドレスがあるため送信できません"
-                             "（instance/config.py の MAIL_FROM・MAIL_TO・MAIL_CC を確認してください）: {}")
+                             "（システム設定の「基本設定」タブの MAIL_FROM・MAIL_TO・MAIL_CC を確認してください）: {}")
 
 
 def _close_smtp(smtp):
@@ -4072,7 +3639,7 @@ def send_mail(subject, text, html=None, attachments=(), to=None, cc=None, test=F
 #
 # ldap_client.py(プロジェクト直下)は本番環境ごとに差し替えるファイルなので、ここからは
 # authenticate() と _LOCAL_ACCOUNTS(表示名・役割)しか使わない(中身には依存しない)。
-# 固定ローカル管理者(admin)のパスワードは、instance/config.py の ADMIN_PASSWORD で
+# 固定ローカル管理者(admin)のパスワードは、基本設定(config.py / instance/settings.json)の ADMIN_PASSWORD で
 # 先に確認する(設定が空のときだけ ldap_client.py の判定に任せる)。
 # ADMIN_PASSWORD はシステム設定の「基本設定」タブからも変更でき、保存するとすぐに有効になる
 # (ログインのたびに current_app.config から読む)。
@@ -4336,7 +3903,7 @@ def no_store_when_logged_in(response):
 
 
 def _check_config_admin(username, password):
-    """instance/config.py の ADMIN_PASSWORD で固定ローカル管理者を確認する。
+    """基本設定の ADMIN_PASSWORD(current_app.config)で固定ローカル管理者を確認する。
 
     戻り値: (確認したか, 認証結果)
       - ADMIN_PASSWORD が空、または admin 以外のID → (False, None) = ldap_client.py に任せる
@@ -4504,7 +4071,7 @@ def login():
             flash(LOGIN_BUSY_MESSAGE, "danger")
             return render_template("auth/login.html", username=username)
 
-        # ① 本人確認: 固定ローカル管理者は instance/config.py で、
+        # ① 本人確認: 固定ローカル管理者は基本設定の ADMIN_PASSWORD で、
         #    それ以外は ldap_client.py の authenticate()(LDAP＋固定ローカル)で確認する
         #    (本番の ldap_client.py は LDAP認証API に問い合わせる。止まっている・つながらないときの例外は
         #    内部エラーの画面にせず、ログイン画面で案内する。パスワードはログに出さない)
@@ -6891,8 +6458,7 @@ def draft_skill_description(name, skill_type, category, current=""):
     戻り値: (下書き または None, メッセージ)。メッセージは画面にそのまま表示する。
     """
     if not ai_is_configured():
-        return None, ("AI（ChatGPT互換API）が未設定のため、下書きを作成できません。"
-                      "システム設定の「基本設定」タブで AI_API_KEY または AI_API_URL を設定してください。")
+        return None, "AIが未設定のため、下書きを作成できません。{}。".format(ai_missing_label())
     text, error = ai_chat(build_description_messages(name, skill_type, category, current))
     if error:
         return None, "AIで下書きを作成できませんでした: {}".format(error)
@@ -7924,7 +7490,7 @@ def delete_member(user_id):
     if is_local_account(user.username):
         # 固定ローカル管理者はログインのたびに有効に戻る(無効化してもログインは止まらない)
         flash(f"「{user.display_name}」({user.username})は固定ローカル管理者のため、削除・無効化できません"
-              "（ログインを止めるには instance/config.py の ADMIN_PASSWORD を変更してください。"
+              "（ログインを止めるにはシステム設定の「基本設定」タブで ADMIN_PASSWORD を変更してください。"
               "変更すると、既にログインしているブラウザもログイン画面に戻ります）。", "warning")
         return redirect(url_for("departments.manage"))
 
@@ -8482,7 +8048,7 @@ def all_xlsx():
 #
 # アプリ共通の部品を使う: AI(4-1 ai_chat)・メール送信(4-2 send_mail)・
 # 自動送信のスケジューラ(12。「flask --app app run」で起動したときだけ動く)。
-# 接続設定(メール・AI)はすべて instance/config.py から読み込む(システム設定の「基本設定」タブで変更)。
+# 接続設定(メール・AI)はすべて基本設定(config.py / instance/settings.json。システム設定の「基本設定」タブで変更)から読む。
 
 
 # =============================================================================
@@ -8653,7 +8219,7 @@ def build_weekly_subject(pattern, start, end, send_date):
 # 記録したとき)に作成される。
 #
 # ここに保存するのは「いつ・誰を・どう書くか」だけ。メールの送信サーバー・宛先や
-# AIのキーは保存しない(instance/config.py。システム設定の「基本設定」タブで変更する)。
+# AIのキーは保存しない(基本設定。システム設定の「基本設定」タブで変更する)。
 # 画面の入力チェックは設定フォーム(6-3。システム設定の「週報」タブで使う)。
 #
 # 保存項目:
@@ -9896,7 +9462,7 @@ def _weekly_error_message(app, exc):
 # 週報の設定(曜日・時刻・対象者・見本など)は、システム設定の「週報」タブで変更する
 # (入力チェックは parse_weekly_form()、保存先は instance/weekly_settings.json)。
 # メールの送信サーバー・宛先、AIの接続先・キーはシステム設定の「基本設定」タブ
-# (instance/config.py)で変更する(この画面では状況だけを表示する)。
+# (instance/settings.json)で変更する(この画面では状況だけを表示する)。
 
 weekly_bp = Blueprint("weekly", __name__, url_prefix="/weekly")
 # 週報の画面・作成はマネージャーのみ(未ログインはログイン画面へ。2-5)
@@ -10064,7 +9630,7 @@ def weekly_run_now():
 #
 # アプリ共通の部品を使う: メール送信(4-2 send_mail)・営業日カレンダー(2-4)・
 # 自動送信のスケジューラ(12。「flask --app app run」で起動したときだけ動く)。
-# メールの送信サーバー・宛先・リンクの基準URL(APP_BASE_URL)は instance/config.py から読み込む
+# メールの送信サーバー・宛先・リンクの基準URL(APP_BASE_URL)は基本設定(config.py / instance/settings.json)から読む
 # (システム設定の「基本設定」タブで変更)。
 
 
@@ -10127,7 +9693,7 @@ def next_overdue_run(settings, now):
 # 記録したとき)に作成される。
 #
 # ここに保存するのは「いつ・何件のコメントを載せるか」だけ。メールの送信サーバー・宛先や
-# リンクの基準URLは保存しない(instance/config.py。システム設定の「基本設定」タブで変更する)。
+# リンクの基準URLは保存しない(基本設定。システム設定の「基本設定」タブで変更する)。
 # 画面の入力チェックは設定フォーム(7-3。システム設定の「期限超過通知」タブで使う)。
 #
 # 保存項目:
@@ -10254,7 +9820,7 @@ def overdue_form_context(settings):
 # 直前の営業日とその後の土日祝の記載を「1日前（土日祝除く）」として数える)。
 # 本文は1行にまとめ(改行は空白に)、長いものは COMMENT_TEXT_MAX 文字で切る。
 #
-# リンクは APP_BASE_URL(instance/config.py。システム設定の「基本設定」タブで変更)＋タスク詳細画面のパス。
+# リンクは APP_BASE_URL(基本設定。システム設定の「基本設定」タブで変更)＋タスク詳細画面のパス。
 # APP_BASE_URL が空・不正ならリンクは付けない(タスク名だけ)。
 # テキスト版は「タスク名（URL）」、HTML版はタスク名をリンクにする。HTML版は
 # テンプレート(templates.html の overdue/mail.html)で作り、すべての値をエスケープする。
@@ -10621,7 +10187,7 @@ def start_overdue_background(app, trigger, test=False):
 # 期限超過通知の設定(自動送信・時刻・コメント件数)は、システム設定の「期限超過通知」タブで変更する
 # (入力チェックは parse_overdue_form()、保存先は instance/overdue_settings.json)。
 # メールの送信サーバー・宛先・リンクの基準URL(APP_BASE_URL)はシステム設定の「基本設定」タブ
-# (instance/config.py)で変更する(この画面では状況だけを表示する)。
+# (instance/settings.json)で変更する(この画面では状況だけを表示する)。
 
 overdue_bp = Blueprint("overdue", __name__, url_prefix="/overdue")
 # 期限超過通知の画面・送信はマネージャーのみ(未ログインはログイン画面へ。2-5)
@@ -10966,7 +10532,7 @@ def skilltest_form_context(settings):
 # =============================================================================
 # スキルテストの問題(4択)をAIで作成し、検証して問題プールに保存する。
 #
-# AIの接続はアプリ共通の ai_chat()(4-1)を使う(接続先・キーは instance/config.py)。
+# AIの接続はアプリ共通の ai_chat()(4-1)を使う(接続先・キーは基本設定)。
 # 1回の呼び出しで作る問題は最大 CHUNK_SIZE 問。足りなければ数回に分けて呼び出す。
 #
 # AIの応答は信用せず、次をすべて満たす問題だけを保存する:
@@ -11037,9 +10603,8 @@ def normalize_text(text):
 
 
 def model_label():
-    """問題に記録するAIのモデル名(instance/config.py の AI_MODEL。空なら既定のモデル名)。"""
-    name = str(current_app.config.get("AI_MODEL") or "").strip() or AI_DEFAULT_MODEL
-    return name[:64]
+    """問題に記録するAIのモデル名(基本設定の AI_MODEL。AI は設定済みのときだけ呼ぶため空にはならない)。"""
+    return str(current_app.config.get("AI_MODEL") or "").strip()[:64]
 
 
 def _scope_rules(description, level):
@@ -12125,8 +11690,7 @@ def _topup(app, skill_id):
                 ok, message = False, "対象外のスキルです（有効なテクニカルスキルだけ補充できます）。"
             elif not ai_is_configured():
                 name = skill.name
-                ok, message = False, ("AI（ChatGPT互換API）が未設定のため問題を作成できません。"
-                                      "システム設定の「基本設定」タブで AI_API_KEY または AI_API_URL を設定してください。")
+                ok, message = False, "AIが未設定のため問題を作成できません。{}。".format(ai_missing_label())
             else:
                 name = skill.name
                 settings = load_skilltest_settings()
@@ -12569,7 +12133,7 @@ def admin_topup(skill_id):
         flash("有効なテクニカルスキルだけ補充できます。", "warning")
         return redirect(back)
     if not ai_is_configured():
-        flash("AI（ChatGPT互換API）が未設定のため、問題を作成できません。", "danger")
+        flash("AIが未設定のため、問題を作成できません。{}。".format(ai_missing_label()), "danger")
         return redirect(back)
     settings_error = SKILLTEST_SETTINGS.load_error()
     if settings_error:
@@ -16991,8 +16555,7 @@ def analysis_run():
     args = {key: request.form.get(key, "").strip() for key in _ANALYSIS_PERIOD_ARGS}
     back = url_for("manager.analysis", **{k: v for k, v in args.items() if v})
     if not ai_is_configured():
-        flash("AI（ChatGPT互換API）が未設定のため、AIで分析できません。"
-              "システム設定の「基本設定」タブで AI_API_KEY または AI_API_URL を設定してください。", "danger")
+        flash("AIが未設定のため、AIで分析できません。{}。".format(ai_missing_label()), "danger")
     elif start_ai_analysis(current_app._get_current_object(), args):
         flash("AIで分析を始めました。終わると結果がこの画面に表示されます（人数・タスクの数によっては数分かかります）。", "info")
     else:
@@ -17863,7 +17426,7 @@ def reminder_recipients_for(routine, rem, users, emails):
 # 10-5. リマインド: 送信の設定(instance/routine_reminder_settings.json)
 # =============================================================================
 # 定型業務リマインドの自動送信の設定(画面で編集する値)と前回の結果。DBは使わず、
-# instance/routine_reminder_settings.json(Git管理外)に保存する(2-3 の JsonSettings。instance/config.py には置かない)。
+# instance/routine_reminder_settings.json(Git管理外)に保存する(2-3 の JsonSettings。基本設定には置かない)。
 # 画面はシステム設定の「定型業務リマインド」タブ(11-3)。
 #
 # 保存項目:
@@ -18558,9 +18121,9 @@ def save_member_email(user_id):
 #
 #   11-1 項目の定義    基本設定の項目の定義(キー・グループ・表示名・説明・種類・再起動の要否・秘密か)。
 #                      項目の定義はここの1か所だけにある
-#   11-2 入力チェック  基本設定の入力チェック・保存(instance/config.py の書き換え)・画面表示用の値
+#   11-2 入力チェック  基本設定の入力チェック・保存(instance/settings.json)・画面表示用の値
 #   11-3 画面          Blueprint: system_bp, /system/settings。タブ:
-#                        基本設定（config） : instance/config.py の環境ごとの設定
+#                        基本設定（config） : 環境ごとの設定(初期値 config.py ＋ 画面の設定 instance/settings.json)
 #                        週報               : instance/weekly_settings.json
 #                        期限超過通知       : instance/overdue_settings.json
 #                        スキルテスト       : instance/skilltest_settings.json
@@ -18575,28 +18138,28 @@ def save_member_email(user_id):
 # =============================================================================
 # 11-1. システム設定: 基本設定の項目の定義
 # =============================================================================
-# 基本設定(instance/config.py)の項目の定義。項目の定義はここ(FIELDS)の1か所だけに置く。
+# 基本設定(初期値 config.py ＋ 画面の設定 instance/settings.json)の項目の定義。項目の定義はここ(FIELDS)の
+# 1か所だけに置く(項目のキーの一覧は ENV_KEYS〔1-1〕と同じ)。
 #
 # 各項目: キー・グループ・表示名・説明・種類・再起動が必要か・秘密の値か(＋種類ごとの条件)。
-# 新しい環境ごとの設定を Config と見本(CONFIG_TEMPLATE)に追加したら、ここにも定義を追加する
-# (定義の無いキーは、画面の「その他」に読み取り専用で表示される)。
+# 新しい環境ごとの設定を ENV_KEYS・Config(1-1)と config.py に追加したら、ここにも定義を追加する
+# (定義の無い config.py の項目は、画面の「その他」に読み取り専用で表示される)。
 #
+# 画面で編集するのは画面の設定の層だけ。どの種類も、空欄のまま保存すると変更しない(今の層のまま)。
+# 「初期値に戻す」で画面の設定から外す(config.py の値が有効になる)。
 # 種類:
 #   text       1行の文字列(改行・制御文字は不可。pattern があればその形式だけ)
-#   url        http:// または https:// で始まるURL(空も可)
+#   url        http:// または https:// で始まるURL
 #   int        整数(min〜max)
-#   bool       オン/オフ(チェックボックス)
-#   address    メールアドレス1件(空も可)
+#   address    メールアドレス1件
 #   addresses  メールアドレスの一覧(1行に1件。「,」「;」区切りも可)
-#   secret     パスワード・キー。値は画面に出さない(設定あり/未設定だけ)。
-#              空欄のまま保存すると変更しない。「空にする」で空にする。
+#   secret     パスワード・キー。値は画面に出さない(設定あり/未設定だけ)。「空にする」で空にする。
 #              bound_to の接続先を変えるときは、入力し直すか「空にする」が必要
 #   secret_key セッションの秘密鍵。自由入力はなく、「新しいキーを生成」だけ
 
 TYPE_TEXT = "text"
 TYPE_URL = "url"
 TYPE_INT = "int"
-TYPE_BOOL = "bool"
 TYPE_ADDRESS = "address"
 TYPE_ADDRESSES = "addresses"
 TYPE_SECRET = "secret"
@@ -18685,8 +18248,11 @@ class Field:
     confirm: bool = False              # secret: 確認のためもう一度入力する
     min_length: int = 0                # secret: 最小の文字数
     clear_warning: str = ""            # secret: 空にするときの注意
+    # secret: 有効な値が空(config.py にも画面の設定にも無い)のときに、その項目の欄に表示する注意(状態に応じた表示)
+    unset_warning: str = ""
     # secret: この値を送る接続先の項目。これらを変えるときは、保存済みの値を新しい接続先へ
-    # 送らないよう、値を入力し直すか「空にする」を指定してもらう
+    # 送らないよう、値を入力し直すか「空にする」を指定してもらう。「初期値に戻す」で config.py の値を使うときは、
+    # 接続先も config.py の接続先でなければならない(config.py の値は config.py の接続先にだけ使う)
     bound_to: tuple = ()
     # url・secret: 半角英数字・記号(ASCII)だけを受け付ける(AI の呼び出し〔urllib〕は、URL・ヘッダに
     # 全角の文字・日本語を含められないため)
@@ -18699,16 +18265,21 @@ FIELDS = (
         "SECRET_KEY", GROUP_LOGIN, "セッションの秘密鍵",
         "ログイン状態（セッション）の暗号化に使う鍵です。値は表示しません。"
         "自由には入力できず、「新しいキーを生成」で作り直します。"
-        "未設定の場合は起動のたびに一時的な鍵を使います（再起動でログアウト）。",
+        "config.py にも画面の設定にも無い場合は、起動時に1回だけ生成して画面の設定（instance/settings.json）に保存します"
+        "（再起動しても同じ鍵を使います）。",
         type=TYPE_SECRET_KEY, restart_required=True, secret=True,
     ),
     Field(
         "ADMIN_PASSWORD", GROUP_LOGIN, "固定ローカル管理者（admin）のパスワード",
         "ID「admin」でログインするときのパスワードです。値は表示しません。"
-        "変更する場合だけ、新しいパスワードを2回入力してください（8文字以上）。保存するとすぐに有効になります。",
+        "変更する場合だけ、新しいパスワードを2回入力してください（8文字以上）。保存するとすぐに有効になります。"
+        "config.py にも画面の設定にも無い（空の）場合は、admin のログイン可否は ldap_client.py の判定に任されます。",
         type=TYPE_SECRET, secret=True, confirm=True, min_length=8,
         clear_warning="空にすると、admin のログイン可否は ldap_client.py の判定に任されます"
                       "（ldap_client.py に admin 用の固定パスワードがある場合は、それでログインできるようになります）。",
+        unset_warning="ADMIN_PASSWORD が未設定です（config.py にも画面の設定にも無い・空）。admin のログイン可否は "
+                      "ldap_client.py の判定に任されています（同梱の ldap_client.py では、admin 用の既定の固定パスワードで"
+                      "ログインできます）。新しいパスワードを入力して保存してください。",
     ),
     # ---- LDAP ----
     Field(
@@ -18721,28 +18292,29 @@ FIELDS = (
     # ---- AI ----
     Field(
         "AI_API_URL", GROUP_AI, "AI APIのエンドポイント",
-        "空なら OpenAI 公式のエンドポイントを使います。OpenAI互換の独自APIを使う場合に記入します"
-        "（例: https://api.example.com/v1/chat/completions）。"
+        "ChatGPT互換（OpenAI互換の形式）APIのエンドポイントです（例: https://api.example.com/v1/chat/completions）。"
+        "既定の接続先は無く、ここで設定した接続先にだけ送ります。"
         "週報の文章整形・スキルテストの問題作成・スキルの説明の下書き・AI分析に使います"
         "（AI分析では、メンバーの名前・タスクの内容・すべての進捗の記載をこの接続先に送ります）。"
-        "エンドポイントとAPIキーがどちらも空なら、AIは使いません（週報はルールベースで作成、"
+        "エンドポイントとモデル名の両方が設定されるまで、AIは使いません（週報はルールベースで作成、"
         "スキルテストは問題プールにある問題だけで出題、スキルの説明の「AIで下書き」は使えず、"
         "AI分析はアプリの集計とルールの推奨アクションだけ）。",
         type=TYPE_URL, ascii_only=True,
     ),
     Field(
         "AI_API_KEY", GROUP_AI, "APIキー",
-        "OpenAI 公式を使う場合に必要です。キーが不要な独自APIなら空のままでかまいません。値は表示しません。"
+        "接続先がキーを求める場合に設定します（Authorization ヘッダに付けます）。キーが不要な接続先なら空のままでかまいません。"
+        "値は表示しません。"
         "エンドポイントの接続先（ホスト・ポート・http/https）を変えるときは、キーを入力し直すか「空にする」を指定してください。",
         type=TYPE_SECRET, secret=True, bound_to=("AI_API_URL",), ascii_only=True,
     ),
     Field(
         "AI_MODEL", GROUP_AI, "モデル名",
-        "使用するモデル名です（空なら gpt-4o-mini）。独自APIの場合は利用できるモデル名にします。",
+        "使用するモデル名です（接続先で利用できるモデル名。既定のモデル名は無く、空のままではAIを使いません）。",
     ),
     Field(
         "AI_TIMEOUT", GROUP_AI, "タイムアウト（秒）",
-        "AIの応答を待つ最大の秒数です。",
+        "AIの応答を待つ最大の秒数です（1以上の整数でなければAIを使いません）。",
         type=TYPE_INT, min=5, max=600,
     ),
     # ---- メール送信 ----
@@ -18754,7 +18326,7 @@ FIELDS = (
     ),
     Field(
         "MAIL_SMTP_PORT", GROUP_MAIL, "ポート番号",
-        "一般的には 25 です。送信サーバーの指定に合わせます。",
+        "一般的には 25 です。送信サーバーの指定に合わせます（未設定・1〜65535 の整数でないときは送信しません）。",
         type=TYPE_INT, min=1, max=65535,
     ),
     Field(
@@ -18785,10 +18357,12 @@ FIELDS = (
 
 FIELD_MAP = {field.key: field for field in FIELDS}
 SECRET_KEYS = tuple(field.key for field in FIELDS if field.secret)
+# 画面の項目の定義と、環境ごとの設定の項目(ENV_KEYS。1-1)は同じ(読み込みの重ね合わせと画面の編集が1対1になるように)
+assert tuple(FIELD_MAP) == ENV_KEYS, "FIELDS と ENV_KEYS の項目が違います"
 
-# 以前の版で使っていて、今は使わない項目 {キー: 使わない理由}。instance/config.py に残っていれば、
-# 画面の「その他」に「未使用」としてこの理由を付けて表示する。ファイルからは自動では消さず、
-# マネージャーが「未使用の設定を削除」を押したときだけ、その行を削除する(remove_unused_config)
+# 以前の版で使っていて、今は使わない項目 {キー: 使わない理由}。config.py(初期値)に書かれていれば、
+# 画面の「その他」に「未使用」としてこの理由を付けて表示する(アプリは config.py を書き換えないため、
+# 不要なら config.py から直接消す)
 RETIRED_KEYS = {
     "SERVER_HOST": "待ち受けのアドレスは起動のコマンド「flask --app app run」の --host で指定します",
     "SERVER_PORT": "待ち受けのポートは起動のコマンド「flask --app app run」の --port で指定します",
@@ -18801,45 +18375,26 @@ RETIRED_KEYS = {
 }
 
 
-def _assigned_names(statements):
-    """文の並びの中で代入している大文字の名前(出てきた順)。"""
-    names = []
-    for stmt in statements:
-        targets = []
-        if isinstance(stmt, ast.Assign):
-            targets = stmt.targets
-        elif isinstance(stmt, ast.AnnAssign):
-            targets = [stmt.target]
-        for target in targets:
-            for node in ast.walk(target):
-                if isinstance(node, ast.Name) and node.id.isupper():
-                    names.append((node.id, stmt.lineno))
-    return names
-
-
-def documented_keys():
-    """見本(CONFIG_TEMPLATE)と Config(環境ごとの設定の既定値)に出てくるキー。
-
-    戻り値: (環境ごとの設定のキー(出てきた順), 固定設定(FixedConfig)のキーの集合)
-    """
-    keys = [name for name, _line in _assigned_names(ast.parse(CONFIG_TEMPLATE).body)]
-    keys += [name for name in vars(Config) if name.isupper()]
-    fixed = {name for name in vars(FixedConfig) if name.isupper()}
-    return list(dict.fromkeys(keys)), fixed
-
-
 # =============================================================================
 # 11-2. システム設定: 基本設定の入力チェック・保存
 # =============================================================================
-# 基本設定(instance/config.py)の入力チェック・保存・画面表示用の値。
+# 基本設定の入力チェック・保存(instance/settings.json)・画面表示用の値。
 #
 # 項目の定義は FIELDS(11-1。1か所)にあり、ここではそれに従って処理する。
+# 値は2つの層から決まる(1-3): 初期値(config.py)と画面の設定(instance/settings.json)。画面で編集するのは
+# 画面の設定の層だけで、config.py は変更しない。
 #
 # 保存の流れ(save_config_form):
-#   1. instance/config.py を読み、画面を開いたときから変わっていないか確かめる(版の比較)
+#   1. instance/settings.json を読み、画面を開いたときから変わっていないか確かめる(版 version の比較)
 #   2. すべての項目を検証する。誤りが1つでもあれば何も書かない(入力は画面に残す。秘密の値は除く)
-#   3. 値が変わった項目だけを instance/config.py に書く(1-3 の update_config。
-#      元のファイルは instance/config.py.bak に残す)
+#      - 入力欄が空のまま(秘密の値の欄も): その項目の画面の設定は変えない(今の層のまま)
+#      - 「初期値に戻す」: その項目を settings.json から削除する(config.py の値が有効になる)。入力欄に表示している
+#        今の画面の設定のままの値は入力とみなさない(別の値の入力と同時は誤り)
+#      - 秘密の値の「空にする」: 画面の設定を空にする(有効な値も空)。SECRET_KEY は「新しいキーを生成」だけ
+#      - 接続先(AI_API_URL)を変えるとき、保存済みの APIキーをそのまま使わせない(入力し直す〔同じ値でも〕か「空にする」)。
+#        「初期値に戻す」で config.py の APIキーを使うときは、接続先も config.py の接続先でなければならない
+#        (_check_secret_destinations)
+#   3. 変わった項目だけを instance/settings.json に書く(1-3 の write_settings。一時ファイルに書いて置き換える)
 #   4. 再起動が不要な項目は、実行中のアプリの設定(current_app.config)にもすぐ反映する。
 #      SECRET_KEY はファイルにだけ書き、再起動後に反映される
 #
@@ -18906,65 +18461,46 @@ CONFIG_SAVE_OK = "ok"
 CONFIG_SAVE_UNCHANGED = "unchanged"
 CONFIG_SAVE_INVALID = "invalid"
 CONFIG_SAVE_CONFLICT = "conflict"
-CONFIG_SAVE_ERROR = "error"
+CONFIG_SAVE_UNREADABLE = "unreadable"   # instance/settings.json があるのに読めない(上書きしない)
+CONFIG_SAVE_ERROR = "error"             # 書けなかった
 
-# changed         : ファイルで値を変えた項目
-# restart_changed : そのうち再起動後に反映される項目
+# 変更の種類(parse_config_form の changes の値の1つ目)
+CHANGE_SET = "set"       # 画面の設定にこの値を入れる
+CHANGE_RESET = "reset"   # 画面の設定から外す(初期値に戻す)
+
+# changed         : 画面の設定(settings.json)を変えた項目
+# reset           : そのうち「初期値に戻す」で外した項目
+# restart_changed : 変えた項目のうち、再起動後に反映されるもの(SECRET_KEY)
 # applied         : 実行中のアプリに反映した(値が変わった)項目
-SaveResult = namedtuple("SaveResult", "status errors state changed restart_changed applied message")
+SaveResult = namedtuple("SaveResult", "status errors state changed reset restart_changed applied message")
 
-MSG_CONFLICT = ("画面を開いた後に、設定ファイル（instance/config.py）が更新されています"
-                "（ほかの人の保存・直接の編集、または自分の「未使用の設定を削除」・別のタブや前の画面からの保存）。"
+MSG_CONFLICT = ("画面を開いた後に、基本設定（instance/settings.json）が更新されています"
+                "（ほかの人の保存、または別のタブや前の画面からの保存）。"
                 "最新の内容を表示しましたので、もう一度変更してください。")
 # 保存のボタンの二度押し(同じ画面からの同じ内容が、1回目の保存の後に届いた)のときの案内
 MSG_ALREADY_SAVED = ("この内容は既に保存されています（同じ内容の送信が2回届いたか、画面を開いた後に"
-                     "ほかの操作で同じ内容になっています）。設定ファイルは更新していません。")
-MSG_ALREADY_REMOVED = "未使用の設定は既に削除されています（設定ファイルは更新していません）。"
+                     "ほかの操作で同じ内容になっています）。画面の設定は更新していません。")
 # 基本設定の保存の1回限りの印(once)の種類(already_submitted)
 CONFIG_ONCE_KIND = "config"
-# 設定ファイルが無いとき(サーバーの実行中に削除・名前の変更をした)は、画面からは保存しない。
-# 一部の項目だけのファイルを作ると、自動作成(見本・秘密鍵・admin のパスワード)が行われなくなり、
-# 実行中の設定も既定値(空の admin のパスワードなど)で上書きしてしまうため
-MSG_CONFIG_MISSING = ("instance/config.py がありません。サーバーを再起動すると見本から自動作成されます"
-                      "（SECRET_KEY と ADMIN_PASSWORD にはランダムな値が入ります）。その後に、もう一度保存してください。"
-                      "設定は保存していません。")
 
 
 # --------------------------------------------------------------------------- #
-# 既定値・現在の値
+# 実行中の値との比較
 # --------------------------------------------------------------------------- #
-def defaults(app):
-    """Config の既定値(create_app で控えたもの。無ければ Config クラス)。"""
-    stored = app.extensions.get("config_defaults")
-    if stored is not None:
-        return stored
-    return {name: getattr(Config, name) for name in dir(Config) if name.isupper()}
-
-
-def effective(app, file_values):
-    """各項目の値(ファイルに書かれていればその値、無ければ既定値)。"""
-    base = defaults(app)
-    return {f.key: file_values[f.key] if f.key in file_values else base.get(f.key)
-            for f in FIELDS}
-
-
 def running_value(app, key):
-    """実行中のアプリの値。SECRET_KEY が起動時の一時的な鍵なら空として扱う。"""
-    if key == "SECRET_KEY" and app.extensions.get("secret_key_temporary"):
-        return ""
+    """実行中のアプリの値。"""
     return app.config.get(key)
 
 
-def _differs(field, file_value, run_value):
+def _differs(field, saved_value, run_value):
     if field.type in (TYPE_SECRET, TYPE_SECRET_KEY):
-        return str(file_value or "") != str(run_value or "")
-    return not same_value(file_value, run_value)
+        return str(saved_value or "") != str(run_value or "")
+    return not same_value(saved_value, run_value)
 
 
-def pending_fields(app, file_values):
-    """ファイルの値と実行中の値が違う項目(再起動すると反映される)。"""
-    values = effective(app, file_values)
-    return [f for f in FIELDS if _differs(f, values[f.key], running_value(app, f.key))]
+def pending_fields(app, values):
+    """有効な値(values)と実行中の値が違う項目(再起動すると反映される。SECRET_KEY)。"""
+    return [f for f in FIELDS if _differs(f, values.get(f.key), running_value(app, f.key))]
 
 
 def mask_secrets(app, text):
@@ -19086,37 +18622,51 @@ _PARSERS = {
     TYPE_ADDRESSES: _parse_addresses,
 }
 
+MSG_RESET_WITH_INPUT = "入力と「初期値に戻す」は同時に指定できません。"
 
-def _parse_secret(field, form, current_value):
-    """秘密の値。空欄なら変更しない、「空にする」なら空、入力があればその値。"""
+
+def _parse_secret(field, form):
+    """秘密の値。戻り値: (変更 または None〔変えない〕, エラー, 印 {"clear", "reset"})。
+
+    空欄なら変えない、「空にする」なら画面の設定を空に、「初期値に戻す」なら画面の設定から外す、
+    入力があればその値を画面の設定に入れる。
+    """
     raw = form.get(field.key, "")
     confirm = form.get(field.key + "_confirm", "") if field.confirm else ""
     clear = form.get("clear_" + field.key) == "1"
+    reset = form.get("reset_" + field.key) == "1"
+    flags = {"clear": clear, "reset": reset}
+    if reset:
+        if raw or confirm or clear:
+            return None, "新しい値の入力・「空にする」と「初期値に戻す」は同時に指定できません。", flags
+        return (CHANGE_RESET, None), None, flags
     if clear:
         if raw or confirm:
-            return None, "新しい値の入力と「空にする」は同時に指定できません。", clear
-        return "", None, clear
+            return None, "新しい値の入力と「空にする」は同時に指定できません。", flags
+        return (CHANGE_SET, ""), None, flags
     if not raw:
         if confirm:
-            return None, "新しいパスワードを両方の欄に入力してください。", clear
-        return current_value, None, clear  # 変更しない
+            return None, "新しいパスワードを両方の欄に入力してください。", flags
+        return None, None, flags  # 変更しない
     if _CONFIG_CONTROL.search(raw):
-        return None, "改行・制御文字は使えません。", clear
+        return None, "改行・制御文字は使えません。", flags
     if field.ascii_only and not raw.isascii():
-        return None, "半角英数字・記号で入力してください（全角の文字・日本語は送信できないため使えません）。", clear
+        return None, "半角英数字・記号で入力してください（全角の文字・日本語は送信できないため使えません）。", flags
     if len(raw) > SECRET_MAX:
-        return None, "{}文字以内で入力してください。".format(SECRET_MAX), clear
+        return None, "{}文字以内で入力してください。".format(SECRET_MAX), flags
     if field.min_length and len(raw) < field.min_length:
-        return None, "{}文字以上で入力してください。".format(field.min_length), clear
+        return None, "{}文字以上で入力してください。".format(field.min_length), flags
     if field.confirm and raw != confirm:
-        return None, "確認のための入力が一致しません。", clear
-    return raw, None, clear
+        return None, "確認のための入力が一致しません。", flags
+    return (CHANGE_SET, raw), None, flags
 
 
 def _destination(key, value):
     """秘密の値を送る接続先としての値(同じ接続先なら同じ値。AI_API_URL はスキーム・ホスト・ポート)。"""
     if key == "AI_API_URL":
-        url = str(value or "").strip() or AI_DEFAULT_API_URL
+        url = str(value or "").strip()
+        if not url:
+            return ""
         try:
             parts = urlsplit(url)
             port = parts.port or {"http": 80, "https": 443}.get(parts.scheme.lower())
@@ -19126,25 +18676,49 @@ def _destination(key, value):
     return str(value or "").strip()
 
 
-def _check_secret_destinations(form, current, values, errors):
+def apply_changes(overrides, changes):
+    """画面の設定(overrides)に変更(changes)を当てた新しい辞書。"""
+    values = dict(overrides)
+    for key, (kind, value) in changes.items():
+        if kind == CHANGE_RESET:
+            values.pop(key, None)
+        else:
+            values[key] = value
+    return values
+
+
+def _check_secret_destinations(initial, overrides, changes, errors, confirmed=()):
     """接続先を変えるのに、保存済みの秘密の値をそのまま使おうとしていないか。
 
-    画面に表示しない値(APIキー・パスワード)が、新しい接続先へ送られないようにする。
+    画面に表示しない値(APIキー・パスワード)が、入力した人の知らないまま新しい接続先へ送られないようにする。
+    confirmed : この保存で値を入力し直した・「空にする」を指定した秘密の値の項目(今の画面の設定と同じ値を入力し直した
+                ときも含む。入力した人が接続先を承知しているので、接続先の変更と一緒に保存できる)
+    ・入力なし(今の値のまま): 有効な値があるのに接続先が変わるなら誤り
+    ・「初期値に戻す」(config.py の値を使う): config.py の値は config.py の接続先にだけ使う。接続先が config.py の
+      接続先と違うなら誤り(画面の設定で別の接続先にしたまま、config.py のキーを使わせない)
     """
+    before = effective_values(initial, overrides)
+    after = effective_values(initial, apply_changes(overrides, changes))
     for field in FIELDS:
         if not field.bound_to or field.key in errors:
             continue
-        kept = not form.get(field.key, "") and form.get("clear_" + field.key) != "1"
-        if not kept or not _is_set(current.get(field.key)):
-            continue
+        change = changes.get(field.key)
+        if field.key in confirmed or (change is not None and change[0] == CHANGE_SET):
+            continue  # 入力し直した・「空にする」
+        if not _is_set(after.get(field.key)):
+            continue  # 送る値が無い
+        if change is not None and change[0] == CHANGE_RESET:
+            base, message = initial, (
+                "「初期値に戻す」で config.py の{label}を使うときは、{moved}も config.py の接続先にしてください"
+                "（config.py の{label}は config.py の接続先にだけ使います。別の接続先に使うときは{label}を入力し直してください）。")
+        else:
+            base, message = before, (
+                "{moved}を変更するときは、{label}を入力し直すか「空にする」を指定してください"
+                "（保存済みの値は新しい接続先には使いません）。")
         moved = [FIELD_MAP[key] for key in field.bound_to
-                 if key in values and _destination(key, values[key]) != _destination(key, current.get(key))]
+                 if key not in errors and _destination(key, after.get(key)) != _destination(key, base.get(key))]
         if moved:
-            errors[field.key] = (
-                "{}を変更するときは、{}を入力し直すか「空にする」を指定してください"
-                "（保存済みの値は新しい接続先には使いません）。".format(
-                    "・".join(f.label for f in moved), field.label))
-            values.pop(field.key, None)
+            errors[field.key] = message.format(moved="・".join(f.label for f in moved), label=field.label)
 
 
 def _shown_unchanged(field, raw, current_value):
@@ -19162,123 +18736,103 @@ def _shown_unchanged(field, raw, current_value):
     return norm(raw) == norm(_display(field, current_value))
 
 
-def parse_config_form(form, current):
+def parse_config_form(form, initial, overrides):
     """フォームの入力を検証する。
 
-    current : 今の値(ファイルの値。無ければ既定値)。秘密の値を変更しないときや、
-              フォームに項目が無いときに使う
-    戻り値: (values, errors, state)
-      values : 全項目の保存後の値 {KEY: 値}
-      errors : 誤りのある項目 {KEY: メッセージ}
-      state  : 再表示用の入力(秘密の値は含めない)
+    initial   : 初期値(config.py の値)
+    overrides : 今の画面の設定(instance/settings.json の values)
+    戻り値: (changes, errors, state)
+      changes : 画面の設定の変更 {KEY: (CHANGE_SET, 値) または (CHANGE_RESET, None)}(変わらない項目は含まない)
+      errors  : 誤りのある項目 {KEY: メッセージ}
+      state   : 再表示用の入力(秘密の値は含めない)
     """
-    values, errors, state = {}, {}, {}
+    changes, errors, state = {}, {}, {}
+    confirmed = set()  # 値を入力し直した・「空にする」を指定した秘密の値(接続先の確認 _check_secret_destinations に渡す)
     for field in FIELDS:
         key = field.key
+        reset = form.get("reset_" + key) == "1"
+        state["reset_" + key] = reset
+        has_override = key in overrides
         if field.type == TYPE_SECRET_KEY:
             generate = form.get("generate_" + key) == "1"
             state["generate_" + key] = generate
-            values[key] = secrets.token_hex(32) if generate else current.get(key)
+            if generate and reset:
+                errors[key] = "「新しいキーを生成」と「初期値に戻す」は同時に指定できません。"
+            elif generate:
+                changes[key] = (CHANGE_SET, secrets.token_hex(32))
+            elif reset and has_override:
+                changes[key] = (CHANGE_RESET, None)
             continue
         if field.type == TYPE_SECRET:
-            value, error, clear = _parse_secret(field, form, current.get(key))
-            state["clear_" + key] = clear
-        elif field.type == TYPE_BOOL:
-            # チェックボックスの前に hidden の "0" を置いている(項目が無い = 変更しない)
-            posted = form.getlist(key)
-            value, error = ("1" in posted) if posted else current.get(key), None
-            state[key] = bool(value)
-        elif key not in form:
-            value, error = current.get(key), None
-            state[key] = _display(field, value)
-        else:
-            raw = form.get(key, "")
-            state[key] = raw
-            if _shown_unchanged(field, raw, current.get(key)):
-                # 画面に表示した今の値のまま(変更していない欄)は、検証し直さずに今の値を使う
-                # (ファイルの値が、アプリでは正しく使えるのに入力欄の検証より緩い書き方〔「"表示名" <アドレス>」・
-                # 60.0 など〕のときに、触っていない欄のために、ほかの項目の保存まで断らないように)
-                value, error = current.get(key), None
-            else:
-                value, error = _PARSERS[field.type](field, raw)
+            change, error, flags = _parse_secret(field, form)
+            state["clear_" + key] = flags["clear"]
+            if error:
+                errors[key] = error
+            elif change is not None:
+                kind, value = change
+                if kind == CHANGE_SET:
+                    confirmed.add(key)  # 入力し直した・「空にする」(今の画面の設定と同じ値でも、入力した人の確認になる)
+                if kind == CHANGE_RESET and not has_override:
+                    continue  # 画面の設定が無いので戻すものが無い
+                if kind == CHANGE_SET and has_override and str(overrides[key] or "") == str(value):
+                    continue  # 今の画面の設定と同じ
+                changes[key] = change
+            continue
+        # 通常の欄: 画面の設定(無ければ空欄)を表示している。空欄のままなら変えない
+        raw = form.get(key) if key in form else None
+        state[key] = raw if raw is not None else (_display(field, overrides.get(key)) if has_override else "")
+        if reset:
+            # 入力欄には今の画面の設定を表示している。表示したままの値(触っていない欄)は入力とみなさず、
+            # 「初期値に戻す」だけを行う。別の値を入力していたら、どちらにするか分からないので誤り
+            if raw is not None and raw.strip() and not (has_override and _shown_unchanged(field, raw, overrides.get(key))):
+                errors[key] = MSG_RESET_WITH_INPUT
+            elif has_override:
+                changes[key] = (CHANGE_RESET, None)
+            continue
+        if raw is None or not raw.strip():
+            continue
+        if has_override and _shown_unchanged(field, raw, overrides.get(key)):
+            # 画面に表示した今の値のまま(変更していない欄)は、検証し直さずに今の値のままにする
+            # (旧版から取り込んだ値が、アプリでは正しく使えるのに入力欄の検証より緩い書き方〔「"表示名" <アドレス>」・
+            # 60.0 など〕のときに、触っていない欄のために、ほかの項目の保存まで断らないように)
+            continue
+        value, error = _PARSERS[field.type](field, raw)
         if error:
             errors[key] = error
-        else:
-            values[key] = value
-    _check_secret_destinations(form, current, values, errors)
-    return values, errors, state
+        elif not (has_override and same_value(overrides.get(key), value)):
+            changes[key] = (CHANGE_SET, value)
+    _check_secret_destinations(initial, overrides, changes, errors, confirmed)
+    return changes, errors, state
 
 
 # --------------------------------------------------------------------------- #
 # 保存
 # --------------------------------------------------------------------------- #
-def _apply_live(app, file_values):
-    """再起動が不要な項目に、ファイルの値を実行中のアプリの設定へ反映する。値が変わった項目を返す。"""
-    final = effective(app, file_values)
-    applied = []
-    for field in FIELDS:
-        if field.restart_required:
-            continue
-        if not same_value(app.config.get(field.key), final[field.key]):
-            applied.append(field.key)
-        app.config[field.key] = final[field.key]
-    return applied
-
-
-# 画面から保存した instance/config.py の版(file_version)を、同じフォルダで動いているほかのサーバー(プロセス)に
-# 知らせるファイル(instance/ の中)。同じフォルダで2つ以上のサーバーを起動したとき・--debug の親のプロセス
-# (サーバーを起動し直すだけのプロセス。自動送信はここで動く。ファイルの変更の見張りと画面の表示は、親が起動し直す
-# サーバーのプロセスが行う)にも、画面で保存した値を反映するために使う(refresh_live_config)。
-# 直接の編集(この印の版と違う)は、今までどおりサーバーの再起動で反映する(書きかけのファイルを読まないように)
-CONFIG_SAVED_SIGNAL = "config_saved.json"
-# このプロセスの実行中の設定に反映済みの instance/config.py の版(app.extensions のキー)
-CONFIG_LIVE_VERSION_KEY = "config_live_version"
-
-
-def _config_signal_path(instance_path):
-    return os.path.join(instance_path, CONFIG_SAVED_SIGNAL)
-
-
-def announce_config_saved(app, version):
-    """画面からの保存・反映の後に呼ぶ(config_file_lock の中)。保存した版を記録し、ほかのプロセスに知らせる。"""
-    app.extensions[CONFIG_LIVE_VERSION_KEY] = version
-    try:
-        write_file_atomic(_config_signal_path(app.instance_path),
-                          json.dumps({"version": version}).encode("utf-8"), ".config_saved_")
-    except OSError as exc:
-        app.logger.warning("基本設定の保存をほかのサーバーに知らせるファイルを保存できませんでした: %s（%s）",
-                           CONFIG_SAVED_SIGNAL, exc.__class__.__name__)
+def _apply_live(app, values):
+    """再起動が不要な項目に、有効な値(values)を実行中のアプリの設定へ反映する。値が変わった項目を返す。"""
+    keys = [field.key for field in FIELDS if not field.restart_required]
+    return apply_values(app, values, keys)
 
 
 def refresh_live_config(app):
-    """ほかのプロセス(同じフォルダのほかのサーバー)が画面から保存した instance/config.py を、このプロセスの
+    """ほかのプロセス(同じフォルダのほかのサーバー)が画面から保存した instance/settings.json を、このプロセスの
     実行中の設定に反映する(再起動が不要な項目だけ。_apply_live)。反映した項目の一覧を返す。
 
-    要求のたび(before_request)と、自動送信の前(_execute)に呼ぶ。ファイルの版が反映済みと同じなら何もしない
-    (ファイルの更新日時・サイズを見るだけ)。版が変わっていても、画面からの保存の印(CONFIG_SAVED_SIGNAL)の版と
-    違うとき(直接の編集・保存の途中)は反映しない(直接の編集は今までどおり再起動で反映)。ログには項目名だけを書く。
+    要求のたび(before_request)と、自動送信の前(_execute)に呼ぶ。ファイルの版(更新日時とサイズ)が反映済みと
+    同じなら何もしない。読めないファイルはそのままにして(反映せず)ログに残す。ログには項目名だけを書く。
     """
-    path = config_path(app.instance_path)
-    version = file_version(path)
-    if version == app.extensions.get(CONFIG_LIVE_VERSION_KEY):
+    version = file_version(settings_path(app.instance_path))
+    if version == app.extensions.get(SETTINGS_LIVE_VERSION_KEY):
         return []
-    try:
-        with open(_config_signal_path(app.instance_path), "rb") as f:
-            signal = json.loads(f.read().decode("utf-8")).get("version")
-    except (OSError, ValueError, AttributeError, RecursionError):
-        return []
-    if signal != version:
-        return []
-    with config_file_lock:
+    with settings_store_lock:
         try:
-            info = read_config(app.instance_path)
-        except ConfigFileError as exc:
+            store = read_settings(app.instance_path)
+        except SettingsStoreError as exc:
+            app.extensions[SETTINGS_LIVE_VERSION_KEY] = version  # 直るまで毎回は読まない(直ると版が変わる)
             app.logger.warning("ほかのサーバーで保存された基本設定を読み込めませんでした: %s", exc)
             return []
-        if not info["exists"] or info["version"] != signal:
-            return []
-        app.extensions[CONFIG_LIVE_VERSION_KEY] = info["version"]
-        applied = _apply_live(app, info["values"])
+        app.extensions[SETTINGS_LIVE_VERSION_KEY] = store["file_version"]
+        applied = _apply_live(app, effective_values(initial_values(app), store["values"]))
     if applied:
         app.logger.info("ほかのサーバーで保存された基本設定を実行中の設定に反映しました: %s", ", ".join(applied))
     return applied
@@ -19292,121 +18846,76 @@ def refresh_live_config_before_request():
 def save_config_form(app, form, username):
     """基本設定を保存する。戻り値: SaveResult(メッセージに秘密の値は含めない)。
 
-    保存後(変更が無かった場合も)、再起動が不要な項目はファイルの値を実行中のアプリに反映する
-    (ファイルを直接編集した値も、ここで保存すると反映される)。
+    保存後(変更が無かった場合も)、再起動が不要な項目は有効な値を実行中のアプリに反映する。
     """
-    def result(status, errors=None, state=None, changed=(), restart_changed=(), applied=(),
+    def result(status, errors=None, state=None, changed=(), reset=(), restart_changed=(), applied=(),
                message=""):
-        return SaveResult(status, errors or {}, state, list(changed), list(restart_changed),
+        return SaveResult(status, errors or {}, state, list(changed), list(reset), list(restart_changed),
                           list(applied), message)
 
-    with config_file_lock:
+    with settings_store_lock:
         try:
-            info = read_config(app.instance_path)
-        except ConfigFileError as exc:
-            return result(CONFIG_SAVE_ERROR, message=str(exc))
-        if not info["exists"]:
-            return result(CONFIG_SAVE_ERROR, message=MSG_CONFIG_MISSING)
-        if form.get("version", "") != info["version"]:
-            if _config_already_saved(app, form, info):
+            store = read_settings(app.instance_path)
+        except SettingsStoreError as exc:
+            return result(CONFIG_SAVE_UNREADABLE, message=str(exc))
+        if form.get("version", "") != str(store["version"]):
+            if _config_already_saved(app, form, store):
                 return result(CONFIG_SAVE_UNCHANGED, message=MSG_ALREADY_SAVED)
             return result(CONFIG_SAVE_CONFLICT, message=MSG_CONFLICT)
 
-        current = effective(app, info["values"])
-        values, errors, state = parse_config_form(form, current)
+        initial = initial_values(app)
+        changes, errors, state = parse_config_form(form, initial, store["values"])
         if errors:
             return result(CONFIG_SAVE_INVALID, errors=errors, state=state)
 
-        changes = {f.key: values[f.key] for f in FIELDS
-                   if not same_value(values[f.key], current.get(f.key))}
         if not changes:
-            applied = _apply_live(app, info["values"])
+            applied = _apply_live(app, effective_values(initial, store["values"]))
             if applied:
-                app.logger.info("システム設定（基本設定）: ファイルの値を実行中の設定に反映しました: %s（%s）",
+                app.logger.info("システム設定（基本設定）: 保存済みの値を実行中の設定に反映しました: %s（%s）",
                                 ", ".join(applied), username)
-            # ほかのサーバーにも今のファイルの値を反映させる(このサーバーだけ再起動済みで、ほかのサーバーが
-            # 直接の編集の前の値のままのときも、ここで保存すれば揃う)
-            announce_config_saved(app, info["version"])
             return result(CONFIG_SAVE_UNCHANGED, applied=applied)
 
+        new_values = apply_changes(store["values"], changes)
         try:
-            new_values = update_config(
-                app.instance_path, changes, username, expected_version=info["version"])
-        except ConfigConflictError:
+            write_settings(app.instance_path, new_values, username, expected_version=store["version"])
+        except SettingsConflictError:
             return result(CONFIG_SAVE_CONFLICT, message=MSG_CONFLICT)
-        except ConfigFileError as exc:
-            app.logger.warning("システム設定（基本設定）を保存できませんでした: %s", exc)
-            return result(CONFIG_SAVE_ERROR, state=state, message=str(exc))
+        except (OSError, SettingsStoreError) as exc:
+            app.logger.warning("システム設定（基本設定）を保存できませんでした: %s", exc.__class__.__name__)
+            return result(CONFIG_SAVE_ERROR, state=state,
+                          message="instance/{} を保存できませんでした（{}）。".format(
+                              SETTINGS_FILENAME, exc.__class__.__name__))
+        app.extensions[SETTINGS_LIVE_VERSION_KEY] = file_version(settings_path(app.instance_path))
 
         if has_request_context():
             # 保存のボタンの二度押しの2回目を「ほかの人の保存」と案内しないように、印と内容を覚える
             remember_submitted(CONFIG_ONCE_KIND, "")
-        # 再起動が不要な項目は、実行中のアプリにもすぐ反映する(同じフォルダのほかのサーバーにも知らせる)
-        applied = _apply_live(app, new_values)
-        announce_config_saved(app, file_version(info["path"]))
+        # 再起動が不要な項目は、実行中のアプリにもすぐ反映する(同じフォルダのほかのサーバーは、次の要求の前・
+        # 自動送信の前に settings.json の版を見て反映する。refresh_live_config)
+        final = effective_values(initial, new_values)
+        applied = _apply_live(app, final)
         changed = [f.key for f in FIELDS if f.key in changes]
-        restart_changed = [key for key in changed if FIELD_MAP[key].restart_required]
-        app.logger.info("システム設定（基本設定）を変更しました: %s（%s）",
-                        ", ".join(changed), username)
-        return result(CONFIG_SAVE_OK, changed=changed, restart_changed=restart_changed,
+        reset = [key for key in changed if changes[key][0] == CHANGE_RESET]
+        restart_changed = [key for key in changed if FIELD_MAP[key].restart_required
+                           and _differs(FIELD_MAP[key], final.get(key), running_value(app, key))]
+        app.logger.info("システム設定（基本設定）を変更しました: %s（%s）", ", ".join(changed), username)
+        return result(CONFIG_SAVE_OK, changed=changed, reset=reset, restart_changed=restart_changed,
                       applied=applied)
 
 
-def _config_already_saved(app, form, info):
+def _config_already_saved(app, form, store):
     """画面を開いた後にファイルが変わっていた(version が違う)保存が、既に保存された内容の2回目か。
 
     ・同じ画面(1回限りの印 once)からの同じ内容が、少し前に保存されている(二度押し。新しいキーの生成も含む)
-    ・または、入力のとおりに保存しても値が1つも変わらない(新しいキーの生成を除く。上書きで失われるものが無い)
-    どちらでもなければ False(ほかの人の保存・直接の編集と重なった)。
+    ・または、入力のとおりに保存しても画面の設定が1つも変わらない(新しいキーの生成を除く。上書きで失われるものが無い)
+    どちらでもなければ False(ほかの人の保存と重なった)。
     """
     if has_request_context() and already_submitted(CONFIG_ONCE_KIND) is not None:
         return True
     if any(form.get("generate_" + f.key) == "1" for f in FIELDS if f.type == TYPE_SECRET_KEY):
         return False
-    current = effective(app, info["values"])
-    values, errors, _state = parse_config_form(form, current)
-    if errors:
-        return False
-    return all(same_value(values[f.key], current.get(f.key)) for f in FIELDS)
-
-
-def remove_unused_config(app, form, username):
-    """instance/config.py に残っている、今は使わない項目(RETIRED_KEYS)の行を削除する。
-
-    form の version(画面を開いたときのファイルの版)が今の版と違えば削除しない(競合)。
-    削除の仕組みは remove_config_keys()(1-3。変更前の内容は instance/config.py.bak に残す)。
-    戻り値: (結果 CONFIG_SAVE_〜, 削除した項目の一覧, メッセージ)。
-    """
-    with config_file_lock:
-        try:
-            info = read_config(app.instance_path)
-        except ConfigFileError as exc:
-            return CONFIG_SAVE_ERROR, [], str(exc)
-        if not info["exists"]:
-            return CONFIG_SAVE_ERROR, [], MSG_CONFIG_MISSING
-        keys = unused_keys_in_file(info["values"])
-        if form.get("version", "") != info["version"]:
-            if not keys:
-                # 二度押しの2回目など: 削除する項目はもう無い(削除し直すものが無いので、競合とはしない)
-                return CONFIG_SAVE_UNCHANGED, [], MSG_ALREADY_REMOVED
-            return CONFIG_SAVE_CONFLICT, [], MSG_CONFLICT
-        if not keys:
-            return CONFIG_SAVE_UNCHANGED, [], ""
-        try:
-            removed, _values = remove_config_keys(
-                app.instance_path, keys, username, expected_version=info["version"])
-        except ConfigConflictError:
-            return CONFIG_SAVE_CONFLICT, [], MSG_CONFLICT
-        except ConfigFileError as exc:
-            app.logger.warning("システム設定（基本設定）: 未使用の設定を削除できませんでした: %s", exc)
-            return CONFIG_SAVE_ERROR, [], str(exc)
-        # 実行中の設定からも外す(どこからも使われていないが、ファイルと揃える)
-        for key in removed:
-            app.config.pop(key, None)
-        announce_config_saved(app, file_version(config_path(app.instance_path)))
-        app.logger.info("システム設定（基本設定）: 未使用の設定を削除しました: %s（%s）",
-                        ", ".join(removed), username)
-        return CONFIG_SAVE_OK, removed, ""
+    changes, errors, _state = parse_config_form(form, initial_values(app), store["values"])
+    return not errors and not changes
 
 
 # --------------------------------------------------------------------------- #
@@ -19414,8 +18923,6 @@ def remove_unused_config(app, form, username):
 # --------------------------------------------------------------------------- #
 def _display(field, value):
     """入力欄に表示する値(秘密の値には使わない)。"""
-    if field.type == TYPE_BOOL:
-        return bool(value)
     if field.type == TYPE_ADDRESSES:
         if isinstance(value, str):
             items = re.split(r"[,;]", value)
@@ -19433,34 +18940,37 @@ def _is_set(value):
     return value not in (None, "", [], ())
 
 
-def unused_keys_in_file(file_values):
-    """instance/config.py に残っている、今は使わない項目(RETIRED_KEYS。ファイルに出てくる順)。"""
-    return [key for key in file_values if key in RETIRED_KEYS]
+def _summary(field, value):
+    """初期値・画面の設定・有効な値の表示用の短い文(秘密の値は 設定あり/未設定。URL の ID・パスワードは伏せる)。"""
+    if field.secret:
+        return "設定あり" if _is_set(value) else "未設定"
+    if not _is_set(value):
+        return "未設定"
+    if field.type == TYPE_ADDRESSES:
+        text = "、".join(_display(field, value).split("\n"))
+    else:
+        text = str(value)
+    text = mask_url_userinfo(text) if field.type == TYPE_URL else _URL_USERINFO_IN_VALUE.sub(r"\1***@", text)
+    return text if len(text) <= 120 else text[:117] + "..."
 
 
-def _other_rows(app, file_values):
-    """定義の無いキー(読み取り専用で「その他」に表示)。今は使わない項目には retired を付ける。"""
-    documented, fixed = documented_keys()
-    base = defaults(app)
-    keys = [(key, "app.py の見本・既定値") for key in documented if key not in FIELD_MAP]
-    keys += [(key, "instance/config.py だけに記載") for key in file_values
-             if key not in FIELD_MAP and key not in fixed and key not in documented]
-    # 固定設定(FixedConfig)を instance/config.py で上書きしている項目(実行中の動作が変わるため表示する)
-    keys += [(key, "instance/config.py で上書き（固定設定）") for key in file_values
-             if key in fixed and key not in FIELD_MAP]
+def _other_rows(app, initial):
+    """FIELDS に定義の無い config.py の項目(読み取り専用で「その他」に表示)。今は使わない項目には retired を付ける。"""
+    fixed = {name for name in vars(FixedConfig) if name.isupper()}
+    keys = [(key, "config.py に記載") for key in initial if key not in FIELD_MAP and key not in fixed]
+    # 固定設定(FixedConfig)を config.py で上書きしている項目(実行中の動作が変わるため表示する)
+    keys += [(key, "config.py で上書き（固定設定）") for key in initial if key in fixed and key not in FIELD_MAP]
     rows = []
     for key, source in keys:
-        in_file = key in file_values
-        value = file_values[key] if in_file else base.get(key)
+        value = initial[key]
         # 名前が秘密の値らしい項目と、値の辞書の中に秘密の値らしいキー(bind_password・Authorization など)が
         # ある項目は、値を表示しない
         hidden = bool(_SECRET_LIKE.search(key)) or _has_secret_like_key(value)
         # 値の中の URL の ID・パスワード(user:pass@。一覧・辞書の中も)は伏せる(基本設定の URL の欄と同じ)
-        text = masked_repr(value) if (in_file or key in base) else ""
+        text = masked_repr(value)
         rows.append({
             "key": key,
             "source": source,
-            "in_file": in_file,
             "is_set": _is_set(value),
             "hidden": hidden,
             "value": "" if hidden else (text if len(text) <= 120 else text[:117] + "..."),
@@ -19475,7 +18985,7 @@ def mask_url_userinfo(url):
     return _URL_USERINFO.sub(r"\1***@", str(url or ""))
 
 
-# 設定ファイルの URL に ID・パスワードが含まれているときの案内(入力欄には伏せた URL を出す)
+# 保存されている URL に ID・パスワードが含まれているときの案内(入力欄には伏せた URL を出す)
 URL_USERINFO_NOTICE = ("この URL には ID・パスワード（user:pass@ の形）が含まれています（画面では伏せて表示しています）。"
                        "この形の URL は使えないため、ID・パスワードを含めない URL に直して保存してください"
                        "（このままでは基本設定を保存できません）。")
@@ -19487,63 +18997,64 @@ def config_form_context(app, state=None, errors=None):
     try:
         # 保存(一時ファイルからの置き換え)と同時に読むと、Windows では置き換えが PermissionError になるため、
         # 読み込みも保存と同じロックの中で行う
-        with config_file_lock:
-            info = read_config(app.instance_path)
+        with settings_store_lock:
+            store = read_settings(app.instance_path)
         file_error = None
-    except ConfigFileError as exc:
-        info, file_error = None, str(exc)
+    except SettingsStoreError as exc:
+        store, file_error = None, str(exc)
 
-    if info is not None and info["exists"]:
-        file_values = info["values"]
-        current = effective(app, file_values)
-        pending = pending_fields(app, file_values)
-    else:
-        # 読み込めない・ファイルが無い: 実行中の値を表示する(画面からは保存できない)
-        file_values = {}
-        current = {f.key: app.config.get(f.key) for f in FIELDS}
-        pending = []
+    initial = initial_values(app)
+    overrides = store["values"] if store is not None else {}
+    current = effective_values(initial, overrides)
+    pending = pending_fields(app, current) if store is not None else []
     pending_keys = {f.key for f in pending}
 
     groups = []
     for group_key, group_label in GROUPS:
         rows = []
         for field in (f for f in FIELDS if f.group == group_key):
-            value = current.get(field.key)
-            if field.type == TYPE_SECRET_KEY and not (info is not None and info["exists"]):
-                value = running_value(app, field.key)
+            key = field.key
+            has_override = key in overrides
             row = {
                 "field": field,
-                "is_set": _is_set(value),
-                "in_file": field.key in file_values,
-                "pending": field.key in pending_keys,
-                "error": errors.get(field.key),
+                "is_set": _is_set(current.get(key)),
+                "has_override": has_override,
+                "in_initial": key in initial,
+                "initial_text": _summary(field, initial.get(key)) if key in initial else "（config.py に記載なし）",
+                "override_text": _summary(field, overrides.get(key)) if has_override else "",
+                "effective_text": _summary(field, current.get(key)),
+                "pending": key in pending_keys,
+                "error": errors.get(key),
                 # キー名に clear などを使わない(Jinja の row.clear が dict.clear メソッドになるため)
-                "clear_checked": bool(state and state.get("clear_" + field.key)),
-                "generate_checked": bool(state and state.get("generate_" + field.key)),
+                "clear_checked": bool(state and state.get("clear_" + key)),
+                "generate_checked": bool(state and state.get("generate_" + key)),
+                "reset_checked": bool(state and state.get("reset_" + key)),
                 "value": "",
+                "placeholder": "",
             }
             if not field.secret:
-                if state is not None and field.key in state:
-                    row["value"] = state[field.key]
-                else:
-                    row["value"] = _display(field, value)
+                if state is not None and key in state:
+                    row["value"] = state[key]
+                elif has_override:
+                    row["value"] = _display(field, overrides.get(key))
                 if field.type == TYPE_URL and url_has_userinfo(row["value"]):
-                    # ID・パスワードを含む URL(直接の編集・以前の版からの引き継ぎ)は、値を HTML に出さない
+                    # ID・パスワードを含む URL(旧版からの取り込みなど)は、値を HTML に出さない
                     row["value"] = mask_url_userinfo(row["value"])
                     row["notice"] = URL_USERINFO_NOTICE
+                if not has_override:
+                    row["placeholder"] = "初期値: {}".format(row["initial_text"]) if key in initial else "未設定"
             rows.append(row)
         groups.append({"key": group_key, "label": group_label, "rows": rows})
 
     return {
         "file_error": file_error,
-        "can_save": bool(info and info["exists"]),
-        "exists": bool(info and info["exists"]),
-        # ファイルが無い(読み込めないのではない)
-        "missing": info is not None and not info["exists"],
-        "version": info["version"] if info else "",
+        "can_save": file_error is None,
+        "exists": bool(store and store["exists"]),
+        "version": str(store["version"]) if store is not None else "",
+        "updated_at": store["updated_at"] if store is not None else "",
+        "updated_by": store["updated_by"] if store is not None else "",
         "groups": groups,
-        "other": _other_rows(app, file_values),
-        "unused": unused_keys_in_file(file_values),
+        "other": _other_rows(app, initial),
         "pending": pending,
         "pending_secret_key": "SECRET_KEY" in pending_keys,
         "error_count": len(errors),
@@ -19560,16 +19071,13 @@ def config_form_context(app, state=None, errors=None):
 # システム設定の画面。マネージャーのみ(未ログインはログイン画面へ、メンバーは403)。
 #
 # GET  /system/settings?tab=<タブ>     設定画面(タブ: config / weekly / overdue / skilltest / analysis / reminder)
-# POST /system/settings/config         基本設定の保存(instance/config.py)
+# POST /system/settings/config         基本設定の保存(instance/settings.json。画面の設定の層)
 # POST /system/settings/weekly         週報の設定の保存(instance/weekly_settings.json)
 # POST /system/settings/overdue        期限超過通知の設定の保存(instance/overdue_settings.json)
 # POST /system/settings/skilltest      スキルテストの設定の保存(instance/skilltest_settings.json)
 # POST /system/settings/analysis       AI分析の設定の保存(instance/ai_analysis_settings.json)
 # POST /system/settings/reminder       定型業務リマインドの設定の保存(instance/routine_reminder_settings.json)
 # POST /system/settings/reminder/test  定型業務リマインドのテスト送信(今の未完了の回をすべて載せて、差出人宛てに1通)
-# POST /system/settings/config/remove-unused
-#                                      基本設定の「未使用の設定を削除」(instance/config.py から
-#                                      今は使わない項目の行を削除する。RETIRED_KEYS)
 # POST /system/settings/test-mail      メール接続テスト(保存済みの設定で、差出人宛てに短いメール)
 # POST /system/settings/test-ai        AI接続テスト(保存済みの設定で、短い問い合わせを1回)
 #
@@ -19710,7 +19218,7 @@ def system_settings():
 
 
 # --------------------------------------------------------------------------- #
-# 基本設定(instance/config.py)
+# 基本設定(画面の設定の層 instance/settings.json を編集する)
 # --------------------------------------------------------------------------- #
 @system_bp.route("/settings/config", methods=["POST"])
 def save_config():
@@ -19725,47 +19233,34 @@ def save_config():
     if result.status == CONFIG_SAVE_CONFLICT:
         flash(result.message, "warning")
         return redirect(_tab_url(TAB_CONFIG))
+    if result.status == CONFIG_SAVE_UNREADABLE:
+        # 画面の設定のファイルが読めない(壊れている): 上書きせず、保存できない旨を表示する(500 にはしない)
+        flash("基本設定を保存できませんでした（画面の設定のファイルを読み込めないため、上書きしていません）: {}".format(
+            result.message), "danger")
+        return _render_system_settings(TAB_CONFIG, status=400, config_state=result.state)
     if result.status == CONFIG_SAVE_ERROR:
         flash("基本設定を保存できませんでした: {}".format(result.message), "danger")
         return _render_system_settings(TAB_CONFIG, status=500, config_state=result.state)
     if result.status == CONFIG_SAVE_UNCHANGED:
-        message = result.message or "変更された項目はありません（設定ファイルは更新していません）。"
+        message = result.message or "変更された項目はありません（画面の設定は更新していません）。"
         if result.applied:
-            message += "設定ファイルの値を実行中の設定に反映しました: {}。".format("、".join(result.applied))
+            message += "保存済みの値を実行中の設定に反映しました: {}。".format("、".join(result.applied))
         flash(message, "info")
         return redirect(_tab_url(TAB_CONFIG))
 
-    message = "基本設定を保存しました（変更: {}）。変更前の内容は instance/config.py.bak に残しています。".format(
-        "、".join(result.changed))  # 保存は instance/config.py があるときだけ(必ず .bak を作る)
-    live = [key for key in result.changed if key not in result.restart_changed]
+    message = "基本設定を保存しました（変更: {}）。".format("、".join(result.changed))
+    if result.reset:
+        message += "{} は初期値（config.py の値）に戻しました。".format("、".join(result.reset))
+    live = [key for key in result.changed if key not in result.restart_changed
+            and not FIELD_MAP[key].restart_required]
     if live:
         message += "{} はすぐに反映しました。".format("、".join(live))
-    others = [key for key in result.applied if key not in result.changed]
-    if others:
-        message += "設定ファイルを直接編集した {} も実行中の設定に反映しました。".format("、".join(others))
     flash(message, "success")
     if result.restart_changed:
         notice = "{} はサーバーの再起動後に反映されます。".format("、".join(result.restart_changed))
         if "SECRET_KEY" in result.restart_changed:
             notice += "再起動すると全員がログアウトされます。"
         flash(notice, "warning")
-    return redirect(_tab_url(TAB_CONFIG))
-
-
-@system_bp.route("/settings/config/remove-unused", methods=["POST"])
-def remove_unused():
-    """instance/config.py から、今は使わない項目(「その他」の「未使用」)の行を削除する。"""
-    app = current_app._get_current_object()
-    status, removed, message = remove_unused_config(app, request.form, current_user.username)
-    if status == CONFIG_SAVE_OK:
-        flash("未使用の設定を削除しました（{}）。変更前の内容は instance/config.py.bak に残しています。".format(
-            "、".join(removed)), "success")
-    elif status == CONFIG_SAVE_UNCHANGED:
-        flash(message or "削除する未使用の設定はありません（設定ファイルは更新していません）。", "info")
-    elif status == CONFIG_SAVE_CONFLICT:
-        flash(message, "warning")
-    else:
-        flash("未使用の設定を削除できませんでした: {}".format(message), "danger")
     return redirect(_tab_url(TAB_CONFIG))
 
 
@@ -20390,11 +19885,11 @@ def send_static_section(filename):
 # =============================================================================
 # 13-2. create_app(アプリの作成)
 # =============================================================================
-# 設定の読み込み順:
-#   1. Config(このファイルの固定設定と、環境ごとの設定の既定値)
-#   2. instance/config.py(環境ごとの実際の値。無ければ初回に自動作成)
-# instance/config.py は、マネージャーが画面(システム設定の「基本設定」タブ)からも変更できる
-# (再起動が不要な項目は保存と同時に app.config にも反映される)。
+# 設定の読み込み順(1。load_config_layers):
+#   1. Config(このファイルの固定設定と、環境ごとの設定の項目〔空の値〕)
+#   2. config.py(app.py と同じフォルダ。環境ごとの設定の初期値。無ければ起動しない)
+#   3. instance/settings.json(システム設定の「基本設定」タブで保存した値。あればその値が優先)
+# 画面(システム設定の「基本設定」タブ)で保存した値は、再起動が不要な項目なら保存と同時に app.config にも反映される。
 #
 # 新しい機能は、Blueprint を作って BLUEPRINTS に加えるだけで追加できる。
 BLUEPRINTS = (
@@ -20421,23 +19916,140 @@ BLUEPRINTS = (
 )
 
 
-def _ensure_secret_key(app):
-    """SECRET_KEY が空なら、このプロセス限りのランダムな鍵を使う。
+# SECRET_KEY の生成を、同じフォルダのプロセスの間(--debug の親と子・同時に最初の起動をしたほかのサーバー)で直列にする
+# ロックのファイル(instance/。scheduler.lock と同じ OS のロック。ファイルは残る。中身は無い)
+SETTINGS_LOCK_FILENAME = "settings.lock"
+# 生成→保存→読み直しを試す回数(読んだ後にほかのプロセスが保存していた〔SettingsConflictError〕ときに読み直す)
+_SECRET_KEY_ATTEMPTS = 3
 
-    鍵は起動のたびに変わるため、再起動するとログイン状態が切れる。
-    instance/config.py に SECRET_KEY を記入すれば固定される
-    (システム設定の「基本設定」タブの「新しいキーを生成」でも記入できる)。
-    一時的な鍵を使っていることは app.extensions["secret_key_temporary"] に控える
-    (システム設定の画面で、ファイルの値と実行中の値の違いを正しく判定するため)。
+
+def _lock_settings_file(instance_path):
+    """instance/settings.lock のロックを取る(ほかのプロセスが持っていれば待つ)。戻り値: 開いたファイル、または None。
+
+    Windows(msvcrt.locking LK_LOCK)は1秒おきに10回まで試し、取れなければ OSError。ほかの OS は取れるまで待つ。
+    取れない・開けない(権限など)ときは None(ロック無しで続ける。保存の後にファイルの鍵を読み直すので、
+    最後はファイルの鍵に合わせる)。
     """
-    if app.config.get("SECRET_KEY"):
+    try:
+        lock_file = open(os.path.join(instance_path, SETTINGS_LOCK_FILENAME), "a+b")
+    except OSError:
+        return None
+    try:
+        if os.name == "nt":
+            import msvcrt
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    except OSError:
+        lock_file.close()
+        return None
+    return lock_file
+
+
+def _unlock_settings_file(lock_file):
+    """_lock_settings_file で取ったロックを外して閉じる(None なら何もしない)。"""
+    if lock_file is None:
         return
-    app.config["SECRET_KEY"] = secrets.token_hex(32)
-    app.extensions["secret_key_temporary"] = True
-    app.logger.warning(
-        "SECRET_KEY が未設定のため、一時的な鍵で起動します（再起動でログアウトされます）。"
-        "instance/%s に SECRET_KEY を設定してください。", CONFIG_FILENAME
-    )
+    try:
+        if os.name == "nt":
+            import msvcrt
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    lock_file.close()
+
+
+def _stored_secret_key(store):
+    """settings.json(read_settings の結果)にある SECRET_KEY(空でない文字列)。無ければ ""。"""
+    key = store["values"].get("SECRET_KEY")
+    return key if isinstance(key, str) and key else ""
+
+
+def _generate_secret_key(instance_path):
+    """settings.json に SECRET_KEY が無ければ生成して保存し、ファイルにある鍵を返す。戻り値: (鍵, 生成したか)。
+
+    保存の後にファイルを読み直し、ファイルにある鍵を使う(ファイルの鍵が常に正。同時に最初の起動をしたほかの
+    プロセスが生成した鍵と、このプロセスの鍵が食い違わないように)。読んだ後にほかのプロセスが保存していたとき
+    (SettingsConflictError)は読み直して、その鍵があればそれを使う。
+    """
+    new_key = ""
+    for _attempt in range(_SECRET_KEY_ATTEMPTS):
+        store = read_settings(instance_path)
+        key = _stored_secret_key(store)
+        if key:
+            return key, False
+        new_key = secrets.token_hex(32)
+        values = dict(store["values"])
+        values["SECRET_KEY"] = new_key
+        try:
+            write_settings(instance_path, values, UPDATED_BY_AUTO, expected_version=store["version"])
+        except SettingsConflictError:
+            continue  # ほかのプロセスが先に保存した。読み直す
+        key = _stored_secret_key(read_settings(instance_path))
+        if key:
+            return key, key == new_key
+    raise SettingsStoreError("instance/{} に SECRET_KEY を保存できませんでした（ほかの保存と重なりました）。".format(
+        SETTINGS_FILENAME))
+
+
+def _ensure_secret_key(app):
+    """SECRET_KEY が config.py にも instance/settings.json にも無ければ、1回だけ生成して settings.json に保存する。
+
+    生成した鍵は画面の設定の層(settings.json)に残るため、再起動しても同じ鍵を使う(ログイン状態が切れない)。
+    ほかのプロセス(--debug の親と子・同じフォルダのほかのサーバー)との間では、instance/settings.lock のロックで
+    生成を直列にし、保存の後にファイルを読み直してファイルにある鍵を使う(同時に最初の起動をしても鍵は1つ。
+    先に生成したプロセスがあれば、その鍵を使う。_generate_secret_key)。保存できないときは ConfigLoadError で止める
+    (起動のたびに別の鍵になる動きはしない)。鍵の値はログに書かない。
+    """
+    running = app.config.get("SECRET_KEY")
+    if isinstance(running, str) and running:
+        return False
+    with settings_store_lock:
+        lock_file = _lock_settings_file(app.instance_path)
+        try:
+            key, generated = _generate_secret_key(app.instance_path)
+        except (OSError, SettingsStoreError) as exc:
+            raise ConfigLoadError(
+                "SECRET_KEY が未設定のため鍵を生成しましたが、instance/{} に保存できませんでした（{}）。"
+                "起動のたびに別の鍵にはしません（再起動でログアウトされるため）。フォルダの書き込みの権限・"
+                "ディスクの空きと、同じフォルダでほかのサーバーを同時に起動していないかを確認してから、"
+                "もう一度実行してください。".format(SETTINGS_FILENAME, exc.__class__.__name__)) from None
+        finally:
+            _unlock_settings_file(lock_file)
+        app.extensions[SETTINGS_LIVE_VERSION_KEY] = file_version(settings_path(app.instance_path))
+    app.config["SECRET_KEY"] = key
+    if generated:
+        app.logger.info("SECRET_KEY が未設定のため生成し、instance/%s に保存しました（値は表示しません）。",
+                        SETTINGS_FILENAME)
+    return generated
+
+
+def _hint_old_config(app, store):
+    """旧版の instance/config.py があり、まだ画面の設定に取り込んでいないようなら、取り込み方を1行案内する。
+
+    settings.json が無いとき、または SECRET_KEY の自動生成でしか書かれていないときに表示する。
+    """
+    old = os.path.join(app.instance_path, OLD_CONFIG_FILENAME)
+    if os.path.isfile(old) and (not store["exists"] or store["updated_by"] == UPDATED_BY_AUTO):
+        _notice(OLD_CONFIG_HINT + "（取り込むまで、そのファイルの値は使われません）。")
+
+
+# ADMIN_PASSWORD がどちらの層にも無い(空)ときの起動時の案内(値を自動では決めない。設定するまで毎回表示する)
+ADMIN_PASSWORD_UNSET_HINT = ("ADMIN_PASSWORD が未設定のため、admin のログイン可否は ldap_client.py の判定に任されています"
+                             "（同梱の ldap_client.py では admin 用の既定の固定パスワードでログインできます）。"
+                             "システム設定の「基本設定」タブで設定してください")
+
+
+def _hint_admin_password(app):
+    """有効な ADMIN_PASSWORD が空なら、admin のログインが ldap_client.py の判定に任されている旨を1行案内する。"""
+    if not str(app.config.get("ADMIN_PASSWORD") or ""):
+        _notice(ADMIN_PASSWORD_UNSET_HINT)
 
 
 def instance_db_path(app):
@@ -20445,55 +20057,11 @@ def instance_db_path(app):
     return os.path.join(app.instance_path, "app.db")
 
 
-class ConfigLoadError(click.ClickException):
-    """起動・コマンドの開始時に instance/config.py を読み込めない(メッセージに設定値は含めない)。
-
-    click の例外にして、「flask --app app run / seed / migrate」が Python の例外の表示(誤りの行の内容、
-    つまりパスワードやキーの値を含む)ではなく、日本語のメッセージ「Error: ...」を表示して終わるようにする。
-    """
-
-
-def _config_error_line(exc, path):
-    """設定ファイルの評価の例外 exc から、ファイルの中の行番号を探す(分からなければ None)。"""
-    if isinstance(exc, SyntaxError) and exc.lineno:
-        return exc.lineno
-    line = None
-    tb = exc.__traceback__
-    target = os.path.normcase(os.path.abspath(path))
-    while tb is not None:
-        filename = tb.tb_frame.f_code.co_filename
-        if filename and os.path.normcase(os.path.abspath(filename)) == target:
-            line = tb.tb_lineno
-        tb = tb.tb_next
-    return line
-
-
-def load_instance_config(app):
-    """instance/config.py の値で、既定値(Config)を上書きする(起動・seed / migrate の開始時)。
-
-    手で編集した内容に書式の誤り(引用符の閉じ忘れ・引用符の無い値など)があるときは、Python の例外の表示
-    (誤りの行の内容=設定値を含む)ではなく、ファイルの場所・行番号・例外の種類だけの日本語のメッセージで
-    止める(ConfigLoadError)。既定値のまま動かすことはしない(ADMIN_PASSWORD が空になり、admin のログインを
-    ldap_client.py の固定のパスワードに任せることになるため)。
-    """
-    path = config_path(app.instance_path)
-    # 読み込んだ版(ほかのサーバーが画面から保存したときに反映するため。refresh_live_config)
-    app.extensions[CONFIG_LIVE_VERSION_KEY] = file_version(path)
-    try:
-        app.config.from_pyfile(CONFIG_FILENAME, silent=True)
-    except Exception as exc:  # 設定ファイルの評価の例外すべて(書式の誤り・未定義の名前など)
-        line = _config_error_line(exc, path)
-        where = " の {} 行目".format(line) if line else " "
-        message = ("設定ファイル instance/{}{}に誤りがあるため、読み込めません（{}。ファイル: {}）。"
-                   "その行の書式（文字列は \"...\" で囲む、アドレスの一覧は [...] で書く など）を直してから、"
-                   "もう一度実行してください。").format(CONFIG_FILENAME, where, exc.__class__.__name__, path)
-        raise ConfigLoadError(message) from None
-
-
 def prepare_instance(app, create_tables=True):
-    """instance フォルダ(DBファイル・環境ごとの設定ファイル置き場)を用意して、設定とDBを読み込む。
+    """instance フォルダ(DBファイル・画面で設定した値の置き場)を用意して、設定とDBを読み込む。
 
-    instance/config.py が無ければ初回のみ自動作成し、その値で既定値を上書きする。
+    config.py(初期値)と instance/settings.json(画面の設定)を読む(load_config_layers。1-3)。SECRET_KEY が
+    どちらにも無ければ生成して settings.json に保存する(_ensure_secret_key)。
     DB(instance/app.db)に足りないテーブルがあれば作成する(create_tables が偽なら作成しない。
     migrate --check の確認だけのとき)。
     用意済みのアプリ(DBを紐付け済み)では何もしない。
@@ -20502,8 +20070,9 @@ def prepare_instance(app, create_tables=True):
         # create_app() で用意済みのアプリに seed / migrate を実行したときなど
         return
     os.makedirs(app.instance_path, exist_ok=True)
-    ensure_instance_config(app.instance_path)
-    load_instance_config(app)
+    store = load_config_layers(app)
+    _hint_old_config(app, store)
+    _hint_admin_password(app)
     _ensure_secret_key(app)
 
     app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///{}".format(instance_db_path(app))
@@ -20718,10 +20287,6 @@ def create_app():
     app.jinja_loader = SectionTemplateLoader(template_sections)
     app.add_url_rule("/static/<path:filename>", endpoint="static", view_func=send_static_section)
     app.config.from_object(Config)
-    # 既定値の控え(システム設定の画面で、instance/config.py に無い項目の値として使う)
-    app.extensions["config_defaults"] = {
-        name: getattr(Config, name) for name in dir(Config) if name.isupper()
-    }
 
     login_manager.init_app(app)
     # URL の <int:...> は SQLite の整数の範囲まで(範囲外の ID は 404。Blueprint の登録より前に差し替える)
@@ -20792,6 +20357,7 @@ def create_app():
 
     app.cli.add_command(seed_command)
     app.cli.add_command(migrate_command)
+    app.cli.add_command(import_old_config_command)
 
     # flask コマンドから読み込まれているときの click の Context(それ以外は None)
     command = click.get_current_context(silent=True)
@@ -20805,12 +20371,13 @@ def create_app():
 
 
 # #############################################################################
-# 14. flask コマンド(seed / migrate)
+# 14. flask コマンド(seed / migrate / import-old-config)
 # #############################################################################
 # 「flask --app app <コマンド>」で使えるコマンド(create_app() で登録する)。
-#   flask --app app seed                          初期データの投入
-#   flask --app app migrate [--check] [--db パス]   既存DBを最新のモデル定義に合わせる
-# どちらも定期メールの自動送信スケジューラは起動しない。
+#   flask --app app seed                              初期データの投入
+#   flask --app app migrate [--check] [--db パス]       既存DBを最新のモデル定義に合わせる
+#   flask --app app import-old-config [--path パス]    旧版の instance/config.py の値を instance/settings.json に取り込む
+# どれも定期メールの自動送信スケジューラは起動しない。
 
 
 # =============================================================================
@@ -21049,8 +20616,8 @@ def seed_command():
 
         print("初期データの投入が完了しました。")
         print("登録ユーザー:", ", ".join(user_map.keys()))
-        print("固定ローカル管理者(admin)のパスワードは instance/config.py の "
-              "ADMIN_PASSWORD を確認してください。")
+        print("固定ローカル管理者(admin)のパスワード(ADMIN_PASSWORD)は config.py またはシステム設定の「基本設定」タブで"
+              "設定してください(どちらにも無ければ ldap_client.py の判定でログインします)。")
 
 
 # =============================================================================
@@ -21260,3 +20827,116 @@ def _migrate(app, check_only, db_path=None):
         insp2 = inspect(db.engine)
         still_tables, still_missing = collect_changes(insp2)
         _migrate_result(still_tables, still_missing)
+
+
+# =============================================================================
+# 14-3. import-old-config: 旧版の instance/config.py の取り込み
+# =============================================================================
+# 旧版(環境ごとの設定を instance/config.py に書いていた版)から更新したときに1回実行する。
+# 旧版のファイルは読むだけ(一切書き換えない・消さない)で、その値を画面の設定の層(instance/settings.json)に
+# 取り込む(updated_by は「移行」)。アプリは instance/config.py をもう読まないため、取り込むまでその値は使われない。
+#
+# 取り込むのは、FIELDS(11-1)の項目のうち、値があって(空・None・[] でない)初期値(config.py)と違うもの。
+#   - AI_API_URL が空の旧版の設定(社外の既定の接続先に送る形の設定)の AI_API_URL / AI_API_KEY / AI_MODEL は
+#     取り込まない(接続先を設定したうえで、画面で設定し直す)
+#   - 旧版の AI_API_URL を取り込み、旧版の AI_API_KEY が空で config.py に AI_API_KEY があるときは、AI_API_KEY の
+#     画面の設定を空にする(config.py のキーを旧版の接続先に送らない。接続先が config.py と同じならそのまま)
+#   - 項目の種類に合わない型の値(settings_type_problems)は取り込まない(読み込めない settings.json にしない)
+#   - FIELDS に無い項目(使わなくなった項目・固定設定の上書きなど)は取り込まない(必要なら config.py に直接書く)
+#   - JSON に書けない値(文字列・数・真偽・それらの一覧以外)は取り込まない
+# 既に settings.json にある項目は、旧版の値で置き換える(置き換えた項目の名前を表示する)。
+# 表示するのは項目の名前だけ(値・パスワード・キーは表示しない)。
+
+# AI_API_URL が空のときに取り込まない AI の項目
+_IMPORT_AI_KEYS = ("AI_API_URL", "AI_API_KEY", "AI_MODEL")
+
+
+def _json_plain(value, depth=0):
+    """settings.json に書ける値(文字列・数・真偽・None・それらの一覧)か。"""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return True
+    if isinstance(value, (list, tuple)) and depth < 3:
+        return all(_json_plain(item, depth + 1) for item in value)
+    return False
+
+
+def import_old_config(app, path):
+    """旧版の設定ファイル path を読み取り専用で読み、画面の設定(instance/settings.json)に取り込む。
+
+    戻り値: {"imported": [項目], "replaced": [項目], "skipped": [(項目, 理由)], "others": [項目]}
+    ファイルが無い・読めないときは click.ClickException(値は含めない)。
+    """
+    try:
+        old = read_config_file(path, "instance/{}".format(OLD_CONFIG_FILENAME))
+    except FileNotFoundError:
+        raise click.ClickException("旧版の設定ファイルがありません: {}".format(path)) from None
+    initial = read_initial_config()
+    imported, skipped = {}, []
+    for field in FIELDS:
+        key = field.key
+        if key not in old:
+            continue
+        value = old[key]
+        if not _is_set(value):
+            skipped.append((key, "空"))
+        elif key in _IMPORT_AI_KEYS and not _is_set(old.get("AI_API_URL")):
+            skipped.append((key, "旧版の AI の設定（接続先 AI_API_URL が空）は取り込まない"))
+        elif not _json_plain(value):
+            skipped.append((key, "settings.json に書けない値"))
+        elif settings_type_problems({key: value}):
+            skipped.append((key, "項目の種類に合わない型の値"))
+        elif same_value(value, initial.get(key)):
+            skipped.append((key, "初期値と同じ"))
+        else:
+            imported[key] = list(value) if isinstance(value, tuple) else value
+    others = [key for key in old if key not in FIELD_MAP]
+    notes = []
+    # 旧版の接続先(AI_API_URL)を取り込むとき、旧版の APIキーが空(キー無しで送っていた)で config.py に APIキーがあるなら、
+    # config.py のキーを旧版の接続先に送らないよう、AI_API_KEY の画面の設定を空にする(旧版と同じく、キー無しで送る)。
+    # 接続先が config.py の接続先と同じ(スキーム・ホスト・ポート)なら、config.py のキーのままでよい
+    if ("AI_API_URL" in imported and not _is_set(old.get("AI_API_KEY")) and _is_set(initial.get("AI_API_KEY"))
+            and _destination("AI_API_URL", imported["AI_API_URL"]) != _destination("AI_API_URL", initial.get("AI_API_URL"))):
+        imported["AI_API_KEY"] = ""
+        skipped = [(key, reason) for key, reason in skipped if key != "AI_API_KEY"]
+        notes.append("AI_API_KEY は画面の設定を空にしました（旧版では空。config.py の APIキーを旧版の接続先に送らないため）")
+    replaced = []
+    if imported:
+        with settings_store_lock:
+            store = read_settings(app.instance_path)
+            replaced = [key for key in imported if key in store["values"]]
+            values = dict(store["values"])
+            values.update(imported)
+            write_settings(app.instance_path, values, UPDATED_BY_IMPORT, expected_version=store["version"])
+    return {"imported": list(imported), "replaced": replaced, "skipped": skipped, "others": others, "notes": notes}
+
+
+@click.command("import-old-config")
+@click.option("--path", "old_path", metavar="PATH", default=None,
+              help="旧版の設定ファイル(既定: instance/config.py)。読むだけで変更しない。")
+@with_appcontext
+def import_old_config_command(old_path):
+    """旧版の instance/config.py の値を、画面の設定(instance/settings.json)に取り込む(値は表示しない)。"""
+    app = current_app._get_current_object()
+    path = os.path.abspath(old_path) if old_path else os.path.join(app.instance_path, OLD_CONFIG_FILENAME)
+    try:
+        result = import_old_config(app, path)
+    except (OSError, SettingsStoreError) as exc:
+        raise click.ClickException("instance/{} に保存できませんでした（{}）。取り込んでいません。".format(
+            SETTINGS_FILENAME, exc.__class__.__name__))
+    print("旧版の設定ファイル:", path, "（読むだけで変更していません）")
+    if result["imported"]:
+        print("取り込んだ項目（instance/{} に保存。値は表示しません）: {}".format(
+            SETTINGS_FILENAME, "、".join(result["imported"])))
+        if result["replaced"]:
+            print("  うち、既にあった画面の設定を旧版の値で置き換えた項目: {}".format("、".join(result["replaced"])))
+        for note in result["notes"]:
+            print("  " + note)
+    else:
+        print("取り込んだ項目はありません（instance/{} は変更していません）。".format(SETTINGS_FILENAME))
+    if result["skipped"]:
+        print("取り込まなかった項目: {}".format(
+            "、".join("{}（{}）".format(key, reason) for key, reason in result["skipped"])))
+    if result["others"]:
+        print("対象外の項目（基本設定の項目ではないため取り込みません。必要なら config.py に直接書きます）: {}".format(
+            "、".join(result["others"])))
+    print("取り込んだ値はサーバーの次の起動から有効です（起動中のサーバーは、次の画面の表示の前に反映します）。")

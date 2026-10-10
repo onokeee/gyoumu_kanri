@@ -4399,7 +4399,7 @@
       「AIで分析」を押すと、{{ ai_analysis_sent_items() }}が、
       システム設定の「基本設定」で設定したAIの接続先に送られます{% if ai_configured %}（{{ ai_status }}）{% endif %}。
       結果は <code>instance/ai_analysis.json</code> に最新の1回分だけを保存します（DB には保存しません。メンバーは見られません）。
-      {% if not ai_configured %}<br><span class="text-danger"><i class="bi bi-exclamation-circle"></i> AIが未設定のため、「AIで分析」は使えません（システム設定の「基本設定」タブで AI_API_KEY または AI_API_URL を設定すると使えます）。</span>{% endif %}
+      {% if not ai_configured %}<br><span class="text-danger"><i class="bi bi-exclamation-circle"></i> AIが未設定のため、「AIで分析」は使えません（{{ ai_status }}）。</span>{% endif %}
     </div>
   </div>
 </div>
@@ -5234,7 +5234,7 @@
               {% if u.id == current_user.id %}
               <span class="text-muted small">（自分）</span>
               {% elif u.username in local_usernames %}
-              <span class="text-muted small" title="ログインのたびに有効に戻るため、削除・無効化できません（ログインを止めるには instance/config.py の ADMIN_PASSWORD を変更）">（固定ローカル管理者）</span>
+              <span class="text-muted small" title="ログインのたびに有効に戻るため、削除・無効化できません（ログインを止めるにはシステム設定の「基本設定」タブで ADMIN_PASSWORD を変更）">（固定ローカル管理者）</span>
               {% else %}
               {# 確認文は data-confirm に入れる(表示名を onsubmit の JavaScript に直接書かない) #}
               <form method="post" action="{{ url_for('departments.delete_member', user_id=u.id) }}"
@@ -5443,7 +5443,8 @@
           <dd class="col-7">
             {% if ai_enabled %}<span class="text-success">設定あり</span>
             <div class="text-muted text-break">{{ ai_status }}</div>
-            {% else %}未設定（ルールベースで作成）{% endif %}
+            {% else %}未設定（ルールベースで作成）
+            <div class="text-muted text-break">{{ ai_status }}</div>{% endif %}
           </dd>
         </dl>
         <hr>
@@ -5792,21 +5793,15 @@
 
 {% if cfg.file_error %}
 <div class="alert alert-danger small">
-  <i class="bi bi-x-octagon"></i> <strong>設定ファイルを読み込めません。</strong> {{ cfg.file_error }}
-  基本設定は画面から保存できません（実行中の値を表示しています）。ファイルを直接修正してください。
-</div>
-{% elif cfg.missing %}
-<div class="alert alert-danger small">
-  <i class="bi bi-x-octagon"></i> <strong>設定ファイル（<code>instance/config.py</code>）がありません。</strong>
-  サーバーを再起動すると見本から自動作成されます（<code>SECRET_KEY</code> と <code>ADMIN_PASSWORD</code> にはランダムな値が入ります）。
-  それまで基本設定は画面から保存できません（実行中の値を表示しています）。
+  <i class="bi bi-x-octagon"></i> <strong>画面の設定のファイル（<code>instance/settings.json</code>）を読み込めません。</strong> {{ cfg.file_error }}
+  基本設定は画面から保存できません（初期値と実行中の値を表示しています）。ファイルを直すか、名前を変えて（画面の設定を捨てて）ください。上書きはしません。
 </div>
 {% endif %}
 
 {% if cfg.pending %}
 <div class="alert alert-warning small">
   <i class="bi bi-arrow-repeat"></i> <strong>再起動が必要な変更があります。</strong>
-  次の項目は、設定ファイル（<code>instance/config.py</code>）の値と実行中の値が異なります。サーバーを再起動すると反映されます:
+  次の項目は、保存した値（有効な値）と実行中の値が異なります。サーバーを再起動すると反映されます:
   {% for f in cfg.pending %}<code>{{ f.key }}</code>（{{ f.label }}）{% if not loop.last %}、{% endif %}{% endfor %}
   {% if cfg.pending_secret_key %}
   <div class="mt-1"><i class="bi bi-exclamation-triangle"></i> <code>SECRET_KEY</code> が変わるため、再起動すると全員がログアウトされます。</div>
@@ -5852,40 +5847,62 @@
 <script src="{{ url_for('static', filename='js/system-settings.js') }}"></script>
 {% endblock %}
 {#=== system/_config_tab.html ===#}
-{# システム設定「基本設定（config）」タブ。項目の定義は app.py の FIELDS #}
+{# システム設定「基本設定（config）」タブ。項目の定義は app.py の FIELDS。
+   値は2つの層(初期値 config.py ＋ 画面の設定 instance/settings.json)から決まり、画面で編集するのは画面の設定の層だけ #}
+{% macro layer_line(row) %}
+{% set f = row.field %}
+<div class="small text-muted cfg-layers">
+  <span class="me-2">初期値（config.py）: <span class="cfg-initial">{{ row.initial_text }}</span>{% if not row.has_override %} <span class="badge bg-primary">有効</span>{% endif %}</span>
+  <span class="me-2">画面の設定: {% if row.has_override %}<span class="cfg-override">{{ row.override_text }}</span> <span class="badge bg-primary">有効</span>{% else %}<span class="cfg-override">（なし）</span>{% endif %}</span>
+  <span>有効な値: <strong class="cfg-effective">{{ row.effective_text }}</strong></span>
+</div>
+{% endmacro %}
+{% macro reset_check(row) %}
+{% set f = row.field %}
+{% if row.has_override %}
+<div class="form-check mt-1">
+  <input class="form-check-input" type="checkbox" id="cfg-reset-{{ f.key }}" name="reset_{{ f.key }}" value="1"
+         {% if row.reset_checked %}checked{% endif %}>
+  <label class="form-check-label small" for="cfg-reset-{{ f.key }}">初期値に戻す（画面の設定を外し、config.py の値「{{ row.initial_text }}」を使う）</label>
+</div>
+{% endif %}
+{% endmacro %}
 {% macro field_input(row) %}
 {% set f = row.field %}
 {% set invalid = 'is-invalid' if row.error else '' %}
-{% if f.type == 'bool' %}
-  <input type="hidden" name="{{ f.key }}" value="0">
-  <div class="form-check form-switch">
-    <input class="form-check-input {{ invalid }}" type="checkbox" role="switch" id="cfg-{{ f.key }}" name="{{ f.key }}" value="1"
-           {% if row.value %}checked{% endif %}>
-    <label class="form-check-label small" for="cfg-{{ f.key }}">オン</label>
-  </div>
-{% elif f.type == 'int' %}
+{{ layer_line(row) }}
+{% if f.type == 'int' %}
   <input type="number" class="form-control form-control-sm {{ invalid }}" id="cfg-{{ f.key }}" name="{{ f.key }}"
-         value="{{ row.value }}" min="{{ f.min }}" max="{{ f.max }}" step="1" style="max-width: 12rem;">
-  <div class="form-text mt-0">{{ f.min }}〜{{ f.max }}</div>
+         value="{{ row.value }}" min="{{ f.min }}" max="{{ f.max }}" step="1" style="max-width: 12rem;"
+         placeholder="{{ row.placeholder }}">
+  <div class="form-text mt-0">{{ f.min }}〜{{ f.max }}。空欄のまま保存すると変更しません。</div>
+  {{ reset_check(row) }}
 {% elif f.type == 'addresses' %}
   <textarea class="form-control form-control-sm {{ invalid }}" id="cfg-{{ f.key }}" name="{{ f.key }}" rows="3"
-            autocomplete="off" spellcheck="false" placeholder="name@example.com（1行に1件）">{{ row.value }}</textarea>
+            autocomplete="off" spellcheck="false" placeholder="{% if row.placeholder %}{{ row.placeholder }}{% else %}name@example.com（1行に1件）{% endif %}">{{ row.value }}</textarea>
+  <div class="form-text mt-0">1行に1件。空欄のまま保存すると変更しません。</div>
+  {{ reset_check(row) }}
 {% elif f.type == 'secret_key' %}
   <div class="mb-1">
     {% if row.is_set %}<span class="badge bg-success">設定あり</span>{% else %}<span class="badge bg-secondary">未設定</span>
-    <span class="small text-muted">（起動のたびに一時的な鍵を使用）</span>{% endif %}
+    <span class="small text-muted">（次の起動のときに生成して画面の設定に保存します）</span>{% endif %}
   </div>
   <div class="form-check">
     <input class="form-check-input" type="checkbox" id="cfg-generate-{{ f.key }}" name="generate_{{ f.key }}" value="1"
            {% if row.generate_checked %}checked{% endif %}>
-    <label class="form-check-label small" for="cfg-generate-{{ f.key }}">新しいキーを生成する（保存時にランダムな値を作成）</label>
+    <label class="form-check-label small" for="cfg-generate-{{ f.key }}">新しいキーを生成する（保存時にランダムな値を作成し、画面の設定に保存）</label>
   </div>
+  {{ reset_check(row) }}
   <div class="small text-warning-emphasis mt-1"><i class="bi bi-exclamation-triangle"></i> 新しいキーはサーバーの再起動後に有効になります。再起動すると全員がログアウトされます。</div>
 {% elif f.type == 'secret' %}
   <div class="mb-1">
     {% if row.is_set %}<span class="badge bg-success">設定あり</span>{% else %}<span class="badge bg-secondary">未設定</span>{% endif %}
     <span class="small text-muted">値は表示しません。空欄のまま保存すると変更しません。</span>
   </div>
+  {% if f.unset_warning and not row.is_set %}
+  {# 有効な値が空のときだけの注意(状態に応じた表示。ADMIN_PASSWORD: admin のログインが ldap_client.py の判定に任されている) #}
+  <div class="alert alert-warning small py-1 px-2 mb-1 cfg-unset-warning"><i class="bi bi-exclamation-triangle"></i> {{ f.unset_warning }}</div>
+  {% endif %}
   <input type="password" class="form-control form-control-sm {{ invalid }}" id="cfg-{{ f.key }}" name="{{ f.key }}"
          autocomplete="new-password" placeholder="{% if f.confirm %}新しいパスワード{% else %}変更する場合だけ入力{% endif %}">
   {% if f.confirm %}
@@ -5895,25 +5912,31 @@
   <div class="form-check mt-1">
     <input class="form-check-input" type="checkbox" id="cfg-clear-{{ f.key }}" name="clear_{{ f.key }}" value="1"
            {% if row.clear_checked %}checked{% endif %}>
-    <label class="form-check-label small" for="cfg-clear-{{ f.key }}">空にする</label>
+    <label class="form-check-label small" for="cfg-clear-{{ f.key }}">空にする（画面の設定を空にし、config.py の値も使わない）</label>
   </div>
+  {{ reset_check(row) }}
   {% if f.clear_warning %}
   <div class="small text-warning-emphasis"><i class="bi bi-exclamation-triangle"></i> {{ f.clear_warning }}</div>
   {% endif %}
 {% else %}
   <input type="text" class="form-control form-control-sm {{ invalid }}" id="cfg-{{ f.key }}" name="{{ f.key }}"
-         value="{{ row.value }}" autocomplete="off" spellcheck="false"
-         {% if f.type == 'url' %}inputmode="url" placeholder="https://..."{% elif f.type == 'address' %}inputmode="email" placeholder="name@example.com"{% endif %}>
+         value="{{ row.value }}" autocomplete="off" spellcheck="false" placeholder="{{ row.placeholder }}"
+         {% if f.type == 'url' %}inputmode="url"{% elif f.type == 'address' %}inputmode="email"{% endif %}>
+  <div class="form-text mt-0">空欄のまま保存すると変更しません。</div>
+  {{ reset_check(row) }}
 {% endif %}
 {% if row.error %}<div class="invalid-feedback d-block">{{ row.error }}</div>{% endif %}{% if row.notice %}<div class="small text-danger"><i class="bi bi-exclamation-triangle"></i> {{ row.notice }}</div>{% endif %}
 <div class="form-text">{{ f.help }}</div>
 {% endmacro %}
 
 <p class="small text-muted">
-  環境ごとの設定（接続先・宛先・パスワードなど）です。保存すると設定ファイル <code>instance/config.py</code> の、変更した項目の値だけを書き換えます
-  （コメントやほかの項目はそのまま。複数行に分けて書いた一覧は1行になり、その中のコメントは消えます。変更前の内容は <code>instance/config.py.bak</code> に残します）。
+  環境ごとの設定（接続先・宛先・パスワードなど）です。値は <strong>初期値</strong>（<code>config.py</code>。app.py と同じフォルダ）と
+  <strong>画面の設定</strong>（<code>instance/settings.json</code>。この画面で保存した値）の2つの層から決まり、
+  画面の設定があればそれが優先されます。この画面で保存すると画面の設定の層だけが変わります（<code>config.py</code> は書き換えません）。
+  入力欄には画面の設定を表示しています（空欄は「画面の設定なし」。空欄のまま保存すると、その項目は変更しません）。
+  「初期値に戻す」で画面の設定を外すと、<code>config.py</code> の値が使われます。
   <span class="badge bg-warning text-dark">再起動が必要</span> の項目以外は、保存するとすぐに反映されます。
-  <code>instance/config.py</code> はこれまでどおり直接編集することもできます（その場合はサーバーの再起動で反映）。
+  {% if cfg.updated_at %}<br>画面の設定の最終更新: {{ cfg.updated_at }}（{{ cfg.updated_by }}）{% endif %}
 </p>
 
 <form method="post" action="{{ url_for('system.save_config') }}" id="config-form" autocomplete="off" novalidate>
@@ -5932,11 +5955,9 @@
           <div class="small">
             <code>{{ f.key }}</code>
             {% if f.restart_required %}<span class="badge bg-warning text-dark">再起動が必要</span>{% endif %}
-            {% if row.pending %}<span class="badge bg-info text-dark" title="ファイルの値と実行中の値が異なります">再起動待ち</span>{% endif %}
+            {% if row.pending %}<span class="badge bg-info text-dark" title="保存した値と実行中の値が異なります">再起動待ち</span>{% endif %}
           </div>
-          {% if not row.in_file and cfg.can_save %}
-          <div class="small text-muted">ファイルに記載なし（既定値を使用）</div>
-          {% endif %}
+          <div class="small text-muted">{% if row.has_override %}画面の設定が有効{% else %}初期値（config.py）が有効{% endif %}</div>
         </div>
         <div class="col-md-8">
           {{ field_input(row) }}
@@ -5952,9 +5973,9 @@
     <div class="card-header bg-white fw-bold">その他（読み取り専用）</div>
     <div class="card-body small">
       <p class="text-muted mb-2">
-        次の項目はこの画面の項目の定義（<code>app.py</code> の FIELDS）に無いため、画面からは変更できません。
-        変更する場合は <code>instance/config.py</code> を直接編集し、サーバーを再起動してください。
-        {% if cfg.other|selectattr('retired')|list %}<span class="badge bg-secondary">未使用</span> の項目は以前の版の設定で、今は使われていません（残っていても動作には影響しません）。{% endif %}
+        次の項目は <code>config.py</code> に書かれていますが、この画面の項目の定義（<code>app.py</code> の FIELDS）に無いため、画面からは変更できません。
+        変更する場合は <code>config.py</code> を直接編集し、サーバーを再起動してください。
+        {% if cfg.other|selectattr('retired')|list %}<span class="badge bg-secondary">未使用</span> の項目は以前の版の設定で、今は使われていません（残っていても動作には影響しません。不要なら <code>config.py</code> から消してください）。{% endif %}
       </p>
       <div class="table-responsive">
         <table class="table table-sm align-middle mb-0">
@@ -5964,48 +5985,28 @@
             <tr>
               <td><code>{{ row.key }}</code>{% if row.retired %} <span class="badge bg-secondary">未使用</span>{% endif %}</td>
               <td class="text-muted">{{ row.source }}{% if row.retired %}<div class="small">使われていません（{{ row.retired_note }}）</div>{% endif %}</td>
-              <td>{% if row.is_set %}設定あり{% else %}未設定{% endif %}{% if not row.in_file %}<span class="text-muted">（ファイルに記載なし）</span>{% endif %}</td>
+              <td>{% if row.is_set %}設定あり{% else %}未設定{% endif %}</td>
               <td class="text-break">{% if row.hidden %}<span class="text-muted">（表示しません）</span>{% elif row.value %}<code>{{ row.value }}</code>{% else %}<span class="text-muted">―</span>{% endif %}</td>
             </tr>
             {% endfor %}
           </tbody>
         </table>
       </div>
-      {% if cfg.unused and cfg.can_save %}
-      <p class="text-muted mt-2 mb-0">未使用の項目は、下の「基本設定を保存」の後にある「未使用の設定を削除」で <code>instance/config.py</code> から削除できます。</p>
-      {% endif %}
     </div>
   </div>
   {% endif %}
 
   <div class="d-flex justify-content-end align-items-center gap-2 mb-4">
-    {% if not cfg.can_save %}<span class="small text-danger">{% if cfg.missing %}設定ファイルが無いため保存できません（サーバーの再起動で自動作成されます）。{% else %}設定ファイルを読み込めないため保存できません。{% endif %}</span>{% endif %}
+    {% if not cfg.can_save %}<span class="small text-danger">画面の設定のファイル（<code>instance/settings.json</code>）を読み込めないため保存できません。</span>{% endif %}
     <button class="btn btn-primary" {% if not cfg.can_save %}disabled{% endif %}><i class="bi bi-save"></i> 基本設定を保存</button>
   </div>
 </form>
-{% if cfg.unused and cfg.can_save %}
-{# 未使用の設定の削除は、基本設定のフォームの外の別のフォームで送る(入力中の基本設定は送らない・保存しない) #}
-<div class="card shadow-sm mb-4">
-  <div class="card-body small">
-    <form method="post" action="{{ url_for('system.remove_unused') }}" id="unused-config-form">
-      <input type="hidden" name="version" value="{{ cfg.version }}">
-      <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
-        <span class="text-muted">「その他」の <span class="badge bg-secondary">未使用</span> の項目（{{ cfg.unused|join('、') }}）の行（すぐ上の説明のコメントを含む）を <code>instance/config.py</code> から削除します。変更前の内容は <code>instance/config.py.bak</code> に残します。<strong>入力中で保存していない基本設定の変更は保存されません</strong>（先に「基本設定を保存」を押してください）。</span>
-        <button type="submit" form="unused-config-form" class="btn btn-sm btn-outline-danger"
-                onclick="return confirm('未使用の設定（{{ cfg.unused|join('、') }}）の行を instance/config.py から削除します。\n変更前の内容は instance/config.py.bak に残します。\n入力中で保存していない基本設定の変更は保存されません（先に「基本設定を保存」を押してください）。\nよろしいですか？');">
-          <i class="bi bi-trash"></i> 未使用の設定を削除
-        </button>
-      </div>
-    </form>
-  </div>
-</div>
-{% endif %}
 
 {# 接続テスト(保存済みの設定を使う。入力中の値は使わない) #}
 <div class="card shadow-sm mb-4">
   <div class="card-header bg-white fw-bold"><i class="bi bi-plug"></i> 接続テスト</div>
   <div class="card-body">
-    <p class="small text-muted">保存済みの設定（実行中の値）で接続を確かめます。入力中の値は使わないため、変更した場合は先に保存してください。</p>
+    <p class="small text-muted">保存済みの設定（有効な値）で接続を確かめます。入力中の値は使わないため、変更した場合は先に保存してください。</p>
     <div class="row g-3">
       <div class="col-md-6">
         <form method="post" action="{{ url_for('system.test_mail') }}">
@@ -6027,6 +6028,9 @@
           </button>
         </form>
         <div class="small text-muted mt-1">AIに短い問い合わせを1回送ります（{{ cfg.ai_status }}）。</div>
+        {% if not cfg.ai_enabled %}
+        <div class="small text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> AIが未設定のため送れません。</div>
+        {% endif %}
       </div>
     </div>
   </div>
@@ -6391,7 +6395,7 @@
   定型・定期業務のリマインドの自動送信です。業務ごとの実施日・追加の宛先は、各業務の登録・編集の画面の「リマインド」で設定します。
   実施日に担当者へメールで知らせ、その回の完了の入力があるまで、送信時刻1・2（1日2回）にリマインドします。
   宛先ごとに、その宛先に関係する業務（本日実施予定・完了の入力がまだのもの）を1通にまとめて送ります。
-  設定は <code>instance/routine_reminder_settings.json</code> に保存され、<code>instance/config.py</code> には保存しません。
+  設定は <code>instance/routine_reminder_settings.json</code> に保存され、基本設定（<code>instance/settings.json</code>）には保存しません。
 </p>
 {% if rm_status.address_problems %}
 <div class="alert alert-warning small">
@@ -7406,7 +7410,9 @@ a:hover {
  *
  * ・開いているタブを URL(?tab=...)に残す(再読み込み・ブックマークでも同じタブを開く)。
  *   #weekly のような URL の末尾(フラグメント)でもタブを指定できる。
- * ・基本設定で admin のパスワードを空にする・新しい SECRET_KEY を生成するときは、保存前に確認する。
+ * ・基本設定で admin のパスワードを空にする・初期値に戻す、新しい SECRET_KEY を生成するときは、保存前に確認する。
+ * ・基本設定の「初期値に戻す」にチェックすると、その項目の入力欄(今の画面の設定を表示している)を空にして入力できなくする
+ *   (チェックを外すと元の表示に戻す。表示したままの値なら、JavaScript が無くてもサーバー側は「初期値に戻す」として受け付ける)。
  *
  * JavaScript が無効でも、タブは ?tab= のリンクとして動き、保存もできる。
  */
@@ -7442,9 +7448,13 @@ a:hover {
     form.addEventListener("submit", function (event) {
       var messages = [];
       var clearAdmin = form.elements["clear_ADMIN_PASSWORD"];
+      var resetAdmin = form.elements["reset_ADMIN_PASSWORD"];
       var generateKey = form.elements["generate_SECRET_KEY"];
       if (clearAdmin && clearAdmin.checked) {
         messages.push("admin のパスワードを空にします（admin のログイン可否は ldap_client.py の判定に任されます）。");
+      }
+      if (resetAdmin && resetAdmin.checked) {
+        messages.push("admin のパスワードの画面の設定を外し、config.py の値にします（config.py で空なら、admin のログイン可否は ldap_client.py の判定に任されます）。");
       }
       if (generateKey && generateKey.checked) {
         messages.push("新しい SECRET_KEY を生成します（サーバーの再起動後に有効になり、そのとき全員がログアウトされます）。");
@@ -7455,9 +7465,34 @@ a:hover {
     });
   }
 
+  function setupResetChecks() {
+    var form = document.getElementById("config-form");
+    if (!form) return;
+    form.querySelectorAll("input[type=checkbox][name^='reset_']").forEach(function (box) {
+      var input = document.getElementById("cfg-" + box.name.slice("reset_".length));
+      // 値を表示する入力欄(文字・数・URL・アドレスの一覧)だけ。パスワードの欄は空のまま、SECRET_KEY に入力欄は無い
+      if (!input || input.type === "checkbox" || input.type === "password") return;
+      var kept = null;
+      var apply = function () {
+        if (box.checked) {
+          if (kept === null) kept = input.value;
+          input.value = "";
+          input.readOnly = true;
+        } else if (kept !== null) {
+          input.value = kept;
+          input.readOnly = false;
+          kept = null;
+        }
+      };
+      box.addEventListener("change", apply);
+      if (box.checked) apply();
+    });
+  }
+
   function init() {
     setupTabs();
     setupConfirm();
+    setupResetChecks();
   }
 
   if (document.readyState === "loading") {
