@@ -731,8 +731,8 @@ def prefers_json():
 # =============================================================================
 # 2-2. 小さなヘルパー関数
 # =============================================================================
-# 複数の画面・機能から使う小さなヘルパー関数(現在の日時・フォームの値の読み取り・
-# 主キーでの取り出し・アプリの名前・よく使う問い合わせ・同時の操作と古い画面からの送信の確認)。
+# 複数の画面・機能から使う小さなヘルパー関数(現在の日時・フォームの値の読み取り・画面の共通の応答〔flash_redirect〕・
+# 主キーでの取り出し・アプリの名前・よく使う問い合わせ・同時の操作と古い画面からの送信の確認〔VersionFields〕)。
 
 # 改行・タブ以外の制御文字と、XML 1.0 で使えない文字(サロゲート・U+FFFE/U+FFFF)。
 # AIの応答・AIが作った問題・Excel(.xlsx)・Word(.docx)の出力から除く(1文字でも残っていると、Excel・Word の
@@ -747,6 +747,12 @@ def flash(message, category="message"):
     if isinstance(message, str) and CONTROL_CHARS.search(message):
         message = CONTROL_CHARS.sub("", message)
     _flask_flash(message, category)
+
+
+def flash_redirect(message, category, url):
+    """案内 message を出して url の画面へ移る(権限が無い・古い画面からの操作・保存の後などの、画面の共通の応答)。"""
+    flash(message, category)
+    return redirect(url)
 
 
 def clean_text(value):
@@ -895,6 +901,11 @@ def form_int_range(form, key, low, high, values, errors, message, name=None):
         errors.append(message)
 
 
+def choice_or_default(value, choices, default):
+    """フォーム・URL の選択肢の値(choices に無い値・空なら default)。"""
+    return value if value in choices else default
+
+
 def get_or_404(model, ident):
     """主キーが ident の行を返す。無ければ 404 にする(SQLite の整数の範囲外の ID も 404)。"""
     if isinstance(ident, int) and not SQLITE_INT_MIN <= ident <= SQLITE_INT_MAX:
@@ -913,6 +924,12 @@ def display_app_name(app=None):
 def get_active_users():
     """有効なユーザーを表示名順で取得する(担当者・受信者の選択肢用)。"""
     return User.query.filter_by(is_active=True).order_by(User.display_name).all()
+
+
+def ordered_rows(model, active_only=True):
+    """業務(Operation)・チーム(Department)の一覧(並び順・名前の順)。active_only なら有効なものだけ。"""
+    query = model.query.filter_by(is_active=True) if active_only else model.query
+    return query.order_by(model.sort_order, model.name).all()
 
 
 def filter_user_choices(selected_ids=(), with_work=None):
@@ -934,6 +951,16 @@ def filter_user_choices(selected_ids=(), with_work=None):
         users += User.query.filter(User.is_active.is_(False), db.or_(*conditions)) \
             .order_by(User.display_name).all()
     return users
+
+
+def user_filter_choices(raw, with_work=None):
+    """一覧の担当者/対象者の絞り込み(?assignee= などの値 raw)の選択肢(filter_user_choices)と、確かめた値。
+
+    戻り値: (選択肢, 絞り込みの値〔どのユーザーでもない番号なら ""〕, そのユーザーID〔絞り込まないなら None〕)。
+    """
+    users = filter_user_choices([to_int(raw)], with_work)
+    selected = to_int(raw) if to_int(raw) in {u.id for u in users} else None
+    return users, (raw if selected is not None else ""), selected
 
 
 def set_active_from_form(obj):
@@ -1149,6 +1176,59 @@ def conflicting_fields(changed, current, new):
 _EDITED_ELSEWHERE = ("画面を開いた後に、ほかの操作でこの内容が変更されていたため、保存していません"
                      "（同時に変更された項目: {}）。ほかの操作で変わった項目は今の内容にしてあります。"
                      "確認して、必要ならもう一度変更して保存してください。")
+
+
+class VersionFields:
+    """編集画面で、画面を開いた後のほかの操作の変更を確かめる項目(hidden の version。field_versions)。
+
+    fields は (キー, 画面に出す項目の名前) の並び。values は行の今の値({キー: 値})を返す関数
+    (省略時は属性をそのまま読む)。label_prefix は案内の項目の名前の前に付ける言葉(「リマインドの」)。
+    """
+
+    def __init__(self, fields, values=None, label_prefix=""):
+        self.fields = fields
+        self.keys = tuple(key for key, _label in fields)
+        self.labels = {key: label_prefix + label for key, label in fields}
+        self._values = values
+
+    def values(self, obj):
+        """行 obj の今の値。"""
+        return self._values(obj) if self._values is not None else {key: getattr(obj, key) for key in self.keys}
+
+    def version(self, row):
+        """控え(row は行、または values の辞書)。"""
+        return field_versions(row if isinstance(row, dict) else self.values(row), self.keys)
+
+    def shown(self, form, obj, name="version"):
+        """画面の hidden に入れる控え: 送られた控え(form の name)があればそのまま、無ければ今の値の控え。
+
+        入力エラーの再表示で今の内容の控えにすると、その後の保存で、その間のほかの操作の変更を上書きしてしまうため。
+        """
+        sent = form.get(name) if form is not None else None
+        return sent if sent is not None else self.version(obj)
+
+    def conflicts(self, current, new, name="version"):
+        """画面を開いた後にほかの操作で変わった項目と、そのうち今回の保存で別の値にしようとしている項目。
+
+        戻り値: (変わった項目〔控えの無い以前の画面からの送信は None〕, 重なる項目)。
+        """
+        changed = fields_changed_since(request.form.get(name), current, self.keys)
+        return changed, conflicting_fields(changed, current, new)
+
+    def conflict_message(self, conflicts):
+        """重なった項目の案内(_EDITED_ELSEWHERE)。"""
+        return _EDITED_ELSEWHERE.format("、".join(self.labels[key] for key in conflicts))
+
+
+def conflict_form(current, changed, to_text=None, form=None):
+    """保存しなかったときの再表示の入力: 送られた入力(form。省略時は request.form)に、ほかの操作で変わった項目
+    (changed)の今の値を重ねる。to_text(キー, 値) は値を入力欄の文字列にする(省略時は None → ""、ほかは str)。"""
+    shown = request.form.to_dict(flat=True) if form is None else form
+    for key in changed:
+        value = current[key]
+        shown[key] = to_text(key, value) if to_text is not None else ("" if value is None else str(value))
+    shown.pop("version", None)
+    return shown
 
 
 # =============================================================================
@@ -4363,9 +4443,8 @@ def _redirect_after_login():
             # (ダウンロードは画面を置き換えない)ため、画面へ移動して、もう一度押してもらう
             if not current_user.is_manager:
                 return redirect(url_for("main.dashboard"))
-            flash("Excel出力のファイルは、ログインの後には自動で作成しません。"
-                  "必要ならもう一度「Excel出力」を押してください。", "info")
-            return redirect(url_for("manager.dashboard"))
+            return flash_redirect("Excel出力のファイルは、ログインの後には自動で作成しません。"
+                                  "必要ならもう一度「Excel出力」を押してください。", "info", url_for("manager.dashboard"))
         if page:
             return redirect(page)
     return redirect(url_for("main.dashboard"))
@@ -4439,8 +4518,7 @@ def logout():
     logout_user()
     session.pop(DROPPED_REQUEST_KEY, None)  # ログインが切れた状態で送った操作の印も消す
     session.pop(LOCAL_AUTH_KEY, None)  # 固定ローカル管理者のパスワードの印も消す
-    flash("ログアウトしました。", "info")
-    return redirect(url_for("auth.login"))
+    return flash_redirect("ログアウトしました。", "info", url_for("auth.login"))
 
 
 # =============================================================================
@@ -4499,12 +4577,7 @@ def main_dashboard():
         priority_choices=PRIORITY_CHOICES,
         # ガント(自分の担当のみ)。リンク・フォームは他セクションの期間も保持する
         gantt_endpoint="main.dashboard",
-        gantt_extra={
-            "afrom": actx["act_from"].strftime("%Y-%m-%d"),
-            "ato": actx["act_to"].strftime("%Y-%m-%d"),
-            "ofrom": octx["o_from"].strftime("%Y-%m-%d"),
-            "oto": octx["o_to"].strftime("%Y-%m-%d"),
-        },
+        gantt_extra=_gantt_extra(actx, octx),
         **actx,
         **octx,
         **gctx,
@@ -4588,8 +4661,7 @@ def _render_task_form(task, users, form, selected, version=None):
     その間のほかの操作の変更を上書きしてしまうため)。
     """
     if task is not None and version is None:
-        version = form.get("version") if form is not None and form.get("version") is not None \
-            else field_versions(_task_values(task), TASK_VERSION_KEYS)
+        version = TASK_VERSION.shown(form, task)
     return render_template(
         "tasks/form.html", task=task, users=users,
         status_choices=STATUS_CHOICES, priority_choices=PRIORITY_CHOICES,
@@ -4627,18 +4699,19 @@ TASK_VERSION_FIELDS = (
     ("outcome_quant_note", "成果（定量）の補足"), ("outcome_qual_estimate", "成果（定性）の見込み"),
     ("outcome_qual_actual", "成果（定性）の実績"),
 )
-TASK_VERSION_KEYS = tuple(key for key, _label in TASK_VERSION_FIELDS)
-_TASK_FIELD_LABELS = dict(TASK_VERSION_FIELDS)
 
 
 def _task_values(task):
     """編集画面で扱う項目の今の値(担当者はユーザーIDの一覧)。"""
-    values = {key: getattr(task, key) for key in TASK_VERSION_KEYS if key != "assignees"}
+    values = {key: getattr(task, key) for key in TASK_VERSION.keys if key != "assignees"}
     values["assignees"] = sorted(u.id for u in task.assignees)
     return values
 
 
-def _task_form_value(value):
+TASK_VERSION = VersionFields(TASK_VERSION_FIELDS, _task_values)
+
+
+def _task_form_value(_key, value):
     """項目の値を、編集画面の入力欄に入れる形にする(_task_values の値 → 文字列)。"""
     if value is None:
         return ""
@@ -4655,15 +4728,8 @@ def _task_conflict_form(task, changed):
     戻り値: (入力, 担当者として選ぶユーザーID の一覧 または None〔送られた選択のまま〕)
     """
     current = _task_values(task)
-    form = request.form.to_dict(flat=True)
-    selected = None
-    for key in changed:
-        if key == "assignees":
-            selected = current["assignees"]
-        else:
-            form[key] = _task_form_value(current[key])
-    form.pop("version", None)
-    return form, selected
+    form = conflict_form(current, [key for key in changed if key != "assignees"], _task_form_value)
+    return form, (current["assignees"] if "assignees" in changed else None)
 
 
 # 画面を開いた後に、そのタスク・定型業務が削除され、同じIDが新しい別の行に使われていたときの案内
@@ -4794,11 +4860,12 @@ def search_keyword():
     return keyword
 
 
-def _like_pattern(keyword):
-    """キーワード検索の LIKE のパターン(「%」「_」と逆スラッシュは文字そのものとして探す)。"""
+def keyword_condition(keyword, *columns):
+    """キーワード検索の条件: columns のどれかに keyword を含む(LIKE。「%」「_」と逆スラッシュは文字そのものとして探す)。"""
     escaped = (keyword.replace(_LIKE_ESCAPE, _LIKE_ESCAPE * 2)
                .replace("%", _LIKE_ESCAPE + "%").replace("_", _LIKE_ESCAPE + "_"))
-    return "%{}%".format(escaped)
+    like = "%{}%".format(escaped)
+    return db.or_(*(column.ilike(like, escape=_LIKE_ESCAPE) for column in columns))
 
 
 def _read_choice(name, choices, default):
@@ -4834,9 +4901,7 @@ def list_tasks():
     if hide_done:
         query = query.filter(Task.status != STATUS_DONE)
     if keyword:
-        like = _like_pattern(keyword)
-        query = query.filter(db.or_(Task.title.ilike(like, escape=_LIKE_ESCAPE),
-                                    Task.description.ilike(like, escape=_LIKE_ESCAPE)))
+        query = query.filter(keyword_condition(keyword, Task.title, Task.description))
 
     # 未完了→期限が近い順、その後に完了タスク(担当者はまとめて読む。行ごとに読みに行かない)
     tasks = query.options(selectinload(Task.assignees)).order_by(
@@ -4867,16 +4932,14 @@ def list_tasks():
 def new_task():
     # タスクの登録はマネージャーのみ(メンバーは不可)
     if not current_user.is_manager:
-        flash("タスクを登録できるのはマネージャーのみです。", "danger")
-        return redirect(url_for("tasks.list_tasks"))
+        return flash_redirect("タスクを登録できるのはマネージャーのみです。", "danger", url_for("tasks.list_tasks"))
 
     if request.method == "POST":
         # 担当者の確認から保存までの間に、その人が削除されないように(チーム管理の削除と1つずつにする)
         lock_for_write()
         done = already_submitted("task")
         if done:
-            flash(_SUBMITTED_TWICE.format("タスク"), "info")
-            return redirect(done)
+            return flash_redirect(_SUBMITTED_TWICE.format("タスク"), "info", done)
     users = get_active_users()
 
     if request.method == "POST":
@@ -4928,8 +4991,7 @@ def new_task():
         _log_status(task, task.status)  # 初期ステータスを履歴に記録
         db.session.flush()
         commit_submitted("task", url_for("tasks.detail", task_id=task.id))
-        flash("タスクを登録しました。", "success")
-        return redirect(url_for("tasks.detail", task_id=task.id))
+        return flash_redirect("タスクを登録しました。", "success", url_for("tasks.detail", task_id=task.id))
 
     return _render_task_form(None, users, None, [])
 
@@ -4942,7 +5004,7 @@ def task_detail(task_id):
     if not row_key_matches(task, request.args.get("t")):
         abort(404)
     # 進捗の記載の編集フォームの控え(古い画面からの保存で、ほかの操作の変更を上書きしない)
-    comment_versions = {c.id: field_versions({"body": c.body}, COMMENT_VERSION_KEYS) for c in task.comments}
+    comment_versions = {c.id: COMMENT_VERSION.version(c) for c in task.comments}
     return render_template("tasks/detail.html", task=task, can_edit=_can_edit(task),
                            comment_versions=comment_versions)
 
@@ -4954,11 +5016,9 @@ def edit_task(task_id):
         lock_for_write()  # 確かめてから保存するまでの間に、ほかの保存・削除が入らないように
     task = get_or_404(Task, task_id)
     if request.method == "POST" and not row_key_matches(task, request.form.get("row")):
-        flash(_STALE_TASK, "warning")
-        return redirect(url_for("tasks.list_tasks"))
+        return flash_redirect(_STALE_TASK, "warning", url_for("tasks.list_tasks"))
     if not _can_edit(task):
-        flash("このタスクを編集する権限がありません。", "danger")
-        return redirect(url_for("tasks.detail", task_id=task.id))
+        return flash_redirect("このタスクを編集する権限がありません。", "danger", url_for("tasks.detail", task_id=task.id))
 
     # 担当者の選択肢(担当のまま無効化されたユーザーも、外さずに残せるよう含める)
     users = _assignee_choices(task)
@@ -5017,13 +5077,12 @@ def edit_task(task_id):
         new = dict(data, title=title, description=description, status=status, priority=priority,
                    start_date=start_date, due_date=due_date, scale=scale,
                    assignees=sorted(u.id for u in assignees))
-        changed = fields_changed_since(request.form.get("version"), current, TASK_VERSION_KEYS)
-        conflicts = conflicting_fields(changed, current, new)
+        changed, conflicts = TASK_VERSION.conflicts(current, new)
         if conflicts:
-            flash(_EDITED_ELSEWHERE.format("、".join(_TASK_FIELD_LABELS[k] for k in conflicts)), "warning")
+            flash(TASK_VERSION.conflict_message(conflicts), "warning")
             form, selected = _task_conflict_form(task, changed)
             return _render_task_form(task, users, form, sel if selected is None else selected,
-                                     version=field_versions(current, TASK_VERSION_KEYS))
+                                     version=TASK_VERSION.version(current))
 
         task.title = title
         task.description = description
@@ -5043,8 +5102,7 @@ def edit_task(task_id):
                 task.updated_at = datetime.now()
         _apply_outcomes(task, data)
         db.session.commit()
-        flash("タスクを更新しました。", "success")
-        return redirect(url_for("tasks.detail", task_id=task_id))
+        return flash_redirect("タスクを更新しました。", "success", url_for("tasks.detail", task_id=task_id))
 
     return _render_task_form(task, users, None, [u.id for u in task.assignees])
 
@@ -5062,11 +5120,9 @@ def update_status(task_id):
     task = get_or_404(Task, task_id)
     back = _back_to_referrer(url_for("tasks.list_tasks"))
     if not row_key_matches(task, request.form.get("row")):
-        flash(_STALE_TASK, "warning")
-        return redirect(url_for("tasks.list_tasks"))
+        return flash_redirect(_STALE_TASK, "warning", url_for("tasks.list_tasks"))
     if not _can_edit(task):
-        flash("このタスクを更新する権限がありません。", "danger")
-        return redirect(back)
+        return flash_redirect("このタスクを更新する権限がありません。", "danger", back)
 
     new_status = request.form.get("status")
     # 画面を開いたときの状態(hidden の from。無い以前の画面は今までどおり)。その後にほかの操作で状態が
@@ -5074,13 +5130,11 @@ def update_status(task_id):
     shown = request.form.get("from")
     if new_status in STATUS_CHOICES and shown is not None and shown != task.status \
             and new_status != task.status:
-        flash(f"画面を開いた後に、ほかの操作で状態が「{task.status}」に変更されています（変更していません）。"
-              "確認して、必要ならもう一度変更してください。", "warning")
-        return redirect(back)
+        return flash_redirect(f"画面を開いた後に、ほかの操作で状態が「{task.status}」に変更されています（変更していません）。"
+                              "確認して、必要ならもう一度変更してください。", "warning", back)
     if new_status in STATUS_CHOICES and new_status == task.status:
         # 選択を変えずに押した・二度押しの2回目・ほかの操作で既にその状態になっていた: 記録も最終更新も変えない
-        flash(f"ステータスは既に「{new_status}」です（変更していません）。", "info")
-        return redirect(back)
+        return flash_redirect(f"ステータスは既に「{new_status}」です（変更していません）。", "info", back)
     if new_status in STATUS_CHOICES:
         if new_status == STATUS_DONE and not task.has_outcome_actual:
             flash(_COMPLETE_NEEDS_OUTCOME + "(タスクの編集画面から入力できます)", "warning")
@@ -5102,26 +5156,22 @@ def add_comment(task_id):
     lock_for_write()
     task = get_or_404(Task, task_id)
     if not row_key_matches(task, request.form.get("row")):
-        flash(_STALE_TASK, "warning")
-        return redirect(url_for("tasks.list_tasks"))
+        return flash_redirect(_STALE_TASK, "warning", url_for("tasks.list_tasks"))
     if not _can_edit(task):
-        flash("進捗状況を記載できるのは担当者・マネージャーのみです。", "danger")
-        return redirect(url_for("tasks.detail", task_id=task_id))
+        return flash_redirect("進捗状況を記載できるのは担当者・マネージャーのみです。", "danger", url_for("tasks.detail", task_id=task_id))
     body = request.form.get("body", "").strip()
     back = url_for("tasks.detail", task_id=task_id)
     if not body:
-        flash("進捗状況の内容を入力してください。", "danger")
-        return redirect(back)
+        return flash_redirect("進捗状況の内容を入力してください。", "danger", back)
     if already_submitted("comment"):
-        flash(_SUBMITTED_TWICE.format("進捗状況の記載"), "info")
-        return redirect(back)
+        return flash_redirect(_SUBMITTED_TWICE.format("進捗状況の記載"), "info", back)
     db.session.add(TaskComment(task_id=task_id, user_id=current_user.id, body=body))
     commit_submitted("comment", back)
     return redirect(back)
 
 
 # 進捗の記載の編集で、画面を開いた後の変更を確かめる項目(hidden の version)
-COMMENT_VERSION_KEYS = ("body",)
+COMMENT_VERSION = VersionFields((("body", "進捗状況の内容"),))
 
 
 def _can_edit_comment(comment):
@@ -5139,30 +5189,25 @@ def edit_comment(task_id, comment_id):
     lock_for_write()
     task = get_or_404(Task, task_id)
     if not row_key_matches(task, request.form.get("row")):
-        flash(_STALE_TASK, "warning")
-        return redirect(url_for("tasks.list_tasks"))
+        return flash_redirect(_STALE_TASK, "warning", url_for("tasks.list_tasks"))
     comment = db.session.get(TaskComment, comment_id)
     if comment is None or comment.task_id != task.id:
         abort(404)
     if not _can_edit_comment(comment):
-        flash("進捗状況を変更できるのは記載者本人・マネージャーのみです。", "danger")
-        return redirect(url_for("tasks.detail", task_id=task_id))
+        return flash_redirect("進捗状況を変更できるのは記載者本人・マネージャーのみです。", "danger", url_for("tasks.detail", task_id=task_id))
 
     body = request.form.get("body", "").strip()
     if not body:
-        flash("進捗状況の内容を入力してください。", "danger")
-        return redirect(url_for("tasks.detail", task_id=task_id))
+        return flash_redirect("進捗状況の内容を入力してください。", "danger", url_for("tasks.detail", task_id=task_id))
     # 画面を開いた後に、ほかの操作(本人の別のタブ・マネージャー)で記載が変更されていたら上書きしない
     # (控え version の無い以前の画面からの送信は確かめない)
-    current = {"body": comment.body}
-    changed = fields_changed_since(request.form.get("version"), current, COMMENT_VERSION_KEYS)
-    if conflicting_fields(changed, current, {"body": body}):
-        flash(_EDITED_ELSEWHERE.format("進捗状況の内容"), "warning")
-        return redirect(url_for("tasks.detail", task_id=task_id))
+    _changed, conflicts = COMMENT_VERSION.conflicts(COMMENT_VERSION.values(comment), {"body": body})
+    if conflicts:
+        return flash_redirect(COMMENT_VERSION.conflict_message(conflicts), "warning",
+                              url_for("tasks.detail", task_id=task_id))
     comment.body = body
     db.session.commit()
-    flash("進捗状況を更新しました。", "success")
-    return redirect(url_for("tasks.detail", task_id=task_id))
+    return flash_redirect("進捗状況を更新しました。", "success", url_for("tasks.detail", task_id=task_id))
 
 
 @tasks_bp.route("/<int:task_id>/delete", methods=["POST"])
@@ -5171,20 +5216,16 @@ def delete_task(task_id):
     lock_for_write()  # 同時に押された削除(二度押し・2人)は、後の側を「既に削除」にする
     task = db.session.get(Task, task_id)
     if task is None:
-        flash("このタスクは既に削除されています。", "info")
-        return redirect(url_for("tasks.list_tasks"))
+        return flash_redirect("このタスクは既に削除されています。", "info", url_for("tasks.list_tasks"))
     if not row_key_matches(task, request.form.get("row")):
-        flash(_STALE_TASK, "warning")
-        return redirect(url_for("tasks.list_tasks"))
+        return flash_redirect(_STALE_TASK, "warning", url_for("tasks.list_tasks"))
     # 削除はマネージャーのみ(担当メンバーは編集・状態変更は可、削除は不可)
     if not current_user.is_manager:
-        flash("タスクを削除できるのはマネージャーのみです。", "danger")
-        return redirect(url_for("tasks.detail", task_id=task_id))
+        return flash_redirect("タスクを削除できるのはマネージャーのみです。", "danger", url_for("tasks.detail", task_id=task_id))
 
     db.session.delete(task)
     db.session.commit()
-    flash("タスクを削除しました。", "info")
-    return redirect(url_for("tasks.list_tasks"))
+    return flash_redirect("タスクを削除しました。", "info", url_for("tasks.list_tasks"))
 
 
 # =============================================================================
@@ -5283,11 +5324,9 @@ def _render_routine_form(routine, users, form=None, version=None, rem_state=None
     rem = db.session.get(RoutineReminder, routine.id) if routine is not None else None
     choices = reminder_extra_user_choices(rem)
     if routine is not None and version is None:
-        version = form.get("version") if form is not None and form.get("version") is not None \
-            else field_versions(_routine_values(routine), ROUTINE_VERSION_KEYS)
+        version = ROUTINE_VERSION.shown(form, routine)
     if routine is not None and rem_version is None:
-        rem_version = form.get("reminder_version") if form is not None and form.get("reminder_version") is not None \
-            else field_versions(reminder_values(rem), REMINDER_VERSION_KEYS)
+        rem_version = REMINDER_VERSION.shown(form, rem, "reminder_version")
     if rem_state is None:
         if form is not None and form.get(REMINDER_FORM_MARK) and hasattr(form, "getlist"):
             rem_state = reminder_state_from_form(form)
@@ -5308,32 +5347,19 @@ def _render_routine_form(routine, users, form=None, version=None, rem_state=None
 
 
 # 編集画面で、画面を開いた後のほかの操作の変更を確かめる項目(名前は画面の表示)
-ROUTINE_VERSION_FIELDS = (
+ROUTINE_VERSION = VersionFields((
     ("name", "業務名"), ("assignee_id", "担当者"), ("purpose", "目的"), ("frequency_count", "回数"),
     ("frequency_unit", "頻度単位"), ("minutes_per", "1回の所要時間"), ("content", "業務内容"),
     ("manual_status", "手順書作成状況"),
-)
-ROUTINE_VERSION_KEYS = tuple(key for key, _label in ROUTINE_VERSION_FIELDS)
-_ROUTINE_FIELD_LABELS = dict(ROUTINE_VERSION_FIELDS)
+))
 
 
-def _routine_values(rw):
-    """編集画面で扱う項目の今の値。"""
-    return {key: getattr(rw, key) for key in ROUTINE_VERSION_KEYS}
-
-
-def _routine_conflict_form(current, changed):
-    """保存しなかったときの再表示の入力: 送られた入力に、ほかの操作で変わった項目の今の値を重ねる。"""
-    form = request.form.to_dict(flat=True)
-    for key in changed:
-        value = current[key]
-        if key == "assignee_id":
-            user = db.session.get(User, value) if value is not None else None
-            form[key] = user.form_key if user is not None else ""
-        else:
-            form[key] = "" if value is None else str(value)
-    form.pop("version", None)
-    return form
+def _routine_form_value(key, value):
+    """項目の値を、編集画面の入力欄に入れる形にする(担当者は「ユーザーID:ログインID」。conflict_form 用)。"""
+    if key == "assignee_id":
+        user = db.session.get(User, value) if value is not None else None
+        return user.form_key if user is not None else ""
+    return "" if value is None else str(value)
 
 
 def _fill_from_form(rw, form, users, forced_assignee_id=None):
@@ -5366,12 +5392,8 @@ def _fill_from_form(rw, form, users, forced_assignee_id=None):
     if errors:
         return errors
 
-    unit = form.get("frequency_unit") or FREQ_MONTH
-    if unit not in FREQ_UNIT_CHOICES:
-        unit = FREQ_MONTH
-    manual = form.get("manual_status") or MANUAL_UNDONE
-    if manual not in MANUAL_CHOICES:
-        manual = MANUAL_UNDONE
+    unit = choice_or_default(form.get("frequency_unit"), FREQ_UNIT_CHOICES, FREQ_MONTH)
+    manual = choice_or_default(form.get("manual_status"), MANUAL_CHOICES, MANUAL_UNDONE)
 
     rw.name = name
     rw.assignee_id = assignee_id
@@ -5390,28 +5412,23 @@ def _fill_from_form(rw, form, users, forced_assignee_id=None):
 @routine_bp.route("/")
 @login_required
 def list_routines():
-    assignee_id = request.args.get("assignee", "")
     manual = request.args.get("manual", "")
     scope = request.args.get("scope", "")
     keyword = search_keyword()
-    # 担当者の選択肢: 有効なユーザーと、選択中の無効化したユーザー(マネージャーには定型業務が残っている
-    # 無効化したユーザーも。担当の付け替えのため)。どのユーザーでもない番号は条件に使わない
-    users = filter_user_choices([to_int(assignee_id)], User.id.in_(db.select(RoutineWork.assignee_id))
-                                if current_user.is_manager else None)
-    if to_int(assignee_id) not in {u.id for u in users}:
-        assignee_id = ""
+    # 担当者の選択肢: マネージャーには定型業務が残っている無効化したユーザーも(担当の付け替えのため)
+    users, assignee_id, assignee = user_filter_choices(
+        request.args.get("assignee", ""),
+        User.id.in_(db.select(RoutineWork.assignee_id)) if current_user.is_manager else None)
 
     query = RoutineWork.query
-    if to_int(assignee_id) is not None:
-        query = query.filter(RoutineWork.assignee_id == to_int(assignee_id))
+    if assignee is not None:
+        query = query.filter(RoutineWork.assignee_id == assignee)
     if scope == "mine":
         query = query.filter(RoutineWork.assignee_id == current_user.id)
     if manual in MANUAL_CHOICES:
         query = query.filter(RoutineWork.manual_status == manual)
     if keyword:
-        like = _like_pattern(keyword)
-        query = query.filter(db.or_(RoutineWork.name.ilike(like, escape=_LIKE_ESCAPE),
-                                    RoutineWork.content.ilike(like, escape=_LIKE_ESCAPE)))
+        query = query.filter(keyword_condition(keyword, RoutineWork.name, RoutineWork.content))
 
     routines = query.order_by(RoutineWork.assignee_id, RoutineWork.id.desc()).all()
 
@@ -5441,8 +5458,7 @@ def new_routine():
         lock_for_write()
         done = already_submitted("routine")
         if done:
-            flash(_SUBMITTED_TWICE.format("定型・定期業務"), "info")
-            return redirect(done)
+            return flash_redirect(_SUBMITTED_TWICE.format("定型・定期業務"), "info", done)
     users = _assignee_users()  # メンバーは自分のみ選択可
     if request.method == "POST":
         rw = RoutineWork(creator_id=current_user.id)
@@ -5501,14 +5517,12 @@ def edit_routine(routine_id):
         lock_for_write()  # 確かめてから保存するまでの間に、ほかの保存・削除が入らないように
     rw = get_or_404(RoutineWork, routine_id)
     if request.method == "POST" and not row_key_matches(rw, request.form.get("row")):
-        flash(_STALE_ROUTINE, "warning")
-        return redirect(url_for("routine.list_routines"))
+        return flash_redirect(_STALE_ROUTINE, "warning", url_for("routine.list_routines"))
     if not _can_edit_routine(rw):
-        flash("この定型・定期業務を編集できるのは担当者・マネージャーのみです。", "danger")
-        return redirect(url_for("routine.detail", routine_id=rw.id))
+        return flash_redirect("この定型・定期業務を編集できるのは担当者・マネージャーのみです。", "danger", url_for("routine.detail", routine_id=rw.id))
     users = _assignee_users(rw)
     if request.method == "POST":
-        current = _routine_values(rw)
+        current = ROUTINE_VERSION.values(rw)
         today = reminder_today()
         rem = db.session.get(RoutineReminder, rw.id)
         rem_current = reminder_values(rem)
@@ -5527,26 +5541,25 @@ def edit_routine(routine_id):
                 flash(e, "danger")
             return _render_routine_form(rw, users, request.form)
         # 画面を開いた後に、ほかの操作で変わった項目を古い画面の内容で上書きしない(タスクの編集と同じ)
-        changed = fields_changed_since(request.form.get("version"), current, ROUTINE_VERSION_KEYS)
-        conflicts = conflicting_fields(changed, current, _routine_values(rw))
+        changed, conflicts = ROUTINE_VERSION.conflicts(current, ROUTINE_VERSION.values(rw))
         rem_changed, rem_conflicts = [], []
         if rem_values is not None:
-            rem_changed = fields_changed_since(request.form.get("reminder_version"), rem_current,
-                                               REMINDER_VERSION_KEYS) or []
-            rem_conflicts = conflicting_fields(rem_changed, rem_current, rem_values)
+            rem_changed, rem_conflicts = REMINDER_VERSION.conflicts(rem_current, rem_values, "reminder_version")
+            rem_changed = rem_changed or []
         if conflicts or rem_conflicts:
             db.session.rollback()  # フォームの値を反映した内容は保存しない(今の内容に戻す)
-            labels = [_ROUTINE_FIELD_LABELS[k] for k in conflicts] + [REMINDER_FIELD_LABELS[k] for k in rem_conflicts]
+            labels = ([ROUTINE_VERSION.labels[k] for k in conflicts]
+                      + [REMINDER_VERSION.labels[k] for k in rem_conflicts])
             flash(_EDITED_ELSEWHERE.format("、".join(labels)), "warning")
             # リマインドの欄: ほかの操作で変わった項目は今の値、ほかの項目は送られた入力のまま
             shown = dict(rem_values) if rem_values is not None else dict(rem_current)
             for key in rem_changed:
                 shown[key] = rem_current[key]
             return _render_routine_form(
-                rw, users, _routine_conflict_form(current, changed),
-                version=field_versions(current, ROUTINE_VERSION_KEYS),
+                rw, users, conflict_form(current, changed, _routine_form_value),
+                version=ROUTINE_VERSION.version(current),
                 rem_state=reminder_state_from_values(shown, today, rem_choices),
-                rem_version=field_versions(rem_current, REMINDER_VERSION_KEYS))
+                rem_version=REMINDER_VERSION.version(rem_current))
         notes = []
         if rem_values is not None:
             _rem, notes = save_routine_reminder(rw.id, rem, rem_values, current_user.id, today,
@@ -5571,20 +5584,16 @@ def delete_routine(routine_id):
     lock_for_write()  # 同時に押された削除(二度押し・2人)は、後の側を「既に削除」にする
     rw = db.session.get(RoutineWork, routine_id)
     if rw is None:
-        flash("この定型・定期業務は既に削除されています。", "info")
-        return redirect(url_for("routine.list_routines"))
+        return flash_redirect("この定型・定期業務は既に削除されています。", "info", url_for("routine.list_routines"))
     if not row_key_matches(rw, request.form.get("row")):
-        flash(_STALE_ROUTINE, "warning")
-        return redirect(url_for("routine.list_routines"))
+        return flash_redirect(_STALE_ROUTINE, "warning", url_for("routine.list_routines"))
     if not current_user.is_manager:
-        flash("定型・定期業務を削除できるのはマネージャーのみです。", "danger")
-        return redirect(url_for("routine.detail", routine_id=routine_id))
+        return flash_redirect("定型・定期業務を削除できるのはマネージャーのみです。", "danger", url_for("routine.detail", routine_id=routine_id))
     # リマインドの設定と実施予定日の行も削除する(IDが次に登録した業務に再利用されても引き継がないように。10-2)
     delete_routine_reminder_rows(rw.id)
     db.session.delete(rw)
     db.session.commit()
-    flash("定型・定期業務を削除しました。", "info")
-    return redirect(url_for("routine.list_routines"))
+    return flash_redirect("定型・定期業務を削除しました。", "info", url_for("routine.list_routines"))
 
 
 # =============================================================================
@@ -5634,13 +5643,7 @@ def _can_cancel_leave(leave):
 
 
 # 年休の編集で、画面を開いた後の変更を確かめる項目(hidden の version)と、案内に使う名前
-LEAVE_VERSION_KEYS = ("leave_date", "leave_type")
-_LEAVE_FIELD_LABELS = {"leave_date": "取得日", "leave_type": "種別"}
-
-
-def _leave_values(leave):
-    """編集画面の項目の今の値(画面を開いた後の変更を確かめるため)。"""
-    return {"leave_date": leave.leave_date, "leave_type": leave.leave_type}
+LEAVE_VERSION = VersionFields((("leave_date", "取得日"), ("leave_type", "種別")))
 
 
 def _render_leave_form(leave, form=None, version=None):
@@ -5650,8 +5653,7 @@ def _render_leave_form(leave, form=None, version=None):
     (タスク・定型業務の編集画面と同じ)。
     """
     if leave is not None and version is None:
-        version = form.get("version") if form is not None and form.get("version") is not None \
-            else field_versions(_leave_values(leave), LEAVE_VERSION_KEYS)
+        version = LEAVE_VERSION.shown(form, leave)
     return render_template(
         "leaves/form.html", leave=leave,
         type_choices=LEAVE_TYPE_CHOICES, daily_limit=LEAVE_DAILY_LIMIT, form=form,
@@ -5661,9 +5663,7 @@ def _render_leave_form(leave, form=None, version=None):
 
 def _read_leave_form():
     """フォームの取得日(不正・未入力は None)と種別(不正・未選択は全休)。"""
-    leave_type = request.form.get("leave_type") or LEAVE_FULL
-    if leave_type not in LEAVE_TYPE_CHOICES:
-        leave_type = LEAVE_FULL
+    leave_type = choice_or_default(request.form.get("leave_type"), LEAVE_TYPE_CHOICES, LEAVE_FULL)
     return parse_date(request.form.get("leave_date")), leave_type
 
 
@@ -5694,10 +5694,6 @@ def _duplicate_on(user_id, leave_date, exclude_id=None):
     if exclude_id:
         q = q.filter(LeaveRequest.id != exclude_id)
     return q.first()
-
-
-def _active_departments():
-    return Department.query.filter_by(is_active=True).order_by(Department.sort_order, Department.name).all()
 
 
 # --------------------------------------------------------------------------- #
@@ -5760,7 +5756,7 @@ def _build_weeks(year, month, dept_id=None):
         leaves = [lv for lv in leaves if lv.user_id in member_ids]
 
     # チームごとのメンバー(同日上限の判定用)
-    dept_member_ids = {d.id: {u.id for u in d.users} for d in _active_departments()}
+    dept_member_ids = {d.id: {u.id for u in d.users} for d in ordered_rows(Department)}
 
     by_date = {}
     for lv in leaves:
@@ -5808,7 +5804,7 @@ def calendar_view():
         year, month = today.year, today.month
 
     dept_id = to_int(request.args.get("dept", ""))
-    departments = _active_departments()
+    departments = ordered_rows(Department)
     if dept_id is not None and dept_id not in {d.id for d in departments}:
         # 無効化したチーム: 選択肢に「［無効］」を付けて残す(絞り込みは効いたまま「全体」と表示されないように)。
         # どのチームでもない番号は条件に使わない
@@ -5842,13 +5838,8 @@ def calendar_view():
 @leaves_bp.route("/list")
 @login_required
 def list_leaves():
-    user_id = request.args.get("user", "")
     scope = request.args.get("scope", "")
-    # 対象者の選択肢: 有効なユーザーと、選択中の無効化したユーザー(「［無効］」付き。選択肢から消えて「すべて」と
-    # 表示されたまま絞り込まないように)。どのユーザーでもない番号は条件に使わない
-    users = filter_user_choices([to_int(user_id)])
-    if to_int(user_id) not in {u.id for u in users}:
-        user_id = ""
+    users, user_id, selected = user_filter_choices(request.args.get("user", ""))
     # 取得日の期間: 日付として読めない値(年が5桁以上など)は使わず、その旨を表示する
     # (欄にも表示しない。読めない値をそのまま欄に戻すと、絞り込んでいないのに絞り込んだように見えるため)
     dates, bad = {}, []
@@ -5864,8 +5855,8 @@ def list_leaves():
     date_from, date_to = dates["from"], dates["to"]
 
     query = LeaveRequest.query
-    if to_int(user_id) is not None:
-        query = query.filter(LeaveRequest.user_id == to_int(user_id))
+    if selected is not None:
+        query = query.filter(LeaveRequest.user_id == selected)
     if scope == "mine":
         query = query.filter(LeaveRequest.user_id == current_user.id)
     if date_from:
@@ -5915,8 +5906,7 @@ def new_leave():
                 _registration_messages(current_user, leave_date, exclude_id=dup.id)
                 return redirect(calendar_url)
             if dup:
-                flash("その取得日の年休は既に登録されています。", "warning")
-                return redirect(url_for("leaves.detail", leave_id=dup.id))
+                return flash_redirect("その取得日の年休は既に登録されています。", "warning", url_for("leaves.detail", leave_id=dup.id))
 
             leave = LeaveRequest(
                 user_id=current_user.id, leave_date=leave_date, leave_type=leave_type
@@ -5952,11 +5942,9 @@ def edit_leave(leave_id):
     leave = get_or_404(LeaveRequest, leave_id)
     # 開いたままの画面の行の印(row)が違えば、取消された年休と同じIDの新しい年休なので更新しない
     if request.method == "POST" and not row_key_matches(leave, request.form.get("row")):
-        flash(_STALE_LEAVE, "warning")
-        return redirect(url_for("leaves.calendar_view"))
+        return flash_redirect(_STALE_LEAVE, "warning", url_for("leaves.calendar_view"))
     if not _can_modify_leave(leave):
-        flash("年休を編集できるのは本人のみです。", "danger")
-        return redirect(url_for("leaves.detail", leave_id=leave.id))
+        return flash_redirect("年休を編集できるのは本人のみです。", "danger", url_for("leaves.detail", leave_id=leave.id))
 
     if request.method == "POST":
         leave_date, leave_type = _read_leave_form()
@@ -5970,25 +5958,19 @@ def edit_leave(leave_id):
             lock_for_write()
             leave = get_or_404(LeaveRequest, leave_id)
             if not row_key_matches(leave, request.form.get("row")):
-                flash(_STALE_LEAVE, "warning")
-                return redirect(url_for("leaves.calendar_view"))
+                return flash_redirect(_STALE_LEAVE, "warning", url_for("leaves.calendar_view"))
             # 画面を開いた後に、ほかの操作(別のタブなど)で変わった項目を古い画面の内容で上書きしない
             # (控え version の無い以前の画面は今までどおり)
-            current = _leave_values(leave)
-            changed = fields_changed_since(request.form.get("version"), current, LEAVE_VERSION_KEYS)
-            conflicts = conflicting_fields(changed, current, {"leave_date": leave_date, "leave_type": leave_type})
+            current = LEAVE_VERSION.values(leave)
+            changed, conflicts = LEAVE_VERSION.conflicts(current, {"leave_date": leave_date, "leave_type": leave_type})
             if conflicts:
-                flash(_EDITED_ELSEWHERE.format("、".join(_LEAVE_FIELD_LABELS[k] for k in conflicts)), "warning")
-                shown = request.form.to_dict(flat=True)
-                for key in changed:
-                    value = current[key]
-                    shown[key] = value.isoformat() if isinstance(value, date) else str(value or "")
-                shown.pop("version", None)
-                return _render_leave_form(leave, shown, version=field_versions(current, LEAVE_VERSION_KEYS))
+                flash(LEAVE_VERSION.conflict_message(conflicts), "warning")
+                shown = conflict_form(current, changed,
+                                      lambda _k, v: v.isoformat() if isinstance(v, date) else str(v or ""))
+                return _render_leave_form(leave, shown, version=LEAVE_VERSION.version(current))
             dup = _duplicate_on(current_user.id, leave_date, exclude_id=leave.id)
             if dup:
-                flash("その取得日の年休は既に登録されています。", "warning")
-                return redirect(url_for("leaves.detail", leave_id=dup.id))
+                return flash_redirect("その取得日の年休は既に登録されています。", "warning", url_for("leaves.detail", leave_id=dup.id))
             leave.leave_date = leave_date
             leave.leave_type = leave_type
             db.session.commit()
@@ -6008,18 +5990,15 @@ def cancel_leave(leave_id):
     lock_for_write()  # 同時に押された取消(二度押し)は、後の側を「既に取消」にする
     leave = db.session.get(LeaveRequest, leave_id)
     if leave is None:
-        flash("この年休は既に取消されています。", "info")
-        return redirect(url_for("leaves.calendar_view"))
+        return flash_redirect("この年休は既に取消されています。", "info", url_for("leaves.calendar_view"))
     if not row_key_matches(leave, request.form.get("row")):
-        flash(_STALE_LEAVE, "warning")
-        return redirect(url_for("leaves.calendar_view"))
+        return flash_redirect(_STALE_LEAVE, "warning", url_for("leaves.calendar_view"))
     if not _can_cancel_leave(leave):
-        flash("年休を取消できるのは本人のみです（無効化したメンバーの年休はマネージャーも取消できます）。", "danger")
-        return redirect(url_for("leaves.detail", leave_id=leave.id))
+        return flash_redirect("年休を取消できるのは本人のみです（無効化したメンバーの年休はマネージャーも取消できます）。",
+                              "danger", url_for("leaves.detail", leave_id=leave.id))
     db.session.delete(leave)
     db.session.commit()
-    flash("年休を取消しました。", "info")
-    return redirect(url_for("leaves.calendar_view"))
+    return flash_redirect("年休を取消しました。", "info", url_for("leaves.calendar_view"))
 
 
 # =============================================================================
@@ -6072,19 +6051,19 @@ def _not_target_message(user):
 
 
 def _active_skills(skill_type):
-    return (
-        Skill.query.filter_by(skill_type=skill_type, is_active=True)
-        .order_by(Skill.sort_order, Skill.name)
-        .all()
-    )
+    """区分 skill_type の有効なスキル項目(並び順・名前の順)。"""
+    return Skill.query.filter_by(skill_type=skill_type, is_active=True).order_by(Skill.sort_order, Skill.name).all()
 
 
-def _active_operations():
-    return (
-        Operation.query.filter_by(is_active=True)
-        .order_by(Operation.sort_order, Operation.name)
-        .all()
-    )
+def _skills_by_type(pair):
+    """区分ごとの有効なスキル項目と pair(スキル) の値の組({区分: [(スキル, 値)]}。到達度・必要レベルの画面)。"""
+    return {stype: [(s, pair(s)) for s in _active_skills(stype)] for stype in SKILL_TYPE_CHOICES}
+
+
+def _form_level(form, skill):
+    """到達度の入力欄(level_<スキルID>)の値を 0〜そのスキルの最大レベルにして返す。無い・不正な値なら None。"""
+    level = to_int(form.get(f"level_{skill.id}"))
+    return None if level is None else max(0, min(level, skill.max_level))
 
 
 # --------------------------------------------------------------------------- #
@@ -6093,9 +6072,7 @@ def _active_operations():
 @skills_bp.route("/")
 def list_skills():
     # 既定は「全スキル」(一番左のタブ)。個別区分は ?type=<区分> で表示。
-    skill_type = request.args.get("type", SKILL_TYPE_ALL)
-    if skill_type != SKILL_TYPE_ALL and skill_type not in SKILL_TYPE_CHOICES:
-        skill_type = SKILL_TYPE_ALL
+    skill_type = choice_or_default(request.args.get("type"), SKILL_TYPE_CHOICES, SKILL_TYPE_ALL)
     is_all = skill_type == SKILL_TYPE_ALL
 
     # 横軸に表示する列(ヒト・業務を任意に組み合わせ。既定はヒトのみ)
@@ -6121,7 +6098,7 @@ def list_skills():
         })
 
     # 業務列(横軸=業務): {skill_id: {op_id: 必要レベル}}
-    operations = _active_operations() if show_op else []
+    operations = ordered_rows(Operation) if show_op else []
     req_by_skill = {sid: {} for sid in all_skill_ids}
     if show_op and all_skill_ids:
         for r in OperationSkill.query.filter(
@@ -6181,9 +6158,7 @@ def edit_operation(op_id):
         # 確かめて(画面を開いたときの値と今の値を比べて)から保存するまでの間に、ほかの保存が入らないように
         lock_for_write()
     op = get_or_404(Operation, op_id)
-    all_skills = []
-    for stype in SKILL_TYPE_CHOICES:
-        all_skills.extend(_active_skills(stype))
+    all_skills = [s for stype in SKILL_TYPE_CHOICES for s in _active_skills(stype)]
 
     if request.method == "POST":
         form = request.form
@@ -6191,11 +6166,9 @@ def edit_operation(op_id):
         # 行の追加は保存(commit)のときにまとめて行う(同時に送られた保存と重なっても commit_or_conflict で受け止める)
         with db.session.no_autoflush:
             for s in all_skills:
-                level = to_int(form.get(f"level_{s.id}"))
+                level = _form_level(form, s)
                 if level is None:
-                    # フォームに無い(画面を開いた後に追加・有効化されたスキル)・不正な値の行は変えない
-                    continue
-                level = max(0, min(level, s.max_level))
+                    continue  # フォームに無い(画面を開いた後に追加・有効化されたスキル)・不正な値の行は変えない
                 req = op.req_for(s)
                 stored = req.level if req is not None else 0
                 # 画面を開いたときの値(hidden。無い古いフォームは保存されている値とみなす)
@@ -6228,14 +6201,10 @@ def edit_operation(op_id):
                   "今の値を確認して、必要ならもう一度変更してください: {}".format("、".join(conflicts)), "warning")
         return redirect(url_for("skills.list_skills", show=[AXIS_OPERATION]))
 
-    by_type = {}
-    for stype in SKILL_TYPE_CHOICES:
-        by_type[stype] = [(s, op.req_for(s)) for s in _active_skills(stype)]
-
     return render_template(
         "skills/operation_edit.html",
         operation=op,
-        by_type=by_type,
+        by_type=_skills_by_type(op.req_for),
         type_choices=SKILL_TYPE_CHOICES,
         type_labels=SKILL_TYPE_LABELS,
     )
@@ -6244,7 +6213,7 @@ def edit_operation(op_id):
 @skills_bp.route("/coverage")
 def coverage():
     """別の見方: 縦=業務、横=ヒト。各ヒトがその業務に対応できるか(必要スキル充足)。"""
-    operations = _active_operations()
+    operations = ordered_rows(Operation)
     users = _skill_users()
 
     # 必要スキルの到達度を lookup 化: (user_id, skill_id) -> level
@@ -6302,16 +6271,10 @@ def member(user_id):
     member = get_or_404(User, user_id)
     if not _is_skill_target(member):
         # manager権限のユーザー・無効化されたユーザーはスキル管理の対象外
-        flash(_not_target_message(member), "info")
-        return redirect(url_for("skills.list_skills"))
+        return flash_redirect(_not_target_message(member), "info", url_for("skills.list_skills"))
 
     # 区分ごとに (skill, rating) を整理
-    by_type = {}
-    for stype in SKILL_TYPE_CHOICES:
-        rows = []
-        for s in _active_skills(stype):
-            rows.append((s, s.rating_for(member)))
-        by_type[stype] = rows
+    by_type = _skills_by_type(lambda s: s.rating_for(member))
 
     # --- 育成計画: 業務ごとの必要スキルに対する本人の過不足 ---
     current = {
@@ -6320,7 +6283,7 @@ def member(user_id):
     }
     op_rows = []
     need = {}  # skill_id -> 育成が必要なスキルの集約
-    for op in _active_operations():
+    for op in ordered_rows(Operation):
         reqs = sorted(
             op.active_skill_reqs,
             key=lambda r: (r.skill.skill_type, r.skill.sort_order, r.skill.name),
@@ -6380,30 +6343,24 @@ def edit_member(user_id):
     member = get_or_404(User, user_id)
     if not _is_skill_target(member):
         # manager権限のユーザー・無効化されたユーザーはスキル管理の対象外
-        flash(_not_target_message(member), "info")
-        return redirect(url_for("skills.list_skills"))
+        return flash_redirect(_not_target_message(member), "info", url_for("skills.list_skills"))
 
     # 全区分の有効スキルをまとめて編集
-    all_skills = []
-    for stype in SKILL_TYPE_CHOICES:
-        all_skills.extend(_active_skills(stype))
+    all_skills = [s for stype in SKILL_TYPE_CHOICES for s in _active_skills(stype)]
 
     if request.method == "POST":
         form = request.form
         if form.get("member_username") != member.username:
             # 画面を開いた後にその人が削除され、IDが別の人に再利用された(または古い画面): 保存しない
-            flash(_STALE_MEMBERS, "warning")
-            return redirect(url_for("skills.list_skills"))
+            return flash_redirect(_STALE_MEMBERS, "warning", url_for("skills.list_skills"))
         conflicts = []
         # 行の追加・削除は保存(commit)のときにまとめて行う(途中の読み込みで追加すると、同時に送られた保存と
         # 重なったときに commit_or_conflict で受け止められない)
         with db.session.no_autoflush:
             for s in all_skills:
-                level = to_int(form.get(f"level_{s.id}"))
+                level = _form_level(form, s)
                 if level is None:
-                    # フォームに無い(画面を開いた後に追加・有効化されたスキル)・不正な値の行は変えない
-                    continue
-                level = max(0, min(level, s.max_level))
+                    continue  # フォームに無い(画面を開いた後に追加・有効化されたスキル)・不正な値の行は変えない
                 note = (form.get(f"note_{s.id}", "") or "").strip()
 
                 rating = s.rating_for(member)
@@ -6442,14 +6399,10 @@ def edit_member(user_id):
                       "、".join(conflicts)), "warning")
         return redirect(url_for("skills.member", user_id=member.id))
 
-    by_type = {}
-    for stype in SKILL_TYPE_CHOICES:
-        by_type[stype] = [(s, s.rating_for(member)) for s in _active_skills(stype)]
-
     return render_template(
         "skills/member_edit.html",
         member=member,
-        by_type=by_type,
+        by_type=_skills_by_type(lambda s: s.rating_for(member)),
         type_choices=SKILL_TYPE_CHOICES,
         type_labels=SKILL_TYPE_LABELS,
     )
@@ -6527,14 +6480,8 @@ def description_outline(skill_type):
 
 
 # スキル項目の編集で、画面を開いた後のほかの操作の変更を確かめる項目(名前は画面の表示。タスクの編集と同じ)
-SKILL_ITEM_VERSION_FIELDS = (("name", "スキル名"), ("category", "カテゴリ"), ("description", "説明"),
-                             ("sort_order", "並び順"))
-SKILL_ITEM_VERSION_KEYS = tuple(key for key, _label in SKILL_ITEM_VERSION_FIELDS)
-
-
-def _skill_item_values(skill):
-    """スキル項目の編集画面で扱う項目の今の値。"""
-    return {key: getattr(skill, key) for key in SKILL_ITEM_VERSION_KEYS}
+SKILL_ITEM_VERSION = VersionFields((("name", "スキル名"), ("category", "カテゴリ"), ("description", "説明"),
+                                    ("sort_order", "並び順")))
 
 
 def _render_item_form(skill, form=None, status=200, version=None):
@@ -6544,8 +6491,7 @@ def _render_item_form(skill, form=None, status=200, version=None):
     送られた控えのまま(_render_task_form と同じ)。
     """
     if skill is not None and version is None:
-        sent = request.form.get("version") if request.method == "POST" else None
-        version = sent if sent is not None else field_versions(_skill_item_values(skill), SKILL_ITEM_VERSION_KEYS)
+        version = SKILL_ITEM_VERSION.shown(request.form if request.method == "POST" else None, skill)
     return render_template(
         "skills/item_form.html", skill=skill, version=version,
         type_choices=SKILL_TYPE_CHOICES, type_labels=SKILL_TYPE_LABELS, form=form,
@@ -6677,13 +6623,10 @@ def new_item():
         if not name:
             flash("スキル名は必須です。", "danger")
             return _render_item_form(None, request.form)
-        stype = request.form.get("skill_type")
-        if stype not in SKILL_TYPE_CHOICES:
-            stype = SKILL_TECHNICAL
+        stype = choice_or_default(request.form.get("skill_type"), SKILL_TYPE_CHOICES, SKILL_TECHNICAL)
         lock_for_write()  # 二度押しの確認から追加までの間に、同時に届いた2回目が入らないように
         if already_submitted("skill_item"):
-            flash(_SUBMITTED_TWICE.format("スキル項目「{}」".format(name)), "info")
-            return redirect(url_for("skills.items"))
+            return flash_redirect(_SUBMITTED_TWICE.format("スキル項目「{}」".format(name)), "info", url_for("skills.items"))
         skill = Skill(
             name=name,
             skill_type=stype,
@@ -6693,8 +6636,7 @@ def new_item():
         )
         db.session.add(skill)
         commit_submitted("skill_item", url_for("skills.items"))
-        flash("スキル項目を追加しました。", "success")
-        return redirect(url_for("skills.items"))
+        return flash_redirect("スキル項目を追加しました。", "success", url_for("skills.items"))
 
     return _render_item_form(None)
 
@@ -6715,16 +6657,13 @@ def edit_item(skill_id):
                "sort_order": form_sort_order(request.form)}
         # 画面を開いた後に、ほかの操作(別のタブ・別のマネージャー)で変わった項目を、古い画面の内容で上書きしない
         # (説明はスキルテストの問題作成の基準になるため。控え version の無い以前の画面からの送信は確かめない)
-        current = _skill_item_values(skill)
-        changed = fields_changed_since(request.form.get("version"), current, SKILL_ITEM_VERSION_KEYS)
-        conflicts = conflicting_fields(changed, current, new)
+        current = SKILL_ITEM_VERSION.values(skill)
+        changed, conflicts = SKILL_ITEM_VERSION.conflicts(current, new)
         if conflicts:
-            labels = dict(SKILL_ITEM_VERSION_FIELDS)
-            flash(_EDITED_ELSEWHERE.format("、".join(labels[k] for k in conflicts)), "warning")
-            form = {key: request.form.get(key, "") for key in ("name", "category", "description", "sort_order")}
-            for key in changed:
-                form[key] = "" if current[key] is None else str(current[key])
-            return _render_item_form(skill, form, version=field_versions(current, SKILL_ITEM_VERSION_KEYS))
+            flash(SKILL_ITEM_VERSION.conflict_message(conflicts), "warning")
+            form = conflict_form(current, changed,
+                                 form={key: request.form.get(key, "") for key in SKILL_ITEM_VERSION.keys})
+            return _render_item_form(skill, form, version=SKILL_ITEM_VERSION.version(current))
         skill.name = new["name"]
         skill.category = new["category"]
         skill.description = new["description"]
@@ -6756,9 +6695,8 @@ def description_draft():
         if skill is None:
             abort(404)
     # 区分は、編集中のスキルならそのスキルの区分(変更できないため)、追加中なら選択中の区分
-    skill_type = skill.skill_type if skill is not None else request.form.get("skill_type")
-    if skill_type not in SKILL_TYPE_CHOICES:
-        skill_type = SKILL_TECHNICAL
+    skill_type = choice_or_default(skill.skill_type if skill is not None else request.form.get("skill_type"),
+                                   SKILL_TYPE_CHOICES, SKILL_TECHNICAL)
     name = request.form.get("name", "").strip()
     category = request.form.get("category", "").strip()
     current = request.form.get("description", "")
@@ -6778,110 +6716,110 @@ def description_draft():
     return _render_item_form(skill, form)
 
 
+def _toggle_active(obj, label, url):
+    """有効/無効の切り替えボタン(set_active_from_form)の共通の応答。label は案内の「業務」「チーム」(スキル項目は "")。"""
+    changed = set_active_from_form(obj)
+    if changed:
+        db.session.commit()
+    state = "有効" if obj.is_active else "無効"
+    if changed:
+        return flash_redirect("{}「{}」を{}にしました。".format(label, obj.name, state), "info", url)
+    return flash_redirect("{}「{}」は既に{}です（変更していません）。".format(label, obj.name, state), "info", url)
+
+
 @skills_bp.route("/items/<int:skill_id>/toggle", methods=["POST"])
 def toggle_item(skill_id):
-    skill = get_or_404(Skill, skill_id)
-    if not set_active_from_form(skill):
-        flash(f"「{skill.name}」は既に{'有効' if skill.is_active else '無効'}です（変更していません）。", "info")
-        return redirect(url_for("skills.items"))
-    db.session.commit()
-    flash(
-        f"「{skill.name}」を{'有効' if skill.is_active else '無効'}にしました。", "info"
-    )
-    return redirect(url_for("skills.items"))
+    return _toggle_active(get_or_404(Skill, skill_id), "", url_for("skills.items"))
 
 
 # --------------------------------------------------------------------------- #
 # 業務(Operation)項目の管理(マネージャー)。横軸「業務」ビューの列に使う。
 # --------------------------------------------------------------------------- #
 # 業務の名称・説明・並び順の保存で、画面を開いた後のほかの操作の変更を確かめる項目(名前は画面の表示)
-OPERATION_VERSION_FIELDS = (("name", "業務名"), ("description", "説明"), ("sort_order", "並び順"))
-OPERATION_VERSION_KEYS = tuple(key for key, _label in OPERATION_VERSION_FIELDS)
+OPERATION_VERSION = VersionFields((("name", "業務名"), ("description", "説明"), ("sort_order", "並び順")))
 
 
-def _operation_values(op):
-    """業務の一覧の各フォームで扱う項目の今の値。"""
-    return {key: getattr(op, key) for key in OPERATION_VERSION_KEYS}
+def _add_named_row(model, kind, label, empty_message, dup_message, url, make_row):
+    """名前の重複を許さない行(業務・チーム〔5-8〕)を追加する共通の流れ。kind は二度押しの印の種類、make_row(名前) は新しい行。
+
+    追加のボタンの二度押し(同じ印 once・同じ内容)の2回目は、追加済みと案内する(「既にあります」の注意にしない)。
+    """
+    name = request.form.get("name", "").strip()
+    lock_for_write()  # 二度押しの確認から追加までの間に、同時に届いた2回目が入らないように
+    existing = model.query.filter_by(name=name).first() if name else None
+    if not name:
+        flash(empty_message, "danger")
+    elif existing is not None and already_submitted(kind):
+        flash(_SUBMITTED_TWICE.format("{}「{}」".format(label, existing.name)), "info")
+    elif existing is not None:
+        flash(dup_message, "warning")
+    else:
+        db.session.add(make_row(name))
+        if commit_unique_submitted(kind, url, dup_message):
+            flash("{}「{}」を追加しました。".format(label, name), "success")
+    return redirect(url)
+
+
+def _rename_named_row(obj, spec, new, label, empty_message, dup_message, url):
+    """名前の重複を許さない行(業務・チーム〔5-8〕)の名称などを保存する共通の流れ。new は保存する値({項目: 値}。name を含む)。
+
+    画面を開いた後に、ほかの操作(別のタブ・別のマネージャー)で変わった項目(spec: VersionFields)は、古い画面の値で
+    上書きせず今の内容のままにする(控え version の無い以前の画面からの送信は確かめない)。ほかの項目は保存する。
+    """
+    if not new["name"]:
+        return flash_redirect(empty_message, "danger", url)
+    current = spec.values(obj)
+    _changed, conflicts = spec.conflicts(current, new)
+    for key in conflicts:
+        new[key] = current[key]
+    other = type(obj).query.filter_by(name=new["name"]).first()
+    if other and other.id != obj.id:
+        return flash_redirect(dup_message, "warning", url)
+    for key, value in new.items():
+        setattr(obj, key, value)
+    if commit_unique(dup_message):
+        if conflicts:
+            flash("画面を開いた後に、ほかの操作で{}「{}」の内容が変更されていたため、{}は今の内容のままにしました"
+                  "（ほかの項目の変更は保存しました）。確認して、必要ならもう一度変更して保存してください。".format(
+                      label, obj.name, "・".join(spec.labels[k] for k in conflicts)), "warning")
+        else:
+            flash("{}を更新しました。".format(label), "success")
+    return redirect(url)
 
 
 @skills_bp.route("/operations")
 def operations():
-    ops = Operation.query.order_by(Operation.sort_order, Operation.name).all()
-    versions = {o.id: field_versions(_operation_values(o), OPERATION_VERSION_KEYS) for o in ops}
-    return render_template("skills/operations.html", operations=ops, versions=versions)
+    ops = ordered_rows(Operation, active_only=False)
+    return render_template("skills/operations.html", operations=ops,
+                           versions={o.id: OPERATION_VERSION.version(o) for o in ops})
 
 
 @skills_bp.route("/operations/new", methods=["POST"])
 def new_operation():
-    """業務項目を追加する。追加のボタンの二度押し(同じ印 once・同じ内容)の2回目は、追加済みと案内する
-    (チームの追加と同じ。「既にあります」の注意にしない)。"""
-    name = request.form.get("name", "").strip()
-    lock_for_write()  # 二度押しの確認から追加までの間に、同時に届いた2回目が入らないように
-    existing = Operation.query.filter_by(name=name).first() if name else None
-    if not name:
-        flash("業務名を入力してください。", "danger")
-    elif existing is not None and already_submitted("operation"):
-        flash(_SUBMITTED_TWICE.format(f"業務「{existing.name}」"), "info")
-    elif existing is not None:
-        flash("同じ名称の業務が既にあります。", "warning")
-    else:
-        db.session.add(Operation(
-            name=name,
-            description=request.form.get("description", "").strip() or None,
-            sort_order=form_sort_order(request.form),
-        ))
-        if commit_unique_submitted("operation", url_for("skills.operations"), "同じ名称の業務が既にあります。"):
-            flash(f"業務「{name}」を追加しました。", "success")
-    return redirect(url_for("skills.operations"))
+    """業務項目を追加する(_add_named_row。二度押しの2回目は追加済みと案内する)。"""
+    def make_row(name):
+        return Operation(name=name, description=request.form.get("description", "").strip() or None,
+                         sort_order=form_sort_order(request.form))
+
+    return _add_named_row(Operation, "operation", "業務", "業務名を入力してください。", "同じ名称の業務が既にあります。",
+                          url_for("skills.operations"), make_row)
 
 
 @skills_bp.route("/operations/<int:op_id>/rename", methods=["POST"])
 def rename_operation(op_id):
-    """業務の名称・説明・並び順を保存する。
-
-    画面を開いた後に、ほかの操作(別のタブ・別のマネージャー)で変わった項目は、古い画面の値で上書きせず
-    今の内容のままにする(控え version の無い以前の画面からの送信は確かめない)。ほかの項目は保存する。
-    """
+    """業務の名称・説明・並び順を保存する(_rename_named_row)。"""
     lock_for_write()  # 確かめてから保存するまでの間に、ほかの保存が入らないように
     op = get_or_404(Operation, op_id)
-    name = request.form.get("name", "").strip()
-    if not name:
-        flash("業務名を入力してください。", "danger")
-        return redirect(url_for("skills.operations"))
-    current = _operation_values(op)
-    new = {"name": name, "description": request.form.get("description", "").strip() or None,
+    new = {"name": request.form.get("name", "").strip(),
+           "description": request.form.get("description", "").strip() or None,
            "sort_order": form_sort_order(request.form, op.sort_order)}
-    changed = fields_changed_since(request.form.get("version"), current, OPERATION_VERSION_KEYS)
-    conflicts = conflicting_fields(changed, current, new)
-    for key in conflicts:
-        new[key] = current[key]
-    other = Operation.query.filter_by(name=new["name"]).first()
-    if other and other.id != op.id:
-        flash("同じ名称の業務が既にあります。", "warning")
-        return redirect(url_for("skills.operations"))
-    op.name = new["name"]
-    op.description = new["description"]
-    op.sort_order = new["sort_order"]
-    if commit_unique("同じ名称の業務が既にあります。"):
-        if conflicts:
-            labels = dict(OPERATION_VERSION_FIELDS)
-            flash("画面を開いた後に、ほかの操作で業務「{}」の内容が変更されていたため、{}は今の内容のままにしました"
-                  "（ほかの項目の変更は保存しました）。確認して、必要ならもう一度変更して保存してください。".format(
-                      op.name, "・".join(labels[k] for k in conflicts)), "warning")
-        else:
-            flash("業務を更新しました。", "success")
-    return redirect(url_for("skills.operations"))
+    return _rename_named_row(op, OPERATION_VERSION, new, "業務", "業務名を入力してください。", "同じ名称の業務が既にあります。",
+                             url_for("skills.operations"))
 
 
 @skills_bp.route("/operations/<int:op_id>/toggle", methods=["POST"])
 def toggle_operation(op_id):
-    op = get_or_404(Operation, op_id)
-    if not set_active_from_form(op):
-        flash(f"業務「{op.name}」は既に{'有効' if op.is_active else '無効'}です（変更していません）。", "info")
-        return redirect(url_for("skills.operations"))
-    db.session.commit()
-    flash(f"業務「{op.name}」を{'有効' if op.is_active else '無効'}にしました。", "info")
-    return redirect(url_for("skills.operations"))
+    return _toggle_active(get_or_404(Operation, op_id), "業務", url_for("skills.operations"))
 
 
 # =============================================================================
@@ -7280,22 +7218,15 @@ def _build_gantt(today, only_user_id=None):
     if limited:
         flash("ガントチャートの期間は最長{}日（約2年）までです。{}〜{} を表示しています。".format(
             GANTT_MAX_DAYS, gfrom.strftime("%Y/%m/%d"), gto.strftime("%Y/%m/%d")), "warning")
-    gsort = request.args.get("gsort", "task")
-    if gsort not in ("task", "assignee"):
-        gsort = "task"
-    gdir = request.args.get("gdir", "asc")
-    if gdir not in ("asc", "desc"):
-        gdir = "asc"
+    gsort = choice_or_default(request.args.get("gsort"), ("task", "assignee"), "task")
+    gdir = choice_or_default(request.args.get("gdir"), ("asc", "desc"), "asc")
     ghide = request.args.get("ghide") == "1"
-    # 個人ダッシュボードは本人固定(担当者フィルタは出さない)
-    gassignee = "" if only_user_id is not None else request.args.get("gassignee", "")
-    gusers = []
+    # 個人ダッシュボードは本人固定(担当者フィルタは出さない)。マネージャーの画面の担当者の選択肢には、未完了の
+    # タスクが残っている無効化したユーザーも(担当の付け替えのため)
+    gassignee, gusers, gassignee_id = "", [], None
     if only_user_id is None:
-        # 担当者の選択肢: 有効なユーザーと、選択中の無効化したユーザー・未完了のタスクが残っている無効化した
-        # ユーザー(担当の付け替えのため。ガントはマネージャーの画面)。どのユーザーでもない番号は条件に使わない
-        gusers = filter_user_choices([to_int(gassignee)], User.assigned_tasks.any(Task.status != STATUS_DONE))
-        if to_int(gassignee) not in {u.id for u in gusers}:
-            gassignee = ""
+        gusers, gassignee, gassignee_id = user_filter_choices(
+            request.args.get("gassignee", ""), User.assigned_tasks.any(Task.status != STATUS_DONE))
 
     gtotal_days = (gto - gfrom).days + 1
 
@@ -7310,8 +7241,8 @@ def _build_gantt(today, only_user_id=None):
         gquery = gquery.filter(Task.status != STATUS_DONE)
     if only_user_id is not None:
         gquery = gquery.filter(Task.assignees.any(User.id == only_user_id))
-    elif to_int(gassignee) is not None:
-        gquery = gquery.filter(Task.assignees.any(User.id == to_int(gassignee)))
+    elif gassignee_id is not None:
+        gquery = gquery.filter(Task.assignees.any(User.id == gassignee_id))
 
     # 担当者はまとめて読む。状態の変更・コメントは、棒が期間に入るタスクの分だけをまとめて読む
     # (タスクごとに読みに行くと、タスクの数に比例して遅くなるため)
@@ -7410,6 +7341,12 @@ def _build_gantt(today, only_user_id=None):
     }
 
 
+def _gantt_extra(actx, octx):
+    """ガントの期間のリンク・フォームが保持する、ほかの区画(活動状況・成果)の期間(YYYY-MM-DD)。"""
+    return {"afrom": actx["act_from"].strftime("%Y-%m-%d"), "ato": actx["act_to"].strftime("%Y-%m-%d"),
+            "ofrom": octx["o_from"].strftime("%Y-%m-%d"), "oto": octx["o_to"].strftime("%Y-%m-%d")}
+
+
 @manager_bp.route("/", endpoint="dashboard")
 @manager_required
 def manager_dashboard():
@@ -7443,11 +7380,7 @@ def manager_dashboard():
     )
 
     # ---- スキル保有状況(テクニカル) ----
-    tech_skills = (
-        Skill.query.filter_by(skill_type=SKILL_TECHNICAL, is_active=True)
-        .order_by(Skill.sort_order, Skill.name)
-        .all()
-    )
+    tech_skills = _active_skills(SKILL_TECHNICAL)
     weak_threshold = max(1, (member_count + 2) // 3)  # 対象の約1/3未満を手薄とみなす
     skill_rows = []
     for s in tech_skills:
@@ -7476,9 +7409,6 @@ def manager_dashboard():
 
     # ---- メンバーの活動状況(進捗記載)。ヒト別 → タスク別 → 時系列 ----
     actx = _build_activity(today, users)
-    activity_rows = actx["activity_rows"]
-    act_from = actx["act_from"]
-    act_to = actx["act_to"]
 
     # ---- ヒト別 負荷・案件状況(タスク＋定型業務を合算) ----
     workload_rows, workload_totals = _build_workload(today, users)
@@ -7508,18 +7438,10 @@ def manager_dashboard():
         skill_rows=skill_rows,
         member_avg=member_avg,
         proficient=SKILL_PROFICIENT_LEVEL,
-        # メンバーの活動状況
-        activity_rows=activity_rows,
-        act_from=act_from,
-        act_to=act_to,
         # ガントチャート(ダッシュボード内蔵。リンクは他セクションの期間も保持)
         gantt_endpoint="manager.dashboard",
-        gantt_extra={
-            "afrom": act_from.strftime("%Y-%m-%d"),
-            "ato": act_to.strftime("%Y-%m-%d"),
-            "ofrom": octx["o_from"].strftime("%Y-%m-%d"),
-            "oto": octx["o_to"].strftime("%Y-%m-%d"),
-        },
+        gantt_extra=_gantt_extra(actx, octx),
+        **actx,  # メンバーの活動状況
         **octx,
         **gctx,
     )
@@ -7574,15 +7496,13 @@ def _member_has_history(user):
 @departments_bp.route("/")
 @manager_required
 def manage():
-    departments = Department.query.order_by(Department.sort_order, Department.name).all()
+    departments = ordered_rows(Department, active_only=False)
     users = get_active_users()
-    inactive_members = (
-        User.query.filter_by(is_active=False).order_by(User.display_name).all()
-    )
+    inactive_members = User.query.filter_by(is_active=False).order_by(User.display_name).all()
     # 紐づけ判定用: {dept_id: set(user_id)}
     membership = {d.id: {u.id for u in d.users} for d in departments}
     # チームの名称・並び順のフォームの控え(古い画面からの保存で、ほかの操作の変更を上書きしない)
-    versions = {d.id: field_versions(_department_values(d), DEPARTMENT_VERSION_KEYS) for d in departments}
+    versions = {d.id: DEPARTMENT_VERSION.version(d) for d in departments}
     # メンバーのメールアドレス(定型業務のリマインドの宛先。10-3)と、そのフォームの控え
     emails = user_email_map(u.id for u in users)
     return render_template(
@@ -7611,9 +7531,7 @@ def new_member():
     """
     username = request.form.get("username", "").strip()
     display_name = request.form.get("display_name", "").strip()
-    role = request.form.get("role", ROLE_MEMBER)
-    if role not in (ROLE_MANAGER, ROLE_MEMBER):
-        role = ROLE_MEMBER
+    role = choice_or_default(request.form.get("role"), (ROLE_MANAGER, ROLE_MEMBER), ROLE_MEMBER)
 
     lock_for_write()  # 二度押しの確認から追加までの間に、同時に届いた2回目が入らないように
     existing = User.query.filter_by(username=username).first() if username else None
@@ -7672,19 +7590,16 @@ def delete_member(user_id):
     lock_for_write()
     user = db.session.get(User, user_id)
     if user is None:
-        flash("このメンバーは既に削除されています。", "info")
-        return redirect(url_for("departments.manage"))
+        return flash_redirect("このメンバーは既に削除されています。", "info", url_for("departments.manage"))
     if not _same_member(user):
         return redirect(url_for("departments.manage"))
     if user.id == current_user.id:
-        flash("自分自身は削除できません。", "warning")
-        return redirect(url_for("departments.manage"))
+        return flash_redirect("自分自身は削除できません。", "warning", url_for("departments.manage"))
     if is_local_account(user.username):
         # 固定ローカル管理者はログインのたびに有効に戻る(無効化してもログインは止まらない)
-        flash(f"「{user.display_name}」({user.username})は固定ローカル管理者のため、削除・無効化できません"
-              "（ログインを止めるにはシステム設定の「基本設定」タブで ADMIN_PASSWORD を変更してください。"
-              "変更すると、既にログインしているブラウザもログイン画面に戻ります）。", "warning")
-        return redirect(url_for("departments.manage"))
+        return flash_redirect(f"「{user.display_name}」({user.username})は固定ローカル管理者のため、削除・無効化できません"
+                              "（ログインを止めるにはシステム設定の「基本設定」タブで ADMIN_PASSWORD を変更してください。"
+                              "変更すると、既にログインしているブラウザもログイン画面に戻ります）。", "warning", url_for("departments.manage"))
 
     name = user.display_name
     if _member_has_history(user):
@@ -7729,8 +7644,7 @@ def reactivate_member(user_id):
         return redirect(url_for("departments.manage"))
     if user.is_active:
         # 古い画面(別のタブ・別のマネージャーが既に復帰した)からの復帰
-        flash(f"メンバー「{user.display_name}」は既に有効です（変更していません）。", "info")
-        return redirect(url_for("departments.manage"))
+        return flash_redirect(f"メンバー「{user.display_name}」は既に有効です（変更していません）。", "info", url_for("departments.manage"))
     user.is_active = True
     db.session.commit()
     flash(f"メンバー「{user.display_name}」を復帰しました。", "success")
@@ -7743,82 +7657,31 @@ def reactivate_member(user_id):
 @departments_bp.route("/new", methods=["POST"])
 @manager_required
 def new_department():
-    """チームを追加する。追加のボタンの二度押し(同じ印 once・同じ内容)の2回目は、追加済みと案内する。"""
-    name = request.form.get("name", "").strip()
-    lock_for_write()  # 二度押しの確認から追加までの間に、同時に届いた2回目が入らないように
-    existing = Department.query.filter_by(name=name).first() if name else None
-    if not name:
-        flash("チームの名称を入力してください。", "danger")
-    elif existing is not None and already_submitted("department"):
-        flash(_SUBMITTED_TWICE.format(f"チーム「{existing.name}」"), "info")
-    elif existing is not None:
-        flash("同じ名称のチームが既にあります。", "warning")
-    else:
-        db.session.add(Department(name=name, sort_order=form_sort_order(request.form)))
-        if commit_unique_submitted("department", url_for("departments.manage"), "同じ名称のチームが既にあります。"):
-            flash(f"チーム「{name}」を追加しました。", "success")
-    return redirect(url_for("departments.manage"))
+    """チームを追加する(_add_named_row〔5-6〕。二度押しの2回目は追加済みと案内する)。"""
+    return _add_named_row(Department, "department", "チーム", "チームの名称を入力してください。", "同じ名称のチームが既にあります。",
+                          url_for("departments.manage"),
+                          lambda name: Department(name=name, sort_order=form_sort_order(request.form)))
 
 
 # チームの名称・並び順の保存で、画面を開いた後のほかの操作の変更を確かめる項目(名前は画面の表示)
-DEPARTMENT_VERSION_FIELDS = (("name", "名称"), ("sort_order", "並び順"))
-DEPARTMENT_VERSION_KEYS = tuple(key for key, _label in DEPARTMENT_VERSION_FIELDS)
-
-
-def _department_values(dept):
-    """チームの一覧の名称のフォームで扱う項目の今の値。"""
-    return {key: getattr(dept, key) for key in DEPARTMENT_VERSION_KEYS}
+DEPARTMENT_VERSION = VersionFields((("name", "名称"), ("sort_order", "並び順")))
 
 
 @departments_bp.route("/<int:dept_id>/rename", methods=["POST"])
 @manager_required
 def rename_department(dept_id):
-    """チームの名称・並び順を保存する。
-
-    画面を開いた後に、ほかの操作(別のタブ・別のマネージャー)で変わった項目は、古い画面の値で上書きせず
-    今の内容のままにする(控え version の無い以前の画面からの送信は確かめない)。ほかの項目は保存する。
-    """
+    """チームの名称・並び順を保存する(_rename_named_row〔5-6〕)。"""
     lock_for_write()  # 確かめてから保存するまでの間に、ほかの保存が入らないように
     dept = get_or_404(Department, dept_id)
-    name = request.form.get("name", "").strip()
-    if not name:
-        flash("チームの名称を入力してください。", "danger")
-        return redirect(url_for("departments.manage"))
-    current = _department_values(dept)
-    new = {"name": name, "sort_order": form_sort_order(request.form, dept.sort_order)}
-    changed = fields_changed_since(request.form.get("version"), current, DEPARTMENT_VERSION_KEYS)
-    conflicts = conflicting_fields(changed, current, new)
-    for key in conflicts:
-        new[key] = current[key]
-    other = Department.query.filter_by(name=new["name"]).first()
-    if other and other.id != dept.id:
-        flash("同じ名称のチームが既にあります。", "warning")
-        return redirect(url_for("departments.manage"))
-    dept.name = new["name"]
-    dept.sort_order = new["sort_order"]
-    if commit_unique("同じ名称のチームが既にあります。"):
-        if conflicts:
-            labels = dict(DEPARTMENT_VERSION_FIELDS)
-            flash("画面を開いた後に、ほかの操作でチーム「{}」の内容が変更されていたため、{}は今の内容のままにしました"
-                  "（ほかの項目の変更は保存しました）。確認して、必要ならもう一度変更して保存してください。".format(
-                      dept.name, "・".join(labels[k] for k in conflicts)), "warning")
-        else:
-            flash("チームを更新しました。", "success")
-    return redirect(url_for("departments.manage"))
+    new = {"name": request.form.get("name", "").strip(), "sort_order": form_sort_order(request.form, dept.sort_order)}
+    return _rename_named_row(dept, DEPARTMENT_VERSION, new, "チーム", "チームの名称を入力してください。",
+                             "同じ名称のチームが既にあります。", url_for("departments.manage"))
 
 
 @departments_bp.route("/<int:dept_id>/toggle", methods=["POST"])
 @manager_required
 def toggle_department(dept_id):
-    dept = get_or_404(Department, dept_id)
-    if not set_active_from_form(dept):
-        flash(f"チーム「{dept.name}」は既に{'有効' if dept.is_active else '無効'}です（変更していません）。", "info")
-        return redirect(url_for("departments.manage"))
-    db.session.commit()
-    flash(
-        f"チーム「{dept.name}」を{'有効' if dept.is_active else '無効'}にしました。", "info"
-    )
-    return redirect(url_for("departments.manage"))
+    return _toggle_active(get_or_404(Department, dept_id), "チーム", url_for("departments.manage"))
 
 
 # チームが1つも無いときの紐づけの案内(画面の「メンバーの紐づけ」と同じ文)
@@ -7844,12 +7707,10 @@ def save_memberships():
     # 紐づける人の確認から保存までの間に、その人が削除されないように(メンバーの削除と1つずつにする)
     lock_for_write()
     if not shown_dept_ids and Department.query.count() == 0:
-        flash(_NO_DEPARTMENTS, "info")
-        return redirect(url_for("departments.manage"))
+        return flash_redirect(_NO_DEPARTMENTS, "info", url_for("departments.manage"))
     if not shown_keys or not shown_dept_ids:
-        flash("紐づけの表の内容を読み取れませんでした（保存していません）。画面を開き直してから保存してください。",
-              "warning")
-        return redirect(url_for("departments.manage"))
+        return flash_redirect("紐づけの表の内容を読み取れませんでした（保存していません）。画面を開き直してから保存してください。",
+                              "warning", url_for("departments.manage"))
     members, stale = users_from_form_keys(shown_keys, get_active_users())
     # チームは件数が少ないため、すべて読んでから選ぶ(送られたIDの一覧を SQL に渡すと、件数がとても多い
     # 送信で SQL の変数の上限を超えて内部エラーになる)
@@ -7917,6 +7778,11 @@ def _fmt(v):
             v = _cut_utf16(v, XLSX_CELL_MAX - _utf16_len(XLSX_TRUNCATED_MARK)) + XLSX_TRUNCATED_MARK
         return v
     return v
+
+
+def _choices4(question):
+    """問題(または回答)の選択肢を4つに(足りない分は空。選択肢A〜Dの列)。"""
+    return (question.choice_list + ["", "", "", ""])[:4]
 
 
 def _utf16_len(text):
@@ -8060,8 +7926,8 @@ def _skills_sheets():
         r.level, r.note, r.rater.display_name if r.rater else "", r.rated_at,
     ] for r in ratings]
 
-    ops = Operation.query.order_by(Operation.sort_order, Operation.name).all()
-    o_rows = [[o.id, o.name, o.description, o.is_active, o.sort_order] for o in ops]
+    o_rows = [[o.id, o.name, o.description, o.is_active, o.sort_order]
+              for o in ordered_rows(Operation, active_only=False)]
 
     reqs = OperationSkill.query.all()
     req_rows = [[
@@ -8127,14 +7993,12 @@ def _skilltest_sheets():
     ]
     w_rows = []
     for w in answers:
-        choices = (w.choice_list + ["", "", "", ""])[:4]
         attempt = w.attempt
         w_rows.append([
             w.attempt_id,
             attempt.user.display_name if attempt and attempt.user else "",
             attempt.skill.name if attempt and attempt.skill else "",
-            w.seq, w.level, w.question_id, w.question,
-            choices[0], choices[1], choices[2], choices[3],
+            w.seq, w.level, w.question_id, w.question, *_choices4(w),
             choice_letter(w.correct_index), choice_letter(w.selected_index), w.result_label,
             w.time_limit_sec, w.served_at, w.answered_at, w.elapsed_sec, w.blur_count,
         ])
@@ -8145,14 +8009,10 @@ def _skilltest_sheets():
         "問題ID", "スキル", "レベル", "問題文", "選択肢A", "選択肢B", "選択肢C", "選択肢D",
         "正解", "解説", "作成元", "モデル", "有効", "作成日時",
     ]
-    q_rows = []
-    for q in questions:
-        choices = (q.choice_list + ["", "", "", ""])[:4]
-        q_rows.append([
-            q.id, q.skill.name if q.skill else "", q.level, q.question,
-            choices[0], choices[1], choices[2], choices[3],
-            q.answer_letter, q.explanation, q.source_label, q.model, q.is_active, q.created_at,
-        ])
+    q_rows = [[
+        q.id, q.skill.name if q.skill else "", q.level, q.question, *_choices4(q),
+        q.answer_letter, q.explanation, q.source_label, q.model, q.is_active, q.created_at,
+    ] for q in questions]
 
     return [
         ("スキルテスト受験履歴", a_headers, a_rows),
@@ -8162,11 +8022,10 @@ def _skilltest_sheets():
 
 
 def _teams_sheets():
-    depts = Department.query.order_by(Department.sort_order, Department.name).all()
     d_rows = [[
         d.id, d.name, d.is_active, d.sort_order,
         "、".join(u.display_name for u in d.users),
-    ] for d in depts]
+    ] for d in ordered_rows(Department, active_only=False)]
 
     users = User.query.order_by(User.display_name).all()
     emails = user_email_map()
@@ -8181,36 +8040,15 @@ def _teams_sheets():
 
 
 # --------------------------------------------------------------------------- #
-# ダウンロード用ルート
+# ダウンロード用ルート: GET /export/<名前>.xlsx(エンドポイント export.<名前>_xlsx)。all.xlsx はすべてのシート
 # --------------------------------------------------------------------------- #
-@export_bp.route("/tasks.xlsx")
-def tasks_xlsx():
-    return _xlsx_response(_tasks_sheets(), "tasks.xlsx")
+def _xlsx_download(sheets, filename):
+    return _xlsx_response(sheets(), filename)
 
 
-@export_bp.route("/routine.xlsx")
-def routine_xlsx():
-    return _xlsx_response(_routine_sheets(), "routine.xlsx")
-
-
-@export_bp.route("/skills.xlsx")
-def skills_xlsx():
-    return _xlsx_response(_skills_sheets(), "skills.xlsx")
-
-
-@export_bp.route("/leaves.xlsx")
-def leaves_xlsx():
-    return _xlsx_response(_leaves_sheets(), "leaves.xlsx")
-
-
-@export_bp.route("/skilltest.xlsx")
-def skilltest_xlsx():
-    return _xlsx_response(_skilltest_sheets(), "skilltest.xlsx")
-
-
-@export_bp.route("/teams.xlsx")
-def teams_xlsx():
-    return _xlsx_response(_teams_sheets(), "teams.xlsx")
+for _name, _sheets in (("tasks", _tasks_sheets), ("routine", _routine_sheets), ("skills", _skills_sheets),
+                       ("leaves", _leaves_sheets), ("skilltest", _skilltest_sheets), ("teams", _teams_sheets)):
+    export_bp.add_url_rule("/{}.xlsx".format(_name), _name + "_xlsx", partial(_xlsx_download, _sheets, _name + ".xlsx"))
 
 
 @export_bp.route("/all.xlsx")
@@ -9340,12 +9178,19 @@ def _new_document(title, author="", created_at=None):
     return doc
 
 
+def _add_small(doc, text, gray=False, italic=False):
+    """小さめ(9pt)の1段落(注記・作成日時・チーム合計)。gray は灰色、italic は斜体。"""
+    run = doc.add_paragraph().add_run(_xml_text(text))
+    if italic:
+        run.italic = True
+    run.font.size = Pt(9)
+    if gray:
+        run.font.color.rgb = RGBColor(0x6C, 0x75, 0x7D)
+
+
 def _add_note(doc, text):
     """小さめの灰色の注記(「AI未整形」など)。"""
-    run = doc.add_paragraph().add_run("※" + _xml_text(text))
-    run.italic = True
-    run.font.size = Pt(9)
-    run.font.color.rgb = RGBColor(0x6C, 0x75, 0x7D)
+    _add_small(doc, "※" + _xml_text(text), gray=True, italic=True)
 
 
 def add_text(doc, text):
@@ -9409,10 +9254,7 @@ def build_docx(material, written, created_at, app_name):
 
     doc.add_heading("週報", level=0)
     doc.add_paragraph("対象期間: {}（対象 {}名）".format(period, len(written["persons"])))
-    info = doc.add_paragraph().add_run(
-        "{}が自動作成（{}）".format(_xml_text(app_name), created_at.strftime("%Y/%m/%d %H:%M")))
-    info.font.size = Pt(9)
-    info.font.color.rgb = RGBColor(0x6C, 0x75, 0x7D)
+    _add_small(doc, "{}が自動作成（{}）".format(_xml_text(app_name), created_at.strftime("%Y/%m/%d %H:%M")), gray=True)
 
     # ---- チーム全体 ----
     doc.add_heading("チーム全体", level=1)
@@ -9423,8 +9265,7 @@ def build_docx(material, written, created_at, app_name):
 
     doc.add_paragraph("■メンバー別の集計（システム集計）", style="Heading 2")
     _add_member_table(doc, material["team"]["rows"])
-    total = doc.add_paragraph().add_run(_team_total_line(material["team"]))
-    total.font.size = Pt(9)
+    _add_small(doc, _team_total_line(material["team"]))
 
     # ---- 個人(1人1ページ) ----
     for person in written["persons"]:
@@ -9718,21 +9559,18 @@ def weekly_run_now():
     raw_end = (request.form.get("end") or "").strip()
     start, end = parse_date(raw_start), parse_date(raw_end)
     if (raw_start and start is None) or (raw_end and end is None):
-        flash("期間の日付が正しくありません（YYYY-MM-DD の形式で、実在する日付を指定してください）。"
-              "作成・送信はしていません。", "danger")
-        return redirect(url_for("weekly.index"))
+        return flash_redirect("期間の日付が正しくありません（YYYY-MM-DD の形式で、実在する日付を指定してください）。"
+                              "作成・送信はしていません。", "danger", url_for("weekly.index"))
     start = start or default_from
     end = end or default_to
     if end < start:
         start, end = end, start
     if (end - start).days + 1 > RUN_MAX_DAYS:
-        flash("期間は{}日以内で指定してください。".format(RUN_MAX_DAYS), "danger")
-        return redirect(url_for("weekly.index"))
+        return flash_redirect("期間は{}日以内で指定してください。".format(RUN_MAX_DAYS), "danger", url_for("weekly.index"))
     if end > RUN_LAST_DAY:
         # 期限が近いタスクの判定などで、期間の終わりより後の日付を計算するため
-        flash("期間の日付が正しくありません（{}より後の日付は指定できません）。".format(
-            RUN_LAST_DAY.strftime("%Y/%m/%d")), "danger")
-        return redirect(url_for("weekly.index"))
+        return flash_redirect("期間の日付が正しくありません（{}より後の日付は指定できません）。".format(
+                            RUN_LAST_DAY.strftime("%Y/%m/%d")), "danger", url_for("weekly.index"))
 
     app = current_app._get_current_object()
 
@@ -9740,8 +9578,7 @@ def weekly_run_now():
         result = run_weekly(
             app, start, end, TRIGGER_MANUAL, DELIVER_DOWNLOAD)
         if not result["ok"]:
-            flash(result["message"], "danger")
-            return redirect(url_for("weekly.index"))
+            return flash_redirect(result["message"], "danger", url_for("weekly.index"))
         return _docx_response(result["data"], result["filename"], start, end)
 
     trigger, label = SEND_ACTIONS[action]
@@ -11786,18 +11623,23 @@ def _guard():
         attempt_id = (request.view_args or {}).get("attempt_id")
         if request.method == "GET" and endpoint in ("skilltest.question", "skilltest.result") \
                 and attempt_id is not None:
-            flash("マネージャーはスキル管理の対象外のため、受験の画面は開けません。"
-                  "スキルテスト管理の受験の詳細を表示します。", "info")
-            return redirect(url_for("skilltest.admin_attempt", attempt_id=attempt_id))
+            return flash_redirect("マネージャーはスキル管理の対象外のため、受験の画面は開けません。"
+                                  "スキルテスト管理の受験の詳細を表示します。", "info",
+                                  url_for("skilltest.admin_attempt", attempt_id=attempt_id))
         if request.method == "GET" or endpoint == "skilltest.start":
-            flash("マネージャーはスキル管理の対象外のため、スキルテストは受験できません。"
-                  "スキルテスト管理を表示します。", "info")
-            return redirect(url_for("skilltest.admin_attempts"))
+            return flash_redirect("マネージャーはスキル管理の対象外のため、スキルテストは受験できません。"
+                                  "スキルテスト管理を表示します。", "info", url_for("skilltest.admin_attempts"))
     abort(403, description=SKILLTEST_TAKERS_ONLY)
 
 
 def _tech_scale():
     return scale_for(SKILL_TECHNICAL)
+
+
+def _technical_skills():
+    """管理画面の絞り込み・問題プールのテクニカルスキル(無効化したものも。有効なものを先に)。"""
+    return (Skill.query.filter_by(skill_type=SKILL_TECHNICAL)
+            .order_by(Skill.is_active.desc(), Skill.sort_order, Skill.name).all())
 
 
 def _rules(settings):
@@ -11852,8 +11694,8 @@ def start(skill_id):
     skill = get_or_404(Skill, skill_id)
     outcome = start_attempt(current_user._get_current_object(), skill)
     if outcome.error:
-        flash(outcome.error, "danger" if outcome.error == MSG_NOT_READY else "warning")
-        return redirect(url_for("skilltest.index"))
+        return flash_redirect(outcome.error,
+                              "danger" if outcome.error == MSG_NOT_READY else "warning", url_for("skilltest.index"))
     if outcome.resumed:
         flash("受験中のテスト（{}）を再開します。".format(outcome.attempt.skill.name), "info")
     return redirect(url_for("skilltest.question", attempt_id=outcome.attempt.id))
@@ -11947,10 +11789,8 @@ def admin_attempts():
     filters = {
         "user_id": form_int(request.args, "user_id"),
         "skill_id": form_int(request.args, "skill_id"),
-        "status": request.args.get("status", ""),
+        "status": choice_or_default(request.args.get("status"), ATTEMPT_STATUS_LABELS, ""),
     }
-    if filters["status"] not in ATTEMPT_STATUS_LABELS:
-        filters["status"] = ""
 
     query = SkillTestAttempt.query
     if filters["user_id"]:
@@ -11967,11 +11807,6 @@ def admin_attempts():
         u for u in User.query.order_by(User.display_name).all()
         if u.id in taker_ids or (u.is_active and u.role == ROLE_MEMBER)
     ]
-    skills = (
-        Skill.query.filter_by(skill_type=SKILL_TECHNICAL)
-        .order_by(Skill.is_active.desc(), Skill.sort_order, Skill.name)
-        .all()
-    )
     return render_template(
         "skilltest/admin_attempts.html",
         nav_top_level=_rules(load_skilltest_settings())["top_level"],
@@ -11979,7 +11814,7 @@ def admin_attempts():
         attempts=attempts,
         filters=filters,
         users=users,
-        skills=skills,
+        skills=_technical_skills(),
         status_labels=ATTEMPT_STATUS_LABELS,
         scale=_tech_scale(),
     )
@@ -12009,11 +11844,7 @@ def admin_attempt(attempt_id):
 def admin_pool():
     settings = load_skilltest_settings()
     counts = counts_by_skill()
-    skills = (
-        Skill.query.filter_by(skill_type=SKILL_TECHNICAL)
-        .order_by(Skill.is_active.desc(), Skill.sort_order, Skill.name)
-        .all()
-    )
+    skills = _technical_skills()
     levels = tested_levels(settings, len(_tech_scale()) - 1)
     # 目標数が1回の受験に必要な問題数より少ないレベル(補充はそのレベルを必要な数まで作る)
     below_need = [lv for lv in levels if settings["pool_target_per_level"] < questions_for(settings, lv)]
@@ -12060,9 +11891,7 @@ def admin_pool():
 def admin_pool_skill(skill_id):
     skill = get_or_404(Skill, skill_id)
     level = form_int(request.args, "level")
-    state = request.args.get("state", "")
-    if state not in (STATE_ACTIVE, STATE_INACTIVE):
-        state = ""
+    state = choice_or_default(request.args.get("state"), (STATE_ACTIVE, STATE_INACTIVE), "")
     query = SkillTestQuestion.query.filter_by(skill_id=skill.id)
     if level:
         query = query.filter(SkillTestQuestion.level == level)
@@ -12107,11 +11936,9 @@ def admin_topup(skill_id):
     back = url_for("skilltest.admin_pool_skill", skill_id=skill.id) \
         if request.form.get("back") == "skill" else url_for("skilltest.admin_pool")
     if not is_testable(skill):
-        flash("有効なテクニカルスキルだけ補充できます。", "warning")
-        return redirect(back)
+        return flash_redirect("有効なテクニカルスキルだけ補充できます。", "warning", back)
     if not ai_is_configured():
-        flash("AIが未設定のため、問題を作成できません。{}。".format(ai_missing_label()), "danger")
-        return redirect(back)
+        return flash_redirect("AIが未設定のため、問題を作成できません。{}。".format(ai_missing_label()), "danger", back)
     # 既定値で補充しても、結果(前回の補充の結果)を記録できず、設定した目標数も使えないため行わない
     if settings_unreadable(SKILLTEST_SETTINGS,
                            "スキルテストの設定ファイルを読み込めないため、補充できません（結果を記録できないため）。{}"):
@@ -12129,10 +11956,9 @@ def admin_topup(skill_id):
         else:
             flash("別の補充を処理中です。完了してから、もう一度実行してください。", "warning")
         return redirect(back)
-    flash("「{}」の問題の補充を開始しました。数分かかることがあります。結果は問題プールの"
-          "「前回の補充の結果」に表示されます（画面を再読み込みして確認してください）。".format(skill.name),
-          "info")
-    return redirect(back)
+    return flash_redirect("「{}」の問題の補充を開始しました。数分かかることがあります。結果は問題プールの"
+                          "「前回の補充の結果」に表示されます（画面を再読み込みして確認してください）。".format(skill.name),
+                          "info", back)
 
 
 @skilltest_bp.route("/admin/pool/<int:skill_id>/deactivate", methods=["POST"])
@@ -12145,13 +11971,12 @@ def admin_deactivate_all(skill_id):
     """
     skill = get_or_404(Skill, skill_id)
     if running_skill_id() == skill.id:
-        flash("「{}」の問題を補充中のため停止できません。補充が終わってから、もう一度実行してください。".format(
-            skill.name), "warning")
-        return redirect(url_for("skilltest.admin_pool_skill", skill_id=skill.id))
+        return flash_redirect("「{}」の問題を補充中のため停止できません。補充が終わってから、もう一度実行してください。".format(
+                            skill.name), "warning", url_for("skilltest.admin_pool_skill", skill_id=skill.id))
     if is_generating_at_start(skill.id):
-        flash("「{}」の問題を、メンバーの受験の開始のためにAIで作成中のため停止できません。"
-              "1〜2分待ってから、もう一度実行してください。".format(skill.name), "warning")
-        return redirect(url_for("skilltest.admin_pool_skill", skill_id=skill.id))
+        return flash_redirect("「{}」の問題を、メンバーの受験の開始のためにAIで作成中のため停止できません。"
+                              "1〜2分待ってから、もう一度実行してください。".format(skill.name), "warning",
+                              url_for("skilltest.admin_pool_skill", skill_id=skill.id))
     count = (SkillTestQuestion.query
              .filter_by(skill_id=skill.id, is_active=True)
              .update({SkillTestQuestion.is_active: False}, synchronize_session=False))
@@ -16962,8 +16787,6 @@ REMINDER_VERSION_FIELDS = (
     ("dates", "指定日"), ("holiday_rule", "営業日でない日の扱い"), ("start_date", "開始日"),
     ("extra_user_ids", "追加の宛先（メンバー）"), ("extra_emails", "追加の宛先（アドレス）"),
 )
-REMINDER_VERSION_KEYS = tuple(key for key, _label in REMINDER_VERSION_FIELDS)
-REMINDER_FIELD_LABELS = {key: "リマインドの" + label for key, label in REMINDER_VERSION_FIELDS}
 # 予定の作り方の項目(変えると開始日を今日にする)
 REMINDER_RULE_KEYS = ("rule_type", "weekdays", "month_days", "dates", "holiday_rule")
 
@@ -16991,6 +16814,9 @@ def reminder_values(rem):
         "extra_user_ids": rem.extra_user_ids or "",
         "extra_emails": rem.extra_emails or "",
     }
+
+
+REMINDER_VERSION = VersionFields(REMINDER_VERSION_FIELDS, reminder_values, "リマインドの")
 
 
 def reminder_extra_user_choices(rem):
@@ -17227,7 +17053,7 @@ def save_routine_reminder(routine_id, rem, values, user_id, today, by_manager=Fa
                          "前の日から作るときは、開始日を変更して保存してください）。".format(
                              "予定の作り方を変えた" if rule_changed else "リマインドをオンにした",
                              today.strftime("%Y/%m/%d")))
-    for key in REMINDER_VERSION_KEYS:
+    for key in REMINDER_VERSION.keys:
         setattr(rem, key, new[key])
     rem.updated_by_id = user_id
     if by_manager:
@@ -17835,56 +17661,53 @@ def occurrence_page(occ_id):
     )
 
 
+def _occurrence_to_act_on(occ_id):
+    """完了の入力・取り消しの対象の回(書き込みのロックを取ってから読む。同時に押された2回目は「既に完了」などになる)。
+
+    戻り値: (回, 戻る画面の URL, 案内の中の呼び名)。削除された・印(o)が違うときは (None, None, None)。
+    """
+    lock_for_write()
+    occ = db.session.get(RoutineOccurrence, occ_id)
+    if occ is None or occ.routine is None or not row_key_matches(occ, request.form.get("o")):
+        return None, None, None
+    target = _occurrence_back_url(occ, request.form.get("back", "detail"))
+    return occ, target, "「{}」（予定日 {}）".format(occ.routine.name, _due_label(occ.due_date))
+
+
 @routine_bp.route("/occurrences/<int:occ_id>/complete", methods=["POST"])
 @login_required
 def complete_occurrence(occ_id):
     """完了を入力する(その業務の担当者・マネージャー)。入力するとその回のリマインドは止まる。"""
-    lock_for_write()  # 同時に押された完了(二度押し・2人)は、後の側を「既に完了」にする
-    occ = db.session.get(RoutineOccurrence, occ_id)
-    back = request.form.get("back", "detail")
-    if occ is None or occ.routine is None or not row_key_matches(occ, request.form.get("o")):
-        flash(_STALE_OCCURRENCE, "warning")
-        return redirect(url_for("routine.list_routines"))
-    target = _occurrence_back_url(occ, back)
-    label = "「{}」（予定日 {}）".format(occ.routine.name, _due_label(occ.due_date))
+    occ, target, label = _occurrence_to_act_on(occ_id)
+    if occ is None:
+        return flash_redirect(_STALE_OCCURRENCE, "warning", url_for("routine.list_routines"))
     if not can_complete_occurrence(occ, current_user):
-        flash("完了を入力できるのは、この業務の担当者とマネージャーだけです。", "danger")
-        return redirect(target)
+        return flash_redirect("完了を入力できるのは、この業務の担当者とマネージャーだけです。", "danger", target)
     if occ.completed_at is not None:
         who = occ.completed_by.display_name if occ.completed_by is not None else "（不明）"
-        flash("{}は既に完了が入力されています（{}・{}）。".format(
-            label, who, occ.completed_at.strftime("%Y/%m/%d %H:%M")), "info")
-        return redirect(target)
+        return flash_redirect("{}は既に完了が入力されています（{}・{}）。".format(
+                            label, who, occ.completed_at.strftime("%Y/%m/%d %H:%M")), "info", target)
     occ.completed_at = _now()
     occ.completed_by_id = current_user.id
     db.session.commit()
-    flash("{}の完了を入力しました。この回のリマインドは送られません。".format(label), "success")
-    return redirect(target)
+    return flash_redirect("{}の完了を入力しました。この回のリマインドは送られません。".format(label), "success", target)
 
 
 @routine_bp.route("/occurrences/<int:occ_id>/undo", methods=["POST"])
 @login_required
 def undo_occurrence(occ_id):
     """完了を取り消す(マネージャーのみ)。その回は未完了に戻り、リマインドの対象になる。"""
-    lock_for_write()
-    occ = db.session.get(RoutineOccurrence, occ_id)
-    back = request.form.get("back", "detail")
-    if occ is None or occ.routine is None or not row_key_matches(occ, request.form.get("o")):
-        flash(_STALE_OCCURRENCE, "warning")
-        return redirect(url_for("routine.list_routines"))
-    target = _occurrence_back_url(occ, back)
-    label = "「{}」（予定日 {}）".format(occ.routine.name, _due_label(occ.due_date))
+    occ, target, label = _occurrence_to_act_on(occ_id)
+    if occ is None:
+        return flash_redirect(_STALE_OCCURRENCE, "warning", url_for("routine.list_routines"))
     if not current_user.is_manager:
-        flash("完了の取り消しはマネージャーのみです。", "danger")
-        return redirect(target)
+        return flash_redirect("完了の取り消しはマネージャーのみです。", "danger", target)
     if occ.completed_at is None:
-        flash("{}は完了が入力されていません（変更していません）。".format(label), "info")
-        return redirect(target)
+        return flash_redirect("{}は完了が入力されていません（変更していません）。".format(label), "info", target)
     occ.completed_at = None
     occ.completed_by_id = None
     db.session.commit()
-    flash("{}の完了を取り消しました（未完了に戻り、リマインドの対象になります）。".format(label), "info")
-    return redirect(target)
+    return flash_redirect("{}の完了を取り消しました（未完了に戻り、リマインドの対象になります）。".format(label), "info", target)
 
 
 # 画面を開いた後に、ほかの操作でメールアドレスが変更されていたため保存しなかったときの案内({} は誰の)
@@ -17927,12 +17750,10 @@ def account_email():
             flash(_EMAIL_EDITED_ELSEWHERE.format(""), "warning")
             return _render_account_email(current, email_version(current), 409)
         if value == current:
-            flash("メールアドレスは変わっていません（変更していません）。", "info")
-            return redirect(url_for("account.email"))
+            return flash_redirect("メールアドレスは変わっていません（変更していません）。", "info", url_for("account.email"))
         set_user_email(current_user.id, value)
         db.session.commit()
-        flash("メールアドレスを{}しました。".format("保存" if value else "削除"), "success")
-        return redirect(url_for("account.email"))
+        return flash_redirect("メールアドレスを{}しました。".format("保存" if value else "削除"), "success", url_for("account.email"))
     current = user_email(current_user.id)
     return _render_account_email(current, email_version(current))
 
@@ -17944,28 +17765,26 @@ def save_member_email(user_id):
     lock_for_write()
     user = db.session.get(User, user_id)
     if user is None:
-        flash("このメンバーは既に削除されています。", "info")
-        return redirect(url_for("departments.manage"))
+        return flash_redirect("このメンバーは既に削除されています。", "info", url_for("departments.manage"))
     if not _same_member(user):
         return redirect(url_for("departments.manage"))
     raw = request.form.get("email", "")
     value, error = check_email(raw)
     if error:
         shown = raw.strip() if len(raw.strip()) <= 100 else raw.strip()[:99] + "…"
-        flash("{}さんのメールアドレス（{}）を保存できません: {}".format(
-            user.display_name, " ".join(shown.split()), error), "danger")
-        return redirect(url_for("departments.manage"))
+        return flash_redirect("{}さんのメールアドレス（{}）を保存できません: {}".format(
+                            user.display_name, " ".join(shown.split()), error), "danger", url_for("departments.manage"))
     current = user_email(user.id)
     if _email_conflict(request.form.get("version"), current, value):
-        flash(_EMAIL_EDITED_ELSEWHERE.format("{}さんの".format(user.display_name)), "warning")
-        return redirect(url_for("departments.manage"))
+        return flash_redirect(_EMAIL_EDITED_ELSEWHERE.format("{}さんの".format(user.display_name)),
+                              "warning", url_for("departments.manage"))
     if value == current:
-        flash("{}さんのメールアドレスは変わっていません（変更していません）。".format(user.display_name), "info")
-        return redirect(url_for("departments.manage"))
+        return flash_redirect("{}さんのメールアドレスは変わっていません（変更していません）。".format(user.display_name),
+                              "info", url_for("departments.manage"))
     set_user_email(user.id, value)
     db.session.commit()
-    flash("{}さんのメールアドレスを{}しました。".format(user.display_name, "保存" if value else "削除"), "success")
-    return redirect(url_for("departments.manage"))
+    return flash_redirect("{}さんのメールアドレスを{}しました。".format(user.display_name, "保存" if value else "削除"),
+                          "success", url_for("departments.manage"))
 
 
 # #############################################################################
@@ -19043,10 +18862,7 @@ def system_index():
 
 @system_bp.route("/settings", endpoint="settings")
 def system_settings():
-    tab = request.args.get("tab", "")
-    if tab not in TAB_KEYS:
-        tab = TAB_CONFIG
-    return _render_system_settings(tab)
+    return _render_system_settings(choice_or_default(request.args.get("tab"), TAB_KEYS, TAB_CONFIG))
 
 
 # --------------------------------------------------------------------------- #
@@ -19063,8 +18879,7 @@ def save_config():
         return _render_system_settings(TAB_CONFIG, status=400,
                                        config_state=result.state, config_errors=result.errors)
     if result.status == CONFIG_SAVE_CONFLICT:
-        flash(result.message, "warning")
-        return redirect(_tab_url(TAB_CONFIG))
+        return flash_redirect(result.message, "warning", _tab_url(TAB_CONFIG))
     if result.status == CONFIG_SAVE_UNREADABLE:
         # 画面の設定のファイルが読めない(壊れている): 上書きせず、保存できない旨を表示する(500 にはしない)
         flash("基本設定を保存できませんでした（画面の設定のファイルを読み込めないため、上書きしていません）: {}".format(
@@ -19077,8 +18892,7 @@ def save_config():
         message = result.message or "変更された項目はありません（画面の設定は更新していません）。"
         if result.applied:
             message += "保存済みの値を実行中の設定に反映しました: {}。".format("、".join(result.applied))
-        flash(message, "info")
-        return redirect(_tab_url(TAB_CONFIG))
+        return flash_redirect(message, "info", _tab_url(TAB_CONFIG))
 
     message = "基本設定を保存しました（変更: {}）。".format("、".join(result.changed))
     if result.reset:
@@ -19177,8 +18991,7 @@ def _save_feature(tab):
         return _render_system_settings(tab, status=409,
                                        inputs={tab: feature.with_input(copy.deepcopy(current), kept)},
                                        versions={tab: store.version(current)})
-    flash(feature.saved_message, "success")
-    return redirect(_tab_url(tab))
+    return flash_redirect(feature.saved_message, "success", _tab_url(tab))
 
 
 # POST /system/settings/<タブ>(エンドポイント system.save_<タブ>)で、そのタブの設定を保存する
