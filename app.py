@@ -830,6 +830,51 @@ def form_sort_order(form, default=0):
     return default if number is None else number
 
 
+def _is_int(value):
+    """整数か(bool は除く。JSON の true/false を数として受け取らないため)。"""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def valid_int(value, low, high):
+    """範囲内の整数か(bool は除く)。"""
+    return _is_int(value) and low <= value <= high
+
+
+def int_like(raw):
+    """設定値を整数として読む(整数・整数の値の float・数字だけの文字列。bool は除く)。読めなければ None。"""
+    if _is_int(raw):
+        return raw
+    if isinstance(raw, float) and raw.is_integer():
+        return int(raw)
+    if isinstance(raw, str) and raw.strip().isascii() and raw.strip().isdigit():
+        return int(raw.strip())
+    return None
+
+
+def hhmm_text(value):
+    """"HH:MM"(または "H:MM")の文字列を "HH:MM" に整える。文字列でない・不正なら None。"""
+    at = parse_hhmm(value) if isinstance(value, str) else None
+    return None if at is None else at.strftime("%H:%M")
+
+
+def form_hhmm(form, key, values, errors, message):
+    """フォームの時刻(「時:分」)を values[key] に "HH:MM" で入れる。不正なら errors に message を足す。"""
+    hhmm = hhmm_text(form.get(key))
+    if hhmm is None:
+        errors.append(message)
+    else:
+        values[key] = hhmm
+
+
+def form_int_range(form, key, low, high, values, errors, message, name=None):
+    """フォームの整数(欄の名前 name。省略時は key)が low〜high なら values[key] に入れる。そうでなければ errors に message を足す。"""
+    value = form_int(form, name or key)
+    if valid_int(value, low, high):
+        values[key] = value
+    else:
+        errors.append(message)
+
+
 def get_or_404(model, ident):
     """主キーが ident の行を返す。無ければ 404 にする(SQLite の整数の範囲外の ID も 404)。"""
     if isinstance(ident, int) and not SQLITE_INT_MIN <= ident <= SQLITE_INT_MAX:
@@ -1099,9 +1144,11 @@ _EDITED_ELSEWHERE = ("画面を開いた後に、ほかの操作でこの内容�
 #   read_json(path, label)      : 読む。無ければ None、あるのに読めなければ SettingsFileError
 #   write_json(path, data)      : 一時ファイルに書いてから置き換える(書き込み途中で壊れない)
 #   JsonSettings(...)           : 1つの設定ファイルの読み込み(load)・画面からの保存(save)・
-#                                 前回の結果の記録(set_last_result)。機能ごとに1つ作る
+#                                 前回の結果の記録(set_last_result)。機能ごとに1つ作り、既定値と
+#                                 (項目, 検証関数) の表で読み込んだ値を整える
 #   normalize_last_result(v)    : 読み込んだ「前回の結果」を検証する(不正なら None)
 #   new_last_result(...)        : 新しい「前回の結果」(日時・きっかけ・成否・メッセージ)
+#   settings_unreadable(...)    : 画面から送信・補充を始める前に、設定ファイルが読み込めないなら案内して止める
 #
 # 画面の保存とバックグラウンドの送信が同時に書き込んでも壊れないよう、JsonSettings は
 # 設定ファイルごとのロックで「読む→書く」を直列化する。
@@ -1228,22 +1275,55 @@ def auto_slots_done(settings, day):
     return set(record["done"])
 
 
+# 設定の項目の検証関数(読み込んだ値 → 整えた値。不正なら None で既定値のまま)。JsonSettings の fields に使う
+def _as_bool(value):
+    return value if isinstance(value, bool) else None
+
+
+def _int_between(low, high):
+    return lambda value: value if valid_int(value, low, high) else None
+
+
+def _one_of(choices):
+    # 文字列のときだけ比べる(手で直した一覧・辞書などは、ハッシュできず TypeError になるため)
+    return lambda value: value if isinstance(value, str) and value in choices else None
+
+
+def _text_up_to(limit):
+    return lambda value: value[:limit] if isinstance(value, str) else None
+
+
 class JsonSettings:
     """画面で編集する設定(instance/ の JSON ファイル1つ)の読み込み・保存。
 
-    filename  : instance/ の中のファイル名
-    label     : エラーメッセージに使う設定の名前(例: 「週報の設定ファイル」)
-    normalize : 読み込んだ値を検証して整える関数(不正・欠落した項目は既定値で補う。
-                辞書でなければ既定値だけを返す)
-    editable  : 画面から保存できる項目(last_result は実行の結果の記録だけが書き込む)
+    filename : instance/ の中のファイル名
+    label    : エラーメッセージに使う設定の名前(例: 「週報の設定ファイル」)
+    defaults : 既定値(すべての項目。"last_result" は実行の結果の記録で、画面からは保存できない〔editable 以外〕)
+    fields   : (項目, 検証関数) の表。検証関数は読み込んだ値を整えて返し、不正なら None(既定値のまま)
+    finish   : (整えた設定, 読み込んだ値) → 設定。表に書けない項目(週報の対象者・自動送信の印)を整える
     """
 
-    def __init__(self, filename, label, normalize, editable):
+    def __init__(self, filename, label, defaults, fields, finish=None):
         self.filename = filename
         self.label = label
-        self.normalize = normalize
-        self.editable = tuple(editable)
+        self.defaults = defaults
+        self.fields = tuple(fields)
+        self.finish = finish
+        self.editable = tuple(key for key in defaults if key != "last_result")
         self.lock = threading.RLock()
+
+    def normalize(self, data):
+        """読み込んだ値を検証し、不正・欠落した項目は既定値で補う(辞書でなければ既定値だけを返す)。"""
+        result = copy.deepcopy(self.defaults)
+        if not isinstance(data, dict):
+            return result
+        for key, check in self.fields:
+            value = check(data.get(key))
+            if value is not None:
+                result[key] = value
+        if "last_result" in result:
+            result["last_result"] = normalize_last_result(data.get("last_result"))
+        return self.finish(result, data) if self.finish is not None else result
 
     def path(self):
         return os.path.join(current_app.instance_path, self.filename)
@@ -1354,6 +1434,21 @@ class JsonSettings:
             current["last_result"] = new_last_result(trigger, ok, message)
             write_json(self.path(), current)
             return current["last_result"]
+
+
+# 画面から送信を始めるとき、別の送信(自動・ほかのマネージャー)を処理中だったときの案内
+SENDING_BUSY_MESSAGE = "別の送信を処理中です。完了してから、もう一度実行してください。"
+
+
+def settings_unreadable(store, message):
+    """設定ファイルがあるのに読み込めないときは、その旨(message の {} に理由)を案内して True。
+
+    画面から送信・補充を始める前に使う(既定値で動かさず、前回の結果にも記録できないため、始めない)。
+    """
+    error = store.load_error()
+    if error:
+        flash(message.format(error), "danger")
+    return bool(error)
 
 
 # =============================================================================
@@ -1618,6 +1713,9 @@ def manager_required(view):
 # 画面から始める時間のかかる処理(週報・期限超過通知の送信、スキルテストの問題の補充、AI分析)は、
 # 別スレッドで実行して画面はすぐに戻す。処理ごとのロックで同時に1つだけにする
 # (ロックを取れなければ「処理中」として始めない)。結果は各機能の「前回の結果」などに残す。
+#   start_in_thread : ロックを取れたら別スレッドで実行する(汎用)
+#   MailJob         : メール機能(週報・期限超過通知・定型業務リマインド)の送信のとりまとめ
+#                     (同時に1つだけ・app_context・成否にかかわらず「前回の結果」を上書き)
 
 
 def start_in_thread(app, lock, name, work, error_message, prepare=None, cleanup=None):
@@ -1652,6 +1750,73 @@ def start_in_thread(app, lock, name, work, error_message, prepare=None, cleanup=
         release()
         raise
     return True
+
+
+class MailJob:
+    """メール機能(週報・期限超過通知・定型業務リマインド)の送信のとりまとめ。
+
+    送信(テスト・本番)は同時に1つだけ(lock。二重送信の防止)。成否にかかわらず store の「前回の結果」を上書きする。
+    label       : 機能の名前(ログ・メッセージ用)
+    thread_name : 画面から別スレッドで送るときのスレッドの名前
+    expected    : 利用者に伝える想定内のエラーの例外クラス(ログにトレースは残さない)
+    rollback    : 失敗したとき DB の変更を取り消す(リマインドは実施予定の行を作るため)
+    """
+
+    def __init__(self, label, lock, store, thread_name=None, expected=None, rollback=False):
+        self.label = label
+        self.lock = lock
+        self.store = store
+        self.thread_name = thread_name
+        self.expected = expected
+        self.rollback = rollback
+
+    def is_sending(self):
+        """送信(テスト・本番)の処理中か。"""
+        return self.lock.locked()
+
+    def error_message(self, app, exc):
+        """例外を画面・前回の結果用の短い文言にする(想定外のものはログにトレースを残す)。"""
+        if self.expected is not None and isinstance(exc, self.expected):
+            app.logger.warning("%s: %s", self.label, exc)
+            return str(exc)
+        app.logger.exception("%sの作成・送信に失敗しました", self.label)
+        return "{}の作成中にエラーが発生しました: {}".format(self.label, exc)
+
+    def deliver(self, app, trigger, body, prefix=""):
+        """送信の本体(lock を持った状態で呼ぶ)。app_context の中で body() → (成否, メッセージ) を実行し、
+        成否にかかわらず「前回の結果」(prefix + メッセージ)を上書きする。戻り値: {"ok", "message"}。
+        例外は外に出さず、失敗として記録する。"""
+        with app.app_context():
+            try:
+                ok, message = body()
+            except Exception as exc:
+                if self.rollback:
+                    db.session.rollback()
+                ok, message = False, self.error_message(app, exc)
+            try:
+                self.store.set_last_result(trigger, ok, prefix + message)
+            except Exception:
+                app.logger.exception("%sの前回の結果を保存できませんでした", self.label)
+            return {"ok": ok, "message": message}
+
+    def run(self, work):
+        """work() を実行する(処理中なら終わるまで待つ)。"""
+        with self.lock:
+            return work()
+
+    def try_run(self, work):
+        """work() を実行する。処理中なら待たずに None を返す(画面のテスト送信用)。"""
+        if not self.lock.acquire(blocking=False):
+            return None
+        try:
+            return work()
+        finally:
+            self.lock.release()
+
+    def start_background(self, app, work):
+        """work() を別スレッドで始める(画面からの送信用)。既に処理中なら何もせず False を返す。"""
+        return start_in_thread(app, self.lock, self.thread_name, work,
+                               "{}の送信処理でエラーが発生しました".format(self.label))
 
 
 # #############################################################################
@@ -2981,15 +3146,7 @@ AI_NOT_CONFIGURED_MESSAGE = "AIの接続先（AI_API_URL）とモデル名（AI_
 
 def positive_int_value(raw):
     """設定値を1以上の整数として読む(数字だけの文字列・整数の値の float も可)。読めなければ None。"""
-    number = None
-    if isinstance(raw, bool):
-        return None
-    if isinstance(raw, int):
-        number = raw
-    elif isinstance(raw, float) and raw.is_integer():
-        number = int(raw)
-    elif isinstance(raw, str) and raw.strip().isascii() and raw.strip().isdigit():
-        number = int(raw.strip())
+    number = int_like(raw)
     return number if number is not None and number >= 1 else None
 
 
@@ -3310,13 +3467,7 @@ def smtp_port_value(raw):
     """
     if raw is None or (isinstance(raw, str) and not raw.strip()):
         return "", SMTP_PORT_MISSING_MESSAGE
-    port = None
-    if isinstance(raw, int) and not isinstance(raw, bool):
-        port = raw
-    elif isinstance(raw, float) and raw.is_integer():
-        port = int(raw)
-    elif isinstance(raw, str) and raw.strip().isascii() and raw.strip().isdigit():
-        port = int(raw.strip())
+    port = int_like(raw)
     if port is not None and 1 <= port <= 65535:
         return port, None
     shown = str(raw)
@@ -3723,7 +3874,7 @@ def _read_login_sessions(path):
         for key, tokens in data.items():
             if isinstance(key, str) and isinstance(tokens, dict):
                 kept = {t: at for t, at in tokens.items()
-                        if isinstance(t, str) and isinstance(at, int) and not isinstance(at, bool)}
+                        if isinstance(t, str) and _is_int(at)}
                 if kept:
                     clean[key] = kept
     _login_sessions_cache[path] = (stamp, clean)
@@ -8237,9 +8388,6 @@ def build_weekly_subject(pattern, start, end, send_date):
 # ファイルの読み書きは共通の部品(2-3 の JsonSettings)を使う(画面の保存とバックグラウンドの送信が
 # 同時に書き込んでも壊れない。読み込めないファイルは上書きしない)。
 
-WEEKLY_SETTINGS_FILENAME = "weekly_settings.json"
-WEEKLY_SETTINGS_LABEL = "週報の設定ファイル"
-
 # 文章の見本などの最大文字数(設定ファイルの肥大化を防ぐ)
 WEEKLY_TEXT_MAX = 20000
 # ファイル名・メール件名のパターン(1行の項目)の最大文字数。ファイル名は作るときに FILENAME_MAX 文字までに
@@ -8295,53 +8443,26 @@ WEEKLY_DEFAULTS = {
     "last_result": None,
 }
 
-# 画面から保存できる項目(last_result は送信処理だけが書き込む)
-WEEKLY_EDITABLE_KEYS = [k for k in WEEKLY_DEFAULTS if k != "last_result"]
-
-_TEXT_KEYS = (
-    "team_sample", "person_sample", "guidelines",
-    "filename_pattern", "subject_pattern", "mail_body",
-)
+_TEXT_KEYS = ("team_sample", "person_sample", "guidelines", "filename_pattern", "subject_pattern", "mail_body")
+WEEKLY_FIELDS = (
+    ("enabled", _as_bool), ("weekday", _int_between(0, 6)), ("time", hhmm_text), ("period_rule", _one_of(PERIOD_RULES)),
+) + tuple((key, _text_up_to(WEEKLY_TEXT_MAX)) for key in _TEXT_KEYS)
 
 
-def _normalize_weekly_settings(data):
-    """読み込んだ値を検証し、不正・欠落した項目は既定値で補う。"""
-    result = copy.deepcopy(WEEKLY_DEFAULTS)
-    if not isinstance(data, dict):
-        return result
-
-    if isinstance(data.get("enabled"), bool):
-        result["enabled"] = data["enabled"]
-    weekday = data.get("weekday")
-    if isinstance(weekday, int) and not isinstance(weekday, bool) and 0 <= weekday <= 6:
-        result["weekday"] = weekday
-    at = parse_hhmm(data.get("time")) if isinstance(data.get("time"), str) else None
-    if at is not None:
-        result["time"] = at.strftime("%H:%M")
-    # 文字列のときだけ比べる(手で直した一覧・辞書などは、ハッシュできず TypeError になるため)
-    if isinstance(data.get("period_rule"), str) and data["period_rule"] in PERIOD_RULES:
-        result["period_rule"] = data["period_rule"]
-    ids = data.get("target_user_ids")
-    names = data.get("target_usernames")
+def _finish_weekly_settings(result, data):
+    """対象者(IDとログインIDの両方が記録されている人だけ)と、自動送信の実行の印を整える。"""
+    ids, names = data.get("target_user_ids"), data.get("target_usernames")
     if isinstance(ids, list) and isinstance(names, dict):
         # ログインIDの記録が無いIDは本人か確認できないため、対象者に含めない
         result["target_user_ids"] = sorted({
-            i for i in ids
-            if isinstance(i, int) and not isinstance(i, bool)
-            and isinstance(names.get(str(i)), str) and names.get(str(i))
-        })
-        result["target_usernames"] = {
-            str(i): names[str(i)] for i in result["target_user_ids"]
-        }
-    for key in _TEXT_KEYS:
-        if isinstance(data.get(key), str):
-            result[key] = data[key][:WEEKLY_TEXT_MAX]
-    result["last_result"] = normalize_last_result(data.get("last_result"))
+            i for i in ids if _is_int(i) and isinstance(names.get(str(i)), str) and names.get(str(i))})
+        result["target_usernames"] = {str(i): names[str(i)] for i in result["target_user_ids"]}
     return keep_auto_run_key(result, data)
 
 
-WEEKLY_SETTINGS = JsonSettings(WEEKLY_SETTINGS_FILENAME, WEEKLY_SETTINGS_LABEL,
-                               _normalize_weekly_settings, WEEKLY_EDITABLE_KEYS)
+WEEKLY_SETTINGS = JsonSettings("weekly_settings.json", "週報の設定ファイル", WEEKLY_DEFAULTS, WEEKLY_FIELDS,
+                               _finish_weekly_settings)
+WEEKLY_EDITABLE_KEYS = WEEKLY_SETTINGS.editable          # 画面から保存できる項目(last_result は送信処理だけが書き込む)
 load_weekly_settings = WEEKLY_SETTINGS.load              # 現在の設定(読み込めなければ既定値)
 save_weekly_settings = WEEKLY_SETTINGS.save              # 画面で編集した項目を保存する
 set_weekly_last_result = WEEKLY_SETTINGS.set_last_result  # 前回の結果を上書きする
@@ -8384,18 +8505,8 @@ def parse_weekly_form(form):
     errors = []
     values = {"enabled": form.get("enabled") == "1"}
 
-    weekday = form.get("weekday", "")
-    weekday_number = to_int(weekday)  # 桁数を制限して読む(とても長い数字の int() で止まらないように)
-    if weekday_number is not None and 0 <= weekday_number <= 6:
-        values["weekday"] = weekday_number
-    else:
-        errors.append("送信する曜日を選択してください。")
-
-    at = parse_hhmm(form.get("time"))
-    if at is not None:
-        values["time"] = at.strftime("%H:%M")
-    else:
-        errors.append("送信する時刻を「時:分」（例: 08:00）で入力してください。")
+    form_int_range(form, "weekday", 0, 6, values, errors, "送信する曜日を選択してください。")
+    form_hhmm(form, "time", values, errors, "送信する時刻を「時:分」（例: 08:00）で入力してください。")
 
     rule = form.get("period_rule", "")
     if rule in PERIOD_RULES:
@@ -9308,9 +9419,7 @@ class WeeklyError(Exception):
     """利用者に伝える想定内のエラー(対象者が未選択など)。ログにトレースは残さない。"""
 
 
-def weekly_is_sending():
-    """メール送信(テスト・本番)の処理中か。"""
-    return _weekly_send_lock.locked()
+WEEKLY_JOB = MailJob("週報", _weekly_send_lock, WEEKLY_SETTINGS, "weekly-send", expected=WeeklyError)
 
 
 def target_users(settings):
@@ -9366,36 +9475,24 @@ def _build_weekly(app, start, end, send_date):
 
 
 def _deliver_weekly(app, start, end, trigger, deliver, send_date):
-    """テスト送信・本番送信の本体(_weekly_send_lock を持った状態で呼ぶ)。
-
-    成否にかかわらず「前回の結果」を上書きする。
-    """
+    """テスト送信・本番送信の本体(_weekly_send_lock を持った状態で呼ぶ)。成否にかかわらず「前回の結果」を上書きする。"""
     test = deliver == DELIVER_TEST
-    with app.app_context():
-        result = {"filename": None, "data": None}
-        try:
-            # 送信できない設定なら、時間のかかる作成(AI呼び出し)の前に止める
-            problem = check_mail_settings(test=test)
-            if problem:
-                ok, message = False, problem
-            else:
-                result, users, written = _build_weekly(app, start, end, send_date)
-                ok, send_message = send_mail(
-                    result["subject"], result["body"],
-                    attachments=[(result["filename"], result["data"],
-                                  DOCX_MAINTYPE, DOCX_SUBTYPE)],
-                    test=test,
-                )
-                message = _weekly_summary(written, users, send_message)
-        except Exception as exc:
-            ok, message = False, _weekly_error_message(app, exc)
+    result = {"filename": None, "data": None}
 
-        prefix = "期間 {}〜{}: ".format(start.strftime("%m/%d"), end.strftime("%m/%d"))
-        try:
-            set_weekly_last_result(trigger, ok, prefix + message)
-        except Exception:
-            app.logger.exception("週報の前回の結果を保存できませんでした")
-        return dict(result, ok=ok, message=message)
+    def body():
+        # 送信できない設定なら、時間のかかる作成(AI呼び出し)の前に止める
+        problem = check_mail_settings(test=test)
+        if problem:
+            return False, problem
+        built, users, written = _build_weekly(app, start, end, send_date)
+        result.update(built)
+        ok, send_message = send_mail(
+            result["subject"], result["body"],
+            attachments=[(result["filename"], result["data"], DOCX_MAINTYPE, DOCX_SUBTYPE)], test=test)
+        return ok, _weekly_summary(written, users, send_message)
+
+    prefix = "期間 {}〜{}: ".format(start.strftime("%m/%d"), end.strftime("%m/%d"))
+    return dict(result, **WEEKLY_JOB.deliver(app, trigger, body, prefix=prefix))
 
 
 def run_weekly(app, start, end, trigger, deliver, send_date=None):
@@ -9416,36 +9513,20 @@ def run_weekly(app, start, end, trigger, deliver, send_date=None):
             try:
                 result, users, written = _build_weekly(app, start, end, send_date)
             except Exception as exc:
-                return {"ok": False, "message": _weekly_error_message(app, exc),
-                        "filename": None, "data": None}
+                return {"ok": False, "message": WEEKLY_JOB.error_message(app, exc), "filename": None, "data": None}
             return dict(result, ok=True, message=_weekly_summary(written, users))
-
-    with _weekly_send_lock:
-        return _deliver_weekly(app, start, end, trigger, deliver, send_date)
+    return WEEKLY_JOB.run(lambda: _deliver_weekly(app, start, end, trigger, deliver, send_date))
 
 
 def start_weekly_background(app, start, end, trigger, deliver, send_date=None):
     """テスト送信・本番送信を別スレッドで始める(画面の「今すぐ作成」用)。
 
-    既に送信処理中なら何もせず False を返す(二重送信の防止)。
-    結果は「前回の結果」に記録される。
+    既に送信処理中なら何もせず False を返す(二重送信の防止)。結果は「前回の結果」に記録される。
     """
     if deliver not in (DELIVER_TEST, DELIVER_SEND):
         raise ValueError("deliver が不正です: {}".format(deliver))
     send_date = send_date or date.today()
-    return start_in_thread(
-        app, _weekly_send_lock, "weekly-send",
-        lambda: _deliver_weekly(app, start, end, trigger, deliver, send_date),
-        "週報の送信処理でエラーが発生しました")
-
-
-def _weekly_error_message(app, exc):
-    """例外を画面・前回の結果用の短い文言にする(想定外のものはログにトレースを残す)。"""
-    if isinstance(exc, WeeklyError):
-        app.logger.warning("週報: %s", exc)
-        return str(exc)
-    app.logger.exception("週報の作成・送信に失敗しました")
-    return "週報の作成中にエラーが発生しました: {}".format(exc)
+    return WEEKLY_JOB.start_background(app, lambda: _deliver_weekly(app, start, end, trigger, deliver, send_date))
 
 
 # =============================================================================
@@ -9476,42 +9557,45 @@ RUN_MAX_DAYS = 366
 RUN_LAST_DAY = date.max - timedelta(days=DUE_SOON_DAYS + 1)
 
 
+def mail_feature_context(job, settings, upcoming):
+    """週報・期限超過通知の画面に共通の表示(設定・次回の自動送信・前回の結果・メールの設定状況・送信中か)。"""
+    return {
+        "settings": settings,
+        "settings_error": job.store.load_error(),
+        "upcoming": upcoming,
+        # 自動送信が有効でも、スケジューラがどのプロセスでも動いていなければ送信されない(画面で注意する)
+        "scheduler_stopped": upcoming is not None and scheduler_is_stopped(current_app),
+        "weekday_labels": WEEKDAY_LABELS,
+        "last": settings["last_result"],
+        "mail": mail_settings(),
+        "mail_problem": check_mail_settings(test=False),
+        "test_problem": check_mail_settings(test=True),
+        "sending": job.is_sending(),
+    }
+
+
 def _render_weekly(settings):
     """週報の画面を表示する(実行と状況だけ。設定はシステム設定の「週報」タブ)。"""
     today = date.today()
     users = get_active_users()
     selected = [u for u in users if is_weekly_target(settings, u)]
     run_from, run_to = period_for(today, settings["period_rule"])
-
     upcoming = next_weekly_run(settings, datetime.now())
-    # 自動送信が有効でも、スケジューラがどのプロセスでも動いていなければ送信されない(画面で注意する)
-    scheduler_stopped = upcoming is not None and scheduler_is_stopped(current_app)
     upcoming_period = None
     if upcoming is not None:
         upcoming_period = period_label(*period_for(upcoming.date(), settings["period_rule"]))
-
-    mail = mail_settings()
     return render_template(
         "weekly/index.html",
-        settings=settings,
-        settings_error=WEEKLY_SETTINGS.load_error(),
         selected_users=selected,
         selected_count=len(selected),
-        weekday_labels=WEEKDAY_LABELS,
         period_rules=PERIOD_RULES,
         preview=preview_names(settings, today),
-        upcoming=upcoming,
         upcoming_period=upcoming_period,
-        scheduler_stopped=scheduler_stopped,
-        last=settings["last_result"],
         run_from=run_from,
         run_to=run_to,
-        mail=mail,
-        mail_problem=check_mail_settings(test=False),
-        test_problem=check_mail_settings(test=True),
         ai_enabled=ai_is_configured(),
         ai_status=ai_status_label(),
-        sending=weekly_is_sending(),
+        **mail_feature_context(WEEKLY_JOB, settings, upcoming)
     )
 
 
@@ -9558,10 +9642,8 @@ def weekly_run_now():
     if action not in DELIVER_CHOICES:
         abort(400)
 
-    settings_error = WEEKLY_SETTINGS.load_error()
-    if settings_error:
-        # 既定値(対象者なし・既定の見本)で作らない。前回の結果にも記録できないため、始めない
-        flash("週報の設定ファイルを読み込めないため、作成・送信できません。{}".format(settings_error), "danger")
+    # 既定値(対象者なし・既定の見本)で作らない
+    if settings_unreadable(WEEKLY_SETTINGS, "週報の設定ファイルを読み込めないため、作成・送信できません。{}"):
         return redirect(url_for("weekly.index"))
 
     settings = load_weekly_settings()
@@ -9604,7 +9686,7 @@ def weekly_run_now():
         trigger, label = TRIGGER_MANUAL, "本番の宛先への送信"
 
     if not start_weekly_background(app, start, end, trigger, action):
-        flash("別の送信を処理中です。完了してから、もう一度実行してください。", "warning")
+        flash(SENDING_BUSY_MESSAGE, "warning")
         return redirect(url_for("weekly.index"))
 
     flash("{}を開始しました（期間 {}）。結果は「前回の結果」に表示されます"
@@ -9705,9 +9787,6 @@ def next_overdue_run(settings, now):
 # ファイルの読み書きは週報と共通の部品(2-3 の JsonSettings)を使う(画面の保存とバックグラウンドの
 # 送信が同時に書き込んでも壊れない。読み込めないファイルは上書きしない)。
 
-OVERDUE_SETTINGS_FILENAME = "overdue_settings.json"
-OVERDUE_SETTINGS_LABEL = "期限超過通知の設定ファイル"
-
 # 各タスクに載せるコメント件数の範囲
 COMMENT_COUNT_MIN = 1
 COMMENT_COUNT_MAX = 10
@@ -9719,35 +9798,11 @@ OVERDUE_DEFAULTS = {
     "last_result": None,
 }
 
-# 画面から保存できる項目(last_result は送信処理だけが書き込む)
-OVERDUE_EDITABLE_KEYS = [k for k in OVERDUE_DEFAULTS if k != "last_result"]
-
-
-def valid_comment_count(value):
-    """コメント件数として使える整数か(bool は除く)。"""
-    return (isinstance(value, int) and not isinstance(value, bool)
-            and COMMENT_COUNT_MIN <= value <= COMMENT_COUNT_MAX)
-
-
-def _normalize_overdue_settings(data):
-    """読み込んだ値を検証し、不正・欠落した項目は既定値で補う。"""
-    result = copy.deepcopy(OVERDUE_DEFAULTS)
-    if not isinstance(data, dict):
-        return result
-
-    if isinstance(data.get("enabled"), bool):
-        result["enabled"] = data["enabled"]
-    at = parse_hhmm(data.get("time")) if isinstance(data.get("time"), str) else None
-    if at is not None:
-        result["time"] = at.strftime("%H:%M")
-    if valid_comment_count(data.get("comment_count")):
-        result["comment_count"] = data["comment_count"]
-    result["last_result"] = normalize_last_result(data.get("last_result"))
-    return keep_auto_run_key(result, data)
-
-
-OVERDUE_SETTINGS = JsonSettings(OVERDUE_SETTINGS_FILENAME, OVERDUE_SETTINGS_LABEL,
-                                _normalize_overdue_settings, OVERDUE_EDITABLE_KEYS)
+OVERDUE_SETTINGS = JsonSettings(
+    "overdue_settings.json", "期限超過通知の設定ファイル", OVERDUE_DEFAULTS,
+    (("enabled", _as_bool), ("time", hhmm_text), ("comment_count", _int_between(COMMENT_COUNT_MIN, COMMENT_COUNT_MAX))),
+    keep_auto_run_key)
+OVERDUE_EDITABLE_KEYS = OVERDUE_SETTINGS.editable          # 画面から保存できる項目(last_result は送信処理だけが書き込む)
 load_overdue_settings = OVERDUE_SETTINGS.load              # 現在の設定(読み込めなければ既定値)
 save_overdue_settings = OVERDUE_SETTINGS.save              # 画面で編集した項目を保存する
 set_overdue_last_result = OVERDUE_SETTINGS.set_last_result  # 前回の結果を上書きする
@@ -9776,18 +9831,9 @@ def parse_overdue_form(form):
     errors = []
     values = {"enabled": form.get("enabled") == "1"}
 
-    at = parse_hhmm(form.get("time"))
-    if at is not None:
-        values["time"] = at.strftime("%H:%M")
-    else:
-        errors.append("送信する時刻を「時:分」（例: 05:00）で入力してください。")
-
-    count = form_int(form, "comment_count")
-    if valid_comment_count(count):
-        values["comment_count"] = count
-    else:
-        errors.append("表示するコメント件数は{}〜{}の数字で入力してください。".format(
-            COMMENT_COUNT_MIN, COMMENT_COUNT_MAX))
+    form_hhmm(form, "time", values, errors, "送信する時刻を「時:分」（例: 05:00）で入力してください。")
+    form_int_range(form, "comment_count", COMMENT_COUNT_MIN, COMMENT_COUNT_MAX, values, errors,
+                   "表示するコメント件数は{}〜{}の数字で入力してください。".format(COMMENT_COUNT_MIN, COMMENT_COUNT_MAX))
     return values, errors
 
 
@@ -10103,11 +10149,7 @@ def build_overdue_content(today, comment_count):
 
 # メール送信(テスト・本番)は同時に1つだけ(二重送信を防ぐ)
 _overdue_send_lock = threading.Lock()
-
-
-def overdue_is_sending():
-    """メール送信(テスト・本番)の処理中か。"""
-    return _overdue_send_lock.locked()
+OVERDUE_JOB = MailJob("期限超過通知", _overdue_send_lock, OVERDUE_SETTINGS, "overdue-send")
 
 
 def build_overdue_mail(today=None):
@@ -10127,26 +10169,16 @@ def _overdue_summary(mail, send_message):
 
 def _deliver_overdue(app, trigger, test, today):
     """送信の本体(_overdue_send_lock を持った状態で呼ぶ)。成否にかかわらず「前回の結果」を上書きする。"""
-    with app.app_context():
-        try:
-            problem = check_mail_settings(test)
-            if problem:
-                ok, message = False, problem
-            else:
-                mail = build_overdue_mail(today)
-                # 宛先は週報と同じ MAIL_TO・MAIL_CC(テスト送信は差出人だけ)
-                ok, send_message = send_mail(
-                    mail["subject"], mail["text"], html=mail["html"], test=test)
-                message = _overdue_summary(mail, send_message)
-        except Exception as exc:
-            app.logger.exception("期限超過通知の作成・送信に失敗しました")
-            ok, message = False, "期限超過通知の作成中にエラーが発生しました: {}".format(exc)
+    def body():
+        problem = check_mail_settings(test)
+        if problem:
+            return False, problem
+        mail = build_overdue_mail(today)
+        # 宛先は週報と同じ MAIL_TO・MAIL_CC(テスト送信は差出人だけ)
+        ok, send_message = send_mail(mail["subject"], mail["text"], html=mail["html"], test=test)
+        return ok, _overdue_summary(mail, send_message)
 
-        try:
-            set_overdue_last_result(trigger, ok, message)
-        except Exception:
-            app.logger.exception("期限超過通知の前回の結果を保存できませんでした")
-        return {"ok": ok, "message": message}
+    return OVERDUE_JOB.deliver(app, trigger, body)
 
 
 def run_overdue(app, trigger, test=False, today=None):
@@ -10157,21 +10189,16 @@ def run_overdue(app, trigger, test=False, today=None):
     戻り値: {"ok", "message"}。例外は外に出さず、失敗は ok=False とメッセージで返す。
     送信は同時に1つだけ(処理中なら終わるまで待つ)。
     """
-    with _overdue_send_lock:
-        return _deliver_overdue(app, trigger, test, today)
+    return OVERDUE_JOB.run(lambda: _deliver_overdue(app, trigger, test, today))
 
 
 def start_overdue_background(app, trigger, test=False):
     """送信を別スレッドで始める(画面の「今すぐ送信」用)。
 
-    既に送信処理中なら何もせず False を返す(二重送信の防止)。
-    結果は「前回の結果」に記録される。
+    既に送信処理中なら何もせず False を返す(二重送信の防止)。結果は「前回の結果」に記録される。
     """
     today = date.today()
-    return start_in_thread(
-        app, _overdue_send_lock, "overdue-send",
-        lambda: _deliver_overdue(app, trigger, test, today),
-        "期限超過通知の送信処理でエラーが発生しました")
+    return OVERDUE_JOB.start_background(app, lambda: _deliver_overdue(app, trigger, test, today))
 
 
 # =============================================================================
@@ -10201,31 +10228,20 @@ def _preview_document(html):
 
 def _render_overdue(settings):
     """期限超過通知の画面を表示する(実行と状況だけ。設定はシステム設定の「期限超過通知」タブ)。"""
-    mail = mail_settings()
     base_url, link_problem = link_base()
     # 今この時点のメールの内容。「今すぐ送信」と同じく保存済みの設定で作る
     preview = build_overdue_content(date.today(), settings["comment_count"])
-    upcoming = next_overdue_run(settings, datetime.now())
+    context = mail_feature_context(OVERDUE_JOB, settings, next_overdue_run(settings, datetime.now()))
     return render_template(
         "overdue/index.html",
-        settings=settings,
-        settings_error=OVERDUE_SETTINGS.load_error(),
-        upcoming=upcoming,
-        # 自動送信が有効でも、スケジューラがどのプロセスでも動いていなければ送信されない(画面で注意する)
-        scheduler_stopped=upcoming is not None and scheduler_is_stopped(current_app),
-        weekday_labels=WEEKDAY_LABELS,
-        last=settings["last_result"],
-        mail=mail,
-        to_count=len(mail["to"]),
-        cc_count=len(mail["cc"]),
-        mail_problem=check_mail_settings(test=False),
-        test_problem=check_mail_settings(test=True),
+        to_count=len(context["mail"]["to"]),
+        cc_count=len(context["mail"]["cc"]),
         base_url=base_url,
         link_configured=bool(str(current_app.config.get("APP_BASE_URL") or "").strip()),
         link_problem=link_problem,
         preview=preview,
         preview_document=_preview_document(preview["html"]),
-        sending=overdue_is_sending(),
+        **context
     )
 
 
@@ -10253,15 +10269,13 @@ def overdue_run_now():
     else:
         abort(400)
 
-    settings_error = OVERDUE_SETTINGS.load_error()
-    if settings_error:
-        # 既定値(コメント件数など)で送らない。前回の結果にも記録できないため、始めない
-        flash("期限超過通知の設定ファイルを読み込めないため、送信できません。{}".format(settings_error), "danger")
+    # 既定値(コメント件数など)で送らない
+    if settings_unreadable(OVERDUE_SETTINGS, "期限超過通知の設定ファイルを読み込めないため、送信できません。{}"):
         return redirect(url_for("overdue.index"))
 
     app = current_app._get_current_object()
     if not start_overdue_background(app, trigger, test=test):
-        flash("別の送信を処理中です。完了してから、もう一度実行してください。", "warning")
+        flash(SENDING_BUSY_MESSAGE, "warning")
         return redirect(url_for("overdue.index"))
 
     flash("{}を開始しました。結果は「前回の結果」に表示されます"
@@ -10313,9 +10327,6 @@ def overdue_run_now():
 # ファイルの読み書きは週報・期限超過通知と共通の部品(2-3 の JsonSettings)を使う(画面の保存と
 # バックグラウンドの補充が同時に書き込んでも壊れない。読み込めないファイルは既定値で動き、上書きしない)。
 
-SKILLTEST_SETTINGS_FILENAME = "skilltest_settings.json"
-SKILLTEST_SETTINGS_LABEL = "スキルテストの設定ファイル"
-
 # テストで判定できるレベル(1〜4)。5・6 と コンセプチュアル/ヒューマンはマネージャーが評価する
 SKILLTEST_LEVELS = [1, 2, 3, 4]
 
@@ -10347,50 +10358,32 @@ SKILLTEST_DEFAULTS = {
     "last_result": None,
 }
 
-# 画面から保存できる項目(last_result は問題の補充だけが書き込む)
-SKILLTEST_EDITABLE_KEYS = [k for k in SKILLTEST_DEFAULTS if k != "last_result"]
+# レベルごと以外の数値の項目: (キー, 表示名, 下限, 上限, 単位)。読み込み時の検証と画面の入力チェックに使う
+_SCALAR_FIELDS = (
+    ("pass_rate", "合格ライン", PASS_RATE_MIN, PASS_RATE_MAX, "%"),
+    ("retake_days", "再受験までの日数", RETAKE_DAYS_MIN, RETAKE_DAYS_MAX, "日"),
+    ("max_auto_level", "判定・自動登録するレベルの上限", AUTO_LEVEL_MIN, AUTO_LEVEL_MAX, ""),
+    ("pool_target_per_level", "問題プールの目標数", POOL_TARGET_MIN, POOL_TARGET_MAX, "問"),
+)
 
 
-def valid_int(value, low, high):
-    """範囲内の整数か(bool は除く)。"""
-    return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
-
-
-def _per_level(data, default, low, high):
-    """レベルごとの値({"1": n, ...})を検証し、不正・欠落したレベルは既定値で補う。"""
-    result = dict(default)
-    if isinstance(data, dict):
-        for level in SKILLTEST_LEVELS:
-            value = data.get(str(level))
-            if valid_int(value, low, high):
-                result[str(level)] = value
-    return result
-
-
-def _normalize_skilltest_settings(data):
-    """読み込んだ値を検証し、不正・欠落した項目は既定値で補う。"""
-    result = copy.deepcopy(SKILLTEST_DEFAULTS)
-    if not isinstance(data, dict):
+def _per_level(default, low, high):
+    """レベルごとの値({"1": n, ...})の検証関数: 不正・欠落したレベルは既定値で補う。"""
+    def check(data):
+        result = dict(default)
+        if isinstance(data, dict):
+            for level in SKILLTEST_LEVELS:
+                if valid_int(data.get(str(level)), low, high):
+                    result[str(level)] = data[str(level)]
         return result
-    result["questions_per_level"] = _per_level(
-        data.get("questions_per_level"), SKILLTEST_DEFAULTS["questions_per_level"],
-        QUESTIONS_MIN, QUESTIONS_MAX)
-    result["time_limits"] = _per_level(
-        data.get("time_limits"), SKILLTEST_DEFAULTS["time_limits"], TIME_LIMIT_MIN, TIME_LIMIT_MAX)
-    for key, low, high in (
-        ("pass_rate", PASS_RATE_MIN, PASS_RATE_MAX),
-        ("retake_days", RETAKE_DAYS_MIN, RETAKE_DAYS_MAX),
-        ("max_auto_level", AUTO_LEVEL_MIN, AUTO_LEVEL_MAX),
-        ("pool_target_per_level", POOL_TARGET_MIN, POOL_TARGET_MAX),
-    ):
-        if valid_int(data.get(key), low, high):
-            result[key] = data[key]
-    result["last_result"] = normalize_last_result(data.get("last_result"))
-    return result
+    return check
 
 
-SKILLTEST_SETTINGS = JsonSettings(SKILLTEST_SETTINGS_FILENAME, SKILLTEST_SETTINGS_LABEL,
-                                  _normalize_skilltest_settings, SKILLTEST_EDITABLE_KEYS)
+SKILLTEST_SETTINGS = JsonSettings(
+    "skilltest_settings.json", "スキルテストの設定ファイル", SKILLTEST_DEFAULTS,
+    (("questions_per_level", _per_level(SKILLTEST_DEFAULTS["questions_per_level"], QUESTIONS_MIN, QUESTIONS_MAX)),
+     ("time_limits", _per_level(SKILLTEST_DEFAULTS["time_limits"], TIME_LIMIT_MIN, TIME_LIMIT_MAX)))
+    + tuple((key, _int_between(low, high)) for key, _label, low, high, _unit in _SCALAR_FIELDS))
 load_skilltest_settings = SKILLTEST_SETTINGS.load              # 現在の設定(読み込めなければ既定値)
 save_skilltest_settings = SKILLTEST_SETTINGS.save              # 画面で編集した項目を保存する
 set_skilltest_last_result = SKILLTEST_SETTINGS.set_last_result  # 前回の問題の補充の結果を上書きする
@@ -10451,40 +10444,21 @@ def skilltest_plan(settings, levels):
 SKILLTEST_LABEL = "スキルテスト"
 SKILLTEST_SAVED_MESSAGE = "スキルテストの設定を保存しました（受験中・受験済みのテストには影響しません）。"
 
-# レベルごと以外の数値の項目: (キー, 表示名, 下限, 上限, 単位)
-_SCALAR_FIELDS = (
-    ("pass_rate", "合格ライン", PASS_RATE_MIN, PASS_RATE_MAX, "%"),
-    ("retake_days", "再受験までの日数", RETAKE_DAYS_MIN, RETAKE_DAYS_MAX, "日"),
-    ("max_auto_level", "判定・自動登録するレベルの上限", AUTO_LEVEL_MIN, AUTO_LEVEL_MAX, ""),
-    ("pool_target_per_level", "問題プールの目標数", POOL_TARGET_MIN, POOL_TARGET_MAX, "問"),
-)
-
 
 def parse_skilltest_form(form):
     """フォームの入力を検証する。戻り値: (values, errors)。errors が空なら保存してよい。"""
     errors = []
     values = {"questions_per_level": {}, "time_limits": {}}
-
     for level in SKILLTEST_LEVELS:
-        count = form_int(form, "questions_{}".format(level))
-        if valid_int(count, QUESTIONS_MIN, QUESTIONS_MAX):
-            values["questions_per_level"][str(level)] = count
-        else:
-            errors.append("Lv{}の問題数は{}〜{}の数字で入力してください。".format(
-                level, QUESTIONS_MIN, QUESTIONS_MAX))
-        limit = form_int(form, "limit_{}".format(level))
-        if valid_int(limit, TIME_LIMIT_MIN, TIME_LIMIT_MAX):
-            values["time_limits"][str(level)] = limit
-        else:
-            errors.append("Lv{}の制限時間は{}〜{}秒の数字で入力してください。".format(
-                level, TIME_LIMIT_MIN, TIME_LIMIT_MAX))
-
+        form_int_range(form, str(level), QUESTIONS_MIN, QUESTIONS_MAX, values["questions_per_level"], errors,
+                       "Lv{}の問題数は{}〜{}の数字で入力してください。".format(level, QUESTIONS_MIN, QUESTIONS_MAX),
+                       name="questions_{}".format(level))
+        form_int_range(form, str(level), TIME_LIMIT_MIN, TIME_LIMIT_MAX, values["time_limits"], errors,
+                       "Lv{}の制限時間は{}〜{}秒の数字で入力してください。".format(level, TIME_LIMIT_MIN, TIME_LIMIT_MAX),
+                       name="limit_{}".format(level))
     for key, label, low, high, unit in _SCALAR_FIELDS:
-        value = form_int(form, key)
-        if valid_int(value, low, high):
-            values[key] = value
-        else:
-            errors.append("{}は{}〜{}{}の数字で入力してください。".format(label, low, high, unit))
+        form_int_range(form, key, low, high, values, errors,
+                       "{}は{}〜{}{}の数字で入力してください。".format(label, low, high, unit))
     return values, errors
 
 
@@ -12135,12 +12109,9 @@ def admin_topup(skill_id):
     if not ai_is_configured():
         flash("AIが未設定のため、問題を作成できません。{}。".format(ai_missing_label()), "danger")
         return redirect(back)
-    settings_error = SKILLTEST_SETTINGS.load_error()
-    if settings_error:
-        # 既定値で補充しても、結果(前回の補充の結果)を記録できず、設定した目標数も使えないため行わない
-        # (週報・期限超過通知の今すぐ実行と同じ)
-        flash("スキルテストの設定ファイルを読み込めないため、補充できません（結果を記録できないため）。{}".format(
-            settings_error), "danger")
+    # 既定値で補充しても、結果(前回の補充の結果)を記録できず、設定した目標数も使えないため行わない
+    if settings_unreadable(SKILLTEST_SETTINGS,
+                           "スキルテストの設定ファイルを読み込めないため、補充できません（結果を記録できないため）。{}"):
         return redirect(back)
     app = current_app._get_current_object()
     if not start_topup(app, skill):
@@ -12306,8 +12277,6 @@ def admin_settings():
 #                        チームのまとめの材料が長いときは、詳細な一覧を先に分けて要約してから送る
 # ファイルが無い・読み込めない場合は既定値を使う(読み込めないファイルは上書きしない)。
 
-AI_ANALYSIS_SETTINGS_FILENAME = "ai_analysis_settings.json"
-AI_ANALYSIS_SETTINGS_LABEL = "AI分析の設定ファイル"
 AI_ANALYSIS_LABEL = "AI分析"
 AI_ANALYSIS_SAVED_MESSAGE = "AI分析の設定を保存しました。"
 
@@ -12340,34 +12309,18 @@ AI_ANALYSIS_SEND_FIELDS = (
 _AI_ANALYSIS_ALL_FIELDS = AI_ANALYSIS_FIELDS + AI_ANALYSIS_SEND_FIELDS
 
 
-def _normalize_ai_analysis_settings(data):
-    """読み込んだ値を検証し、不正・欠落した項目は既定値で補う。"""
-    result = dict(AI_ANALYSIS_DEFAULTS)
-    if not isinstance(data, dict):
-        return result
-    for key, _label, low, high, _help in _AI_ANALYSIS_ALL_FIELDS:
-        if valid_int(data.get(key), low, high):
-            result[key] = data[key]
-    return result
-
-
 AI_ANALYSIS_SETTINGS = JsonSettings(
-    AI_ANALYSIS_SETTINGS_FILENAME, AI_ANALYSIS_SETTINGS_LABEL, _normalize_ai_analysis_settings,
-    [key for key, _label, _low, _high, _help in _AI_ANALYSIS_ALL_FIELDS])
+    "ai_analysis_settings.json", "AI分析の設定ファイル", AI_ANALYSIS_DEFAULTS,
+    [(key, _int_between(low, high)) for key, _label, low, high, _help in _AI_ANALYSIS_ALL_FIELDS])
 load_ai_analysis_settings = AI_ANALYSIS_SETTINGS.load  # 現在の設定(読み込めなければ既定値)
 save_ai_analysis_settings = AI_ANALYSIS_SETTINGS.save  # 画面で編集した項目を保存する
 
 
 def parse_ai_analysis_form(form):
     """フォームの入力を検証する。戻り値: (values, errors)。errors が空なら保存してよい。"""
-    errors = []
-    values = {}
+    values, errors = {}, []
     for key, label, low, high, _help in _AI_ANALYSIS_ALL_FIELDS:
-        value = form_int(form, key)
-        if valid_int(value, low, high):
-            values[key] = value
-        else:
-            errors.append("{}は{}〜{}の数字で入力してください。".format(label, low, high))
+        form_int_range(form, key, low, high, values, errors, "{}は{}〜{}の数字で入力してください。".format(label, low, high))
     return values, errors
 
 
@@ -16137,7 +16090,7 @@ def _str_lists(value, keys):
 
 
 def _int_value(value):
-    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+    return value if _is_int(value) else 0
 
 
 def _result_ids(values):
@@ -16145,7 +16098,7 @@ def _result_ids(values):
     if not isinstance(values, (list, tuple, set)):
         return out  # 手で書き換えたファイルなど(リストでなければ空とみなす)
     for v in values:
-        if isinstance(v, int) and not isinstance(v, bool):
+        if _is_int(v):
             out.add(v)
     return out
 
@@ -16383,7 +16336,7 @@ def apply_ai_result(data, stored):
         row["ai"] = _str_lists(person.get("findings"), FINDING_KEYS)
         # 所見を作るときに読み込めなかった回の数(所見は読めた範囲だけに基づく)
         unread_parts = person.get("unread_parts")
-        row["ai_unread_parts"] = unread_parts if isinstance(unread_parts, int) and not isinstance(unread_parts, bool) else 0
+        row["ai_unread_parts"] = unread_parts if _is_int(unread_parts) else 0
         row["ai_notes"] = _str_list(person.get("notes"))
 
     # 担当者のいないタスクを読んだ結果(チームのまとめの材料)
@@ -16427,7 +16380,7 @@ def _checked_action(action, data):
             stale = "対象のメンバーは分析の対象外です"
         elif target.get("username") and target["username"] != member.get("username"):
             stale = AI_STATE_CHANGED + "（同じIDの別のメンバーです）"
-    elif target_id is not None and not (isinstance(target_id, int) and not isinstance(target_id, bool)):
+    elif target_id is not None and not _is_int(target_id):
         stale = "対象を読み取れません"
     if stale is None:
         return dict(action, target=target)
@@ -17438,9 +17391,6 @@ def reminder_recipients_for(routine, rem, users, emails):
 #                        (スケジューラだけが書き込む。2-3 の AUTO_SLOTS_KEY。時刻ではなく枠で記録するため、
 #                        送った後に時刻を変えても、その日はもう一度送らない)
 
-REMINDER_SETTINGS_FILENAME = "routine_reminder_settings.json"
-REMINDER_SETTINGS_LABEL = "定型業務リマインドの設定ファイル"
-
 REMINDER_SETTINGS_DEFAULTS = {
     "enabled": False,
     "time1": "09:00",
@@ -17448,27 +17398,12 @@ REMINDER_SETTINGS_DEFAULTS = {
     "business_days_only": True,
     "last_result": None,
 }
-REMINDER_EDITABLE_KEYS = [k for k in REMINDER_SETTINGS_DEFAULTS if k != "last_result"]
-
-
-def _normalize_reminder_settings(data):
-    """読み込んだ値を検証し、不正・欠落した項目は既定値で補う。"""
-    result = copy.deepcopy(REMINDER_SETTINGS_DEFAULTS)
-    if not isinstance(data, dict):
-        return result
-    for key in ("enabled", "business_days_only"):
-        if isinstance(data.get(key), bool):
-            result[key] = data[key]
-    for key in ("time1", "time2"):
-        at = parse_hhmm(data.get(key)) if isinstance(data.get(key), str) else None
-        if at is not None:
-            result[key] = at.strftime("%H:%M")
-    result["last_result"] = normalize_last_result(data.get("last_result"))
-    return keep_auto_slots(result, data)
-
-
-REMINDER_SETTINGS = JsonSettings(REMINDER_SETTINGS_FILENAME, REMINDER_SETTINGS_LABEL,
-                                 _normalize_reminder_settings, REMINDER_EDITABLE_KEYS)
+REMINDER_SLOT_LABELS = {"time1": "送信時刻1", "time2": "送信時刻2"}  # 送信の枠(それぞれ1日1回)と表示名
+REMINDER_SLOTS = tuple(REMINDER_SLOT_LABELS)
+REMINDER_SETTINGS = JsonSettings(
+    "routine_reminder_settings.json", "定型業務リマインドの設定ファイル", REMINDER_SETTINGS_DEFAULTS,
+    (("enabled", _as_bool), ("business_days_only", _as_bool)) + tuple((slot, hhmm_text) for slot in REMINDER_SLOTS),
+    keep_auto_slots)
 load_reminder_settings = REMINDER_SETTINGS.load              # 現在の設定(読み込めなければ既定値)
 save_reminder_settings = REMINDER_SETTINGS.save              # 画面で編集した項目を保存する
 set_reminder_last_result = REMINDER_SETTINGS.set_last_result  # 前回の結果を上書きする
@@ -17477,16 +17412,13 @@ REMINDER_LABEL = "定型業務リマインド"
 REMINDER_SAVED_MESSAGE = "定型業務リマインドの設定を保存しました。"
 
 
-REMINDER_SLOTS = ("time1", "time2")  # 送信の枠(送信時刻1・2)。それぞれ1日1回
-
-
 def reminder_send_slots(settings):
     """送信の枠と時刻 [("HH:MM", 枠)] の一覧(早い順。同じ時刻の枠は先の枠〔time1〕だけ)。"""
     slots = {}
     for slot in REMINDER_SLOTS:
-        at = parse_hhmm(settings.get(slot)) if isinstance(settings.get(slot), str) else None
-        if at is not None:
-            slots.setdefault(at.strftime("%H:%M"), slot)
+        hhmm = hhmm_text(settings.get(slot))
+        if hhmm is not None:
+            slots.setdefault(hhmm, slot)
     return sorted(slots.items())
 
 
@@ -17499,12 +17431,8 @@ def parse_reminder_settings_form(form):
     """システム設定の「定型業務リマインド」タブの入力を検証する。戻り値: (values, errors)。"""
     errors = []
     values = {"enabled": form.get("enabled") == "1", "business_days_only": form.get("business_days_only") == "1"}
-    for key, label in (("time1", "送信時刻1"), ("time2", "送信時刻2")):
-        at = parse_hhmm(form.get(key))
-        if at is None:
-            errors.append("{}を「時:分」（例: 09:00）で入力してください。".format(label))
-        else:
-            values[key] = at.strftime("%H:%M")
+    for key, label in REMINDER_SLOT_LABELS.items():
+        form_hhmm(form, key, values, errors, "{}を「時:分」（例: 09:00）で入力してください。".format(label))
     if not errors and values["time1"] == values["time2"]:
         errors.append("送信時刻1と送信時刻2には、違う時刻を入力してください（1日2回送ります）。")
     return values, errors
@@ -17752,14 +17680,10 @@ def reminder_address_problems():
 #                   (追加の宛先には送る)。送れなかった宛先・失敗は前回の結果に残す
 #      test=True  : すべての未完了の回を載せた1通を差出人(MAIL_FROM)に送る
 #   成否にかかわらず「前回の結果」を上書きする。未完了の回が無ければ送らない(テスト送信は「該当なし」で送る)。
-# 送信は同時に1つだけ(二重送信の防止。_reminder_send_lock)。必ず app.app_context() の中で動く。
+# 送信は同時に1つだけ(二重送信の防止)。必ず app.app_context() の中で動く(2-6 の MailJob)。
 
-_reminder_send_lock = threading.Lock()
-
-
-def reminder_is_sending():
-    """リマインドの送信(自動・テスト)の処理中か。"""
-    return _reminder_send_lock.locked()
+# 失敗したときは DB の変更(実施予定の行の作成)を取り消す
+REMINDER_JOB = MailJob("定型業務リマインド", threading.Lock(), REMINDER_SETTINGS, rollback=True)
 
 
 def _send_reminder_mails(data):
@@ -17794,32 +17718,22 @@ def _send_reminder_mails(data):
 
 
 def _deliver_reminders(app, trigger, now, test):
-    """送信の本体(_reminder_send_lock を持った状態で呼ぶ)。成否にかかわらず「前回の結果」を上書きする。"""
-    with app.app_context():
-        try:
-            now = now or _now()
-            ensure_routine_occurrences(now.date())
-            data = collect_reminder_mails(now.date(), now)
-            if test:
-                problem = check_mail_settings(test=True)
-                if problem:
-                    ok, message = False, problem
-                else:
-                    mail = build_reminder_test_mail(data)
-                    ok, send_message = send_mail(mail["subject"], mail["text"], html=mail["html"], test=True)
-                    message = "{} ／ 本日実施 {}件・未完了 {}件 ／ 本番の宛先 {}件".format(
-                        send_message.rstrip("。"), data["today_count"], data["overdue_count"], len(data["mails"]))
-            else:
-                ok, message = _send_reminder_mails(data)
-        except Exception as exc:
-            db.session.rollback()
-            app.logger.exception("定型業務リマインドの作成・送信に失敗しました")
-            ok, message = False, "定型業務リマインドの作成中にエラーが発生しました: {}".format(exc)
-        try:
-            set_reminder_last_result(trigger, ok, message)
-        except Exception:
-            app.logger.exception("定型業務リマインドの前回の結果を保存できませんでした")
-        return {"ok": ok, "message": message}
+    """送信の本体(REMINDER_JOB のロックを持った状態で呼ぶ)。成否にかかわらず「前回の結果」を上書きする。"""
+    def body():
+        at = now or _now()
+        ensure_routine_occurrences(at.date())
+        data = collect_reminder_mails(at.date(), at)
+        if not test:
+            return _send_reminder_mails(data)
+        problem = check_mail_settings(test=True)
+        if problem:
+            return False, problem
+        mail = build_reminder_test_mail(data)
+        ok, send_message = send_mail(mail["subject"], mail["text"], html=mail["html"], test=True)
+        return ok, "{} ／ 本日実施 {}件・未完了 {}件 ／ 本番の宛先 {}件".format(
+            send_message.rstrip("。"), data["today_count"], data["overdue_count"], len(data["mails"]))
+
+    return REMINDER_JOB.deliver(app, trigger, body)
 
 
 def run_routine_reminders(app, trigger, now=None, test=False):
@@ -17827,18 +17741,12 @@ def run_routine_reminders(app, trigger, now=None, test=False):
 
     戻り値: {"ok", "message"}。例外は外に出さず、失敗は ok=False とメッセージで返す。
     """
-    with _reminder_send_lock:
-        return _deliver_reminders(app, trigger, now, test)
+    return REMINDER_JOB.run(lambda: _deliver_reminders(app, trigger, now, test))
 
 
 def try_run_routine_reminders(app, trigger, now=None, test=False):
     """run_routine_reminders と同じ。ただし送信の処理中なら待たずに None を返す(画面のテスト送信用)。"""
-    if not _reminder_send_lock.acquire(blocking=False):
-        return None
-    try:
-        return _deliver_reminders(app, trigger, now, test)
-    finally:
-        _reminder_send_lock.release()
+    return REMINDER_JOB.try_run(lambda: _deliver_reminders(app, trigger, now, test))
 
 
 def reminder_status_context(app):
@@ -17863,7 +17771,7 @@ def reminder_status_context(app):
         "address_problems": reminder_address_problems(),
         "emails_pending_reason": REMINDER_EMAILS_PENDING,
         "enabled_count": RoutineReminder.query.filter(RoutineReminder.enabled.is_(True)).count(),
-        "sending": reminder_is_sending(),
+        "sending": REMINDER_JOB.is_sending(),
     }
 
 
@@ -19377,15 +19285,12 @@ def save_reminder():
 @system_bp.route("/settings/reminder/test", methods=["POST"])
 def test_reminder():
     """定型業務リマインドのテスト送信(今の未完了の回をすべて載せた1通を、差出人〔MAIL_FROM〕宛てに送る)。"""
-    settings_error = REMINDER_SETTINGS.load_error()
-    if settings_error:
-        # 前回の結果に記録できないため、始めない
-        flash("定型業務リマインドの設定ファイルを読み込めないため、送信できません。{}".format(settings_error), "danger")
+    if settings_unreadable(REMINDER_SETTINGS, "定型業務リマインドの設定ファイルを読み込めないため、送信できません。{}"):
         return redirect(_tab_url(TAB_REMINDER))
     app = current_app._get_current_object()
     result = try_run_routine_reminders(app, TRIGGER_TEST, test=True)
     if result is None:
-        flash("別の送信を処理中です。完了してから、もう一度実行してください。", "warning")
+        flash(SENDING_BUSY_MESSAGE, "warning")
     elif result["ok"]:
         flash("定型業務リマインドのテスト送信: OK（{}）".format(mask_secrets(app, result["message"])), "success")
     else:
@@ -19459,49 +19364,18 @@ def _weekly_due_key(settings, now):
 
 def _weekly_run(app, settings, now):
     start, end = period_for(now.date(), settings["period_rule"])
-    result = run_weekly(
-        app, start, end, TRIGGER_AUTO, DELIVER_SEND,
-        send_date=now.date(),
-    )
-    return result["ok"]
-
-
-def _weekly_failure(message):
-    set_weekly_last_result(TRIGGER_AUTO, False, message)
-
-
-# --------------------------------------------------------------------------- #
-# 期限超過通知
-# --------------------------------------------------------------------------- #
-def _overdue_run(app, settings, now):
-    result = run_overdue(
-        app, TRIGGER_AUTO, test=False, today=now.date())
-    return result["ok"]
-
-
-def _overdue_failure(message):
-    set_overdue_last_result(TRIGGER_AUTO, False, message)
-
-
-# --------------------------------------------------------------------------- #
-# 定型業務リマインド
-# --------------------------------------------------------------------------- #
-def _reminder_run(app, settings, now):
-    result = run_routine_reminders(app, TRIGGER_AUTO, now=now)
-    return result["ok"]
-
-
-def _reminder_failure(message):
-    set_reminder_last_result(TRIGGER_AUTO, False, message)
+    return run_weekly(app, start, end, TRIGGER_AUTO, DELIVER_SEND, send_date=now.date())["ok"]
 
 
 JOBS = (
-    Job("weekly", "週報", load_weekly_settings, _weekly_due_key, _weekly_run, _weekly_failure,
-        WEEKLY_SETTINGS.claim_auto_run),
+    Job("weekly", "週報", load_weekly_settings, _weekly_due_key, _weekly_run,
+        lambda message: set_weekly_last_result(TRIGGER_AUTO, False, message), WEEKLY_SETTINGS.claim_auto_run),
     Job("overdue", "期限超過通知", load_overdue_settings, overdue_due_key,
-        _overdue_run, _overdue_failure, OVERDUE_SETTINGS.claim_auto_run),
+        lambda app, settings, now: run_overdue(app, TRIGGER_AUTO, test=False, today=now.date())["ok"],
+        lambda message: set_overdue_last_result(TRIGGER_AUTO, False, message), OVERDUE_SETTINGS.claim_auto_run),
     Job("reminder", "定型業務リマインド", load_reminder_settings, reminder_due_key,
-        _reminder_run, _reminder_failure, REMINDER_SETTINGS.claim_auto_slot),
+        lambda app, settings, now: run_routine_reminders(app, TRIGGER_AUTO, now=now)["ok"],
+        lambda message: set_reminder_last_result(TRIGGER_AUTO, False, message), REMINDER_SETTINGS.claim_auto_slot),
 )
 
 _scheduler_start_lock = threading.Lock()
@@ -19532,7 +19406,7 @@ def _execute(app, job, settings, now):
 
 def _auto_started_message(key):
     """自動送信を始めたときに前回の結果に書いておく文(実行が終われば上書きされる)。key は due_key の戻り値。"""
-    slot = {"time1": "送信時刻1", "time2": "送信時刻2"}.get(key[1], key[1])
+    slot = REMINDER_SLOT_LABELS.get(key[1], key[1])
     return ("自動送信を開始しました（{} {} の分。開始 {}）。完了の記録がありません（処理中か、処理の途中で"
             "サーバーが停止・再起動したなどで中断した可能性があります。中断した分は自動では送り直しません）。".format(
                 key[0].strftime("%Y/%m/%d"), slot, datetime.now().strftime("%H:%M")))
@@ -19559,7 +19433,7 @@ def _check_job(app, job, fired, now, start_thread=True):
             app.logger.exception("%sの自動送信: 実行の印を記録できなかったため、実行していません（次の確認でもう一度試します）",
                                  job.label)
             try:
-                slot = {"time1": "送信時刻1", "time2": "送信時刻2"}.get(key[1], key[1])
+                slot = REMINDER_SLOT_LABELS.get(key[1], key[1])
                 job.record_failure("自動送信の実行の印を設定ファイルに記録できなかったため、{} {} の分を実行していません"
                                    "（同じ分のうちにもう一度試します）: {}".format(key[0].strftime("%Y/%m/%d"), slot, exc))
             except Exception:
