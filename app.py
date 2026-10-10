@@ -33,6 +33,7 @@ Python のコードはすべてこの app.py にまとめている。ほかの�
       2-4. 営業日カレンダー(土日・祝日)
       2-5. 画面の権限の確認(マネージャーだけの画面)
       2-6. 時間のかかる処理の別スレッドでの実行(同時に1つだけ)
+      2-7. メール機能(週報・期限超過通知・リマインド)の共通の部品
   3. モデル(DBのテーブル)
       3-1. ユーザー
       3-2. タスク
@@ -531,7 +532,8 @@ def write_settings(instance_path, values, username, expected_version=None):
 # ---- 有効な値(初期値と画面の設定の重ね合わせ) ----
 def effective_values(initial, overrides):
     """各項目(ENV_KEYS)の有効な値。画面の設定(overrides)にあればその値、無ければ初期値(initial)、
-    どちらにも無ければ Config の空の値。"""
+    どちらにも無ければ Config の空の値。
+    """
     values = {}
     for key in ENV_KEYS:
         if key in overrides:
@@ -658,7 +660,10 @@ def prefers_json():
 
 
 # ==== 2-2. 小さなヘルパー関数 =====================================================================
+# 複数の画面・機能から使う小さなヘルパー(文字と画面の案内・日付と時刻・フォームの値の読み取り・DB の行と選択肢・
+# 同時の操作の確認・画面の共通の流れ)。
 
+# ---- 文字・画面の案内 ----
 # 改行・タブ以外の制御文字と、XML 1.0 で使えない文字(サロゲート・U+FFFE/U+FFFF)。
 # AIの応答・AIが作った問題・Excel(.xlsx)・Word(.docx)の出力から除く(1文字でも残っていると、Excel・Word の
 # ファイル全体を作れないため。画面表示でも問題になる)
@@ -667,7 +672,8 @@ CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ud800-\udfff\ufffe\
 def flash(message, category="message"):
     """画面の案内(flask.flash)。セッション(クッキー)に保存できない文字(対になっていないサロゲート・制御文字。
     CONTROL_CHARS)を除いてから入れる(外から来た文〔AI・送信サーバーの応答など〕に含まれていても、
-    以後のすべての画面が内部エラーにならないように)。"""
+    以後のすべての画面が内部エラーにならないように)。
+    """
     if isinstance(message, str) and CONTROL_CHARS.search(message):
         message = CONTROL_CHARS.sub("", message)
     _flask_flash(message, category)
@@ -677,10 +683,15 @@ def flash_redirect(message, category, url):
     flash(message, category)
     return redirect(url)
 
+def lf_text(value):
+    """改行を LF にそろえる(フォームの複数行の値・AI の応答は CRLF のことがある)。"""
+    return str(value).replace("\r\n", "\n").replace("\r", "\n")
+
 def clean_text(value):
     """外から来た文(AI の応答・応答の JSON の値など)を保存・表示できる形にする: 改行を LF にそろえ、制御文字(CONTROL_CHARS)を除く。"""
-    return CONTROL_CHARS.sub("", str(value).replace("\r\n", "\n").replace("\r", "\n"))
+    return CONTROL_CHARS.sub("", lf_text(value))
 
+# ---- 日付・時刻 ----
 def _now():
     """現在の日時。スキルテストの時刻・AI分析の基準の日時・定型業務のリマインドの今日(画面・テスト送信)はすべてここから取る。"""
     return datetime.now()
@@ -702,6 +713,15 @@ def parse_hhmm(value):
     except (TypeError, ValueError):
         return None
 
+def _date_label(d, ref):
+    """日付の短い表記: ref(期間の終わり・今日)と同じ年は mm/dd、違う年は yyyy/mm/dd。None は ―
+    (週報の開始日・期限、期限超過通知・AI分析の日付で共通)。
+    """
+    if not d:
+        return "―"
+    return d.strftime("%m/%d") if d.year == ref.year else d.strftime("%Y/%m/%d")
+
+# ---- フォーム・URL・設定の値の読み取りと入力チェック ----
 # SQLite の INTEGER に入る整数の範囲(これを超える整数で問い合わせると OverflowError になる)
 SQLITE_INT_MAX = 2 ** 63 - 1
 SQLITE_INT_MIN = -(2 ** 63)
@@ -799,6 +819,7 @@ def choice_or_default(value, choices, default):
     """フォーム・URL の選択肢の値(choices に無い値・空なら default)。"""
     return value if value in choices else default
 
+# ---- DB の行の取り出し・一覧の選択肢・アプリの名前 ----
 def get_or_404(model, ident):
     """主キーが ident の行を返す。無ければ 404 にする(SQLite の整数の範囲外の ID も 404)。"""
     if isinstance(ident, int) and not SQLITE_INT_MIN <= ident <= SQLITE_INT_MAX:
@@ -864,6 +885,7 @@ def set_active_from_form(obj):
     obj.is_active = target
     return True
 
+# ---- 同時の操作の確認(保存の衝突・登録の二度押し・古い画面からの送信〔VersionFields〕) ----
 _CONCURRENT_EDIT = ("ほかの操作で同時に変更されたため、保存できませんでした。"
                     "今の内容を確認して、必要ならもう一度保存してください。")
 
@@ -972,7 +994,8 @@ def commit_submitted(kind, url):
 
 def commit_unique_submitted(kind, url, message):
     """commit_submitted と同じく登録を保存して印を覚える。名前・IDの重複(UNIQUE 制約)で保存できなければ
-    取り消して message を表示し False(commit_unique と同じ)。"""
+    取り消して message を表示し False(commit_unique と同じ)。
+    """
     try:
         commit_submitted(kind, url)
         return True
@@ -1012,7 +1035,7 @@ def _value_digest(value):
         # 画面で編集する設定(JSON)の辞書の値(レベルごとの問題数・週報の対象者など)。キーの順番によらない
         text_value = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
     else:
-        text_value = str(value).replace("\r\n", "\n").replace("\r", "\n").strip()
+        text_value = lf_text(value).strip()
     return hashlib.sha256(text_value.encode("utf-8")).hexdigest()[:8]
 
 def field_versions(values, keys):
@@ -1085,13 +1108,69 @@ class VersionFields:
 
 def conflict_form(current, changed, to_text=None, form=None):
     """保存しなかったときの再表示の入力: 送られた入力(form。省略時は request.form)に、ほかの操作で変わった項目
-    (changed)の今の値を重ねる。to_text(キー, 値) は値を入力欄の文字列にする(省略時は None → ""、ほかは str)。"""
+    (changed)の今の値を重ねる。to_text(キー, 値) は値を入力欄の文字列にする(省略時は None → ""、ほかは str)。
+    """
     shown = request.form.to_dict(flat=True) if form is None else form
     for key in changed:
         value = current[key]
         shown[key] = to_text(key, value) if to_text is not None else ("" if value is None else str(value))
     shown.pop("version", None)
     return shown
+
+# ---- 画面の共通の流れ(有効/無効の切り替え・名前の重複を許さない行の追加と名称変更) ----
+def _toggle_active(obj, label, url):
+    """有効/無効の切り替えボタン(set_active_from_form)の共通の応答(スキル項目・業務〔5-6〕・チーム〔5-8〕)。
+    label は案内の「業務」「チーム」(スキル項目は "")。
+    """
+    changed = set_active_from_form(obj)
+    if changed:
+        db.session.commit()
+    state = "有効" if obj.is_active else "無効"
+    if changed:
+        return flash_redirect("{}「{}」を{}にしました。".format(label, obj.name, state), "info", url)
+    return flash_redirect("{}「{}」は既に{}です（変更していません）。".format(label, obj.name, state), "info", url)
+
+def _add_named_row(model, kind, label, empty_message, dup_message, url, make_row):
+    """名前の重複を許さない行(業務〔5-6〕・チーム〔5-8〕)を追加する共通の流れ。kind は二度押しの印の種類、make_row(名前) は新しい行。
+
+    追加のボタンの二度押し(同じ印 once・同じ内容)の2回目は、追加済みと案内する(「既にあります」の注意にしない)。
+    """
+    name = request.form.get("name", "").strip()
+    lock_for_write()  # 二度押しの確認から追加までの間に、同時に届いた2回目が入らないように
+    existing = model.query.filter_by(name=name).first() if name else None
+    if not name:
+        flash(empty_message, "danger")
+    elif existing is not None and already_submitted(kind):
+        flash(_SUBMITTED_TWICE.format("{}「{}」".format(label, existing.name)), "info")
+    elif existing is not None:
+        flash(dup_message, "warning")
+    else:
+        db.session.add(make_row(name))
+        if commit_unique_submitted(kind, url, dup_message):
+            flash("{}「{}」を追加しました。".format(label, name), "success")
+    return redirect(url)
+
+def _rename_named_row(obj, spec, new, label, empty_message, dup_message, url):
+    """名前の重複を許さない行(業務〔5-6〕・チーム〔5-8〕)の名称などを保存する共通の流れ。new は保存する値({項目: 値}。name を含む)。"""
+    if not new["name"]:
+        return flash_redirect(empty_message, "danger", url)
+    current = spec.values(obj)
+    _changed, conflicts = spec.conflicts(current, new)
+    for key in conflicts:
+        new[key] = current[key]
+    other = type(obj).query.filter_by(name=new["name"]).first()
+    if other and other.id != obj.id:
+        return flash_redirect(dup_message, "warning", url)
+    for key, value in new.items():
+        setattr(obj, key, value)
+    if commit_unique(dup_message):
+        if conflicts:
+            flash("画面を開いた後に、ほかの操作で{}「{}」の内容が変更されていたため、{}は今の内容のままにしました"
+                  "（ほかの項目の変更は保存しました）。確認して、必要ならもう一度変更して保存してください。".format(
+                      label, obj.name, "・".join(spec.labels[k] for k in conflicts)), "warning")
+        else:
+            flash("{}を更新しました。".format(label), "success")
+    return redirect(url)
 
 
 # ==== 2-3. 画面で編集する設定(JSONファイル)の読み書き =============================================
@@ -1683,7 +1762,8 @@ class MailJob:
         """送信の本体(lock を持った状態で呼ぶ)。app_context の中で body() → (成否, メッセージ) を実行し、
         成否にかかわらず「前回の結果」(prefix + メッセージ)を上書きする。戻り値: {"ok", "message"}。
         例外は外に出さず、失敗として記録する。check_test(テスト送信か)を渡すと、送信できない設定なら
-        時間のかかる作成(AI の呼び出しなど)の前に止める(4-2 の check_mail_settings)。"""
+        時間のかかる作成(AI の呼び出しなど)の前に止める(4-2 の check_mail_settings)。
+        """
         with app.app_context():
             try:
                 problem = None if check_test is None else check_mail_settings(test=check_test)
@@ -1716,6 +1796,58 @@ class MailJob:
         """work() を別スレッドで始める(画面からの送信用)。既に処理中なら何もせず False を返す。"""
         return start_in_thread(app, self.lock, self.thread_name, work,
                                "{}の送信処理でエラーが発生しました".format(self.label))
+
+
+# ==== 2-7. メール機能(週報・期限超過通知・リマインド)の共通の部品 =================================
+# 設定・前回の結果・画面を持つ3つのメール機能(週報〔6〕・期限超過通知〔7〕・定型業務リマインド〔10〕)で共通の、
+# 画面の表示(設定・次回の自動送信・前回の結果・メールの設定状況)・送信の開始の応答・旧URL の転送と、
+# メールのリンク(リクエストの外でも作れる)・末尾の文・HTML のプレビュー。送信を同時に1つにするのは 2-6 の MailJob。
+
+def mail_feature_context(job, settings, upcoming, test_only=False):
+    """週報・期限超過通知の画面と定型業務リマインドのタブに共通の表示(設定・次回の自動送信・前回の結果・
+    メールの設定状況・送信中か)。test_only は宛先を DB から決める機能(リマインド)で、送信サーバー・差出人だけを確かめる。
+    """
+    context = {
+        "settings": settings,
+        "settings_error": job.store.load_error(),
+        "upcoming": upcoming,
+        # 自動送信が有効でも、スケジューラがどのプロセスでも動いていなければ送信されない(画面で注意する)
+        "scheduler_stopped": upcoming is not None and scheduler_is_stopped(current_app),
+        "weekday_labels": WEEKDAY_LABELS,
+        "last": settings["last_result"],
+        "mail_problem": check_mail_settings(test=test_only),
+        "sending": job.is_sending(),
+    }
+    if not test_only:
+        context.update(mail=mail_settings(), test_problem=check_mail_settings(test=True))
+    return context
+
+def send_started_response(started, index_endpoint, message):
+    """画面から送信を始めた結果の案内(別の送信を処理中で始められなかったときはその旨)をして、機能の画面に戻る。"""
+    if started:
+        flash(message, "info")
+    else:
+        flash(SENDING_BUSY_MESSAGE, "warning")
+    return redirect(url_for(index_endpoint))
+
+def legacy_settings_route(bp, tab):
+    """旧URL POST /<機能>/settings(設定の保存。設定はシステム設定に移した)を、システム設定の保存へ 307 で転送する
+    (フォームの内容はそのまま届き、保存後はシステム設定のそのタブに戻る)。
+    """
+    bp.add_url_rule("/settings", "save_settings", lambda: redirect(url_for("system.save_" + tab), code=307),
+                    methods=["POST"])
+
+def app_path(endpoint, values):
+    """画面のパス(例: /tasks/12?t=…)。リクエストの外(自動送信のスレッド)でも作れるよう URL マップから作る。"""
+    return current_app.url_map.bind("localhost").build(endpoint, values)
+
+def mail_footer():
+    """メールの末尾の文(期限超過通知・定型業務リマインドで共通)。"""
+    return "※このメールは{}から送信しています。".format(display_app_name())
+
+def _preview_document(html):
+    """プレビュー用のHTML(リンクは別タブで開く)。iframe の srcdoc に入れて表示する。"""
+    return html.replace("<head>", '<head>\n<base target="_blank">', 1)
 
 
 # #### 3. モデル(DBのテーブル) #####################################################################
@@ -2061,7 +2193,8 @@ class Task(db.Model):
     @property
     def scale_monthly_hours(self):
         """規模(実働工数)を期間で月換算した、月あたりの目安工数(h)。
-        タスクは一過性のため、開始〜期限の期間で月あたりに配分する。"""
+        タスクは一過性のため、開始〜期限の期間で月あたりに配分する。
+        """
         h = self.scale_hours
         if not h:
             return 0.0
@@ -2626,7 +2759,8 @@ class Operation(db.Model):
     @property
     def active_skill_reqs(self):
         """有効なスキルの必要スキルだけ(無効化したスキルの必要スキルは、対応可否・育成計画・件数に数えない。
-        行は残すので、スキルを有効に戻すと元どおりになる)。"""
+        行は残すので、スキルを有効に戻すと元どおりになる)。
+        """
         return [r for r in self.skill_reqs if r.skill is not None and r.skill.is_active]
 
     def __repr__(self):
@@ -3160,7 +3294,8 @@ def mail_addresses(value):
 
 def _header_address(item):
     """ヘッダ(From/To/Cc)に書くアドレス。「表示名 <アドレス>」の表示名だけを符号化する
-    (日本語の表示名でもアドレスの部分が読める形になる)。"""
+    (日本語の表示名でもアドレスの部分が読める形になる)。
+    """
     name, addr = parseaddr(item)
     if not addr:
         return item
@@ -3218,7 +3353,8 @@ def mail_settings():
 
 def mail_recipients(test=False, to=None, cc=None):
     """宛先 (To, Cc)。テスト送信は差出人(MAIL_FROM)宛てで Cc なし(to / cc は使わない)。
-    本番送信は to / cc(None なら MAIL_TO / MAIL_CC)。"""
+    本番送信は to / cc(None なら MAIL_TO / MAIL_CC)。
+    """
     values = mail_settings()
     if test:
         return ([values["mail_from"]] if values["mail_from"] else []), []
@@ -3228,7 +3364,8 @@ def mail_recipients(test=False, to=None, cc=None):
 
 def check_mail_settings(test=False, to=None, to_label="宛先（MAIL_TO）"):
     """送信に必要な設定が揃っているか。問題があればその説明、無ければ None。
-    to は本番送信の宛先(None なら MAIL_TO)、to_label はその設定項目の名前(テスト送信では使わない)。"""
+    to は本番送信の宛先(None なら MAIL_TO)、to_label はその設定項目の名前(テスト送信では使わない)。
+    """
     values = mail_settings()
     actual_to, _cc = mail_recipients(test, to=to)
     missing = []
@@ -3672,7 +3809,8 @@ def begin_login_attempt(username):
 
 def end_login_attempt(username, failed):
     """begin_login_attempt で数えた確認中の試行を外す。failed(パスワードが違った)なら失敗として数える
-    (同じ鍵の中で)。戻り値: 失敗を数えて制限を始めたら True。"""
+    (同じ鍵の中で)。戻り値: 失敗を数えて制限を始めたら True。
+    """
     with _login_failures_lock:
         for key in _login_failure_keys(username):
             count = _login_pending.get(key, 0) - 1
@@ -5852,10 +5990,10 @@ def clean_description_draft(text, skill_type=None):
     if skill_type is not None:
         levels_heading = next((h for h, _b in description_outline(skill_type) if h.startswith("レベルごとの目安")),
                               DESC_LEVELS)
-    body = strip_code_fence(clean_text(text or ""))
+    body = strip_code_fence(lf_text(text or ""))
     lines = []
     for line in body.split("\n"):
-        line = line.rstrip().replace("**", "")
+        line = CONTROL_CHARS.sub("", line).rstrip().replace("**", "")
         stripped = line.strip()
         known = _DESCRIPTION_HEADING_RE.match(stripped)
         heading = re.match(r"^#{1,6}\s*(.+)$", stripped)
@@ -5993,64 +6131,12 @@ def description_draft():
     flash(message, "info" if draft is not None else "danger")
     return _render_item_form(skill, form)
 
-def _toggle_active(obj, label, url):
-    """有効/無効の切り替えボタン(set_active_from_form)の共通の応答。label は案内の「業務」「チーム」(スキル項目は "")。"""
-    changed = set_active_from_form(obj)
-    if changed:
-        db.session.commit()
-    state = "有効" if obj.is_active else "無効"
-    if changed:
-        return flash_redirect("{}「{}」を{}にしました。".format(label, obj.name, state), "info", url)
-    return flash_redirect("{}「{}」は既に{}です（変更していません）。".format(label, obj.name, state), "info", url)
-
 @skills_bp.route("/items/<int:skill_id>/toggle", methods=["POST"])
 def toggle_item(skill_id):
     return _toggle_active(get_or_404(Skill, skill_id), "", url_for("skills.items"))
 
 # ---- 業務(Operation)項目の管理(マネージャー)。横軸「業務」ビューの列に使う。 ----
 OPERATION_VERSION = VersionFields((("name", "業務名"), ("description", "説明"), ("sort_order", "並び順")))
-
-def _add_named_row(model, kind, label, empty_message, dup_message, url, make_row):
-    """名前の重複を許さない行(業務・チーム〔5-8〕)を追加する共通の流れ。kind は二度押しの印の種類、make_row(名前) は新しい行。
-
-    追加のボタンの二度押し(同じ印 once・同じ内容)の2回目は、追加済みと案内する(「既にあります」の注意にしない)。
-    """
-    name = request.form.get("name", "").strip()
-    lock_for_write()  # 二度押しの確認から追加までの間に、同時に届いた2回目が入らないように
-    existing = model.query.filter_by(name=name).first() if name else None
-    if not name:
-        flash(empty_message, "danger")
-    elif existing is not None and already_submitted(kind):
-        flash(_SUBMITTED_TWICE.format("{}「{}」".format(label, existing.name)), "info")
-    elif existing is not None:
-        flash(dup_message, "warning")
-    else:
-        db.session.add(make_row(name))
-        if commit_unique_submitted(kind, url, dup_message):
-            flash("{}「{}」を追加しました。".format(label, name), "success")
-    return redirect(url)
-
-def _rename_named_row(obj, spec, new, label, empty_message, dup_message, url):
-    """名前の重複を許さない行(業務・チーム〔5-8〕)の名称などを保存する共通の流れ。new は保存する値({項目: 値}。name を含む)。"""
-    if not new["name"]:
-        return flash_redirect(empty_message, "danger", url)
-    current = spec.values(obj)
-    _changed, conflicts = spec.conflicts(current, new)
-    for key in conflicts:
-        new[key] = current[key]
-    other = type(obj).query.filter_by(name=new["name"]).first()
-    if other and other.id != obj.id:
-        return flash_redirect(dup_message, "warning", url)
-    for key, value in new.items():
-        setattr(obj, key, value)
-    if commit_unique(dup_message):
-        if conflicts:
-            flash("画面を開いた後に、ほかの操作で{}「{}」の内容が変更されていたため、{}は今の内容のままにしました"
-                  "（ほかの項目の変更は保存しました）。確認して、必要ならもう一度変更して保存してください。".format(
-                      label, obj.name, "・".join(spec.labels[k] for k in conflicts)), "warning")
-        else:
-            flash("{}を更新しました。".format(label), "success")
-    return redirect(url)
 
 @skills_bp.route("/operations")
 def operations():
@@ -6446,7 +6532,8 @@ def _gantt_details(task_ids, chunk=500):
 
 def _build_gantt(today, only_user_id=None):
     """全タスクのガントチャート用データを組み立てる(ダッシュボード内蔵・全画面で共用)。
-    only_user_id を渡すと、その人が担当のタスクだけに絞る(個人ダッシュボード用)。"""
+    only_user_id を渡すと、その人が担当のタスクだけに絞る(個人ダッシュボード用)。
+    """
     gfrom = parse_date(request.args.get("gfrom")) or (today - timedelta(days=7))
     gto = parse_date(request.args.get("gto")) or (today + timedelta(days=28))
     if gto < gfrom:
@@ -6857,7 +6944,7 @@ def reactivate_member(user_id):
 @departments_bp.route("/new", methods=["POST"])
 @manager_required
 def new_department():
-    """チームを追加する(_add_named_row〔5-6〕。二度押しの2回目は追加済みと案内する)。"""
+    """チームを追加する(_add_named_row〔2-2〕。二度押しの2回目は追加済みと案内する)。"""
     return _add_named_row(Department, "department", "チーム", "チームの名称を入力してください。", "同じ名称のチームが既にあります。",
                           url_for("departments.manage"),
                           lambda name: Department(name=name, sort_order=form_sort_order(request.form)))
@@ -6867,7 +6954,7 @@ DEPARTMENT_VERSION = VersionFields((("name", "名称"), ("sort_order", "並び�
 @departments_bp.route("/<int:dept_id>/rename", methods=["POST"])
 @manager_required
 def rename_department(dept_id):
-    """チームの名称・並び順を保存する(_rename_named_row〔5-6〕)。"""
+    """チームの名称・並び順を保存する(_rename_named_row〔2-2〕)。"""
     lock_for_write()  # 確かめてから保存するまでの間に、ほかの保存が入らないように
     dept = get_or_404(Department, dept_id)
     new = {"name": request.form.get("name", "").strip(), "sort_order": form_sort_order(request.form, dept.sort_order)}
@@ -7211,13 +7298,15 @@ def _teams_sheets():
         ("メンバー", ["ログインID", "氏名", "役割", "有効", "所属チーム", "メールアドレス"], u_rows),
     ]
 
-# ---- ダウンロード用ルート: GET /export/<名前>.xlsx(エンドポイント export.<名前>_xlsx)。all.xlsx はすべてのシート ----
+# ---- ダウンロード用ルート: GET /export/<名前>.xlsx。all.xlsx はすべてのシート ----
+# エンドポイントは export.tasks_xlsx / routine_xlsx / skills_xlsx / leaves_xlsx / skilltest_xlsx / teams_xlsx(画面の url_for で使う)
 def _xlsx_download(sheets, filename):
     return _xlsx_response(sheets(), filename)
 
 for _name, _sheets in (("tasks", _tasks_sheets), ("routine", _routine_sheets), ("skills", _skills_sheets),
                        ("leaves", _leaves_sheets), ("skilltest", _skilltest_sheets), ("teams", _teams_sheets)):
     export_bp.add_url_rule("/{}.xlsx".format(_name), _name + "_xlsx", partial(_xlsx_download, _sheets, _name + ".xlsx"))
+del _name, _sheets
 
 @export_bp.route("/all.xlsx")
 def all_xlsx():
@@ -7464,7 +7553,7 @@ def _finish_weekly_settings(result, data):
 
 WEEKLY_SETTINGS = JsonSettings("weekly_settings.json", "週報の設定ファイル", WEEKLY_DEFAULTS, WEEKLY_FIELDS,
                                _finish_weekly_settings)
-WEEKLY_EDITABLE_KEYS = WEEKLY_SETTINGS.editable          # 画面から保存できる項目(last_result は送信処理だけが書き込む)
+WEEKLY_EDITABLE_KEYS = list(WEEKLY_SETTINGS.editable)    # 画面から保存できる項目(last_result は送信処理だけが書き込む)
 load_weekly_settings = WEEKLY_SETTINGS.load              # 現在の設定(読み込めなければ既定値)
 save_weekly_settings = WEEKLY_SETTINGS.save              # 画面で編集した項目を保存する
 
@@ -7480,7 +7569,7 @@ def is_weekly_target(settings, user):
 
 def _text(form, name, single_line=False):
     """フォームのテキスト(改行を統一。1行項目は改行を除く)。"""
-    value = (form.get(name) or "").replace("\r\n", "\n").replace("\r", "\n")
+    value = lf_text(form.get(name) or "")
     if single_line:
         value = " ".join(value.split("\n")).strip()
     return value
@@ -7836,13 +7925,6 @@ def _mmdd(d):
     """日付(または日時)を mm/dd に。None は ―(期間の中の日付〔記載・完了・状態の変更〕に使う)。"""
     return d.strftime("%m/%d") if d else "―"
 
-def _date_label(d, ref):
-    """日付の短い表記: ref(期間の終わり・今日)と同じ年は mm/dd、違う年は yyyy/mm/dd。None は ―
-    (週報の開始日・期限、期限超過通知・AI分析の日付で共通)。"""
-    if not d:
-        return "―"
-    return d.strftime("%m/%d") if d.year == ref.year else d.strftime("%Y/%m/%d")
-
 def _money(value):
     return "{:,.0f} ￥/年".format(value)
 
@@ -8053,7 +8135,7 @@ def _messages(sample, guidelines, material_text, instruction):
 def _clean_ai_reply(text):
     """AIの応答を整える(改行の統一・コードブロック記号の除去・前後の空白除去)。"""
     lines = []
-    for line in clean_text(text or "").split("\n"):
+    for line in lf_text(text or "").split("\n"):
         if line.strip().startswith("```"):
             continue
         lines.append(line.rstrip())
@@ -8430,39 +8512,7 @@ RUN_MAX_DAYS = 366
 # 期限超過〔終わりの翌日より前〕の判定で、date.max を超える日付を計算しないように)
 RUN_LAST_DAY = date.max - timedelta(days=DUE_SOON_DAYS + 1)
 
-def mail_feature_context(job, settings, upcoming, test_only=False):
-    """週報・期限超過通知の画面と定型業務リマインドのタブに共通の表示(設定・次回の自動送信・前回の結果・
-    メールの設定状況・送信中か)。test_only は宛先を DB から決める機能(リマインド)で、送信サーバー・差出人だけを確かめる。"""
-    context = {
-        "settings": settings,
-        "settings_error": job.store.load_error(),
-        "upcoming": upcoming,
-        # 自動送信が有効でも、スケジューラがどのプロセスでも動いていなければ送信されない(画面で注意する)
-        "scheduler_stopped": upcoming is not None and scheduler_is_stopped(current_app),
-        "weekday_labels": WEEKDAY_LABELS,
-        "last": settings["last_result"],
-        "mail_problem": check_mail_settings(test=test_only),
-        "sending": job.is_sending(),
-    }
-    if not test_only:
-        context.update(mail=mail_settings(), test_problem=check_mail_settings(test=True))
-    return context
-
-def send_started_response(started, index_endpoint, message):
-    """画面から送信を始めた結果の案内(別の送信を処理中で始められなかったときはその旨)をして、機能の画面に戻る。"""
-    if started:
-        flash(message, "info")
-    else:
-        flash(SENDING_BUSY_MESSAGE, "warning")
-    return redirect(url_for(index_endpoint))
-
-def legacy_settings_route(bp, tab):
-    """旧URL POST /<機能>/settings(設定の保存。設定はシステム設定に移した)を、システム設定の保存へ 307 で転送する
-    (フォームの内容はそのまま届き、保存後はシステム設定のそのタブに戻る)。"""
-    bp.add_url_rule("/settings", "save_settings", lambda: redirect(url_for("system.save_" + tab), code=307),
-                    methods=["POST"])
-
-legacy_settings_route(weekly_bp, "weekly")
+legacy_settings_route(weekly_bp, "weekly")  # 旧URL POST /weekly/settings → システム設定の保存(2-7)
 
 def _render_weekly(settings):
     """週報の画面を表示する(実行と状況だけ。設定はシステム設定の「週報」タブ)。"""
@@ -8623,7 +8673,7 @@ OVERDUE_SETTINGS = JsonSettings(
     "overdue_settings.json", "期限超過通知の設定ファイル", OVERDUE_DEFAULTS,
     (("enabled", _as_bool), ("time", hhmm_text), ("comment_count", _int_between(COMMENT_COUNT_MIN, COMMENT_COUNT_MAX))),
     keep_auto_run_key)
-OVERDUE_EDITABLE_KEYS = OVERDUE_SETTINGS.editable          # 画面から保存できる項目(last_result は送信処理だけが書き込む)
+OVERDUE_EDITABLE_KEYS = list(OVERDUE_SETTINGS.editable)    # 画面から保存できる項目(last_result は送信処理だけが書き込む)
 load_overdue_settings = OVERDUE_SETTINGS.load              # 現在の設定(読み込めなければ既定値)
 save_overdue_settings = OVERDUE_SETTINGS.save              # 画面で編集した項目を保存する
 
@@ -8706,19 +8756,16 @@ def link_base():
                     "（システム設定の「基本設定」タブで、http:// または https:// で始まるURLを設定してください）。")
     return raw.rstrip("/"), None
 
-def app_path(endpoint, values):
-    """画面のパス(例: /tasks/12?t=…)。リクエストの外(自動送信のスレッド)でも作れるよう URL マップから作る。"""
-    return current_app.url_map.bind("localhost").build(endpoint, values)
-
 def task_path(task_id, row_key=None):
-    """タスク詳細画面のパス。row_key(Task.row_key)を付けると、そのタスクが削除された後に同じIDが
-    別のタスクに使われても、リンクは別のタスクを開かずに 404 になる(5-3 の task_detail)。"""
+    """タスク詳細画面のパス(2-7 の app_path)。row_key(Task.row_key)を付けると、そのタスクが削除された後に同じIDが
+    別のタスクに使われても、リンクは別のタスクを開かずに 404 になる(5-3 の task_detail)。
+    """
     values = {"task_id": task_id}
     if row_key:
         values["t"] = row_key
     return app_path("tasks.detail", values)
 
-# ---- 表記の小道具(日付の短い表記は 6-4 の _date_label) ----
+# ---- 表記の小道具(日付の短い表記は 2-2 の _date_label) ----
 def _age_label(d, today):
     """コメントの経過日数(営業日。2-4 の elapsed_business_days)。今日(以降)なら「本日」。"""
     if d >= today:
@@ -8829,10 +8876,6 @@ def _intro(data):
             data["today"].strftime("%Y/%m/%d"))
     return "{} 時点で期限を過ぎている未完了のタスクの一覧です（未着手・進行中 {}件／保留 {}件）。".format(
         data["today"].strftime("%Y/%m/%d"), data["counts"]["active"], data["counts"]["hold"])
-
-def mail_footer():
-    """メールの末尾の文(期限超過通知・定型業務リマインドで共通)。"""
-    return "※このメールは{}から送信しています。".format(display_app_name())
 
 def section_heading(section):
     return "■{}　期限超過一覧".format(section["title"])
@@ -8950,10 +8993,6 @@ def start_overdue_background(app, trigger, test=False):
 
 overdue_bp = managers_blueprint("overdue", "/overdue")  # マネージャーのみ(2-5)
 
-def _preview_document(html):
-    """プレビュー用のHTML(リンクは別タブで開く)。iframe の srcdoc に入れて表示する。"""
-    return html.replace("<head>", '<head>\n<base target="_blank">', 1)
-
 def _render_overdue(settings):
     """期限超過通知の画面を表示する(実行と状況だけ。設定はシステム設定の「期限超過通知」タブ)。"""
     base_url, link_problem = link_base()
@@ -8976,7 +9015,7 @@ def _render_overdue(settings):
 def overdue_index():
     return _render_overdue(load_overdue_settings())
 
-legacy_settings_route(overdue_bp, "overdue")  # 旧URL POST /overdue/settings → システム設定の保存(6-8)
+legacy_settings_route(overdue_bp, "overdue")  # 旧URL POST /overdue/settings → システム設定の保存(2-7)
 
 @overdue_bp.route("/run", methods=["POST"], endpoint="run_now")
 def overdue_run_now():
@@ -10708,7 +10747,8 @@ def admin_toggle_question(question_id):
 @skilltest_bp.route("/admin/settings", methods=["GET", "POST"])
 def admin_settings():
     """旧URL。設定はシステム設定の「スキルテスト」タブに移した。
-    GET はそのタブへ移動し、POST は 307 でそのタブの保存へ転送する(フォームの内容はそのまま届く)。"""
+    GET はそのタブへ移動し、POST は 307 でそのタブの保存へ転送する(フォームの内容はそのまま届く)。
+    """
     if request.method == "POST":
         return redirect(url_for("system.save_skilltest"), code=307)
     return redirect(url_for("system.settings", tab="skilltest"))
@@ -12191,7 +12231,7 @@ _DATA_MARKS = str.maketrans({"■": "□", "【": "〔", "】": "〕", "[": "［
 
 def _data_text(text):
     """利用者が書いた本文を材料に入れる形にする(改行はそのまま。記号を置き換える。省略しない)。"""
-    body = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    body = lf_text(text or "")
     return body.translate(_DATA_MARKS).replace("===", "＝＝＝")
 
 def _inline(text):
@@ -12322,7 +12362,8 @@ def task_allowed_numbers(t, facts, parts):
 
 def task_written_text(t, facts):
     """そのタスクの、利用者が書いた本文(タイトル・説明・コメントの本文・成果)とアプリの計算
-    (task_allowed_numbers で数量として認める部分。登録・期限・コメントの日時と ID は含めない)。"""
+    (task_allowed_numbers で数量として認める部分。登録・期限・コメントの日時と ID は含めない)。
+    """
     o = t["outcome"]
     content = [t["title"], t["description"]] + [c["body"] for c in t["comments"]] + [
         o["quant_estimate_label"] or "", o["quant_actual_label"] or "",
@@ -13158,7 +13199,8 @@ def _norm_numbers(text):
 
 def _date_token(match):
     """_NUMBER_TOKEN の一致の種類。("id",) / ("ymd", 年, 月, 日) / ("ym", 年, 月) / ("md", 月, 日) / ("mo", 月) /
-    ("y", 年) / ("hm", 時, 分)。数値(または日付・時刻として正しくないもの)は None。"""
+    ("y", 年) / ("hm", 時, 分)。数値(または日付・時刻として正しくないもの)は None。
+    """
     if match.group("id"):
         return ("id",)
 
@@ -13286,7 +13328,8 @@ def _fraction_key(match):
 
 def _in_stamp(text, items, index):
     """items(_NUMBER_TOKEN の一致と _date_token の組のリスト)の index 番目が、日時(日付に続けて書いた時刻)の
-    時刻か、時刻が続く月日か(2026/10/01 17:45 の 17:45・10/01 17:45 の 10/01 と 17:45)。"""
+    時刻か、時刻が続く月日か(2026/10/01 17:45 の 17:45・10/01 17:45 の 10/01 と 17:45)。
+    """
     match, token = items[index]
     if token[0] == "hm":
         if index == 0:
@@ -13357,7 +13400,8 @@ def parse_ref(value, prefix):
 
 def _asked_items(parsed, name, field, prefix, asked):
     """応答(parsed)の name の配列のうち、field の ID(prefix 付き。parse_ref)がこの回に判定を頼んだ項目 asked にある
-    辞書を (ID, 辞書) の順に返す(頼んでいない項目・読めない ID の判定は捨てる)。"""
+    辞書を (ID, 辞書) の順に返す(頼んでいない項目・読めない ID の判定は捨てる)。
+    """
     asked = set(asked)
     for raw in _ai_dicts(parsed.get(name)):
         ref = parse_ref(raw.get(field), prefix)
@@ -14061,7 +14105,8 @@ class AnalysisRun:
 
 def _identified_target(target, data):
     """推奨アクションの対象に、タスク・人を見分ける印(tid・username)を付ける(保存した後に同じIDの別のタスク・人と
-    取り違えない。9-8)。"""
+    取り違えない。9-8)。
+    """
     if target.get("kind") == "task" and target.get("id") in data["tasks"]:
         t = data["tasks"][target["id"]]
         return dict(target, tid=task_identity(t), fp=action_fingerprint(t))
@@ -15236,7 +15281,8 @@ def reminder_email_check_of(rem):
 
 def _legacy_emails_checked(rem):
     """確認の記録の無い行(以前の版で保存した行)の追加の宛先(アドレス)を、マネージャーが保存したとみなすか
-    (最後に保存した人がマネージャーなら、その人が欄のアドレスごと保存している)。"""
+    (最後に保存した人がマネージャーなら、その人が欄のアドレスごと保存している)。
+    """
     updater = db.session.get(User, rem.updated_by_id) if rem.updated_by_id is not None else None
     return updater is not None and updater.is_manager
 
@@ -15640,8 +15686,9 @@ REMINDER_TODAY_TITLE = "本日実施予定"
 REMINDER_OVERDUE_TITLE = "【リマインド】未完了"
 
 def routine_path(routine_id, row_key=None):
-    """定型業務の詳細画面のパス(例: /routine/3?r=…。7-4 の app_path)。row_key を付けると、その業務が削除された後に
-    同じIDが別の業務に使われても、リンクは別の業務を開かずに 404 になる。"""
+    """定型業務の詳細画面のパス(例: /routine/3?r=…。2-7 の app_path)。row_key を付けると、その業務が削除された後に
+    同じIDが別の業務に使われても、リンクは別の業務を開かずに 404 になる。
+    """
     values = {"routine_id": routine_id}
     if row_key:
         values["r"] = row_key
@@ -15843,6 +15890,8 @@ def _send_reminder_mails(data):
 def _deliver_reminders(app, trigger, now, test):
     """送信の本体(REMINDER_JOB のロックを持った状態で呼ぶ)。成否にかかわらず「前回の結果」を上書きする。"""
     def body():
+        # 送信できる設定かは、実施予定の行を作って未完了の回を集めた後に確かめる(未完了が無ければ送らずに済む。宛先は DB の
+        # アドレスのため、差出人・送信サーバーだけを見る〔test=True〕)。そのため MailJob.deliver の check_test は使わない
         at = now or _now()
         ensure_routine_occurrences(at.date())
         data = collect_reminder_mails(at.date(), at)
@@ -15870,8 +15919,9 @@ def try_run_routine_reminders(app, trigger, now=None, test=False):
     return REMINDER_JOB.try_run(lambda: _deliver_reminders(app, trigger, now, test))
 
 def reminder_status_context():
-    """システム設定の「定型業務リマインド」タブの状況の表示(次回の送信・前回の結果・注意・プレビュー。6-8 の
-    mail_feature_context に加えて、送れない宛先・宛先ごとのプレビュー・テスト送信の1通)。"""
+    """システム設定の「定型業務リマインド」タブの状況の表示(次回の送信・前回の結果・注意・プレビュー。2-7 の
+    mail_feature_context に加えて、送れない宛先・宛先ごとのプレビュー・テスト送信の1通)。
+    """
     settings = load_reminder_settings()
     now = _now()
     refresh_occurrences_for_page(now.date())
@@ -16397,7 +16447,8 @@ def _mask_userinfo_in_value(value):
 
 def _has_secret_like_key(value, depth=0):
     """値(辞書・一覧。入れ子も)の中に、名前が秘密の値らしい辞書のキー(bind_password・Authorization など。
-    _SECRET_LIKE)があるか。「その他」の表で、上の段の名前が普通でも値を表示しないために使う。"""
+    _SECRET_LIKE)があるか。「その他」の表で、上の段の名前が普通でも値を表示しないために使う。
+    """
     if depth > 20:
         return True  # 深すぎる入れ子は確かめきれないので、表示しない側にする
     if isinstance(value, dict):
@@ -16667,7 +16718,7 @@ def _shown_unchanged(field, raw, current_value):
         return False
 
     def norm(text):
-        return str(text).replace("\r\n", "\n").replace("\r", "\n").strip()
+        return lf_text(text).strip()
 
     return norm(raw) == norm(_display(field, current_value))
 
@@ -17218,9 +17269,11 @@ def _save_feature(tab):
                                        versions={tab: store.version(current)})
     return flash_redirect(feature.saved_message, "success", _tab_url(tab))
 
-# POST /system/settings/<タブ>(エンドポイント system.save_<タブ>)で、そのタブの設定を保存する
+# POST /system/settings/<タブ> でそのタブの設定を保存する。エンドポイントは system.save_weekly / save_overdue / save_skilltest /
+# save_analysis / save_reminder(画面の url_for で使う)
 for _tab in FEATURES:
     system_bp.add_url_rule("/settings/" + _tab, "save_" + _tab, partial(_save_feature, _tab), methods=["POST"])
+del _tab
 
 @system_bp.route("/settings/reminder/test", methods=["POST"])
 def test_reminder():
