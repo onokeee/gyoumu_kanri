@@ -749,6 +749,11 @@ def flash(message, category="message"):
     _flask_flash(message, category)
 
 
+def clean_text(value):
+    """外から来た文(AI の応答・応答の JSON の値など)を保存・表示できる形にする: 改行を LF にそろえ、制御文字(CONTROL_CHARS)を除く。"""
+    return CONTROL_CHARS.sub("", str(value).replace("\r\n", "\n").replace("\r", "\n"))
+
+
 def _now():
     """現在の日時。スキルテストの時刻・AI分析の基準の日時・定型業務のリマインドの今日(画面・テスト送信)はすべてここから取る。
 
@@ -838,6 +843,21 @@ def _is_int(value):
 def valid_int(value, low, high):
     """範囲内の整数か(bool は除く)。"""
     return _is_int(value) and low <= value <= high
+
+
+def _dict_or_empty(value):
+    """辞書ならそのまま、そうでなければ空の辞書(保存したファイル・外から来た値の型の違いを既定にする)。"""
+    return value if isinstance(value, dict) else {}
+
+
+def _list_or_empty(value):
+    """リストならそのまま、そうでなければ空のリスト(_dict_or_empty と同じ)。"""
+    return value if isinstance(value, list) else []
+
+
+def _row_by(rows, value, key="id", default=None):
+    """rows(辞書の一覧)のうち key が value の最初の行。無ければ default。"""
+    return next((r for r in rows if r[key] == value), default)
 
 
 def int_like(raw):
@@ -2941,7 +2961,7 @@ def _json_list(text):
         value = json.loads(text or "[]")
     except (TypeError, ValueError):
         return []
-    return value if isinstance(value, list) else []
+    return _list_or_empty(value)
 
 
 def _json_dict(text):
@@ -2950,7 +2970,7 @@ def _json_dict(text):
         value = json.loads(text or "{}")
     except (TypeError, ValueError):
         return {}
-    return value if isinstance(value, dict) else {}
+    return _dict_or_empty(value)
 
 
 class SkillTestQuestion(db.Model):
@@ -3236,6 +3256,11 @@ def ai_status_label():
     return label
 
 
+def ai_context():
+    """画面に AI の状態を出すテンプレート変数(ai_enabled: 使える設定か、ai_status: ai_status_label の表示)。"""
+    return {"ai_enabled": ai_is_configured(), "ai_status": ai_status_label()}
+
+
 def _mask_api_key(text, api_key):
     """エラーメッセージにAPIキーが含まれていた場合に伏せ字にする。"""
     text = str(text or "")
@@ -3292,8 +3317,13 @@ def _call_chat_api(messages):
 
 
 # --------------------------------------------------------------------------- #
-# 呼び出し側が使うのはこの関数だけ
+# 呼び出し側が使うのは、この2つ(依頼の形 chat_messages と送信 ai_chat)と、下の応答の読み取り
 # --------------------------------------------------------------------------- #
+def chat_messages(system, user):
+    """ai_chat に送るメッセージ列(system の決まりと user の依頼文。OpenAI 形式の role/content の辞書のリスト)。"""
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
 def ai_chat(messages):
     """メッセージ列(OpenAI形式の role/content の辞書のリスト)をAIに送る。
 
@@ -6524,8 +6554,7 @@ def _render_item_form(skill, form=None, status=200, version=None):
         headings=SKILL_DESCRIPTION_HEADINGS,
         # テストの対象外の区分(コンセプチュアル・ヒューマン)の見出し(到達尺度のレベルの数は同じ)
         outline_off=description_outline(SKILL_CONCEPTUAL),
-        ai_enabled=ai_is_configured(),
-        ai_status=ai_status_label(),
+        **ai_context(),
         back=_item_back(),
     ), status
 
@@ -6580,12 +6609,8 @@ def build_description_messages(name, skill_type, category, current=""):
         "・全体で600文字程度までにまとめる",
         "・{}つの見出しと箇条書きだけを出力する（前置き・まとめの文・コードブロックは付けない）".format(len(outline)),
     ]
-    return [
-        {"role": "system",
-         "content": ("あなたは、チームのスキル項目の定義を整理する担当者です。"
-                     "指示された形式を守り、日本語で説明の下書きだけを出力してください。")},
-        {"role": "user", "content": "\n".join(lines)},
-    ]
+    return chat_messages("あなたは、チームのスキル項目の定義を整理する担当者です。"
+                         "指示された形式を守り、日本語で説明の下書きだけを出力してください。", "\n".join(lines))
 
 
 def clean_description_draft(text, skill_type=None):
@@ -6597,10 +6622,10 @@ def clean_description_draft(text, skill_type=None):
     if skill_type is not None:
         levels_heading = next((h for h, _b in description_outline(skill_type) if h.startswith("レベルごとの目安")),
                               DESC_LEVELS)
-    body = strip_code_fence(str(text or "").replace("\r\n", "\n").replace("\r", "\n"))
+    body = strip_code_fence(clean_text(text or ""))
     lines = []
     for line in body.split("\n"):
-        line = CONTROL_CHARS.sub("", line).rstrip().replace("**", "")
+        line = line.rstrip().replace("**", "")
         stripped = line.strip()
         known = _DESCRIPTION_HEADING_RE.match(stripped)
         heading = re.match(r"^#{1,6}\s*(.+)$", stripped)
@@ -9145,16 +9170,13 @@ def _messages(sample, guidelines, material_text, instruction):
         "",
         instruction,
     ])
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": content},
-    ]
+    return chat_messages(SYSTEM_PROMPT, content)
 
 
 def _clean_ai_reply(text):
     """AIの応答を整える(改行の統一・コードブロック記号の除去・前後の空白除去)。"""
     lines = []
-    for line in (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+    for line in clean_text(text or "").split("\n"):
         if line.strip().startswith("```"):
             continue
         lines.append(line.rstrip())
@@ -9645,8 +9667,7 @@ def _render_weekly(settings):
         upcoming_period=upcoming_period,
         run_from=run_from,
         run_to=run_to,
-        ai_enabled=ai_is_configured(),
-        ai_status=ai_status_label(),
+        **ai_context(),
         **mail_feature_context(WEEKLY_JOB, settings, upcoming)
     )
 
@@ -10637,12 +10658,8 @@ def build_messages(skill, level, count, avoid=()):
         '"answer_index": 0, "explanation": "解説"}]',
         "answer_index は正解の選択肢の位置（0〜3の整数）。",
     ]
-    return [
-        {"role": "system",
-         "content": ("あなたは、技術スキルの理解度を確認するための4択問題を作る出題者です。"
-                     "指示された条件を守り、JSONの配列だけを出力してください。")},
-        {"role": "user", "content": "\n".join(lines)},
-    ]
+    return chat_messages("あなたは、技術スキルの理解度を確認するための4択問題を作る出題者です。"
+                         "指示された条件を守り、JSONの配列だけを出力してください。", "\n".join(lines))
 
 
 def _is_item_list(value):
@@ -10673,10 +10690,10 @@ def _extract_json_array(text):
 
 
 def _clean_question_text(value):
-    """制御文字(改行・タブ以外。2-2 の CONTROL_CHARS)と前後の空白を除いた文字列(文字列でなければ None)。"""
+    """制御文字(改行・タブ以外。2-2 の clean_text)と前後の空白を除いた文字列(文字列でなければ None)。"""
     if not isinstance(value, str):
         return None
-    return CONTROL_CHARS.sub("", value.replace("\r\n", "\n").replace("\r", "\n")).strip()
+    return clean_text(value).strip()
 
 
 def validate_item(item):
@@ -12034,8 +12051,7 @@ def admin_pool():
         last=settings["last_result"],
         running=is_topup_running(),
         running_name=running_skill_name(),
-        ai_enabled=ai_is_configured(),
-        ai_status=ai_status_label(),
+        **ai_context(),
         scale=_tech_scale(),
     )
 
@@ -14124,7 +14140,7 @@ def _note_suffix(count):
 def person_numbers_text(data, user_id):
     """1人分の【数値】(すべてアプリが計算した値)。"""
     def find(rows, key="user_id"):
-        return next((r for r in rows if r[key] == user_id), None)
+        return _row_by(rows, user_id, key)
 
     period = data["period"]
     ab = find(data["abilities"]["rows"])
@@ -14331,18 +14347,19 @@ FINDINGS_RULES = ("findings: {}の所見。strengths（強み）・concerns（�
                   "それぞれ3件まで。【数値】と材料の事実に基づいて書き、順位・点数・ほかの人との比較は書かない。")
 
 
-def _analysis_messages(user_text):
-    return [{"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
-            {"role": "user", "content": user_text}]
+def _analysis_request(kind, request, output_format, material):
+    """AI分析の依頼(■種類・■依頼・■出力形式〔JSON オブジェクトだけ〕と、その下の材料の行。5種類の呼び出しで共通の並び)。"""
+    lines = ["■種類: {}".format(kind), "■依頼"] + list(request)
+    lines += ["", "■出力形式（JSONオブジェクトだけ）", output_format, ""] + list(material)
+    return chat_messages(ANALYSIS_SYSTEM_PROMPT, "\n".join(lines))
 
 
 def person_chunk_messages(data, group, chunk, index, count, items, with_findings, carry=None):
     """各人(または担当者なし)の材料1回分の依頼。戻り値: (messages, 材料の部分の文〔数値の確認に使う〕)。"""
     is_person = group["key"] != ANALYSIS_GROUP_OTHER
     who = group["label"]
+    kind = "{}（{} {}/{}）".format(AI_KIND_PERSON, who, index, count)
     lines = [
-        "■種類: {}（{} {}/{}）".format(AI_KIND_PERSON, who, index, count),
-        "■依頼",
         "【材料】は、{}に関係するタスクの全文です（タイトル・説明・状態の変更・すべてのコメント・成果）{}。".format(
             who, "。数回に分けて送っているうちの{}回目".format(index) if count > 1 else ""),
         "材料を読み、【判定する項目】について、下の「出力形式」のJSONを返してください。",
@@ -14381,10 +14398,8 @@ def person_chunk_messages(data, group, chunk, index, count, items, with_findings
         extra += ', "memos": [{"id": "C345", "memo": "経過メモ"}]'
     if items["memo_facts"]:
         extra += ', "facts": [{"task": "T5", "facts": "成果の事実メモ"}]'
-    lines += [
-        REWRITE_RULES,
-        "",
-        "■出力形式（JSONオブジェクトだけ）",
+    lines.append(REWRITE_RULES)
+    output_format = (
         '{"issues": [{"task": "T12", "kind": "課題か相談", "text": "課題・相談の内容", "source": "C345"}], '
         '"manager_comments": [{"id": "C345", "request": "求めたこと", "needs_response": true, '
         '"judgement": "対応済み・一部対応・未対応のどれか（返信なしは空）", "remaining": "残っている対応", '
@@ -14392,9 +14407,7 @@ def person_chunk_messages(data, group, chunk, index, count, items, with_findings
         '"outcomes": [{"task": "T5", "vague": true, "reason": "理由", '
         '"suggestion": {"quant_actual": "", "quant_note": "", "qual_actual": ""}}], '
         '"progress": [{"id": "C346", "reason": "理由", "suggestion": "書き直し案"}], '
-        '"notes": ["特徴"]' + (", " + FINDINGS_FORMAT if with_findings else "") + extra + "}",
-        "",
-    ]
+        '"notes": ["特徴"]' + (", " + FINDINGS_FORMAT if with_findings else "") + extra + "}")
     material = []
     if is_person:
         material += [person_numbers_text(data, group["key"]), ""]
@@ -14406,7 +14419,7 @@ def person_chunk_messages(data, group, chunk, index, count, items, with_findings
         material += ["", carried]
     material += ["", "【材料】", chunk["text"] or "（関係するタスクはありません）"]
     text = "\n".join(material)
-    return _analysis_messages("\n".join(lines) + "\n" + text), text
+    return _analysis_request(kind, lines, output_format, [text]), text
 
 
 def _interleave(lists):
@@ -14427,15 +14440,9 @@ def findings_messages(data, group, notes, judged, budget, has_tasks=True, unread
     has_tasks : 関係するタスクがあるか(無いときだけ「記載はありません」と書く)
     unread_note: 読み込めなかった回があるときの説明(材料に書く)
     """
-    lines = [
-        "■種類: {}（{}）".format(AI_KIND_FINDINGS, group["label"]),
-        "■依頼",
+    request = [
         "{}について、【数値】と【材料から分かったこと】（材料を読んだ結果）をもとに findings を返してください。".format(group["label"]),
         FINDINGS_RULES.format(group["label"]),
-        "",
-        "■出力形式（JSONオブジェクトだけ）",
-        "{" + FINDINGS_FORMAT + "}",
-        "",
     ]
     material = [person_numbers_text(data, group["key"]), "", "【材料から分かったこと】"]
     if unread_note:
@@ -14461,7 +14468,8 @@ def findings_messages(data, group, notes, judged, budget, has_tasks=True, unread
         material.append("・（ほかに{}件。1回に送る文字数の上限のため省きました。各回の材料はすべて読み、課題・判定は反映済みです）".format(
             len(notes) - len(shown)))
     text = "\n".join(material + tail)
-    return _analysis_messages("\n".join(lines) + "\n" + text), text
+    return _analysis_request("{}（{}）".format(AI_KIND_FINDINGS, group["label"]), request, "{" + FINDINGS_FORMAT + "}",
+                             [text]), text
 
 
 def skills_units(data):
@@ -14537,21 +14545,12 @@ def skills_units(data):
 
 
 def skills_messages(chunk, index, count):
-    lines = [
-        "■種類: {}（{}/{}）".format(AI_KIND_SKILLS, index, count),
-        "■依頼",
+    return _analysis_request("{}（{}/{}）".format(AI_KIND_SKILLS, index, count), [
         "【材料】はチームのスキルの状況（偏り・メンバーごとの保有スキル・期間内のスキルテストの受験の内容）です{}。".format(
             "。数回に分けて送っているうちの{}回目".format(index) if count > 1 else ""),
         "マネージャー向けに、summary（スキル状況のまとめ）・tests（スキルテストの受け方・結果で気になること、良いこと）・"
         "bias（スキルの偏り・育成の優先順位）をそれぞれ3件まで書いてください。",
-        "",
-        "■出力形式（JSONオブジェクトだけ）",
-        '{"summary": ["まとめ"], "tests": ["テストについて"], "bias": ["偏りについて"]}',
-        "",
-        "【材料】",
-        chunk["text"],
-    ]
-    return _analysis_messages("\n".join(lines))
+    ], '{"summary": ["まとめ"], "tests": ["テストについて"], "bias": ["偏りについて"]}', ["【材料】", chunk["text"]])
 
 
 # チームのまとめの材料のうち、アプリが計算した数値だけの部分(利用者の本文・AI の文・候補の日付が無い。
@@ -14701,30 +14700,20 @@ def _target_text(target):
 
 def team_digest_messages(chunk, index, count, round_no=1):
     """チームのまとめの材料が長いときに、詳細な一覧を先に要約する依頼。"""
-    lines = [
-        "■種類: {}（{}{}/{}）".format(AI_KIND_TEAM_DIGEST, "要点の再要約 " if round_no > 1 else "", index, count),
-        "■依頼",
+    kind = "{}（{}{}/{}）".format(AI_KIND_TEAM_DIGEST, "要点の再要約 " if round_no > 1 else "", index, count)
+    return _analysis_request(kind, [
         "【材料】は、チームのまとめに使う詳細な一覧（要フォローのコメント・課題・保留のタスク・各人の数値と所見など{}）です。"
         "長いため{}回に分けて送っているうちの{}回目です。".format(
             "を前の回で要約した要点" if round_no > 1 else "", count, index),
         "チームのまとめ（progress: ① タスクの進捗、skills: ② スキル状況、outputs: ③ 成果物の状況、abilities: ④ 各人の能力）に"
         "使う要点を、それぞれ{}件まで書いてください。急ぐもの・影響の大きいもの（期限超過・長い経過・未対応・偏りなど）を優先し、"
         "対象のID（T12・P3 など）と数値は【材料】のとおりに書く。".format(TEAM_DIGEST_POINTS),
-        "",
-        "■出力形式（JSONオブジェクトだけ）",
-        '{"progress": ["要点"], "skills": ["要点"], "outputs": ["要点"], "abilities": ["要点"]}',
-        "",
-        "【材料】",
-        chunk["text"],
-    ]
-    return _analysis_messages("\n".join(lines))
+    ], '{"progress": ["要点"], "skills": ["要点"], "outputs": ["要点"], "abilities": ["要点"]}', ["【材料】", chunk["text"]])
 
 
 def team_messages(material_lines):
     """チームのまとめと推奨アクションの依頼(material_lines は材料の行)。"""
-    lines = [
-        "■種類: {}".format(AI_KIND_TEAM),
-        "■依頼",
+    return _analysis_request(AI_KIND_TEAM, [
         "【材料】は、チームの状況をアプリが集計した数値と、各人の材料を読んだ結果（AIの所見・判定）です。",
         "1. summary: ①〜④ のそれぞれについて、マネージャー向けのまとめを3件まで書く"
         "（progress: ① タスクの進捗、skills: ② スキル状況、outputs: ③ 成果物の状況、abilities: ④ 各人の能力）。",
@@ -14732,14 +14721,9 @@ def team_messages(material_lines):
         "（A1 など）を書く。候補に無いことを加えるときは ref を空にし、target に対象のID（T12・P3・S5・O2 のどれか）を書く。"
         "title（やること）・reason（理由）・numbers（根拠の数値。【材料】に書かれた数値をそのまま使う）を書く。".format(
             ACTION_MIN, ACTION_MAX),
-        "",
-        "■出力形式（JSONオブジェクトだけ）",
-        '{"summary": {"progress": ["まとめ"], "skills": ["まとめ"], "outputs": ["まとめ"], "abilities": ["まとめ"]}, '
-        '"actions": [{"ref": "A1", "target": "", "title": "やること", "reason": "理由", "numbers": ["根拠の数値"]}]}',
-        "",
-        "【材料】",
-    ] + list(material_lines)
-    return _analysis_messages("\n".join(lines))
+    ], '{"summary": {"progress": ["まとめ"], "skills": ["まとめ"], "outputs": ["まとめ"], "abilities": ["まとめ"]}, '
+       '"actions": [{"ref": "A1", "target": "", "title": "やること", "reason": "理由", "numbers": ["根拠の数値"]}]}',
+       ["【材料】"] + list(material_lines))
 
 
 # =============================================================================
@@ -14814,6 +14798,11 @@ def _norm_number(text):
     return whole + ("." + frac if frac else "")
 
 
+def _norm_numbers(text):
+    """text にある数値(_NUMBER)を、表記をそろえた形(_norm_number)で順に並べた一覧。"""
+    return [_norm_number(m) for m in _NUMBER.findall(text)]
+
+
 def _date_token(match):
     """_NUMBER_TOKEN の一致の種類。("id",) / ("ymd", 年, 月, 日) / ("ym", 年, 月) / ("md", 月, 日) / ("mo", 月) /
     ("y", 年) / ("hm", 時, 分)。数値(または日付・時刻として正しくないもの)は None。"""
@@ -14882,7 +14871,7 @@ class AllowedNumbers:
         for index, (match, token) in enumerate(items):
             if token is None:
                 if quantities:
-                    self.quantities.update(_norm_number(m) for m in _NUMBER.findall(match.group(0)))
+                    self.quantities.update(_norm_numbers(match.group(0)))
                 continue
             kind = token[0]
             if (quantities and (kind == "hm" or (kind in ("md", "ym") and _SLASH.search(match.group(0))))
@@ -14893,7 +14882,7 @@ class AllowedNumbers:
                 key = _fraction_key(match)
                 if written is None or key in written:
                     self.fractions.add(key)
-                    self.quantities.update(_norm_number(m) for m in _NUMBER.findall(match.group(0)))
+                    self.quantities.update(_norm_numbers(match.group(0)))
             if kind == "ymd":
                 _k, y, mo, d = token
                 self.dates.add((y, mo, d))
@@ -14942,8 +14931,7 @@ class AllowedNumbers:
 
 def _fraction_key(match):
     """「/」「:」で区切った2つの数の字句(12/20・１２／２０・1:30 など)を比べる形にする。(区切り, 数値, …)"""
-    return ("/" if _SLASH.search(match.group(0)) else ":",) + tuple(
-        _norm_number(m) for m in _NUMBER.findall(match.group(0)))
+    return ("/" if _SLASH.search(match.group(0)) else ":",) + tuple(_norm_numbers(match.group(0)))
 
 
 def _in_stamp(text, items, index):
@@ -14986,8 +14974,7 @@ def mask_numbers(text, allowed):
             return plain(match.group(0))
         if allowed.allows(token):
             return match.group(0)
-        if _SLASH.search(match.group(0)) and all(
-                _norm_number(n) in allowed.quantities for n in _NUMBER.findall(match.group(0))):
+        if _SLASH.search(match.group(0)) and all(n in allowed.quantities for n in _norm_numbers(match.group(0))):
             return match.group(0)   # 分数(3/5 ページなど)。数値がすべて材料にある
         count[0] += 1
         return _NUMBER.sub("◯", match.group(0))
@@ -14999,15 +14986,19 @@ def _ai_text(value, limit=AI_TEXT_MAX):
     """AI の応答の文(文字列だけ)。制御文字を除き、長ければ切る。"""
     if not isinstance(value, str):
         return ""
-    text = CONTROL_CHARS.sub("", value.replace("\r\n", "\n").replace("\r", "\n"))
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    text = re.sub(r"\n{3,}", "\n\n", clean_text(value)).strip()
     if len(text) > limit:
         text = text[:limit - 1].rstrip() + "…"
     return text
 
 
 def _ai_dicts(value):
-    return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
+    return [v for v in _list_or_empty(value) if isinstance(v, dict)]
+
+
+def _id_text(value):
+    """AI が書いた ID・参照(「t12」「Ａ１」など)を比べる形にする(NFKC で全角→半角・前後の空白を除く・大文字)。"""
+    return unicodedata.normalize("NFKC", str(value or "")).strip().upper()
 
 
 def parse_ref(value, prefix):
@@ -15016,9 +15007,24 @@ def parse_ref(value, prefix):
         return None
     if isinstance(value, int):
         return value
-    text = unicodedata.normalize("NFKC", str(value or "")).strip().upper()
-    match = re.fullmatch(re.escape(prefix) + r"?\s*(\d+)", text)
+    match = re.fullmatch(re.escape(prefix) + r"?\s*(\d+)", _id_text(value))
     return int(match.group(1)) if match else None
+
+
+def _asked_items(parsed, name, field, prefix, asked):
+    """応答(parsed)の name の配列のうち、field の ID(prefix 付き。parse_ref)がこの回に判定を頼んだ項目 asked にある
+    辞書を (ID, 辞書) の順に返す(頼んでいない項目・読めない ID の判定は捨てる)。"""
+    asked = set(asked)
+    for raw in _ai_dicts(parsed.get(name)):
+        ref = parse_ref(raw.get(field), prefix)
+        if ref in asked:
+            yield ref, raw
+
+
+def _pairs_texts(pairs):
+    """{キー: [(文, ◯にした数)]} を保存する形 ({キー: [文]}, ◯にした数の合計) にする(所見・スキル状況・チームのまとめ)。"""
+    return ({key: [text for text, _n in items] for key, items in pairs.items()},
+            sum(n for items in pairs.values() for _text, n in items))
 
 
 # =============================================================================
@@ -15125,12 +15131,16 @@ class AnalysisRun:
         }
 
     # ------------------------------------------------------------------ 共通
-    def call(self, label, messages):
-        """AI を1回呼ぶ。戻り値: (応答の JSON オブジェクト または None, エラー)。"""
+    def call(self, label, messages, task_ids=(), comment_ids=()):
+        """AI を1回呼ぶ。戻り値: 応答の JSON オブジェクト(呼び出しが失敗した・JSON として読めないときは None)。
+
+        失敗したときは、この呼び出しで送った task_ids・comment_ids とともに「未読込」(unread)に残す。
+        """
         self.progress(self.done, self.total, label)
         if self.aborted:
             self.done += 1
-            return None, self.aborted
+            self.unread(label, self.aborted, task_ids, comment_ids)
+            return None
         text, error = ai_chat(messages)
         parsed = None
         if error is None:
@@ -15152,10 +15162,11 @@ class AnalysisRun:
             self.failures += 1
             if self.failures >= ANALYSIS_MAX_FAILURES:
                 self.aborted = "AIの呼び出しが{}回続けて失敗したため、残りを中止しました。".format(ANALYSIS_MAX_FAILURES)
-            return None, error
+            self.unread(label, error, task_ids, comment_ids)
+            return None
         self.failures = 0
         self.result["calls"]["ok"] += 1
-        return parsed, None
+        return parsed
 
     def unread(self, label, reason, task_ids=(), comment_ids=()):
         """読めなかった材料を「未読込」として残す(コメントの数は ID で数える。同じコメントは1件)。
@@ -15303,7 +15314,7 @@ class AnalysisRun:
             messages, material = person_chunk_messages(self.data, group, chunk, index, len(chunks), items,
                                                        with_findings, carry)
             label = "{}の材料（{}/{}）".format(group["label"], index, len(chunks))
-            parsed, error = self.call(label, messages)
+            parsed = self.call(label, messages, chunk["keys"], chunk["comment_ids"])
             for task_id in chunk["split"]:
                 state = carry.setdefault(task_id, {"seen": set(), "memos": {}, "facts": "", "pieces": 0,
                                                    "failed": False, "failed_comments": set()})
@@ -15313,7 +15324,6 @@ class AnalysisRun:
                     state["failed"] = True
                     state["failed_comments"] |= chunk["comment_ids"]
             if parsed is None:
-                self.unread(label, error, chunk["keys"], chunk["comment_ids"])
                 failed.append((index, list(chunk["keys"])))
                 # この回で判定する(またはこの回が失敗すると判定できなくなる)項目: この人が持ち主のタスクと、
                 # この人の進捗記載(分けて送る記載の前の部分を含む)
@@ -15355,17 +15365,15 @@ class AnalysisRun:
             messages, material = findings_messages(self.data, group, notes, judged,
                                                    self.data["settings"]["chunk_chars"],
                                                    has_tasks=bool(chunks), unread_note=unread_note)
-            parsed, error = self.call(label, messages)
-            if parsed is None:
-                self.unread(label, error)
-            else:
+            parsed = self.call(label, messages)
+            if parsed is not None:
                 # 材料は【数値】と、各回の材料を AI が読んだ結果(分かったこと)。「/」「:」の2つの数は、この人の
                 # タスクの本文と【数値】・判定の件数にあるものだけを数量としても認める(AI の文の日付を数量にしない)
                 allowed = AllowedNumbers(material, written=self.written(
                     group["task_ids"], person_numbers_text(self.data, group["key"]), *judged))
                 findings, findings_masked = self.take_findings(parsed.get("findings"), allowed)
         self.masks[("findings", group["key"])] = findings_masked if findings else 0
-        member = next((m for m in self.data["members"] if m["id"] == group["key"]), {})
+        member = _row_by(self.data["members"], group["key"], default={})
         self.result["persons"][str(group["key"])] = dict(
             {"notes": notes[:AI_LIST_MAX * 2], "findings": findings, "unread_parts": len(failed)},
             **person_identity(member.get("username")))
@@ -15406,11 +15414,9 @@ class AnalysisRun:
         """所見。戻り値: (所見 または None, ◯にした数)。"""
         if not isinstance(value, dict):
             return None, 0
-        pairs = {key: self.line_pairs(value.get(key), allowed, 3) for key, _label in FINDING_KEYS}
-        findings = {key: [text for text, _n in items] for key, items in pairs.items()}
-        if not any(findings.values()):
-            return None, 0
-        return findings, sum(n for items in pairs.values() for _text, n in items)
+        findings, masked = _pairs_texts(
+            {key: self.line_pairs(value.get(key), allowed, 3) for key, _label in FINDING_KEYS})
+        return (findings, masked) if any(findings.values()) else (None, 0)
 
     def take_chunk(self, parsed, items):
         """1回分の応答から、判定を頼んだ項目の結果を取り出す(数値はそのタスクの材料にあるものだけ)。
@@ -15419,12 +15425,8 @@ class AnalysisRun:
         """
         tasks = self.data["tasks"]
         result = self.result
-        issue_tasks = set(items["issues"])
         seen = {(i["task_id"], i["text"]) for i in result["issues"]}
-        for raw in _ai_dicts(parsed.get("issues")):
-            task_id = parse_ref(raw.get("task"), "T")
-            if task_id not in issue_tasks:
-                continue
+        for task_id, raw in _asked_items(parsed, "issues", "task", "T", items["issues"]):
             text, masked = self.masked(raw.get("text"), self.task_numbers.get(task_id))
             if not text or (task_id, text) in seen:
                 continue
@@ -15439,10 +15441,8 @@ class AnalysisRun:
                                      "tid": task_identity(tasks[task_id])})
 
         mc_items = {i["comment_id"]: i for i in items["mc"]}
-        for raw in _ai_dicts(parsed.get("manager_comments")):
-            item = mc_items.get(parse_ref(raw.get("id"), "C"))
-            if item is None:
-                continue
+        for cid, raw in _asked_items(parsed, "manager_comments", "id", "C", mc_items):
+            item = mc_items[cid]
             allowed = self.task_numbers.get(item["task_id"])
             judgement = raw.get("judgement") if item["replied"] else None
             if judgement not in MC_AI_JUDGEMENTS:
@@ -15463,11 +15463,7 @@ class AnalysisRun:
             }, **comment_identity(tasks[item["task_id"]], item["comment_id"]))
 
         rows = {r["task_id"]: r for r in self.data["outputs"]["tasks"]}
-        outcome_tasks = set(items["outcomes"])
-        for raw in _ai_dicts(parsed.get("outcomes")):
-            task_id = parse_ref(raw.get("task"), "T")
-            if task_id not in outcome_tasks:
-                continue
+        for task_id, raw in _asked_items(parsed, "outcomes", "task", "T", items["outcomes"]):
             allowed = self.task_numbers.get(task_id)
             vague = raw.get("vague") is True
             suggestion, n1 = "", 0
@@ -15480,11 +15476,7 @@ class AnalysisRun:
                                                 "suggestion": suggestion, "fp": outcome_fingerprint(tasks[task_id])}
 
         rule_progress = {i["comment_id"] for i in self.data["abilities"]["progress_rewrite"]}
-        progress_ids = set(items["progress"])
-        for raw in _ai_dicts(parsed.get("progress")):
-            cid = parse_ref(raw.get("id"), "C")
-            if cid not in progress_ids:
-                continue
+        for cid, raw in _asked_items(parsed, "progress", "id", "C", items["progress"]):
             task_id = self.comment_task.get(cid)
             allowed = self.task_numbers.get(task_id)
             reason, n1 = self.masked(raw.get("reason"), allowed)
@@ -15500,18 +15492,12 @@ class AnalysisRun:
     def take_memos(self, parsed, items, carry):
         """分けて送っているタスクの経過メモ・成果の事実メモを、次の回に渡すために残す(画面には出さない)。"""
         memo_items = {i["comment_id"]: i for i in items["memo_mc"]}
-        for raw in _ai_dicts(parsed.get("memos")):
-            item = memo_items.get(parse_ref(raw.get("id"), "C"))
-            if item is None:
-                continue
+        for cid, raw in _asked_items(parsed, "memos", "id", "C", memo_items):
+            item = memo_items[cid]
             text = self.clean(raw.get("memo"), self.task_numbers.get(item["task_id"]), AI_MEMO_MAX)
             if text:
                 carry[item["task_id"]]["memos"][item["comment_id"]] = text
-        fact_tasks = set(items["memo_facts"])
-        for raw in _ai_dicts(parsed.get("facts")):
-            task_id = parse_ref(raw.get("task"), "T")
-            if task_id not in fact_tasks:
-                continue
+        for task_id, raw in _asked_items(parsed, "facts", "task", "T", items["memo_facts"]):
             text = self.clean(raw.get("facts"), self.task_numbers.get(task_id), AI_MEMO_MAX)
             if text:
                 carry[task_id]["facts"] = text
@@ -15536,9 +15522,8 @@ class AnalysisRun:
         for index, chunk in enumerate(chunks, 1):
             messages = skills_messages(chunk, index, len(chunks))
             label = "スキル状況の材料（{}/{}）".format(index, len(chunks))
-            parsed, error = self.call(label, messages)
+            parsed = self.call(label, messages)
             if parsed is None:
-                self.unread(label, error)
                 continue
             ok = True
             allowed = AllowedNumbers(chunk["text"])
@@ -15547,9 +15532,8 @@ class AnalysisRun:
                     if text not in [t for t, _n in merged[key]]:
                         merged[key].append((text, n))
         if ok:
-            kept = {key: values[:AI_LIST_MAX] for key, values in merged.items()}
-            self.masks[("skills",)] = sum(n for values in kept.values() for _text, n in values)
-            self.result["skills"] = {key: [text for text, _n in values] for key, values in kept.items()}
+            self.result["skills"], self.masks[("skills",)] = _pairs_texts(
+                {key: values[:AI_LIST_MAX] for key, values in merged.items()})
 
     def run_team(self):
         data = self.data
@@ -15570,17 +15554,16 @@ class AnalysisRun:
             material, shown = self.team_digest(merged, sections, ranked, budget, written)
         candidates = [("A{}".format(i), c) for i, c in enumerate(shown, 1)]
         messages = team_messages(material)
-        parsed, error = self.call("チームのまとめと推奨アクション", messages)
+        parsed = self.call("チームのまとめと推奨アクション", messages)
         fallback = rule_actions(merged)
         if parsed is None:
-            self.unread("チームのまとめと推奨アクション", error)
             self.result["actions"] = _jsonable_actions(fallback)
             return
         allowed = AllowedNumbers("\n".join(material), written=written)
-        summary = parsed.get("summary") if isinstance(parsed.get("summary"), dict) else {}
-        pairs = {key: self.line_pairs(summary.get(key), allowed, 3) for key, _label in SUMMARY_KEYS}
-        self.masks[("team",)] = sum(n for items in pairs.values() for _text, n in items)
-        self.result["team"] = {"summary": {key: [text for text, _n in items] for key, items in pairs.items()}}
+        summary = _dict_or_empty(parsed.get("summary"))
+        texts, self.masks[("team",)] = _pairs_texts(
+            {key: self.line_pairs(summary.get(key), allowed, 3) for key, _label in SUMMARY_KEYS})
+        self.result["team"] = {"summary": texts}
         actions, masked = self.take_actions(parsed.get("actions"), dict(candidates), merged, allowed, fallback)
         if actions:
             self.masks[("actions",)] = masked
@@ -15635,9 +15618,8 @@ class AnalysisRun:
             failed_keys = set()
             for index, chunk in enumerate(chunks, 1):
                 label = "チームの材料の要約（{}{}/{}）".format("要点の再要約 " if round_no > 1 else "", index, len(chunks))
-                parsed, error = self.call(label, team_digest_messages(chunk, index, len(chunks), round_no))
+                parsed = self.call(label, team_digest_messages(chunk, index, len(chunks), round_no))
                 if parsed is None:
-                    self.unread(label, error)
                     failed_keys.update(chunk["keys"])
                     continue
                 allowed = AllowedNumbers(chunk["text"], written=written)
@@ -15685,7 +15667,7 @@ class AnalysisRun:
         for raw in _ai_dicts(value):
             if len(out) >= ACTION_MAX:
                 break
-            ref = unicodedata.normalize("NFKC", str(raw.get("ref") or "")).strip().upper()
+            ref = _id_text(raw.get("ref"))
             cand = candidates.get(ref)
             target = cand["target"] if cand else _parse_target(raw.get("target"), merged)
             if target is None:
@@ -15696,7 +15678,7 @@ class AnalysisRun:
             if not title:
                 continue
             numbers = []
-            for v in raw.get("numbers") if isinstance(raw.get("numbers"), list) else []:
+            for v in _list_or_empty(raw.get("numbers")):
                 # 材料に無い数値を含む行は使わない
                 n = _ai_text(v, 120)
                 if n and allowed.covers(n) and n not in numbers:
@@ -15746,7 +15728,7 @@ def _identified_target(target, data):
         t = data["tasks"][target["id"]]
         return dict(target, tid=task_identity(t), fp=action_fingerprint(t))
     if target.get("kind") == "person":
-        member = next((m for m in data["members"] if m["id"] == target.get("id")), None)
+        member = _row_by(data["members"], target.get("id"))
         if member is not None:
             return dict(target, username=member.get("username") or "")
     return target
@@ -15760,7 +15742,7 @@ def _jsonable_actions(actions):
 
 def _parse_target(value, data):
     """AI が書いた対象の ID(T12・P3・S5・O2)を、推奨アクションの対象にする。実在しなければ None。"""
-    text = unicodedata.normalize("NFKC", str(value or "")).strip().upper()
+    text = _id_text(value)
     match = re.fullmatch(r"([TPSO])\s*(\d+)", text)
     if not match:
         return None
@@ -15769,13 +15751,13 @@ def _parse_target(value, data):
         t = data["tasks"].get(number)
         return {"kind": "task", "id": number, "label": t["title"]} if t else None
     if kind == "P":
-        m = next((m for m in data["members"] if m["id"] == number), None)
+        m = _row_by(data["members"], number)
         return {"kind": "person", "id": number, "label": m["name"]} if m else None
     if kind == "S":
-        s = next((s for s in data["skills"]["skills"] if s["skill_id"] == number), None)
+        s = _row_by(data["skills"]["skills"], number, "skill_id")
         return ({"kind": "skill", "id": number, "label": s["name"], "skill_type": s["skill_type"]}
                 if s else None)
-    op = next((o for o in data["skills"]["operations"] if o["operation_id"] == number), None)
+    op = _row_by(data["skills"]["operations"], number, "operation_id")
     return {"kind": "operation", "id": number, "label": op["name"]} if op else None
 
 
@@ -15791,14 +15773,14 @@ def _target_numbers(target, data):
             numbers.append("期限 {}".format(_analysis_date(t["due_date"], data)))
         return numbers
     if kind == "person":
-        row = next((r for r in data["abilities"]["rows"] if r["user_id"] == target_id), None)
+        row = _row_by(data["abilities"]["rows"], target_id, "user_id")
         return (["進行中 {}件".format(row["doing"]), "未完了 {}件".format(row["task_open"]),
                  "負荷 {}h/月".format(row["load_h"])] if row else [])
     if kind == "skill":
-        s = next((s for s in data["skills"]["skills"] if s["skill_id"] == target_id), None)
+        s = _row_by(data["skills"]["skills"], target_id, "skill_id")
         return ["保有者 {}名".format(s["holder_count"])] if s else []
     if kind == "operation":
-        op = next((o for o in data["skills"]["operations"] if o["operation_id"] == target_id), None)
+        op = _row_by(data["skills"]["operations"], target_id, "operation_id")
         return ["対応できる人 {}名".format(op["capable_count"])] if op else []
     return []
 
@@ -15967,7 +15949,7 @@ def outcome_fingerprint(t):
 
 def comment_fingerprint(t, comment_id):
     """進捗記載(1件のコメント)の本文の指紋。"""
-    c = next((c for c in t["comments"] if c["id"] == comment_id), None)
+    c = _row_by(t["comments"], comment_id)
     return _fingerprint(c["body"]) if c else None
 
 
@@ -15986,7 +15968,7 @@ def comment_identity(t, comment_id):
     タスクを削除するとそのコメントの ID は次に書かれたコメント(別のタスクのものでも)に再利用されるため、
     ID と本文の指紋だけでは、同じ本文(「対応中」など)の別のコメントと取り違える。
     """
-    c = next((c for c in t["comments"] if c["id"] == comment_id), None)
+    c = _row_by(t["comments"], comment_id)
     return {"tid": task_identity(t), "at": _at_text(c["at"]) if c else ""}
 
 
@@ -16062,7 +16044,7 @@ def _changed(stored_fp, current_fp):
 
 def _str_list(value):
     """保存した結果の箇条書き(文字列のリスト)。リストでなければ空、文字列でない要素は除く。"""
-    return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+    return [v for v in _list_or_empty(value) if isinstance(v, str)]
 
 
 def _str_lists(value, keys):
@@ -16090,7 +16072,7 @@ def _result_ids(values):
 def _comment_view(task, comment_id):
     if comment_id is None:
         return None
-    c = next((c for c in task["comments"] if c["id"] == comment_id), None)
+    c = _row_by(task["comments"], comment_id)
     return {"id": c["id"], "at": c["at"], "author": c["author"]} if c else None
 
 
@@ -16142,8 +16124,8 @@ def recount_manager_comments(data):
 def apply_ai_result(data, stored):
     """保存した AI の結果 stored を集計結果 data に反映する(data を書き換える)。"""
     tasks = data["tasks"]
-    stored_unread = stored.get("unread") if isinstance(stored.get("unread"), dict) else {}
-    stored_read = stored.get("read") if isinstance(stored.get("read"), dict) else {}
+    stored_unread = _dict_or_empty(stored.get("unread"))
+    stored_read = _dict_or_empty(stored.get("read"))
     unread = _result_ids(stored_unread.get("task_ids"))
     read = _result_ids(stored_read.get("task_ids"))
     # 項目ごとの「未読込」(この版から保存する。以前の版の結果はタスクごとに判断する)
@@ -16186,8 +16168,7 @@ def apply_ai_result(data, stored):
         return AI_STATE_NEW
 
     def entries(name):
-        value = stored.get(name)
-        return value if isinstance(value, dict) else {}
+        return _dict_or_empty(stored.get(name))
 
     data["ai_applied"] = True
     # ① 課題・相談(AI が抜き出したもの。分析の後にタスクの材料が変わったものは changed の印を付けて残す。
@@ -16215,7 +16196,7 @@ def apply_ai_result(data, stored):
         ai = ai if isinstance(ai, dict) else None
         if ai is not None:
             t = tasks[item["task_id"]]
-            c = next((c for c in t["comments"] if c["id"] == item["comment_id"]), None)
+            c = _row_by(t["comments"], item["comment_id"])
             if c is None or not same_comment(ai, t, c, generated_at, exact):
                 ai = None  # 同じIDの別のコメント(削除したタスクのコメントのIDが再利用された)
         changed = False
@@ -16307,8 +16288,7 @@ def apply_ai_result(data, stored):
     for row in ab["rows"]:
         row["progress_vague"] = sum(1 for i in ab["progress_rewrite"] if i["user_id"] == row["user_id"])
         row["outcome_rewrite"] = out_rows.get(row["user_id"], {}).get("rewrite", row["outcome_rewrite"])
-        person = persons.get(str(row["user_id"]))
-        person = person if isinstance(person, dict) else {}
+        person = _dict_or_empty(persons.get(str(row["user_id"])))
         row["ai_state"] = None
         if person.get("username") and person["username"] != usernames.get(row["user_id"]):
             # 分析した後にその人が削除され、同じIDで別の人が追加された: 前の人の所見は出さない
@@ -16328,11 +16308,10 @@ def apply_ai_result(data, stored):
 
     # ② スキル・まとめ・推奨アクション(画面で箇条書きにする値は文字列のリストに整える)
     data["skills"]["ai"] = _str_lists(stored.get("skills"), SKILLS_AI_KEYS)
-    team = stored.get("team") if isinstance(stored.get("team"), dict) else {}
+    team = _dict_or_empty(stored.get("team"))
     data["ai_summary"] = _str_lists(team.get("summary"), SUMMARY_KEYS)
-    actions = stored.get("actions") if isinstance(stored.get("actions"), list) else []
     data["ai_actions"] = ([_checked_action(dict(a, numbers=_str_list(a.get("numbers"))), data)
-                           for a in actions if isinstance(a, dict)]
+                           for a in _ai_dicts(stored.get("actions"))]
                           if stored.get("actions_source") == "ai" else None)
     # ルールの推奨アクションも AI の判定を反映した集計から選び直す
     data["actions"] = rule_actions(data)
@@ -16359,7 +16338,7 @@ def _checked_action(action, data):
         elif _changed(target.get("fp"), action_fingerprint(t)):
             stale = AI_STATE_CHANGED
     elif kind == "person":
-        member = next((m for m in data["members"] if m["id"] == target_id), None)
+        member = _row_by(data["members"], target_id)
         if member is None:
             stale = "対象のメンバーは分析の対象外です"
         elif target.get("username") and target["username"] != member.get("username"):
@@ -16393,11 +16372,11 @@ _ANALYSIS_PERIOD_ARGS = ("period", "from", "to")
 def _ai_result_summary(stored):
     """保存した結果の見出しの表示用の値(型の違う値は既定の値にする。手で書き換えたファイルなど)。"""
     p = stored.get("period") or {}
-    unread = stored.get("unread") if isinstance(stored.get("unread"), dict) else {}
-    read = stored.get("read") if isinstance(stored.get("read"), dict) else {}
-    calls = stored.get("calls") if isinstance(stored.get("calls"), dict) else {}
-    errors = stored.get("errors") if isinstance(stored.get("errors"), list) else []
-    parts = unread.get("parts") if isinstance(unread.get("parts"), list) else []
+    unread = _dict_or_empty(stored.get("unread"))
+    read = _dict_or_empty(stored.get("read"))
+    calls = _dict_or_empty(stored.get("calls"))
+    errors = _list_or_empty(stored.get("errors"))
+    parts = _ai_dicts(unread.get("parts"))
     dates = "{}〜{}".format(str(p.get("start") or "").replace("-", "/"), str(p.get("end") or "").replace("-", "/"))
     return {
         "generated_at": str(stored.get("generated_at") or "").replace("-", "/"),
@@ -16412,9 +16391,9 @@ def _ai_result_summary(stored):
         "read": dict(read, task_ids=sorted(_result_ids(read.get("task_ids"))),
                      comments=_int_value(read.get("comments"))),
         "unread": dict(unread, count=_int_value(unread.get("count"))),
-        "unread_parts": [u for u in parts if isinstance(u, dict)],
+        "unread_parts": parts,
         # 読み込めなかった呼び出しの回数(中止したため行わなかった呼び出しをまとめた1件は、その回数)
-        "unread_calls": sum(_int_value(u.get("calls")) or 1 for u in parts if isinstance(u, dict)),
+        "unread_calls": sum(_int_value(u.get("calls")) or 1 for u in parts),
         "actions_source": stored.get("actions_source"),
         # 続けて失敗したため途中で中止したときの説明(中止しなかった結果・以前の版の結果には無い)
         "aborted": str(stored.get("aborted") or ""),
@@ -18935,8 +18914,7 @@ def config_form_context(app, state=None, errors=None):
         "error_count": len(errors),
         "mail_test_problem": check_mail_settings(test=True),
         "mail_from": mail_settings()["mail_from"],
-        "ai_enabled": ai_is_configured(),
-        "ai_status": ai_status_label(),
+        **ai_context(),
     }
 
 
@@ -20203,7 +20181,7 @@ def seed_command():
         for username, info in accounts.items():
             if not isinstance(username, str) or not username:
                 continue
-            info = info if isinstance(info, dict) else {}
+            info = _dict_or_empty(info)
             user = User.query.filter_by(username=username).first()
             if user is None:
                 # 無いユーザーだけ作る(既にあるユーザーは、マネージャーが画面で変えた内容のまま)
