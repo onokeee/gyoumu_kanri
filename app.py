@@ -196,7 +196,6 @@ from sqlalchemy.orm.exc import StaleDataError
 from werkzeug.exceptions import BadRequestKeyError, HTTPException, MethodNotAllowed
 from werkzeug.routing import IntegerConverter, RequestRedirect
 
-
 # #### 1. 設定(config.py の初期値・instance/settings.json の画面の設定) ############################
 # 環境ごとの設定(秘密鍵・管理者パスワード・LDAP/AI/メールの接続先など)は、2つの層から決まる:
 #   初期値    : app.py と同じフォルダの config.py(Git管理下。リポジトリに同梱。1-2)
@@ -262,7 +261,6 @@ class Config(FixedConfig):
     MAIL_TO = []
     MAIL_CC = []
     APP_BASE_URL = ""
-
 
 # ==== 1-2. 初期値(config.py)の読み込み ============================================================
 # 起動(flask --app app run)・seed / migrate の開始時に読み、無い・読めないときは止める(ConfigLoadError。
@@ -332,7 +330,6 @@ def read_initial_config(path=None):
             "設定ファイル {0} がありません（{1}）。app.py と同じフォルダに {0}（環境ごとの設定の初期値。"
             "リポジトリに同梱）を置いてから、もう一度実行してください。初期値が無い状態では起動しません。".format(
                 INITIAL_CONFIG_FILENAME, path)) from None
-
 
 # ==== 1-3. 画面で設定した値(instance/settings.json)の読み書きと、有効な値 =========================
 # システム設定の「基本設定」タブで保存した値の置き場(instance/settings.json。DB と同じフォルダ。Git管理外)。
@@ -587,7 +584,6 @@ def load_config_layers(app):
     apply_values(app, effective_values(initial, store["values"]))
     return store
 
-
 # #### 2. 共通の部品 ###############################################################################
 
 # ==== 2-1. Flask 拡張(DB・ログイン管理) ===========================================================
@@ -657,7 +653,6 @@ def prefers_json():
     """
     accept = request.accept_mimetypes
     return accept["application/json"] > accept["text/html"]
-
 
 # ==== 2-2. 小さなヘルパー関数 =====================================================================
 # 複数の画面・機能から使う小さなヘルパー(文字と画面の案内・日付と時刻・フォームの値の読み取り・DB の行と選択肢・
@@ -1172,7 +1167,6 @@ def _rename_named_row(obj, spec, new, label, empty_message, dup_message, url):
             flash("{}を更新しました。".format(label), "success")
     return redirect(url)
 
-
 # ==== 2-3. 画面で編集する設定(JSONファイル)の読み書き =============================================
 # 週報・期限超過通知・スキルテスト・AI分析・定型業務リマインドが、DBを使わずに instance/ の JSON ファイルへ
 # 設定と「前回の結果」を保存するのに使う。
@@ -1449,7 +1443,6 @@ def settings_unreadable(store, message):
         flash(message.format(error), "danger")
     return bool(error)
 
-
 # ==== 2-4. 営業日カレンダー(土日・祝日) ===========================================================
 # 外部のライブラリや祝日データのファイルは使わず、「国民の祝日に関する法律」の
 # ルールから計算する。DBにもFlaskにも依存しないため、どこからでも使える。
@@ -1651,7 +1644,6 @@ def elapsed_business_days(past_date, today):
     """
     return business_days_ago(past_date, today) + (0 if is_business_day(today) else 1)
 
-
 # ==== 2-5. 画面の権限の確認(マネージャーだけの画面) ===============================================
 #   managers_only      : Blueprint 全体に付ける before_request
 #   managers_blueprint : managers_only を付けた Blueprint を作る(スキル管理・データ出力・週報・
@@ -1688,7 +1680,6 @@ def managers_blueprint(name, url_prefix):
     bp = Blueprint(name, __name__, url_prefix=url_prefix)
     bp.before_request(managers_only)
     return bp
-
 
 # ==== 2-6. 時間のかかる処理の別スレッドでの実行(同時に1つだけ) ====================================
 # 画面から始める時間のかかる処理(週報・期限超過通知の送信、スキルテストの問題の補充、AI分析)は、
@@ -1797,7 +1788,6 @@ class MailJob:
         return start_in_thread(app, self.lock, self.thread_name, work,
                                "{}の送信処理でエラーが発生しました".format(self.label))
 
-
 # ==== 2-7. メール機能(週報・期限超過通知・リマインド)の共通の部品 =================================
 # 設定・前回の結果・画面を持つ3つのメール機能(週報〔6〕・期限超過通知〔7〕・定型業務リマインド〔10〕)で共通の、
 # 画面の表示(設定・次回の自動送信・前回の結果・メールの設定状況)・送信の開始の応答・旧URL の転送と、
@@ -1848,7 +1838,6 @@ def mail_footer():
 def _preview_document(html):
     """プレビュー用のHTML(リンクは別タブで開く)。iframe の srcdoc に入れて表示する。"""
     return html.replace("<head>", '<head>\n<base target="_blank">', 1)
-
 
 # #### 3. モデル(DBのテーブル) #####################################################################
 # DBのテーブルは、ここで定義したクラスから作る(足りないテーブルは起動時に create_all で作成。
@@ -2001,7 +1990,6 @@ class UserEmail(db.Model):
 
     def __repr__(self):
         return f"<UserEmail {self.user_id}>"
-
 
 # ==== 3-2. タスク =================================================================================
 
@@ -2274,7 +2262,6 @@ class TaskComment(db.Model):
     def __repr__(self):
         return f"<TaskComment {self.id} task={self.task_id}>"
 
-
 # ==== 3-3. 年休 ===================================================================================
 # チーム内での情報共有・見える化が目的。承認フローは持たない(登録=即共有)。
 
@@ -2325,7 +2312,6 @@ class LeaveRequest(db.Model):
 
     def __repr__(self):
         return f"<LeaveRequest {self.id} user={self.user_id} {self.leave_date} {self.leave_type}>"
-
 
 # ==== 3-4. 定型・定期業務 =========================================================================
 
@@ -2499,7 +2485,6 @@ class RoutineOccurrence(db.Model):
 
     def __repr__(self):
         return f"<RoutineOccurrence {self.id}: {self.routine_id} {self.due_date}>"
-
 
 # ==== 3-5. スキル =================================================================================
 # Katzの3区分(テクニカル/コンセプチュアル/ヒューマン)でメンバーの到達度を管理する。
@@ -2706,7 +2691,6 @@ class SkillRating(db.Model):
     def __repr__(self):
         return f"<SkillRating skill={self.skill_id} user={self.user_id} lv={self.level}>"
 
-
 # ==== 3-6. 業務(Operation)と必要スキル ============================================================
 # スキルマップの縦軸=スキル項目に対し、横軸を『ヒト』だけでなく『業務』でも見られる。
 # 業務に必要なスキルは OperationSkill で持ち、必要到達レベルは
@@ -2766,7 +2750,6 @@ class Operation(db.Model):
     def __repr__(self):
         return f"<Operation {self.id}: {self.name}>"
 
-
 # ==== 3-7. チーム(Department) =====================================================================
 
 user_departments = db.Table(
@@ -2794,7 +2777,6 @@ class Department(db.Model):
 
     def __repr__(self):
         return f"<Department {self.id} {self.name}>"
-
 
 # ==== 3-8. スキルテスト ===========================================================================
 # スキルテスト(AIが作る4択問題で、メンバーのテクニカルスキルの到達度を確認する)のモデル。
@@ -3016,7 +2998,6 @@ class SkillTestAnswer(db.Model):
 
     def __repr__(self):
         return f"<SkillTestAnswer attempt={self.attempt_id} seq={self.seq}>"
-
 
 # #### 4. 外部との接続(AI・メール) #################################################################
 
@@ -3255,7 +3236,6 @@ def parse_json_reply(text, opener, closer):
             return json.loads(body[start:end + 1])
         except (ValueError, RecursionError):
             return None
-
 
 # ==== 4-2. メール送信(SMTP) =======================================================================
 # 送信サーバー・ポート番号・差出人・宛先は config.py(初期値)とシステム設定の「基本設定」タブ(instance/settings.json)
@@ -3610,7 +3590,6 @@ def send_mail(subject, text, html=None, attachments=(), to=None, cc=None, test=F
         return False, "一部の宛先に送信できませんでした（拒否: {}）。他の {} 件には送信済みです。{}".format(
             _refused_list(refused), len(envelope) - len(refused), hint)
     return True, "送信しました（To {}件・Cc {}件）。".format(len(to), len(cc))
-
 
 # #### 5. 画面(Blueprint) ##########################################################################
 
@@ -4182,7 +4161,6 @@ def logout():
     session.pop(LOCAL_AUTH_KEY, None)  # 固定ローカル管理者のパスワードの印も消す
     return flash_redirect("ログアウトしました。", "info", url_for("auth.login"))
 
-
 # ==== 5-2. トップページ(ダッシュボード) ===========================================================
 # 活動状況・ガントチャート・成果は、マネージャーダッシュボードと同じ集計処理を
 # 「自分の担当分だけ」に絞って再利用している(マネージャーダッシュボード(5-7)の _build_*)。
@@ -4233,7 +4211,6 @@ def main_dashboard():
         **octx,
         **gctx,
     )
-
 
 # ==== 5-3. タスク =================================================================================
 
@@ -4807,7 +4784,6 @@ def delete_task(task_id):
     db.session.commit()
     return flash_redirect("タスクを削除しました。", "info", url_for("tasks.list_tasks"))
 
-
 # ==== 5-4. 定型・定期業務 =========================================================================
 # 権限:
 #   ・登録   : 全員。メンバーは担当者が自分に固定され、マネージャーは担当者を選べる
@@ -5131,7 +5107,6 @@ def delete_routine(routine_id):
     db.session.delete(rw)
     db.session.commit()
     return flash_redirect("定型・定期業務を削除しました。", "info", url_for("routine.list_routines"))
-
 
 # ==== 5-5. 年休 ===================================================================================
 
@@ -5477,7 +5452,6 @@ def cancel_leave(leave_id):
     db.session.delete(leave)
     db.session.commit()
     return flash_redirect("年休を取消しました。", "info", url_for("leaves.calendar_view"))
-
 
 # ==== 5-6. スキル管理 =============================================================================
 # スキルの閲覧・編集はいずれもマネージャーのみ(Blueprint 全体を managers_only〔2-5〕で確認。
@@ -6169,7 +6143,6 @@ def rename_operation(op_id):
 def toggle_operation(op_id):
     return _toggle_active(get_or_404(Operation, op_id), "業務", url_for("skills.operations"))
 
-
 # ==== 5-7. マネージャーダッシュボード =============================================================
 # マネージャーのみアクセス可(各画面に manager_required〔2-5〕)。チーム全体を俯瞰する読み取り専用の
 # 集計ビュー。年休は事由を出さない。
@@ -6767,7 +6740,6 @@ def gantt_full():
         **gctx,
     )
 
-
 # ==== 5-8. チーム管理 =============================================================================
 # チーム(Department)の管理ルーティング。マネージャーのみ(各画面に manager_required〔2-5〕)。
 # メンバーのメールアドレス(定型業務のリマインドの宛先)の保存は 10-8(save_member_email)。
@@ -7022,7 +6994,6 @@ def save_memberships():
     if stale:
         flash("画面を開いた後に削除・無効化されたメンバーの紐づけは変更していません。", "info")
     return redirect(url_for("departments.manage"))
-
 
 # ==== 5-9. Excel データ出力 =======================================================================
 # 全データの Excel(.xlsx) 出力。マネージャーのみ(Blueprint 全体を managers_only〔2-5〕で確認)。
@@ -7316,7 +7287,6 @@ def all_xlsx():
     )
     return _xlsx_response(sheets, "all_data.xlsx")
 
-
 # #### 6. 週報(自動作成・メール送信) ###############################################################
 # マネージャーのみ。タスク情報(タスク・進捗記載・ステータス変更・成果・負荷)から、
 # チーム全体＋1人1ページの週報をWordで作り、メールで送る。DBには何も保存しない。
@@ -7464,7 +7434,6 @@ def build_weekly_subject(pattern, start, end, send_date):
     text = render_pattern(pattern, start, end, send_date)
     return _SUBJECT_LINE_BREAKS.sub(" ", text).strip() or "週報"
 
-
 # ==== 6-2. 週報: 設定の保存・読み込み =============================================================
 # DBは使わず、instance/weekly_settings.json(Git管理外)に保存する。
 # ここに保存するのは「いつ・誰を・どう書くか」だけ。メールの送信サーバー・宛先や
@@ -7562,7 +7531,6 @@ def is_weekly_target(settings, user):
     names = settings.get("target_usernames") or {}
     return bool(user.username) and names.get(str(user.id)) == user.username
 
-
 # ==== 6-3. 週報: 設定フォーム =====================================================================
 # 設定の画面はシステム設定(/system/settings?tab=weekly)にまとめてあり、
 # 週報の画面(/weekly/)には実行と状況の表示だけが残る。保存先は 6-2 のまま。
@@ -7651,7 +7619,6 @@ def weekly_form_context(settings):
         "sample_placeholders": SAMPLE_PLACEHOLDER_HELP,
         "preview": preview_names(settings, date.today()),
     }
-
 
 # ==== 6-4. 週報: 材料の収集と集計 =================================================================
 # 材料にするのはタスク情報だけ:
@@ -7893,7 +7860,6 @@ def collect_weekly_material(start, end, users, today=None):
         "persons": persons,
         "team": _team_metrics(facts, persons),
     }
-
 
 # ==== 6-5. 週報: 文章づくり(AI整形とルールベース) =================================================
 # 流れ:
@@ -8212,7 +8178,6 @@ def write_report(material, settings, created_on):
         "ai_fallback": ai.fallback,
     }
 
-
 # ==== 6-6. 週報: Word(.docx)の作成 ================================================================
 # 文章(AI または ルールベース)は1行ずつ次のように変換する:
 #   ■ または 【 で始まる行 → 見出し2
@@ -8372,16 +8337,10 @@ def build_docx(material, written, created_at, app_name):
     doc.save(bio)
     return bio.getvalue()
 
-
 # ==== 6-7. 週報: 作成・送信のとりまとめ ===========================================================
-# run_weekly(app, start, end, trigger, deliver):
-#   1. 設定(instance/weekly_settings.json)と対象者を読み込む
-#   2. 材料を集める(collect_weekly_material) → 文章を作る(write_report) → Wordにする(build_docx)
-#   3. deliver に応じて:
-#        "download" : ファイルを返すだけ(送信しない・前回の結果も変えない)
-#        "test"     : テスト送信。差出人(MAIL_FROM)だけに送る。Cc なし
-#        "send"     : 本番の宛先(MAIL_TO・MAIL_CC)に送る
-#      test / send は成否にかかわらず「前回の結果」を上書きする。
+# run_weekly: 設定と対象者を読み、材料を集めて(collect_weekly_material)文章を作り(write_report)Word にする(build_docx)。
+# deliver は "download"(ファイルを返すだけ。送信せず前回の結果も変えない) / "test"(差出人〔MAIL_FROM〕だけに送る。
+# Cc なし) / "send"(本番の宛先 MAIL_TO・MAIL_CC に送る)。test / send は成否にかかわらず「前回の結果」を上書きする。
 # DBは読み取りのみ(書き込みは一切しない)。必ず app.app_context() の中で動く。
 
 DELIVER_DOWNLOAD = "download"
@@ -8495,14 +8454,10 @@ def start_weekly_background(app, start, end, trigger, deliver, send_date=None):
     send_date = send_date or date.today()
     return WEEKLY_JOB.start_background(app, lambda: _deliver_weekly(app, start, end, trigger, deliver, send_date))
 
-
 # ==== 6-8. 週報: 画面 =============================================================================
-# 週報(自動作成・メール送信)の画面と手動実行。マネージャーのみ。
-# GET  /weekly/          週報の画面(次回の自動送信・前回の結果・メール/AIの設定状況・
-#                        今すぐ作成・現在の設定の概要とファイル名/件名のプレビュー)
-# POST /weekly/run       今すぐ作成: download=Wordをダウンロード / test=テスト送信 / send=本番送信
-# GET  /weekly/preview   入力中のファイル名・件名のプレビュー(JSON。システム設定の「週報」タブで使う)
-# POST /weekly/settings  旧URL。システム設定の保存(POST /system/settings/weekly)へ転送する
+# 週報の画面(/weekly/: 次回の自動送信・前回の結果・メール/AIの設定状況・今すぐ作成〔download=Word をダウンロード /
+# test=テスト送信 / send=本番送信〕)と、入力中のファイル名・件名のプレビュー(JSON。システム設定の「週報」タブで使う)。
+# マネージャーのみ。
 
 weekly_bp = managers_blueprint("weekly", "/weekly")  # マネージャーのみ(2-5)
 
@@ -8608,7 +8563,6 @@ def weekly_run_now():
         "{}を開始しました（期間 {}）。結果は「前回の結果」に表示されます"
         "（作成に数十秒〜数分かかる場合があります。画面を再読み込みして確認してください）。".format(label, period_label(start, end)))
 
-
 # #### 7. 期限超過通知(毎朝のメール) ###############################################################
 # マネージャーのみ。営業日(土日・祝日以外)の毎朝、指定の時刻に「期限を過ぎた未完了タスク」の一覧を
 # 1通のメールで送る。一覧は状態(未着手／進行中・保留)ごと、担当者ごとにまとめ、
@@ -8648,7 +8602,6 @@ def next_overdue_run(settings, now):
         candidate += timedelta(days=1)
     return None
 
-
 # ==== 7-2. 期限超過通知: 設定の保存・読み込み =====================================================
 # DBは使わず、instance/overdue_settings.json(Git管理外)に保存する。
 # ここに保存するのは「いつ・何件のコメントを載せるか」だけ。メールの送信サーバー・宛先や
@@ -8677,7 +8630,6 @@ OVERDUE_EDITABLE_KEYS = list(OVERDUE_SETTINGS.editable)    # 画面から保存�
 load_overdue_settings = OVERDUE_SETTINGS.load              # 現在の設定(読み込めなければ既定値)
 save_overdue_settings = OVERDUE_SETTINGS.save              # 画面で編集した項目を保存する
 
-
 # ==== 7-3. 期限超過通知: 設定フォーム =============================================================
 # 設定の画面はシステム設定(/system/settings?tab=overdue)にまとめてあり、
 # 期限超過通知の画面(/overdue/)には実行・プレビューと状況の表示だけが残る。
@@ -8699,7 +8651,6 @@ def overdue_form_context(settings):
         "comment_min": COMMENT_COUNT_MIN,
         "comment_max": COMMENT_COUNT_MAX,
     }
-
 
 # ==== 7-4. 期限超過通知: タスクの収集とメールの作成 ===============================================
 # 期限超過 = 期限(due_date)が今日より前で、完了していないタスク。
@@ -8931,15 +8882,10 @@ def build_overdue_content(today, comment_count):
         "data": data,
     }
 
-
 # ==== 7-5. 期限超過通知: 作成・送信のとりまとめ ===================================================
-# run_overdue(app, trigger, test):
-#   1. 設定(instance/overdue_settings.json)を読み込む
-#   2. 期限超過タスクを集めてメール(件名・テキスト版・HTML版)を作る(build_overdue_content)
-#   3. test=True  : テスト送信。差出人(MAIL_FROM)だけに送る。Cc なし
-#      test=False : 本番の宛先(週報と同じ MAIL_TO・MAIL_CC)に送る
-#   成否にかかわらず「前回の結果」を上書きする。期限超過が0件でも送る(「該当なし」)。
-# DBは読み取りのみ(書き込みは一切しない)。必ず app.app_context() の中で動く。
+# run_overdue: 設定を読み、期限超過タスクを集めてメール(件名・テキスト版・HTML版)を作り(build_overdue_content)送る
+# (test=True は差出人〔MAIL_FROM〕だけ。本番は週報と同じ MAIL_TO・MAIL_CC)。成否にかかわらず「前回の結果」を上書きし、
+# 期限超過が0件でも送る(「該当なし」)。DBは読み取りのみ(書き込みは一切しない)。必ず app.app_context() の中で動く。
 
 # メール送信(テスト・本番)は同時に1つだけ(二重送信を防ぐ)
 _overdue_send_lock = threading.Lock()
@@ -8983,13 +8929,9 @@ def start_overdue_background(app, trigger, test=False):
     today = date.today()
     return OVERDUE_JOB.start_background(app, lambda: _deliver_overdue(app, trigger, test, today))
 
-
 # ==== 7-6. 期限超過通知: 画面 =====================================================================
-# 期限超過通知(毎朝のメール)の画面と手動送信。マネージャーのみ。
-# GET  /overdue/          期限超過通知の画面(次回の自動送信・前回の結果・メール/リンクの設定状況・
-#                         現在の設定の概要・今この時点のメールのプレビュー)
-# POST /overdue/run       今すぐ送信: test=テスト送信 / send=本番の宛先に送信(バックグラウンド)
-# POST /overdue/settings  旧URL。システム設定の保存(POST /system/settings/overdue)へ転送する
+# 期限超過通知の画面(/overdue/: 次回の自動送信・前回の結果・メール/リンクの設定状況・今この時点のメールのプレビュー・
+# 今すぐ送信〔test / send。バックグラウンド〕)。マネージャーのみ。
 
 overdue_bp = managers_blueprint("overdue", "/overdue")  # マネージャーのみ(2-5)
 
@@ -9032,7 +8974,6 @@ def overdue_run_now():
     return send_started_response(
         start_overdue_background(app, trigger, test=action == DELIVER_TEST), "overdue.index",
         "{}を開始しました。結果は「前回の結果」に表示されます（画面を再読み込みして確認してください）。".format(label))
-
 
 # #### 8. スキルテスト #############################################################################
 # AIが作る4択問題でテクニカルスキルの到達度を確認し、自動で登録する。
@@ -9146,7 +9087,6 @@ def skilltest_plan(settings, levels):
     seconds = sum(r["count"] * r["limit"] for r in rows)
     return rows, total, seconds
 
-
 # ==== 8-2. スキルテスト: 設定フォーム =============================================================
 # 設定の画面はシステム設定(/system/settings?tab=skilltest)にまとめてあり、
 # スキルテスト管理(/skilltest/admin)には受験履歴と問題プールだけが残る。
@@ -9202,7 +9142,6 @@ def skilltest_form_context(settings):
         "grace_sec": GRACE_SEC,
         "margin_min": DEADLINE_MARGIN_MIN,
     }
-
 
 # ==== 8-3. スキルテスト: AIによる問題の作成 =======================================================
 # AIの接続はアプリ共通の ai_chat()(4-1)を使う(接続先・キーは基本設定)。
@@ -9496,7 +9435,6 @@ def generate_questions(skill, level, count, max_calls=None, stop_at=None):
     if len(created) < count:
         return created, last_error or "必要な数の問題を作成できませんでした。"
     return created, None
-
 
 # ==== 8-4. スキルテスト: 受験の流れ ===============================================================
 # ルール(画面・README にも同じことを書いている):
@@ -10200,7 +10138,6 @@ def member_overview(user):
         })
     return rows, running
 
-
 # ==== 8-5. スキルテスト: 問題プールの集計と補充 ===================================================
 # 補充(start_topup)は、指定したスキルの各レベルの「有効な問題」が目標数
 # (設定 pool_target_per_level)に届くまで、AIで問題を作ってプールに保存する。
@@ -10319,27 +10256,14 @@ def start_topup(app, skill):
         "スキルテストの問題の補充でエラーが発生しました",
         prepare=mark_running, cleanup=clear_running)
 
-
 # ==== 8-6. スキルテスト: 画面 =====================================================================
-# メンバー(有効な role=member のみ。マネージャーは受験できない):
-#   GET  /skilltest/                         テストの一覧(現在の到達度・前回の受験・次に受験できる日時・ルール)
-#   POST /skilltest/start/<skill_id>         受験を始める(受験中のテストがあれば再開)
-#   GET  /skilltest/attempt/<id>             出題(1問ずつ。戻れない)
-#   POST /skilltest/attempt/<id>/answer      回答
-#   POST /skilltest/attempt/<id>/blur        画面から離れたことの記録(JavaScript から送る)
-#   GET  /skilltest/attempt/<id>/result      結果(レベルごとの正解数と結果のレベルだけ。正解は見せない)
-# マネージャーのみ(メンバーは403):
-#   GET  /skilltest/admin                    受験履歴(全員。メンバー・スキル・状態で絞り込み)
-#   GET  /skilltest/admin/attempt/<id>       受験の詳細(全問の問題・選択肢・正解・回答・所要時間・離脱回数)
-#   GET  /skilltest/admin/pool               問題プール(スキル・レベルごとの問題数、補充)
-#   GET  /skilltest/admin/pool/<skill_id>    スキルごとの問題の一覧(有効/無効の切り替え)
-#   POST /skilltest/admin/pool/<skill_id>/topup        問題の補充(バックグラウンド)
-#   POST /skilltest/admin/pool/<skill_id>/deactivate   そのスキルの有効な問題をすべて停止(無効)にする
-#                                                      (説明を変えた後、古い説明で作った問題を入れ替えるため)
-#   POST /skilltest/admin/questions/<id>/toggle        問題の有効/無効の切り替え
-#   GET  /skilltest/admin/settings, POST 同じURL       旧URL。設定はシステム設定の「スキルテスト」タブへ移した
-#                                                      (GET はそのタブへ、POST はその保存へ転送する)
-# 受験の操作はすべて本人の受験だけが対象(他人の受験は404)。
+# メンバー(有効な role=member のみ。マネージャーは受験できない)の受験の画面(/skilltest/: テストの一覧・開始〔受験中なら
+# 再開〕・出題〔1問ずつ。戻れない〕・回答・画面から離れたことの記録・結果〔正解は見せない〕)。受験の操作はすべて本人の
+# 受験だけが対象(他人の受験は404)。
+# マネージャー(メンバーは403)の管理の画面(/skilltest/admin: 受験履歴・受験の詳細〔全問の内容・回答・所要時間・離脱回数〕・
+# 問題プール・スキルごとの問題の一覧・補充〔バックグラウンド〕・有効な問題をすべて停止〔説明を変えた後、古い説明で作った
+# 問題を入れ替えるため〕・問題の有効/無効の切り替え)。/skilltest/admin/settings は旧URL(設定はシステム設定の
+# 「スキルテスト」タブへ移した。GET はそのタブへ、POST はその保存へ転送する)。
 
 skilltest_bp = Blueprint("skilltest", __name__, url_prefix="/skilltest")
 
@@ -10753,7 +10677,6 @@ def admin_settings():
         return redirect(url_for("system.save_skilltest"), code=307)
     return redirect(url_for("system.settings", tab="skilltest"))
 
-
 # #### 9. AI分析(サマリーと推奨アクション) #########################################################
 # マネージャーダッシュボードの「AI分析（サマリーと推奨アクション）」(/manager/analysis)。
 # マネージャーのみ(メンバーは画面・データのどれにもアクセスできない。403)。
@@ -10859,7 +10782,6 @@ def ai_analysis_form_context(settings):
         "fields": view(AI_ANALYSIS_FIELDS),
         "send_fields": view(AI_ANALYSIS_SEND_FIELDS),
     }
-
 
 # ==== 9-2. AI分析: 期間と材料 =====================================================================
 # 期間の解釈(画面の ?period=7|14|30|90|range&from=YYYY-MM-DD&to=YYYY-MM-DD)と、
@@ -11058,7 +10980,6 @@ def analysis_members():
         .order_by(User.display_name, User.id)
         .all()
     )
-
 
 # ==== 9-3. AI分析: 集計(①〜④) =====================================================================
 # ルールによる確認(AI を使わない)のしきい値。N1/N2 だけは画面(9-1)で変更できる。
@@ -11909,7 +11830,6 @@ def collect_analysis(period, now, settings):
     data["actions"] = rule_actions(data)
     return data
 
-
 # ==== 9-4. AI分析: 推奨アクション(ルール) =========================================================
 # マネージャーが今やることを、集計結果から優先度の高い順に 5〜10件 選ぶ(AI を使わない)。
 # AI が未設定・失敗のときもこれを表示する(AI の推奨アクションは、この候補と集計結果をもとに作る)。
@@ -12164,7 +12084,6 @@ def rule_actions(data):
     for rank, action in enumerate(picked, start=1):
         action["rank"] = rank
     return picked
-
 
 # ==== 9-5. AI分析: AIに送る材料(テキスト)と分割 ===================================================
 # AI には件数だけでなく本文をすべて渡す(タスクのタイトル・説明、すべてのコメント〔記載者・日時〕、
@@ -13134,7 +13053,6 @@ def team_messages(material_lines):
        '"actions": [{"ref": "A1", "target": "", "title": "やること", "reason": "理由", "numbers": ["根拠の数値"]}]}',
        ["【材料】"] + list(material_lines))
 
-
 # ==== 9-6. AI分析: AIの応答の検証 =================================================================
 # AI の応答は JSON として読み、形・ID・選択肢を確かめてから使う(合わないものは捨てる)。
 #   - ID は、その呼び出しで判定を頼んだ項目のものだけを受け付ける
@@ -13412,7 +13330,6 @@ def _pairs_texts(pairs):
     """{キー: [(文, ◯にした数)]} を保存する形 ({キー: [文]}, ◯にした数の合計) にする(所見・スキル状況・チームのまとめ)。"""
     return ({key: [text for text, _n in items] for key, items in pairs.items()},
             sum(n for items in pairs.values() for _text, n in items))
-
 
 # ==== 9-7. AI分析: 実行(バックグラウンド)と保存 ===================================================
 # 「AIで分析」(POST /manager/analysis/run)で別スレッドの実行を始める(同時に1つだけ)。
@@ -14268,7 +14185,6 @@ def start_ai_analysis(app, args):
     return start_in_thread(app, _analysis_lock, "ai-analysis", lambda: run_ai_analysis_job(app, args),
                            "AI分析でエラーが発生しました", prepare=reset_state)
 
-
 # ==== 9-8. AI分析: 結果の反映(画面・チームのまとめの材料) =========================================
 # 保存した AI の結果を、コードの集計(collect_analysis の戻り値)に ID で結び付けて反映する。
 # 画面では、表示している期間と結果の期間(開始日・終了日)が同じときだけ反映する
@@ -14700,7 +14616,6 @@ def ai_result_matches(stored, period):
     p = stored.get("period") or {}
     return p.get("start") == period["start"].isoformat() and p.get("end") == period["end"].isoformat()
 
-
 # ==== 9-9. AI分析: 画面 ===========================================================================
 # GET  /manager/analysis          コードの集計(①〜④)とルールによる推奨アクションをすぐに表示する。
 #                                 期間は ?period=7|14|30|90(既定 30)または ?period=range&from=...&to=...
@@ -14822,7 +14737,6 @@ def analysis_run():
 def analysis_status():
     """実行中の表示用の状態(JSON)。"""
     return jsonify(ai_analysis_status())
-
 
 # #### 10. 定型業務のリマインド(メール) ############################################################
 # 定型・定期業務(3-4・5-4)の実施日に担当者へメールで知らせ、その回の完了の入力があるまで1日2回
@@ -14988,7 +14902,6 @@ def elapsed_label(due, today):
         return "本日"
     return "{}営業日経過".format(elapsed_business_days(due, today))
 
-
 # ==== 10-2. リマインド: 予定(実施予定日)の作成と未完了の一覧 ======================================
 # 行の作成は同じ日の行を2つ作らない(一意制約。同時に作っても INSERT OR IGNORE で1つだけ)。
 # 作成済みの範囲はプロセスの中で覚え(_occurrence_progress)、次からは前回の後の日だけを調べる
@@ -15130,7 +15043,6 @@ def delete_routine_reminder_rows(routine_id):
     RoutineReminderEmailCheck.query.filter_by(routine_id=routine_id).delete(synchronize_session=False)
     forget_occurrence_progress(routine_id)
 
-
 # ==== 10-3. リマインド: メールアドレス(user_emails) ===============================================
 # 形式は「local@domain」だけ(半角。表示名・<>・改行は不可)。空にすると行を削除する。
 
@@ -15203,7 +15115,6 @@ def forget_user_for_reminders(user_id):
             rem.updated_by_id = None
     for check in RoutineReminderEmailCheck.query.filter_by(checked_by_id=user_id).all():
         check.checked_by_id = None
-
 
 # ==== 10-4. リマインド: 業務ごとの設定(定型業務の画面の「リマインド」) ============================
 # 業務ごとのリマインドの設定(routine_reminders)の入力チェックと保存。定型業務の登録・編集の画面の
@@ -15577,7 +15488,6 @@ def reminder_recipients_for(routine, rem, users, emails):
         recipients.append({"address": address, "name": "", "kind": "追加の宛先", "user_id": None})
     return recipients, problems
 
-
 # ==== 10-5. リマインド: 送信の設定(instance/routine_reminder_settings.json) =======================
 # 定型業務リマインドの自動送信の設定(画面で編集する値)と前回の結果。DBは使わず、
 # instance/routine_reminder_settings.json(Git管理外)に保存する(2-3 の JsonSettings。基本設定には置かない)。
@@ -15671,7 +15581,6 @@ def next_reminder_run(settings, now):
                     return candidate
         day += _ONE_DAY
     return None
-
 
 # ==== 10-6. リマインド: メールの作成(宛先ごとに1通) ===============================================
 # 未完了の回を宛先ごとにまとめ、1つの宛先に1通のメールを作る(件名・テキスト版・HTML版)。
@@ -15843,15 +15752,11 @@ def reminder_address_problems():
     result.sort(key=lambda t: (t["routine"].name, t["routine"].id, t["kind"] != "担当者", t["name"]))
     return result
 
-
 # ==== 10-7. リマインド: 作成・送信のとりまとめ ====================================================
-# run_routine_reminders(app, trigger, now=None, test=False):
-#   1. 開始日〜今日の実施予定日の行を作る(ensure_routine_occurrences)
-#   2. 未完了の回を宛先ごとにまとめる(collect_reminder_mails)
-#   3. test=False : 宛先ごとに1通ずつ送る(To はその宛先だけ。Cc なし)。アドレスの無い担当者には送らない
-#                   (追加の宛先には送る)。送れなかった宛先・失敗は前回の結果に残す
-#      test=True  : すべての未完了の回を載せた1通を差出人(MAIL_FROM)に送る
-#   成否にかかわらず「前回の結果」を上書きする。未完了の回が無ければ送らない(テスト送信は「該当なし」で送る)。
+# run_routine_reminders: 開始日〜今日の実施予定日の行を作り(ensure_routine_occurrences)、未完了の回を宛先ごとにまとめて
+# (collect_reminder_mails)1通ずつ送る(To はその宛先だけ。Cc なし。アドレスの無い担当者には送らず、追加の宛先には送る。
+# 送れなかった宛先・失敗は前回の結果に残す)。test=True はすべての未完了の回を載せた1通を差出人(MAIL_FROM)に送る。
+# 成否にかかわらず「前回の結果」を上書きし、未完了の回が無ければ送らない(テスト送信は「該当なし」で送る)。
 # 送信は同時に1つだけ(二重送信の防止)。必ず app.app_context() の中で動く(2-6 の MailJob)。
 
 # 失敗したときは DB の変更(実施予定の行の作成)を取り消す
@@ -15939,15 +15844,11 @@ def reminder_status_context():
         enabled_count=RoutineReminder.query.filter(RoutineReminder.enabled.is_(True)).count(),
     )
 
-
 # ==== 10-8. リマインド: 画面 ======================================================================
-# 完了の入力・取り消しと、メールアドレスの画面。未完了の回の一覧は、定型業務の一覧(「未完了の定型業務」)・
-# 詳細・個人ダッシュボード(「今日の定型業務」)に出す(5-4・5-2 の画面から routine_*_panel を使う)。
-# GET  /routine/occurrences/<id>?o=<印>   1回分の画面(メールの「完了の入力」のリンク。開くだけでは何も変えない)
-# POST /routine/occurrences/<id>/complete  完了を入力する(担当者・マネージャー)
-# POST /routine/occurrences/<id>/undo      完了を取り消す(マネージャーのみ)
-# GET/POST /account/email                  自分のメールアドレス(ユーザーメニューの「メールアドレス」。全員)
-# POST /departments/members/<id>/email     メンバーのメールアドレス(チーム管理のメンバーの表。マネージャーのみ)
+# 1回分の画面(/routine/occurrences/<id>?o=<印>。メールの「完了の入力」のリンク。開くだけでは何も変えない)と完了の入力
+# (担当者・マネージャー)・取り消し(マネージャーのみ)、メールアドレスの画面(自分: /account/email〔全員〕、メンバー:
+# /departments/members/<id>/email〔チーム管理の表。マネージャーのみ〕)。未完了の回の一覧は、定型業務の一覧・詳細・
+# 個人ダッシュボードに出す(5-4・5-2 の画面から routine_*_panel を使う)。
 # 完了・取り消しは書き込みのロックを取ってから確かめる(同時に押された2回目は「既に完了」と表示する)。
 # 印(o)は回ごとに違う(make_row_key)。削除された業務の回のIDが別の回に使われても、古い画面・メールのリンクから
 # 別の回を完了にしない。
@@ -16158,7 +16059,6 @@ def save_member_email(user_id):
     db.session.commit()
     return flash_redirect("{}さんのメールアドレスを{}しました。".format(user.display_name, "保存" if value else "削除"),
                           "success", url_for("departments.manage"))
-
 
 # #### 11. システム設定 ############################################################################
 # マネージャーのみ。アプリのすべての設定を1つの画面(タブ)で変更する。
@@ -16395,7 +16295,6 @@ RETIRED_KEYS = {
     "OVERDUE_MAIL_TO": "期限超過通知は週報と同じ宛先（MAIL_TO）に送ります",
     "OVERDUE_MAIL_CC": "期限超過通知は週報と同じ同報（MAIL_CC）に送ります",
 }
-
 
 # ==== 11-2. システム設定: 基本設定の入力チェック・保存 ============================================
 # 保存の流れ(save_config_form):
@@ -17032,19 +16931,12 @@ def config_form_context(app, state=None, errors=None):
         **ai_context(),
     }
 
-
 # ==== 11-3. システム設定: 画面 ====================================================================
-# システム設定の画面。マネージャーのみ(未ログインはログイン画面へ、メンバーは403)。
-# GET  /system/settings?tab=<タブ>     設定画面(タブ: config / weekly / overdue / skilltest / analysis / reminder)
-# POST /system/settings/config         基本設定の保存(instance/settings.json。画面の設定の層)
-# POST /system/settings/weekly         週報の設定の保存(instance/weekly_settings.json)
-# POST /system/settings/overdue        期限超過通知の設定の保存(instance/overdue_settings.json)
-# POST /system/settings/skilltest      スキルテストの設定の保存(instance/skilltest_settings.json)
-# POST /system/settings/analysis       AI分析の設定の保存(instance/ai_analysis_settings.json)
-# POST /system/settings/reminder       定型業務リマインドの設定の保存(instance/routine_reminder_settings.json)
-# POST /system/settings/reminder/test  定型業務リマインドのテスト送信(今の未完了の回をすべて載せて、差出人宛てに1通)
-# POST /system/settings/test-mail      メール接続テスト(保存済みの設定で、差出人宛てに短いメール)
-# POST /system/settings/test-ai        AI接続テスト(保存済みの設定で、短い問い合わせを1回)
+# システム設定の画面(GET /system/settings?tab=<タブ>。タブ: config / weekly / overdue / skilltest / analysis / reminder)。
+# マネージャーのみ(未ログインはログイン画面へ、メンバーは403)。保存は POST /system/settings/<タブ>(基本設定は
+# instance/settings.json〔画面の設定の層〕、機能の設定は FEATURES の各 JSON ファイル)。接続テスト(保存済みの設定で、
+# 差出人宛ての短いメール / 短い問い合わせ)は POST /system/settings/test-mail・test-ai、定型業務リマインドのテスト送信は
+# POST /system/settings/reminder/test。
 # タブごとに別のフォーム・保存ボタンを持ち、保存後は同じタブに戻る(?tab= で開くタブを指定)。
 # 入力に誤りがあれば何も保存せず、入力中の内容(秘密の値は除く)を残して同じタブを再表示する。
 
@@ -17290,7 +17182,6 @@ def test_reminder():
         flash("定型業務リマインドのテスト送信: 失敗しました。{}".format(mask_secrets(app, result["message"])), "danger")
     return redirect(_tab_url(TAB_REMINDER))
 
-
 # #### 12. 定期メールの自動送信スケジューラ ########################################################
 
 # ==== 12-1. スケジューラ(週報・期限超過通知・定型業務リマインド) ==================================
@@ -17301,11 +17192,9 @@ def test_reminder():
 #   start_scheduler_once() を呼ぶ。seed / migrate コマンド・テスト・import では起動しない)。
 #   flask run --debug の自動再読み込みで2つのプロセスがアプリを作っても、instance/scheduler.lock の
 #   ロックを取れた1つのプロセスだけが動かす(12-2)
-# - ジョブごとに、同じ (日付, 時刻) では1回しか実行しない。メモリ上の記録(fired)に加えて、各ジョブの
-#   設定ファイルに最後に実行した印(last_auto_key)を残す(実行時刻の分の中でサーバーを再起動しても、
-#   新しいプロセスがもう一度送らないように)。週報・期限超過通知は1日1回の仕事のため、印の日付で比べる
-#   (その日に送った後に時刻を後の時刻に変えても、その日はもう一度送らない)。定型業務リマインドは時刻ではなく
-#   (日付, 枠〔time1 / time2〕) で数え、その日に実行した枠を設定ファイルの auto_slots に残す(JsonSettings.claim_auto_slot)
+# - ジョブごとに、同じ (日付, 時刻) では1回しか実行しない。メモリ上の記録(fired)に加えて、各ジョブの設定ファイルに
+#   実行した印を残す(実行時刻の分の中でサーバーを再起動しても、新しいプロセスがもう一度送らないように。印の決まりは
+#   2-3 の JsonSettings.claim_auto_run〔週報・期限超過通知。日付で比べる〕・claim_auto_slot〔リマインド。日付と枠〕)
 # - 印を設定ファイルに書けなかったとき(Windows でほかのプロセスがファイルを開いていた など)は実行せず、
 #   実行済みの記録(fired)にも入れない(同じ分の次の確認でもう一度試す。印は記録済みなら実行しないため二重には送らない)
 # - 印を記録したら、実行の前に「前回の結果」に「自動送信を開始しました…完了の記録がありません」を書いておく
@@ -17465,7 +17354,6 @@ def start_scheduler(app, interval=CHECK_INTERVAL):
                     interval)
     return _scheduler_thread
 
-
 # ==== 12-2. サーバーとして起動したときの開始(プロセス間で1つだけ) =================================
 SCHEDULER_LOCK_FILENAME = "scheduler.lock"
 
@@ -17588,7 +17476,6 @@ def scheduler_is_stopped(app):
     finally:
         probe.close()
 
-
 # #### 13. アプリの組み立て ########################################################################
 
 # ==== 13-1. 画面テンプレート・静的ファイル(templates.html) ========================================
@@ -17698,7 +17585,6 @@ def send_static_section(filename):
         etag=hashlib.sha1(data).hexdigest(),
         last_modified=mtime,
     )
-
 
 # ==== 13-2. create_app(アプリの作成) ==============================================================
 # 設定は 1 の説明のとおり load_config_layers で読む(Config の空の値 → config.py の初期値 → instance/settings.json の画面の設定)。
@@ -18153,7 +18039,6 @@ def create_app():
         start_scheduler_once(app)
     return app
 
-
 # #### 14. flask コマンド(seed / migrate / import-old-config) ######################################
 # 「flask --app app <コマンド>」で使えるコマンド(create_app() で登録する)。
 # どれも定期メールの自動送信スケジューラは起動しない。
@@ -18392,7 +18277,6 @@ def seed_command():
         print("固定ローカル管理者(admin)のパスワード(ADMIN_PASSWORD)は config.py またはシステム設定の「基本設定」タブで"
               "設定してください(どちらにも無ければ ldap_client.py の判定でログインします)。")
 
-
 # ==== 14-2. migrate: 既存DBを最新のモデル定義に合わせる ===========================================
 # コードを新しいものに差し替えたあと、**実運用中のDBを消さずに** flask --app app migrate を
 # 1回実行すれば、不足しているテーブル・列が追加されて動くようになる。
@@ -18587,7 +18471,6 @@ def _migrate(app, check_only, db_path=None):
         insp2 = inspect(db.engine)
         still_tables, still_missing = collect_changes(insp2)
         _migrate_result(still_tables, still_missing)
-
 
 # ==== 14-3. import-old-config: 旧版の instance/config.py の取り込み ===============================
 # 旧版(環境ごとの設定を instance/config.py に書いていた版)から更新したときに1回実行する。
