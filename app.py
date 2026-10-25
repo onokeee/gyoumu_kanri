@@ -2324,12 +2324,22 @@ class LeaveRequest(db.Model):
 FREQ_DAY = "日"
 FREQ_WEEK = "週"
 FREQ_MONTH = "月"
-FREQ_UNIT_CHOICES = [FREQ_DAY, FREQ_WEEK, FREQ_MONTH]
+FREQ_TERM = "期"   # 半期(6か月)
+FREQ_YEAR = "年"
+FREQ_UNIT_CHOICES = [FREQ_DAY, FREQ_WEEK, FREQ_MONTH, FREQ_TERM, FREQ_YEAR]
 
 MANUAL_UNDONE = "未完"
 MANUAL_DONE = "完"
 MANUAL_CHOICES = [MANUAL_UNDONE, MANUAL_DONE]
 MANUAL_COLORS = {MANUAL_DONE: "success", MANUAL_UNDONE: "secondary"}
+
+# 定型業務の担当者(複数)。新しいテーブル(routine_works は変えない)。routine_works.assignee_id は先頭の担当者を
+# 入れておく(以前の版との互換。担当者の行が無い業務は、起動時に assignee_id から1行作る〔backfill_routine_assignees〕)
+routine_assignees = db.Table(
+    "routine_assignees",
+    db.Column("routine_id", db.Integer, db.ForeignKey("routine_works.id"), primary_key=True),
+    db.Column("user_id", db.Integer, db.ForeignKey("users.id"), primary_key=True),
+)
 
 class RoutineWork(db.Model):
     __tablename__ = "routine_works"
@@ -2352,11 +2362,43 @@ class RoutineWork(db.Model):
 
     assignee = db.relationship("User", foreign_keys=[assignee_id])
     creator = db.relationship("User", foreign_keys=[creator_id])
+    assignees = db.relationship("User", secondary=routine_assignees, order_by="User.display_name")
 
     @property
     def row_key(self):
         """画面のボタンでこの業務を指す印(IDの再利用の取り違え防止。make_row_key)。"""
         return make_row_key(self)
+
+    @property
+    def assignee_list(self):
+        """担当者の一覧(担当者の行がまだ無い業務は assignee_id の1人)。"""
+        if self.assignees:
+            return list(self.assignees)
+        return [self.assignee] if self.assignee is not None else []
+
+    @property
+    def assignee_names(self):
+        return "、".join(u.display_name for u in self.assignee_list)
+
+    @property
+    def assignee_labels(self):
+        """画面に出す担当者(無効化した人には「［無効］」)。"""
+        return "、".join(u.name_label for u in self.assignee_list)
+
+    def is_assigned_to(self, user):
+        return user is not None and any(u.id == user.id for u in self.assignee_list)
+
+    @property
+    def monthly_share_minutes(self):
+        """1人あたりの月間所要時間(分。複数担当は人数で均等に分ける。routine_share_minutes)。"""
+        return routine_share_minutes(self)
+
+    def set_assignees(self, users):
+        """担当者を設定する(先頭の担当者を assignee_id にも入れる。今の先頭が残るなら先頭はそのまま)。"""
+        users = sorted(users, key=lambda u: (u.display_name or "", u.id))
+        self.assignees = users
+        if users and self.assignee_id not in {u.id for u in users}:
+            self.assignee_id = users[0].id
 
     @property
     def manual_color(self):
@@ -2373,14 +2415,20 @@ class RoutineWork(db.Model):
     def minutes_label(self):
         return f"{self.minutes_per}分" if self.minutes_per else "―"
 
-    MONTH_FACTORS = {FREQ_DAY: 30, FREQ_WEEK: 4, FREQ_MONTH: 1}
+    # 月換算係数(日30/週4/月1/期〔6か月〕1/6/年1/12)
+    MONTH_FACTORS = {FREQ_DAY: 30, FREQ_WEEK: 4, FREQ_MONTH: 1, FREQ_TERM: 1 / 6, FREQ_YEAR: 1 / 12}
 
     @property
     def monthly_minutes(self):
-        """月あたりの所要時間(分)= 回数 × 1回所要 × 月換算係数(日30/週4/月1)。"""
+        """月あたりの所要時間(分)= 回数 × 1回所要 × 月換算係数。期・年は小数第1位まで(整数になるなら整数)。"""
         factor = self.MONTH_FACTORS.get(self.frequency_unit)
         if self.frequency_count and self.minutes_per and factor:
-            return self.frequency_count * self.minutes_per * factor
+            value = self.frequency_count * self.minutes_per * factor
+            if isinstance(value, float):
+                value = round(value, 1)
+                if value.is_integer():
+                    value = int(value)
+            return value
         return None
 
     @property
@@ -4908,32 +4956,46 @@ def delete_task(task_id):
 
 routine_bp = Blueprint("routine", __name__, url_prefix="/routine")
 
+def _round_minutes(value):
+    """分の合計を小数第1位までにする(整数になるなら整数)。"""
+    if isinstance(value, float):
+        value = round(value, 1)
+        if value.is_integer():
+            value = int(value)
+    return value
+
+def routine_share_minutes(rw):
+    """1人あたりの月間所要時間(分。複数担当は担当者で均等に分ける)。"""
+    minutes = rw.monthly_minutes or 0
+    people = len(rw.assignee_list)
+    return minutes if people <= 1 else _round_minutes(minutes / people)
+
 def _person_summary():
     """ヒト別の集計(全データ対象): 総件数・総合計時間(月,分)・手順書 完/未完 件数。
 
+    複数担当の業務は各担当者に1件と数え、時間は担当者で均等に分ける。合計の行は業務の数(1業務を1件)。
     返り値 (rows, totals)。rows は担当者名順。担当者が無効化されていても計上する。
     """
     summary = {}
-    for rw in RoutineWork.query.all():
-        s = summary.get(rw.assignee_id)
-        if s is None:
-            s = summary[rw.assignee_id] = {
-                "assignee": rw.assignee, "count": 0, "minutes": 0, "done": 0, "undone": 0,
-            }
-        s["count"] += 1
-        s["minutes"] += rw.monthly_minutes or 0
-        if rw.manual_status == MANUAL_DONE:
-            s["done"] += 1
-        else:
-            s["undone"] += 1
-    rows = sorted(
-        summary.values(),
-        key=lambda x: x["assignee"].display_name if x["assignee"] else "",
-    )
     totals = {"count": 0, "minutes": 0, "done": 0, "undone": 0}
+    routines = RoutineWork.query.options(selectinload(RoutineWork.assignees), selectinload(RoutineWork.assignee)).all()
+    for rw in routines:
+        done = "done" if rw.manual_status == MANUAL_DONE else "undone"
+        share = routine_share_minutes(rw)
+        for user in rw.assignee_list:
+            s = summary.get(user.id)
+            if s is None:
+                s = summary[user.id] = {"assignee": user, "count": 0, "minutes": 0, "done": 0, "undone": 0}
+            s["count"] += 1
+            s["minutes"] += share
+            s[done] += 1
+        totals["count"] += 1
+        totals["minutes"] += rw.monthly_minutes or 0
+        totals[done] += 1
+    rows = sorted(summary.values(), key=lambda x: x["assignee"].display_name if x["assignee"] else "")
     for s in rows:
-        for k in totals:
-            totals[k] += s[k]
+        s["minutes"] = _round_minutes(s["minutes"])
+    totals["minutes"] = _round_minutes(totals["minutes"])
     return rows, totals
 
 ROUTINE_NUMBER_MAX = 999999
@@ -4950,33 +5012,39 @@ def _routine_number(form, name, label, errors):
     return number
 
 def _can_edit_routine(rw):
-    """編集できるか:マネージャー、または自分が担当のもの(メンバーは自分の分のみ)。"""
-    return current_user.is_manager or rw.assignee_id == current_user.id
+    """編集できるか:マネージャー、または自分が担当のもの(メンバーは自分が担当者の1人の業務のみ)。"""
+    return current_user.is_manager or rw.is_assigned_to(current_user)
 
 def _assignee_users(routine=None):
-    """担当者の選択肢。メンバーは自分のみ、マネージャーは全員。
+    """担当者の選択肢(マネージャー): 有効なユーザーと、その業務の担当のまま無効化されたユーザー。
 
-    編集する業務の担当者が無効化されている場合は、その人も選択肢に含める(マネージャーが担当を
-    付け替えずにほかの項目を直せるように。画面では「［無効］」を付ける)。
+    無効化された担当者も選択肢に残す(マネージャーが担当を付け替えずにほかの項目を直せるように。
+    画面では「［無効］」を付ける)。メンバーは担当者を選べない(登録は自分、編集は今の担当者のまま)。
     """
     if not current_user.is_manager:
         return [current_user]
     users = get_active_users()
-    if routine is not None and routine.assignee is not None and not routine.assignee.is_active:
-        users.append(routine.assignee)
+    if routine is not None:
+        inactive = [u for u in routine.assignee_list if not u.is_active]
+        users += sorted(inactive, key=lambda u: u.display_name or "")
     return users
 
-def _forced_assignee_id():
-    """メンバーは担当者を自分に固定する(マネージャーはNone=フォームの選択に従う)。"""
-    return None if current_user.is_manager else current_user.id
-
-def _render_routine_form(routine, users, form=None, version=None, rem_state=None, rem_version=None):
+def _render_routine_form(routine, users, form=None, version=None, rem_state=None, rem_version=None, selected=None):
     """登録・編集の画面を表示する(form は入力エラーで再表示する入力)。
 
     version は編集画面の hidden(画面を開いたときの内容の控え。VersionFields.shown)。
+    selected は担当者として選んでおくユーザーID(省略時は送られた選択、無ければ今の担当者)。
     「リマインド」の欄(10-4)も同じ: rem_state は欄に出す値(省略時は送られた入力か今の設定)、rem_version は
     リマインドの設定の控え(hidden の reminder_version)。
     """
+    if selected is None:
+        if form is not None and hasattr(form, "getlist") and form.get("assignees_sent"):
+            chosen, _stale = users_from_form_keys(form.getlist("assignee_ids"), users)
+            selected = [u.id for u in chosen]
+        elif routine is not None:
+            selected = [u.id for u in routine.assignee_list]
+        else:
+            selected = []
     rem = db.session.get(RoutineReminder, routine.id) if routine is not None else None
     choices = reminder_extra_user_choices(rem)
     if routine is not None and version is None:
@@ -4992,7 +5060,8 @@ def _render_routine_form(routine, users, form=None, version=None, rem_state=None
         # 追加の宛先(アドレス)はマネージャーだけが設定・変更できる(メンバーの画面は今の値を読み取り専用で出す)
         rem_state = dict(rem_state, extra_emails=reminder_values(rem)["extra_emails"])
     return render_template(
-        "routine/form.html", routine=routine, users=users,
+        "routine/form.html", routine=routine, users=users, selected_assignees=selected,
+        can_assign=current_user.is_manager,
         freq_choices=FREQ_UNIT_CHOICES, manual_choices=MANUAL_CHOICES, form=form, version=version,
         rem=rem_state, rem_version=rem_version, rem_choices=choices, rem_ctx=reminder_form_context(),
         rem_mark=REMINDER_FORM_MARK,
@@ -5001,42 +5070,57 @@ def _render_routine_form(routine, users, form=None, version=None, rem_state=None
         rem_emails_pending=rem is not None and not reminder_emails_checked(rem),
     )
 
-ROUTINE_VERSION = VersionFields((
-    ("name", "業務名"), ("assignee_id", "担当者"), ("purpose", "目的"), ("frequency_count", "回数"),
+ROUTINE_VERSION_FIELDS = (
+    ("name", "業務名"), ("assignees", "担当者"), ("purpose", "目的"), ("frequency_count", "回数"),
     ("frequency_unit", "頻度単位"), ("minutes_per", "1回の所要時間"), ("content", "業務内容"),
     ("manual_status", "手順書作成状況"),
-))
+)
 
-def _routine_form_value(key, value):
-    """項目の値を、編集画面の入力欄に入れる形にする(担当者は「ユーザーID:ログインID」。conflict_form 用)。"""
-    if key == "assignee_id":
-        user = db.session.get(User, value) if value is not None else None
-        return user.form_key if user is not None else ""
+def _routine_values(rw):
+    """編集画面で扱う項目の今の値(担当者はユーザーIDの一覧)。"""
+    values = {key: getattr(rw, key) for key, _label in ROUTINE_VERSION_FIELDS if key != "assignees"}
+    values["assignees"] = sorted(u.id for u in rw.assignee_list)
+    return values
+
+ROUTINE_VERSION = VersionFields(ROUTINE_VERSION_FIELDS, _routine_values)
+
+def _routine_form_value(_key, value):
+    """項目の値を、編集画面の入力欄に入れる形にする(conflict_form 用。担当者は別に選び直す)。"""
     return "" if value is None else str(value)
 
-def _fill_from_form(rw, form, users, forced_assignee_id=None):
+def _routine_conflict_form(current, changed):
+    """保存しなかったときの再表示の入力と、担当者として選ぶユーザーID(担当者が変わっていなければ送られた選択)。"""
+    form = conflict_form(current, [key for key in changed if key != "assignees"], _routine_form_value)
+    return form, (current["assignees"] if "assignees" in changed else None)
+
+_ROUTINE_NO_ASSIGNEE = "担当者を1人以上選択してください。"
+
+def _fill_from_form(rw, form, users, is_new):
     """フォーム値を rw に反映。エラーメッセージのリストを返す。
 
-    users は担当者の選択肢(_assignee_users)。担当者の値は「ユーザーID:ログインID」(User.form_key)で、
-    この中の人だけを受け付ける(画面を開いた後に削除・無効化された人や、存在しないIDは保存しない。
-    削除した人のIDは次に追加した人に再利用されるため、ログインIDも照合する)。
-    forced_assignee_id を渡すと担当者はそれに固定(メンバーの自分固定に使う)。
+    担当者(複数)はマネージャーだけが選ぶ。値は「ユーザーID:ログインID」(User.form_key)で、選択肢 users の中の人だけを
+    受け付ける(画面を開いた後に削除・無効化された人や、存在しないIDは保存しない。削除した人のIDは次に追加した人に
+    再利用されるため、ログインIDも照合する)。以前の画面(1人を選ぶ assignee_id)からの送信も受け付ける。
+    メンバーは、登録は自分を担当者に、編集は今の担当者のまま(担当者は変えられない)。
     """
     errors = []
     name = form.get("name", "").strip()
     if not name:
         errors.append("業務名は必須です。")
 
-    if forced_assignee_id is not None:
-        assignee_id = forced_assignee_id
-    else:
-        raw = form.get("assignee_id") or ""
-        chosen, _stale = users_from_form_keys([raw], users) if raw else ([], False)
-        assignee_id = chosen[0].id if chosen else None
-        if not raw:
-            errors.append("担当者を選択してください。")
-        elif assignee_id is None:
-            errors.append("選んだ担当者は、削除・無効化されたか登録されていません。担当者を選択し直してください。")
+    assignees = None
+    if current_user.is_manager:
+        keys = form.getlist("assignee_ids") if hasattr(form, "getlist") else []
+        if not keys and form.get("assignee_id"):
+            keys = [form.get("assignee_id")]
+        chosen, stale = users_from_form_keys(keys, users)
+        if stale:
+            errors.append(_STALE_ASSIGNEE)
+        elif not chosen:
+            errors.append(_ROUTINE_NO_ASSIGNEE)
+        assignees = chosen
+    elif is_new:
+        assignees = [current_user._get_current_object()]
 
     frequency_count = _routine_number(form, "frequency_count", "回数", errors)
     minutes_per = _routine_number(form, "minutes_per", "1回の所要時間(分)", errors)
@@ -5048,7 +5132,8 @@ def _fill_from_form(rw, form, users, forced_assignee_id=None):
     manual = choice_or_default(form.get("manual_status"), MANUAL_CHOICES, MANUAL_UNDONE)
 
     rw.name = name
-    rw.assignee_id = assignee_id
+    if assignees is not None:
+        rw.set_assignees(assignees)
     rw.purpose = form.get("purpose", "").strip()
     rw.frequency_count = frequency_count
     rw.frequency_unit = unit
@@ -5065,13 +5150,13 @@ def list_routines():
     keyword = search_keyword()
     users, assignee_id, assignee = user_filter_choices(
         request.args.get("assignee", ""),
-        User.id.in_(db.select(RoutineWork.assignee_id)) if current_user.is_manager else None)
+        User.id.in_(db.select(routine_assignees.c.user_id)) if current_user.is_manager else None)
 
-    query = RoutineWork.query
+    query = RoutineWork.query.options(selectinload(RoutineWork.assignees), selectinload(RoutineWork.assignee))
     if assignee is not None:
-        query = query.filter(RoutineWork.assignee_id == assignee)
+        query = query.filter(RoutineWork.assignees.any(User.id == assignee))
     if scope == "mine":
-        query = query.filter(RoutineWork.assignee_id == current_user.id)
+        query = query.filter(RoutineWork.assignees.any(User.id == current_user.id))
     if manual in MANUAL_CHOICES:
         query = query.filter(RoutineWork.manual_status == manual)
     if keyword:
@@ -5104,7 +5189,7 @@ def new_routine():
     users = _assignee_users()  # メンバーは自分のみ選択可
     if request.method == "POST":
         rw = RoutineWork(creator_id=current_user.id)
-        errors = _fill_from_form(rw, request.form, users, forced_assignee_id=_forced_assignee_id())
+        errors = _fill_from_form(rw, request.form, users, is_new=True)
         # 「リマインド」の欄(10-4。この欄の無い以前の画面からの登録では作らない)
         today = reminder_today()
         rem_values = None
@@ -5160,7 +5245,7 @@ def edit_routine(routine_id):
         rem = db.session.get(RoutineReminder, rw.id)
         rem_current = reminder_values(rem)
         rem_choices = reminder_extra_user_choices(rem)
-        errors = _fill_from_form(rw, request.form, users, forced_assignee_id=_forced_assignee_id())
+        errors = _fill_from_form(rw, request.form, users, is_new=False)
         # 「リマインド」の欄(10-4)。この欄の無い以前の画面からの保存では、リマインドの設定を変えない
         rem_values = None
         if request.form.get(REMINDER_FORM_MARK):
@@ -5186,8 +5271,9 @@ def edit_routine(routine_id):
             shown = dict(rem_values) if rem_values is not None else dict(rem_current)
             for key in rem_changed:
                 shown[key] = rem_current[key]
+            shown_form, selected = _routine_conflict_form(current, changed)
             return _render_routine_form(
-                rw, users, conflict_form(current, changed, _routine_form_value),
+                rw, users, shown_form, selected=selected,
                 version=ROUTINE_VERSION.version(current),
                 rem_state=reminder_state_from_values(shown, today, rem_choices),
                 rem_version=REMINDER_VERSION.version(rem_current))
@@ -6315,12 +6401,14 @@ def _build_workload(today, users):
                 d["overdue"] += 1
             d["task_h"] += share
 
-    for rw in RoutineWork.query.all():
-        d = load.get(rw.assignee_id)
-        if d is None:
-            continue
-        d["routine_cnt"] += 1
-        d["routine_min"] += rw.monthly_minutes or 0
+    for rw in RoutineWork.query.options(selectinload(RoutineWork.assignees), selectinload(RoutineWork.assignee)).all():
+        share = routine_share_minutes(rw)  # 複数担当は均等割り
+        for user in rw.assignee_list:
+            d = load.get(user.id)
+            if d is None:
+                continue
+            d["routine_cnt"] += 1
+            d["routine_min"] += share
 
     rows = []
     for u in users:
@@ -6875,6 +6963,7 @@ def _member_has_history(user):
         return True
     if RoutineWork.query.filter(
         (RoutineWork.assignee_id == user.id) | (RoutineWork.creator_id == user.id)
+        | RoutineWork.assignees.any(User.id == user.id)
     ).first():
         return True
     if RoutineOccurrence.query.filter_by(completed_by_id=user.id).first():
@@ -6981,7 +7070,7 @@ def delete_member(user_id):
     name = user.display_name
     if _member_has_history(user):
         open_tasks = sum(1 for t in user.assigned_tasks if t.status != STATUS_DONE)
-        routines = RoutineWork.query.filter_by(assignee_id=user.id).count()
+        routines = RoutineWork.query.filter(RoutineWork.assignees.any(User.id == user.id)).count()
         teams = user.department_names
         user.departments = []
         user.is_active = False
@@ -7231,11 +7320,13 @@ def _tasks_sheets():
 
 def _routine_sheets():
     rows = [[
-        r.id, r.name, r.assignee.display_name if r.assignee else "",
+        r.id, r.name, r.assignee_names,
         r.purpose, r.frequency_count, r.frequency_unit, r.minutes_per,
         r.monthly_minutes, r.content, r.manual_status,
         r.creator.display_name if r.creator else "", r.created_at, r.updated_at,
-    ] for r in RoutineWork.query.order_by(RoutineWork.assignee_id, RoutineWork.id).all()]
+    ] for r in RoutineWork.query.options(selectinload(RoutineWork.assignees), selectinload(RoutineWork.assignee),
+                                          selectinload(RoutineWork.creator))
+          .order_by(RoutineWork.assignee_id, RoutineWork.id).all()]
     headers = [
         "ID", "業務名", "担当者", "目的", "回数", "頻度単位", "1回所要(分)",
         "月間所要(分)", "業務内容", "手順書", "登録者", "登録日時", "更新日時",
@@ -15116,19 +15207,20 @@ def pending_occurrences(today, routine_id=None, assignee_id=None):
         .join(RoutineWork, RoutineWork.id == RoutineOccurrence.routine_id)
         .filter(RoutineReminder.enabled.is_(True), RoutineOccurrence.completed_at.is_(None),
                 RoutineOccurrence.due_date <= today)
-        .options(selectinload(RoutineOccurrence.routine).selectinload(RoutineWork.assignee))
+        .options(selectinload(RoutineOccurrence.routine).selectinload(RoutineWork.assignees),
+                 selectinload(RoutineOccurrence.routine).selectinload(RoutineWork.assignee))
     )
     if routine_id is not None:
         query = query.filter(RoutineOccurrence.routine_id == routine_id)
     if assignee_id is not None:
-        query = query.filter(RoutineWork.assignee_id == assignee_id)
+        query = query.filter(RoutineWork.assignees.any(User.id == assignee_id))
     return query.order_by(RoutineOccurrence.due_date, RoutineWork.name, RoutineOccurrence.id).all()
 
 def can_complete_occurrence(occ, user):
-    """完了を入力できるか: その業務の担当者とマネージャー。"""
+    """完了を入力できるか: その業務の担当者(複数担当はだれでも)とマネージャー。"""
     if not getattr(user, "is_authenticated", False):
         return False
-    return user.is_manager or (occ.routine is not None and occ.routine.assignee_id == user.id)
+    return user.is_manager or (occ.routine is not None and occ.routine.is_assigned_to(user))
 
 def occurrence_rows(occurrences, today, user):
     """画面に出す値の一覧 [{"occ", "routine", "due", "is_today", "elapsed", "can_complete", "key"}]。"""
@@ -15147,7 +15239,7 @@ def has_enabled_reminders(assignee_id=None):
     query = db.session.query(RoutineReminder.routine_id).filter(RoutineReminder.enabled.is_(True))
     if assignee_id is not None:
         query = query.join(RoutineWork, RoutineWork.id == RoutineReminder.routine_id).filter(
-            RoutineWork.assignee_id == assignee_id)
+            RoutineWork.assignees.any(User.id == assignee_id))
     return query.first() is not None
 
 def delete_routine_reminder_rows(routine_id):
@@ -15567,25 +15659,29 @@ def reminder_recipients_for(routine, rem, users, emails):
     戻り値: (宛先 [{"address", "name", "kind", "user_id"}], 送れない宛先 [{"name", "reason", "kind"}])。
     user_id はメンバーのアドレス(ユーザーの登録)ならそのユーザーID、追加の宛先に入力したアドレスなら None
     (業務の詳細で、ほかの人が登録したアドレスを表示してよいかの判断に使う)。
-    担当者・追加の宛先(メンバー)は、有効でメールアドレスがある人だけに送る。無効化された人・アドレスの無い人は
-    送れない宛先にする。追加の宛先のアドレスは、マネージャーが保存したもの(reminder_emails_checked)だけを送り、
+    担当者(複数担当は全員)・追加の宛先(メンバー)は、有効でメールアドレスがある人だけに送る。無効化された人・
+    アドレスの無い人は送れない宛先にする。担当者でもある追加の宛先のメンバーは、担当者として1回だけ数える。追加の宛先のアドレスは、マネージャーが保存したもの(reminder_emails_checked)だけを送り、
     確認待ちのものは送れない宛先(「アドレス N件」・マネージャーの確認待ち)にする。
     """
     recipients, problems = [], []
-    assignee = routine.assignee
-    if assignee is None:
+    assignees = routine.assignee_list
+    if not assignees:
         problems.append({"name": "（担当者なし）", "reason": "担当者がいません", "kind": "担当者"})
-    elif not assignee.is_active:
-        problems.append({"name": assignee.display_name, "reason": "無効化されたメンバー", "kind": "担当者"})
-    elif not emails.get(assignee.id):
-        problems.append({"name": assignee.display_name, "reason": "メールアドレス未登録", "kind": "担当者"})
-    else:
-        recipients.append({"address": emails[assignee.id], "name": assignee.display_name, "kind": "担当者",
-                           "user_id": assignee.id})
+    for assignee in assignees:
+        if not assignee.is_active:
+            problems.append({"name": assignee.display_name, "reason": "無効化されたメンバー", "kind": "担当者",
+                             "user_id": assignee.id})
+        elif not emails.get(assignee.id):
+            problems.append({"name": assignee.display_name, "reason": "メールアドレス未登録", "kind": "担当者",
+                             "user_id": assignee.id})
+        else:
+            recipients.append({"address": emails[assignee.id], "name": assignee.display_name, "kind": "担当者",
+                               "user_id": assignee.id})
+    assignee_ids = {u.id for u in assignees}
     for user_id in rem.extra_user_id_list:
         user = users.get(user_id)
-        if user is None:
-            continue  # 削除された人(削除のときに除いているため、通常は無い)
+        if user is None or user_id in assignee_ids:
+            continue  # 削除された人(削除のときに除いているため、通常は無い)・担当者でもある人
         if not user.is_active:
             problems.append({"name": user.display_name, "reason": "無効化されたメンバー", "kind": "追加の宛先"})
         elif not emails.get(user_id):
@@ -15730,7 +15826,7 @@ def _reminder_item(occ, today, base):
     return {
         "id": occ.id,
         "name": one_line(routine.name, limit=200),
-        "assignee": routine.assignee.name_label if routine.assignee is not None else "（担当者なし）",
+        "assignee": routine.assignee_labels or "（担当者なし）",
         "due_date": occ.due_date,
         "due_label": _due_label(occ.due_date),
         "is_today": occ.due_date >= today,
@@ -15990,7 +16086,7 @@ def dashboard_routine_panel(today, user):
         RoutineOccurrence.query
         .join(RoutineReminder, RoutineReminder.routine_id == RoutineOccurrence.routine_id)
         .join(RoutineWork, RoutineWork.id == RoutineOccurrence.routine_id)
-        .filter(RoutineReminder.enabled.is_(True), RoutineWork.assignee_id == user.id,
+        .filter(RoutineReminder.enabled.is_(True), RoutineWork.assignees.any(User.id == user.id),
                 RoutineOccurrence.due_date == today, RoutineOccurrence.completed_at.isnot(None))
         .order_by(RoutineWork.name, RoutineOccurrence.id).all()
     )
@@ -16118,7 +16214,7 @@ def _email_conflict(version, current, new):
 
 def _render_account_email(address, version, status=200):
     routines = (RoutineWork.query.join(RoutineReminder, RoutineReminder.routine_id == RoutineWork.id)
-                .filter(RoutineReminder.enabled.is_(True), RoutineWork.assignee_id == current_user.id)
+                .filter(RoutineReminder.enabled.is_(True), RoutineWork.assignees.any(User.id == current_user.id))
                 .order_by(RoutineWork.name).all())
     return render_template("account/email.html", address=address, version=version, routines=routines,
                            saved=user_email(current_user.id), email_max=EMAIL_MAX), status
@@ -17875,6 +17971,25 @@ def prepare_instance(app, create_tables=True):
     if create_tables:
         with app.app_context():
             db.create_all()
+            backfill_routine_assignees()
+
+def backfill_routine_assignees():
+    """担当者の行(routine_assignees)が無い定型業務に、assignee_id の担当者を1行作る(以前の版で登録した業務)。
+
+    新しいテーブルにだけ書く(routine_works は変えない)。同時に起動したほかのプロセスが先に作ったときは何もしない。
+    """
+    missing = db.session.execute(
+        db.select(RoutineWork.id, RoutineWork.assignee_id)
+        .where(~db.exists().where(routine_assignees.c.routine_id == RoutineWork.id))
+    ).all()
+    rows = [{"routine_id": rid, "user_id": uid} for rid, uid in missing if uid is not None]
+    if not rows:
+        return
+    try:
+        db.session.execute(routine_assignees.insert(), rows)
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
 
 class SqliteIntConverter(IntegerConverter):
     """URL の <int:...>。SQLite の整数の範囲(SQLITE_INT_MAX)を超える値は一致しない(404 になる)。
@@ -18285,8 +18400,9 @@ def seed_command():
             ]
             for r in routines:
                 aname = r.pop("assignee")
-                db.session.add(RoutineWork(
-                    creator_id=admin.id, assignee_id=user_map[aname].id, **r))
+                rw = RoutineWork(creator_id=admin.id, assignee_id=user_map[aname].id, **r)
+                rw.set_assignees([user_map[aname]])
+                db.session.add(rw)
             db.session.commit()
             print(f"サンプル定型・定期業務を {len(routines)} 件作成しました。")
 

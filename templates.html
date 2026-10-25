@@ -111,7 +111,7 @@
           {# マネージャーだけの管理の画面(スキル・スキルテスト管理・チーム管理・システム設定)は「管理」にまとめる
              (項目が多く、一般的な画面の幅で名前が途中で折り返さないように)。マネージャーダッシュボードは一段目の最初の項目 #}
           <li class="nav-item dropdown">
-            <a class="nav-link dropdown-toggle {% if request.blueprint in ('skills', 'skilltest', 'manager', 'departments', 'system') %}active{% endif %}"
+            <a class="nav-link dropdown-toggle {% if request.blueprint in ('skills', 'skilltest', 'departments', 'system') %}active{% endif %}"
                href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false"><i class="bi bi-sliders"></i> 管理</a>
             <ul class="dropdown-menu">
               {# スキルはマネージャーのみ。メンバーにはタブを出さない #}
@@ -1197,7 +1197,7 @@
             {% if row.is_today %}<span class="badge bg-primary">本日</span>{% else %}<span class="text-danger fw-bold">{{ row.elapsed }}</span>{% endif %}
           </td>
           <td><a href="{{ url_for('routine.detail', routine_id=row.routine.id) }}" class="fw-medium">{{ row.routine.name }}</a></td>
-          <td class="text-nowrap">{{ row.routine.assignee.name_label if row.routine.assignee else '―' }}</td>
+          <td class="text-nowrap">{{ row.routine.assignee_labels or '―' }}</td>
           <td class="text-end">{% if row.can_complete %}{{ occurrence_complete_button(row, 'list') }}{% else %}<span class="text-muted small">―</span>{% endif %}</td>
         </tr>
         {% endfor %}
@@ -1214,7 +1214,7 @@
 <div class="card shadow-sm mb-3">
   <div class="card-header bg-white fw-bold">
     <i class="bi bi-people"></i> ヒト別サマリー
-    <span class="text-muted small fw-normal">（全データ対象）</span>
+    <span class="text-muted small fw-normal">（全データ対象。複数担当の業務は担当者ごとに1件と数え、時間は人数で均等に分けて計上。合計の行は業務の数）</span>
   </div>
   <div class="table-responsive">
     <table class="table table-sm table-hover align-middle mb-0 text-end sortable">
@@ -1305,7 +1305,7 @@
       <tbody>
         {% for r in routines %}
         <tr>
-          <td class="text-nowrap">{{ r.assignee.name_label }}</td>
+          <td class="text-nowrap">{{ r.assignee_labels or '―' }}</td>
           <td><a href="{{ url_for('routine.detail', routine_id=r.id) }}" class="fw-medium">{{ r.name }}</a></td>
           <td><small class="text-muted">{{ r.purpose or '―' }}</small></td>
           <td class="text-nowrap">{{ r.frequency_label }}</td>
@@ -1323,7 +1323,7 @@
 </div>
 <p class="text-muted small mt-2">
   {{ routines|length }} 件
-  <span class="ms-2"><i class="bi bi-info-circle"></i> 所要時間(月)＝「回数 × 1回の所要時間」を月換算した目安(4週/月・30日/月で換算)。</span>
+  <span class="ms-2"><i class="bi bi-info-circle"></i> 所要時間(月)＝「回数 × 1回の所要時間」を月換算した目安(4週/月・30日/月・期は6か月・年は12か月で換算)。</span>
 </p>
 {% endblock %}
 {#=== routine/detail.html ===#}
@@ -1348,7 +1348,7 @@
 
     <dl class="row mb-0">
       <dt class="col-sm-3 text-muted">担当者</dt>
-      <dd class="col-sm-9">{{ routine.assignee.name_label }}</dd>
+      <dd class="col-sm-9">{{ routine.assignee_labels or '―' }}{% if routine.assignee_list|length > 1 %} <span class="text-muted small">（{{ routine.assignee_list|length }}人で担当）</span>{% endif %}</dd>
 
       <dt class="col-sm-3 text-muted">目的</dt>
       <dd class="col-sm-9">{{ routine.purpose or '―' }}</dd>
@@ -1361,7 +1361,8 @@
 
       <dt class="col-sm-3 text-muted">所要時間(月換算)</dt>
       <dd class="col-sm-9">{{ routine.monthly_minutes_label }}
-        <span class="text-muted small">（4週/月・30日/月で換算）</span>
+        {% if routine.assignee_list|length > 1 and routine.monthly_minutes is not none %}<span class="small">（1人あたり {{ routine.monthly_share_minutes }}分）</span>{% endif %}
+        <span class="text-muted small">（4週/月・30日/月・期は6か月・年は12か月で換算）</span>
       </dd>
 
       <dt class="col-sm-3 text-muted">業務内容</dt>
@@ -1407,8 +1408,8 @@
     {% else %}
     {% for p in reminder.problems if p.kind == '担当者' %}
     <div class="alert alert-warning small py-2">
-      <i class="bi bi-exclamation-triangle"></i> 担当者（{{ p.name }}）は{{ p.reason }}のため、担当者にはリマインドのメールが送られません（追加の宛先には送ります）。
-      {% if p.reason == 'メールアドレス未登録' %}{% if current_user.id == routine.assignee_id %}<a href="{{ url_for('account.email') }}">自分のメールアドレスを登録する</a>{% elif current_user.is_manager %}<a href="{{ url_for('departments.manage') }}">チーム管理で登録する</a>{% endif %}{% endif %}
+      <i class="bi bi-exclamation-triangle"></i> 担当者（{{ p.name }}）は{{ p.reason }}のため、この人にはリマインドのメールが送られません（ほかの宛先には送ります）。
+      {% if p.reason == 'メールアドレス未登録' %}{% if p.user_id and current_user.id == p.user_id %}<a href="{{ url_for('account.email') }}">自分のメールアドレスを登録する</a>{% elif current_user.is_manager %}<a href="{{ url_for('departments.manage') }}">チーム管理で登録する</a>{% endif %}{% endif %}
     </div>
     {% endfor %}
     {% if reminder.rem.enabled and not reminder.sending_enabled %}
@@ -1500,23 +1501,31 @@
       {# 登録の二度押しで同じ業務を2件にしないための1回限りの印 #}
       <input type="hidden" name="once" value="{{ submit_token() }}">
       {% endif %}
-      <div class="row">
-        <div class="col-md-7 mb-3">
-          <label class="form-label">業務名 <span class="text-danger">*</span></label>
-          <input type="text" name="name" class="form-control" required value="{{ val('name') }}">
+      <div class="mb-3">
+        <label class="form-label">業務名 <span class="text-danger">*</span></label>
+        <input type="text" name="name" class="form-control" required value="{{ val('name') }}">
+      </div>
+      <div class="mb-3">
+        <label class="form-label">担当者 <span class="text-danger">*</span>{% if can_assign %} <span class="text-muted small">（複数選択可）</span>{% endif %}</label>
+        {% if can_assign %}
+        {# 担当者の欄を送ったことの印(チェックをすべて外した送信と、この欄の無い送信を見分ける) #}
+        <input type="hidden" name="assignees_sent" value="1">
+        <div class="row row-cols-2 row-cols-md-3 g-1 border rounded p-2">
+          {% for u in users %}
+          <div class="col">
+            <div class="form-check">
+              <input class="form-check-input" type="checkbox" name="assignee_ids" value="{{ u.form_key }}"
+                     id="rasg{{ u.id }}" {% if u.id in selected_assignees %}checked{% endif %}>
+              <label class="form-check-label small" for="rasg{{ u.id }}">{{ u.display_name }}{% if not u.is_active %} <span class="text-muted">［無効］</span>{% endif %}</label>
+            </div>
+          </div>
+          {% endfor %}
         </div>
-        <div class="col-md-5 mb-3">
-          <label class="form-label">担当者 <span class="text-danger">*</span></label>
-          <select name="assignee_id" class="form-select" required>
-            <option value="">選択してください</option>
-            {% for u in users %}
-            <option value="{{ u.form_key }}"
-              {% if (form and form.get('assignee_id') == u.form_key) or (not form and routine and routine.assignee_id == u.id) %}selected{% endif %}>
-              {{ u.display_name }}{% if not u.is_active %}［無効］{% endif %}
-            </option>
-            {% endfor %}
-          </select>
-        </div>
+        <div class="form-text">複数選ぶと、ヒト別サマリー・負荷の所要時間は人数で均等に分けて計上し、リマインドは担当者全員に送ります。{% if users|rejectattr('is_active')|list %}［無効］は無効化されたメンバーです（担当のまま残します。外す場合はチェックを外してください）。{% endif %}</div>
+        {% else %}
+        <div class="form-control-plaintext py-1">{{ routine.assignee_labels if editing else current_user.display_name }}</div>
+        <div class="form-text">{{ '担当者はマネージャーが変更します。' if editing else '登録すると自分が担当者になります（担当者の追加・変更はマネージャーが行います）。' }}</div>
+        {% endif %}
       </div>
 
       <div class="mb-3">
@@ -1551,7 +1560,7 @@
           </select>
         </div>
       </div>
-      <p class="text-muted small mt--2 mb-3">例: 回数「3」＋頻度単位「週」＝ 週3回。所要時間は1回あたりの分数。</p>
+      <p class="text-muted small mt--2 mb-3">例: 回数「3」＋頻度単位「週」＝ 週3回。「期」は半期（6か月）、「年」は1年あたりの回数です。所要時間は1回あたりの分数。</p>
 
       <div class="mb-3">
         <label class="form-label">業務内容(自由記載)</label>
@@ -1687,7 +1696,7 @@
         {% if not occ.completed_at %}{% if row.is_today %}<span class="badge bg-primary">本日</span>{% else %}<span class="text-danger fw-bold">{{ row.elapsed }}</span>{% endif %}{% endif %}
       </dd>
       <dt class="col-sm-3 text-muted">担当者</dt>
-      <dd class="col-sm-9">{{ routine.assignee.name_label if routine.assignee else '―' }}</dd>
+      <dd class="col-sm-9">{{ routine.assignee_labels or '―' }}</dd>
       <dt class="col-sm-3 text-muted">状態</dt>
       <dd class="col-sm-9">
         {% if occ.completed_at %}<span class="badge bg-success">完了</span>
