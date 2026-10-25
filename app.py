@@ -2055,17 +2055,23 @@ def _fmt_amount(v):
 # タスクの規模(=担当者が完了までに要する実働工数の目安。マネージャがスキル/キャパを
 # 考慮して選ぶため、能力差は規模選択の時点で反映される)。負荷合算のため実働時間(h)に
 # 対応づける(8h/日・40h/週・160h/月換算)。各要素 = (キー, 表示名, 工数h, 目安日数)。
+# キーは tasks.scale にそのまま保存するため、既存のキーは変えない(刻みを細かくするときは間に足す)。
 TASK_SCALES = [
-    ("1h",     "1時間", 1,    1),
-    ("half_d", "半日",  4,    1),
-    ("1d",     "1日",   8,    1),
-    ("3d",     "3日",   24,   3),
-    ("1w",     "1週",   40,   7),
-    ("2w",     "2週",   80,   14),
-    ("1m",     "1か月", 160,  30),
-    ("3m",     "3か月", 480,  91),
-    ("half_y", "半期",  960,  182),
-    ("1y",     "1年",   1920, 365),
+    ("30m",    "30分",   0.5,  1),
+    ("1h",     "1時間",  1,    1),
+    ("2h",     "2時間",  2,    1),
+    ("half_d", "半日",   4,    1),
+    ("1d",     "1日",    8,    1),
+    ("2d",     "2日",    16,   2),
+    ("3d",     "3日",    24,   3),
+    ("1w",     "1週",    40,   7),
+    ("2w",     "2週",    80,   14),
+    ("3w",     "3週",    120,  21),
+    ("1m",     "1か月",  160,  30),
+    ("2m",     "2か月",  320,  61),
+    ("3m",     "3か月",  480,  91),
+    ("half_y", "半期",   960,  182),
+    ("1y",     "1年",    1920, 365),
 ]
 TASK_SCALE_KEYS = [s[0] for s in TASK_SCALES]
 TASK_SCALE_LABELS = {s[0]: s[1] for s in TASK_SCALES}
@@ -4453,14 +4459,90 @@ def _read_choice(name, choices, default):
     value = request.form.get(name) or default
     return value if value in choices else None
 
+# ユーザーごとの画面の表示の設定(タスク一覧の表示する項目など)。instance/user_prefs.json(Git管理外)に
+# {"ユーザーID:ログインID": {項目: 値}} の形で保存する(DBのテーブルは変えない)。読めないときは既定の表示にする。
+USER_PREFS_FILENAME = "user_prefs.json"
+USER_PREFS_LABEL = "画面の表示の設定"
+_user_prefs_lock = threading.RLock()
+
+def _user_prefs_path():
+    return os.path.join(current_app.instance_path, USER_PREFS_FILENAME)
+
+def _read_user_prefs(strict=False):
+    """user_prefs.json の内容(辞書でなければ {})。読めないときは、strict なら SettingsFileError、そうでなければ {}。"""
+    try:
+        data = read_json(_user_prefs_path(), USER_PREFS_LABEL)
+    except SettingsFileError as exc:
+        if strict:
+            raise
+        current_app.logger.warning("%s（既定の表示を使います）", exc)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+def user_pref(user, key):
+    """その人の表示の設定 key の値(無ければ None)。"""
+    prefs = _read_user_prefs().get(user.get_id())
+    return prefs.get(key) if isinstance(prefs, dict) else None
+
+def save_user_pref(user, key, value):
+    """その人の表示の設定 key を保存する(value が None なら消す)。
+
+    読めないファイルを既定で上書きして、ほかの人の設定を消さないように、読めないときは SettingsFileError。
+    書けなければ OSError。
+    """
+    with _user_prefs_lock:
+        data = _read_user_prefs(strict=True)
+        prefs = data.get(user.get_id())
+        if not isinstance(prefs, dict):
+            prefs = {}
+        if value is None:
+            prefs.pop(key, None)
+        else:
+            prefs[key] = value
+        if prefs:
+            data[user.get_id()] = prefs
+        else:
+            data.pop(user.get_id(), None)
+        write_json(_user_prefs_path(), data)
+
+# タスク一覧の表に表示できる項目(タイトルは常に表示)。(キー, 見出し, 並び替えの型〔None=文字〕)
+TASK_COLUMNS = (
+    ("assignees", "担当者", None),
+    ("priority", "優先度", "num"),
+    ("status", "ステータス", "num"),
+    ("start_date", "開始日", None),
+    ("due_date", "期限", None),
+    ("scale", "規模", "num"),
+    ("outcome_estimate", "成果（見込み）", None),
+    ("outcome_actual", "成果（実績）", None),
+    ("creator", "登録者", None),
+    ("last_comment", "最新の進捗記載", None),
+    ("comment_count", "進捗記載の数", "num"),
+    ("created_at", "登録日", None),
+    ("updated_at", "更新日", None),
+)
+TASK_COLUMN_KEYS = tuple(c[0] for c in TASK_COLUMNS)
+TASK_COLUMNS_DEFAULT = ("assignees", "priority", "status", "due_date")
+TASK_COLUMNS_PREF = "task_columns"
+
+def task_columns_for(user):
+    """その人がタスク一覧に表示する項目のキー(保存していなければ既定。知らないキーは除く。表の定義順)。"""
+    saved = user_pref(user, TASK_COLUMNS_PREF)
+    if not isinstance(saved, list):
+        return list(TASK_COLUMNS_DEFAULT)
+    return [key for key in TASK_COLUMN_KEYS if key in saved]
+
 @tasks_bp.route("/")
 @login_required
 def list_tasks():
     statuses = [s for s in request.args.getlist("status") if s in STATUS_CHOICES]
     assignee_ids = to_ints(request.args.getlist("assignee"))
     scope = request.args.get("scope", "")  # "mine" なら自分の担当のみ
-    hide_done = request.args.get("hide_done") == "1"  # 「完了」を除く
+    # 「完了」を除く: 条件なしで開いたときは除く(絞り込みのフォームは hidden の f=1 を送るため、チェックを外した
+    # ときも条件ありになる。ほかの画面からの status=完了 などのリンクはそのまま)
+    hide_done = request.args.get("hide_done") == "1" if request.args else True
     keyword = search_keyword()
+    columns = task_columns_for(current_user)
     # 担当者の選択肢: 有効なユーザーと、選択中の無効化したユーザー(マネージャーには未完了のタスクが残っている
     # 無効化したユーザーも。担当の付け替えのため)。どのユーザーでもない番号は条件に使わない
     users = filter_user_choices(assignee_ids, User.assigned_tasks.any(Task.status != STATUS_DONE)
@@ -4481,8 +4563,13 @@ def list_tasks():
     if keyword:
         query = query.filter(keyword_condition(keyword, Task.title, Task.description))
 
-    # 未完了→期限が近い順、その後に完了タスク(担当者はまとめて読む。行ごとに読みに行かない)
-    tasks = query.options(selectinload(Task.assignees)).order_by(
+    # 未完了→期限が近い順、その後に完了タスク(担当者などはまとめて読む。行ごとに読みに行かない)
+    options = [selectinload(Task.assignees)]
+    if "last_comment" in columns or "comment_count" in columns:
+        options.append(selectinload(Task.comments))
+    if "creator" in columns:
+        options.append(selectinload(Task.creator))
+    tasks = query.options(*options).order_by(
         (Task.status == STATUS_DONE).asc(),
         Task.due_date.is_(None).asc(),
         Task.due_date.asc(),
@@ -4497,11 +4584,32 @@ def list_tasks():
         status_choices=STATUS_CHOICES,
         task_colors=STATUS_COLORS,
         priority_choices=PRIORITY_CHOICES,
+        columns=columns,
+        column_defs=TASK_COLUMNS,
         filters={
             "statuses": statuses, "assignees": assignee_ids,
             "scope": scope, "hide_done": hide_done, "q": keyword,
         },
     )
+
+@tasks_bp.route("/columns", methods=["POST"])
+@login_required
+def save_columns():
+    """タスク一覧に表示する項目を保存する(ユーザーごと。「初期状態に戻す」は保存した設定を消す)。"""
+    back = _safe_next(request.form.get("back")) or url_for("tasks.list_tasks")
+    if request.form.get("reset") == "1":
+        value = None
+    else:
+        chosen = set(request.form.getlist("columns"))
+        value = [key for key in TASK_COLUMN_KEYS if key in chosen]
+    try:
+        save_user_pref(current_user, TASK_COLUMNS_PREF, value)
+    except (OSError, SettingsFileError) as exc:
+        current_app.logger.warning("画面の表示の設定（instance/user_prefs.json）を保存できませんでした: %s", exc)
+        return flash_redirect("表示する項目を保存できませんでした（設定ファイルを読めない・書き込めないためです。"
+                              "マネージャーに連絡してください）。", "danger", back)
+    return flash_redirect("表示する項目を初期状態に戻しました。" if value is None else "表示する項目を保存しました。",
+                          "success", back)
 
 @tasks_bp.route("/new", methods=["GET", "POST"])
 @login_required

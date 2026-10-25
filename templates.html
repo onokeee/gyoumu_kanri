@@ -641,8 +641,10 @@
 </div>
 
 {# 絞り込みフォーム(ステータス・担当者は複数選択可。未チェック=すべて)
-   auto-filter: 選択・入力した時点で自動反映(「絞り込み」ボタンは不要) #}
+   auto-filter: 選択・入力した時点で自動反映(「絞り込み」ボタンは不要)
+   f=1: 条件を送ったことの印(条件なしで開いたときだけ「完了」を除くが既定で入るため、チェックを外した送信と区別する) #}
 <form method="get" class="card card-body shadow-sm mb-3 auto-filter">
+  <input type="hidden" name="f" value="1">
   <div class="row g-3">
     <div class="col-12 col-md-3">
       <label class="form-label small mb-1 fw-bold">キーワード</label>
@@ -700,27 +702,53 @@
   </div>
 </form>
 
+{# 表示する項目(ユーザーごとに保存。タイトルは常に表示)。チェックしても閉じないよう auto-close は外側のクリックだけ #}
+<div class="d-flex justify-content-end mb-2">
+  <div class="dropdown">
+    <button class="btn btn-sm btn-outline-secondary dropdown-toggle" type="button" data-bs-toggle="dropdown"
+            data-bs-auto-close="outside" aria-expanded="false"><i class="bi bi-layout-three-columns"></i> 表示する項目</button>
+    <form method="post" action="{{ url_for('tasks.save_columns') }}" class="dropdown-menu dropdown-menu-end p-3" style="min-width: 17rem;">
+      <input type="hidden" name="back" value="{{ request.full_path|trim('?') }}">
+      <div class="small text-muted mb-2">タイトルは常に表示します。選んだ項目はこのIDに保存され、次に開いたときも同じ表示になります。</div>
+      {% for key, label, _type in column_defs %}
+      <div class="form-check">
+        <input class="form-check-input" type="checkbox" name="columns" value="{{ key }}" id="col_{{ key }}"
+               {% if key in columns %}checked{% endif %}>
+        <label class="form-check-label small" for="col_{{ key }}">{{ label }}</label>
+      </div>
+      {% endfor %}
+      <div class="d-flex gap-2 mt-2">
+        <button type="submit" class="btn btn-sm btn-primary">保存</button>
+        <button type="submit" name="reset" value="1" class="btn btn-sm btn-outline-secondary">初期状態に戻す</button>
+      </div>
+    </form>
+  </div>
+</div>
+
 <div class="card shadow-sm">
   <div class="table-responsive">
     <table class="table table-hover align-middle mb-0 sortable">
       <thead class="table-light">
         <tr>
           <th>タイトル</th>
-          <th class="text-nowrap">担当者</th>
-          <th class="text-nowrap" data-type="num">優先度</th>
-          <th class="text-nowrap" data-type="num">ステータス</th>
-          <th class="text-nowrap">期限</th>
+          {% for key, label, sort_type in column_defs if key in columns %}
+          <th class="text-nowrap"{% if sort_type %} data-type="{{ sort_type }}"{% endif %}>{{ label }}</th>
+          {% endfor %}
         </tr>
       </thead>
       <tbody>
         {% for task in tasks %}
         <tr class="{% if task.is_done %}table-light text-muted{% endif %}">
           <td><a href="{{ url_for('tasks.detail', task_id=task.id) }}" class="fw-medium">{{ task.title }}</a></td>
+          {% for key in columns %}
+          {% if key == 'assignees' %}
           <td><small>{{ task.assignee_labels or '未割当' }}</small></td>
+          {% elif key == 'priority' %}
           {# 並び替えキー: 優先度は 高→低、ステータスは 未着手→完了 の定義順 #}
           <td data-sort="{{ priority_choices.index(task.priority) if task.priority in priority_choices else 9 }}">
             <span class="badge bg-{{ task.priority_color }} text-dark">{{ task.priority }}</span>
           </td>
+          {% elif key == 'status' %}
           <td data-sort="{{ status_choices.index(task.status) if task.status in status_choices else 9 }}">
             {% if task.id in editable_ids %}{# ステータスをその場で変更(作成者・担当者・マネージャーだけ。ほかは状態の表示だけ) #}
             <form method="post" action="{{ url_for('tasks.update_status', task_id=task.id) }}" class="d-inline">
@@ -734,19 +762,59 @@
               </select>
             </form>{% else %}<span class="badge bg-{{ task_colors.get(task.status, 'secondary') }}">{{ task.status }}</span>{% endif %}
           </td>
+          {% elif key == 'start_date' %}
+          <td class="text-nowrap" data-sort="{{ task.start_date.strftime('%Y-%m-%d') if task.start_date else '' }}">
+            {{ task.start_date.strftime('%Y/%m/%d') if task.start_date else '―' }}
+          </td>
+          {% elif key == 'due_date' %}
           <td class="text-nowrap {% if task.is_overdue %}text-danger fw-bold{% endif %}"
               data-sort="{{ task.due_date.strftime('%Y-%m-%d') if task.due_date else '' }}">
             {{ task.due_date.strftime('%Y/%m/%d') if task.due_date else '―' }}
           </td>
+          {% elif key == 'scale' %}
+          <td class="text-nowrap" data-sort="{{ task.scale_hours if task.scale_label else '' }}">
+            {% if task.scale_label %}{{ task.scale_label }} <small class="text-muted">（約{{ task.scale_hours }}h）</small>{% else %}―{% endif %}
+          </td>
+          {% elif key == 'outcome_estimate' %}
+          <td class="small">
+            {%- if task.outcome_quant_estimate_label %}{{ task.outcome_quant_estimate_label }}{% endif -%}
+            {%- if task.outcome_qual_estimate %}{% if task.outcome_quant_estimate_label %}<br>{% endif %}{{ task.outcome_qual_estimate|truncate(40, true) }}{% endif -%}
+            {%- if not task.outcome_quant_estimate_label and not task.outcome_qual_estimate %}―{% endif -%}
+          </td>
+          {% elif key == 'outcome_actual' %}
+          <td class="small">
+            {%- if task.outcome_quant_actual_label %}{{ task.outcome_quant_actual_label }}{% endif -%}
+            {%- if task.outcome_qual_actual %}{% if task.outcome_quant_actual_label %}<br>{% endif %}{{ task.outcome_qual_actual|truncate(40, true) }}{% endif -%}
+            {%- if not task.outcome_quant_actual_label and not task.outcome_qual_actual %}―{% endif -%}
+          </td>
+          {% elif key == 'creator' %}
+          <td class="text-nowrap"><small>{{ task.creator.display_name if task.creator else '―' }}</small></td>
+          {% elif key == 'last_comment' %}
+          {% set last = task.comments[-1] if task.comments else None %}
+          <td class="small" data-sort="{{ last.created_at.strftime('%Y-%m-%d %H:%M') if last else '' }}">
+            {% if last %}<span class="text-muted">{{ last.created_at.strftime('%m/%d') }}</span> {{ last.body|truncate(60, true) }}{% else %}―{% endif %}
+          </td>
+          {% elif key == 'comment_count' %}
+          <td data-sort="{{ task.comments|length }}">{{ task.comments|length }}</td>
+          {% elif key == 'created_at' %}
+          <td class="text-nowrap" data-sort="{{ task.created_at.strftime('%Y-%m-%d %H:%M') if task.created_at else '' }}">
+            {{ task.created_at.strftime('%Y/%m/%d') if task.created_at else '―' }}
+          </td>
+          {% elif key == 'updated_at' %}
+          <td class="text-nowrap" data-sort="{{ task.updated_at.strftime('%Y-%m-%d %H:%M') if task.updated_at else '' }}">
+            {{ task.updated_at.strftime('%Y/%m/%d') if task.updated_at else '―' }}
+          </td>
+          {% endif %}
+          {% endfor %}
         </tr>
         {% else %}
-        <tr><td colspan="5" class="text-center text-muted py-4">該当するタスクはありません。</td></tr>
+        <tr><td colspan="{{ columns|length + 1 }}" class="text-center text-muted py-4">該当するタスクはありません。</td></tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
 </div>
-<p class="text-muted small mt-2">{{ tasks|length }} 件</p>
+<p class="text-muted small mt-2">{{ tasks|length }} 件{% if filters.hide_done %}（「完了」を除く）{% endif %}</p>
 {% endblock %}
 {#=== tasks/detail.html ===#}
 {% extends "base.html" %}
