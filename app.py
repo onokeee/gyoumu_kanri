@@ -233,7 +233,7 @@ ENV_KEYS = (
     "SECRET_KEY", "ADMIN_PASSWORD",
     "LDAP_API_URL",
     "AI_API_URL", "AI_API_KEY", "AI_MODEL", "AI_TIMEOUT",
-    "MAIL_SMTP_SERVER", "MAIL_SMTP_PORT", "MAIL_FROM", "MAIL_TO", "MAIL_CC",
+    "MAIL_SMTP_SERVER", "MAIL_SMTP_PORT", "MAIL_FROM", "MAIL_TO", "MAIL_CC", "MAIL_ALLOWED_DOMAINS",
     "APP_BASE_URL",
 )
 
@@ -260,6 +260,8 @@ class Config(FixedConfig):
     MAIL_FROM = ""
     MAIL_TO = []
     MAIL_CC = []
+    # 送信を許可するドメイン(無い・空なら制限しない)
+    MAIL_ALLOWED_DOMAINS = []
     APP_BASE_URL = ""
 
 # ==== 1-2. 初期値(config.py)の読み込み ============================================================
@@ -445,8 +447,8 @@ def _type_ok(field_type, value):
         # ポート番号・タイムアウト: 整数のほか、旧版から取り込んだ 60.0・"30" のような値も読める(smtp_port_value・
         # positive_int_value が範囲・形を確かめる)
         return isinstance(value, (int, float, str))
-    if field_type == TYPE_ADDRESSES:
-        # アドレスの一覧: 文字列の一覧(「,」「;」区切りの文字列も可。mail_addresses)
+    if field_type in (TYPE_ADDRESSES, TYPE_DOMAINS):
+        # アドレス・ドメインの一覧: 文字列の一覧(区切りの文字列も可。mail_addresses・mail_domain_list)
         if isinstance(value, str):
             return True
         return isinstance(value, (list, tuple)) and all(isinstance(item, str) for item in value)
@@ -3351,6 +3353,58 @@ def mail_envelope(items):
         envelope.setdefault(addr.lower(), addr)
     return list(envelope.values())
 
+# 送信を許可するドメイン(MAIL_ALLOWED_DOMAINS)。設定があると、そのドメイン(サブドメインを含む)のアドレスにだけ
+# 送る(send_mail)。差出人・宛先・同報・メンバーのメールアドレス・リマインドの追加の宛先は、保存のときにも確かめる
+# (11-2 の _check_mail_domains・10-3 の check_email・10-4 の parse_reminder_form)。無い・空なら制限しない。
+
+def mail_domain_list(value):
+    """ドメインの設定値を、小文字のドメインの一覧にする(先頭の「@」・末尾の「.」は除く。空の一覧は制限なし)。
+
+    文字列で書かれていても「,」「;」・空白・改行を区切りとして扱う。形式の誤った値も除かずに残す
+    (どのアドレスにも合わないため、送れる宛先が広がることはない)。
+    """
+    if isinstance(value, str):
+        value = re.split(r"[\s,;]+", value)
+    if not isinstance(value, (list, tuple)):
+        return []
+    result = []
+    for item in value:
+        domain = str(item or "").strip().lstrip("@").rstrip(".").lower()
+        if domain and domain not in result:
+            result.append(domain)
+    return result
+
+def allowed_mail_domains():
+    """送信を許可するドメイン(今の設定 MAIL_ALLOWED_DOMAINS。空なら制限しない)。"""
+    return mail_domain_list(current_app.config.get("MAIL_ALLOWED_DOMAINS"))
+
+def address_domain(address):
+    """アドレス(「表示名 <アドレス>」も可)のドメイン(小文字。末尾の「.」は除く)。"""
+    text = str(address or "")
+    addr = parseaddr(text)[1] or text
+    return addr.rpartition("@")[2].strip().rstrip(".").lower()
+
+def mail_domain_allowed(address, domains):
+    """アドレスが送信を許可するドメイン(サブドメインを含む)のものか。domains が空なら制限しない(True)。"""
+    if not domains:
+        return True
+    domain = address_domain(address)
+    return bool(domain) and any(domain == d or domain.endswith("." + d) for d in domains)
+
+def blocked_by_domain(addresses, domains):
+    """送信を許可するドメイン以外のアドレスの一覧。"""
+    return [a for a in addresses if not mail_domain_allowed(a, domains)]
+
+def domains_label(domains):
+    """案内に出す、送信を許可するドメイン(多いときは先頭の5件)。"""
+    return "、".join(domains[:5]) + (" ほか{}件".format(len(domains) - 5) if len(domains) > 5 else "")
+
+MAIL_DOMAIN_REASON = "送信を許可するドメイン以外のアドレス"
+MAIL_DOMAIN_TEST_MESSAGE = ("差出人（MAIL_FROM）のアドレスが、送信を許可するドメイン（{}）以外のため、テスト送信できません。"
+                            "システム設定の「基本設定」タブで、差出人か送信を許可するドメインを直してください。")
+MAIL_DOMAIN_TO_MESSAGE = ("{}のアドレスがすべて、送信を許可するドメイン（{}）以外のため、送信できません: {}。"
+                          "システム設定の「基本設定」タブで直してください。")
+
 SMTP_PORT_MISSING_MESSAGE = ("送信サーバーのポート番号（MAIL_SMTP_PORT）が未設定です。"
                              "システム設定の「基本設定」タブで設定してください。")
 
@@ -3413,7 +3467,15 @@ def check_mail_settings(test=False, to=None, to_label="宛先（MAIL_TO）"):
         return "メールの設定が不足しています: {}。システム設定の「基本設定」タブで設定してください。".format(
             "、".join(missing))
     # ポート番号が無い・正しくない(config.py を直接編集した値など): 違うポートに接続しないよう送らない
-    return values["port_error"]
+    if values["port_error"]:
+        return values["port_error"]
+    # 送信を許可するドメイン: テスト送信は差出人が、本番は宛先(To)の1件以上がそのドメインでなければ送らない
+    domains = allowed_mail_domains()
+    if test and blocked_by_domain(actual_to, domains):
+        return MAIL_DOMAIN_TEST_MESSAGE.format(domains_label(domains))
+    if not test and actual_to and len(blocked_by_domain(actual_to, domains)) == len(actual_to):
+        return MAIL_DOMAIN_TO_MESSAGE.format(to_label, domains_label(domains), "、".join(actual_to[:5]))
+    return None
 
 def _build_message(text, html, attachments):
     """送信するメッセージを組み立てる(ヘッダは呼び出し元で付ける)。"""
@@ -3564,6 +3626,14 @@ def send_mail(subject, text, html=None, attachments=(), to=None, cc=None, test=F
     values = mail_settings()
     mail_from = values["mail_from"]
     to, cc = mail_recipients(test, to=to, cc=cc)
+    # 送信を許可するドメイン以外の宛先(To・Cc)には送らない(To が1件も残らないときは check_mail_settings で止めている)
+    domains = allowed_mail_domains()
+    blocked = blocked_by_domain(to + cc, domains)
+    if blocked:
+        to = [a for a in to if mail_domain_allowed(a, domains)]
+        cc = [a for a in cc if mail_domain_allowed(a, domains)]
+    blocked_note = ("送信を許可するドメイン（{}）以外の宛先 {}件（{}）には送っていません。".format(
+        domains_label(domains), len(blocked), "、".join(blocked[:10])) if blocked else "")
 
     msg = _build_message(text, html, attachments)
     msg["From"] = _header_address(mail_from)
@@ -3641,8 +3711,10 @@ def send_mail(subject, text, html=None, attachments=(), to=None, cc=None, test=F
 
     if refused:
         hint = smtp_refusal_hint(_refused_replies(refused))
-        return False, "一部の宛先に送信できませんでした（拒否: {}）。他の {} 件には送信済みです。{}".format(
-            _refused_list(refused), len(envelope) - len(refused), hint)
+        return False, "一部の宛先に送信できませんでした（拒否: {}）。他の {} 件には送信済みです。{}{}".format(
+            _refused_list(refused), len(envelope) - len(refused), hint, blocked_note)
+    if blocked:
+        return False, "一部の宛先に送っていません: {}他の {} 件には送信済みです。".format(blocked_note, len(envelope))
     return True, "送信しました（To {}件・Cc {}件）。".format(len(to), len(cc))
 
 # #### 5. 画面(Blueprint) ##########################################################################
@@ -6986,6 +7058,8 @@ def manage():
         emails=emails,
         email_versions={u.id: email_version(emails.get(u.id, "")) for u in users},
         email_max=EMAIL_MAX,
+        allowed_domains=allowed_mail_domains(),
+        email_outside={uid for uid, email in emails.items() if not mail_domain_allowed(email, allowed_mail_domains())},
         users=users,
         local_usernames={u.username for u in users if is_local_account(u.username)},
         inactive_members=inactive_members,
@@ -15265,8 +15339,14 @@ def plain_address_ok(value):
     domain = value.rpartition("@")[2]
     return ".." not in domain and not domain.endswith(".")
 
-def check_email(raw):
-    """入力されたメールアドレスを確かめる。戻り値: (アドレス〔前後の空白を除く。空なら ""〕, 誤り または None)。"""
+EMAIL_DOMAIN_HELP = ("送信を許可するドメイン（{}）以外のアドレスは登録できません"
+                     "（システム設定の「基本設定」タブの「送信を許可するドメイン」）。")
+
+def check_email(raw, check_domain=True):
+    """入力されたメールアドレスを確かめる。戻り値: (アドレス〔前後の空白を除く。空なら ""〕, 誤り または None)。
+
+    check_domain が True なら、送信を許可するドメイン(MAIL_ALLOWED_DOMAINS)のアドレスかも確かめる。
+    """
     value = str(raw if raw is not None else "").strip()
     if not value:
         return "", None
@@ -15276,6 +15356,10 @@ def check_email(raw):
         return None, "メールアドレスは{}文字以内で入力してください。".format(EMAIL_MAX)
     if not plain_address_ok(value):
         return None, EMAIL_FORMAT_HELP
+    if check_domain:
+        domains = allowed_mail_domains()
+        if not mail_domain_allowed(value, domains):
+            return None, EMAIL_DOMAIN_HELP.format(domains_label(domains))
     return value, None
 
 def user_email_map(user_ids=None):
@@ -15544,7 +15628,7 @@ def parse_reminder_form(form, choices, today, current_start=None, kept_emails=No
     for token in _REMINDER_LIST_SPLIT.split(form.get("rem_extra_emails") or ""):
         if not token:
             continue
-        address, error = check_email(token)
+        address, error = check_email(token, check_domain=False)
         if error:
             bad.append(token)
         elif address.lower() not in seen:
@@ -15556,6 +15640,13 @@ def parse_reminder_form(form, choices, today, current_start=None, kept_emails=No
     elif len(addresses) > REMINDER_EXTRA_EMAILS_MAX:
         errors.append("リマインドの追加の宛先（アドレス）は1業務に{}件までです（{}件あります）。".format(
             REMINDER_EXTRA_EMAILS_MAX, len(addresses)))
+    else:
+        domains = allowed_mail_domains()
+        outside = blocked_by_domain(addresses, domains)
+        if outside:
+            errors.append("リマインドの追加の宛先（アドレス）に、送信を許可するドメイン（{}）以外のアドレスがあります: {}"
+                          "（このドメインのアドレスだけを入力してください）。".format(
+                              domains_label(domains), _shown_values(outside)))
     values["extra_emails"] = "\n".join(addresses)
     return values, errors
 
@@ -15664,6 +15755,7 @@ def reminder_recipients_for(routine, rem, users, emails):
     確認待ちのものは送れない宛先(「アドレス N件」・マネージャーの確認待ち)にする。
     """
     recipients, problems = [], []
+    domains = allowed_mail_domains()
     assignees = routine.assignee_list
     if not assignees:
         problems.append({"name": "（担当者なし）", "reason": "担当者がいません", "kind": "担当者"})
@@ -15673,6 +15765,9 @@ def reminder_recipients_for(routine, rem, users, emails):
                              "user_id": assignee.id})
         elif not emails.get(assignee.id):
             problems.append({"name": assignee.display_name, "reason": "メールアドレス未登録", "kind": "担当者",
+                             "user_id": assignee.id})
+        elif not mail_domain_allowed(emails[assignee.id], domains):
+            problems.append({"name": assignee.display_name, "reason": MAIL_DOMAIN_REASON, "kind": "担当者",
                              "user_id": assignee.id})
         else:
             recipients.append({"address": emails[assignee.id], "name": assignee.display_name, "kind": "担当者",
@@ -15686,6 +15781,8 @@ def reminder_recipients_for(routine, rem, users, emails):
             problems.append({"name": user.display_name, "reason": "無効化されたメンバー", "kind": "追加の宛先"})
         elif not emails.get(user_id):
             problems.append({"name": user.display_name, "reason": "メールアドレス未登録", "kind": "追加の宛先"})
+        elif not mail_domain_allowed(emails[user_id], domains):
+            problems.append({"name": user.display_name, "reason": MAIL_DOMAIN_REASON, "kind": "追加の宛先"})
         else:
             recipients.append({"address": emails[user_id], "name": user.display_name, "kind": "追加の宛先",
                                "user_id": user_id})
@@ -15694,8 +15791,12 @@ def reminder_recipients_for(routine, rem, users, emails):
         problems.append({"name": "アドレス {}件".format(len(addresses)), "reason": REMINDER_EMAILS_PENDING,
                          "kind": "追加の宛先"})
         return recipients, problems
+    outside = blocked_by_domain(addresses, domains)
+    if outside:
+        problems.append({"name": "アドレス {}件".format(len(outside)), "reason": MAIL_DOMAIN_REASON, "kind": "追加の宛先"})
     for address in addresses:
-        recipients.append({"address": address, "name": "", "kind": "追加の宛先", "user_id": None})
+        if address not in outside:
+            recipients.append({"address": address, "name": "", "kind": "追加の宛先", "user_id": None})
     return recipients, problems
 
 # ==== 10-5. リマインド: 送信の設定(instance/routine_reminder_settings.json) =======================
@@ -16217,7 +16318,8 @@ def _render_account_email(address, version, status=200):
                 .filter(RoutineReminder.enabled.is_(True), RoutineWork.assignees.any(User.id == current_user.id))
                 .order_by(RoutineWork.name).all())
     return render_template("account/email.html", address=address, version=version, routines=routines,
-                           saved=user_email(current_user.id), email_max=EMAIL_MAX), status
+                           saved=user_email(current_user.id), email_max=EMAIL_MAX,
+                           allowed_domains=allowed_mail_domains()), status
 
 @account_bp.route("/email", methods=["GET", "POST"], endpoint="email")
 @login_required
@@ -16290,6 +16392,7 @@ def save_member_email(user_id):
 #   int        整数(min〜max)
 #   address    メールアドレス1件
 #   addresses  メールアドレスの一覧(1行に1件。「,」「;」区切りも可)
+#   domains    ドメインの一覧(1行に1件。「,」「;」・空白の区切りも可)。「制限しない」で空にする
 #   secret     パスワード・キー。値は画面に出さない(設定あり/未設定だけ)。「空にする」で空にする。
 #              bound_to の接続先を変えるときは、入力し直すか「空にする」が必要
 #   secret_key セッションの秘密鍵。自由入力はなく、「新しいキーを生成」だけ
@@ -16299,6 +16402,7 @@ TYPE_URL = "url"
 TYPE_INT = "int"
 TYPE_ADDRESS = "address"
 TYPE_ADDRESSES = "addresses"
+TYPE_DOMAINS = "domains"
 TYPE_SECRET = "secret"
 TYPE_SECRET_KEY = "secret_key"
 
@@ -16477,6 +16581,14 @@ FIELDS = (
         "週報と期限超過通知の同報（Cc）です。",
         type=TYPE_ADDRESSES,
     ),
+    Field(
+        "MAIL_ALLOWED_DOMAINS", GROUP_RECIPIENTS, "送信を許可するドメイン",
+        "メールを送ってよい宛先のドメインです（1行に1件。例: example.com。サブドメイン〔mail.example.com など〕も"
+        "含みます）。設定すると、差出人・宛先（To）・同報（Cc）・メンバーのメールアドレス・定型業務リマインドの"
+        "追加の宛先には、このドメインのアドレスだけを保存でき、ほかのドメインのアドレスには送信しません"
+        "（設定する前に登録したアドレスも送りません）。未設定（空）なら制限しません。",
+        type=TYPE_DOMAINS,
+    ),
     # ---- リンク ----
     Field(
         "APP_BASE_URL", GROUP_SERVER, "リンクの基準URL",
@@ -16526,6 +16638,9 @@ RETIRED_KEYS = {
 CONFIG_TEXT_MAX = 500           # 1行の文字列・URLの最大文字数
 SECRET_MAX = 500         # パスワード・キーの最大文字数
 ADDRESS_MAX_COUNT = 100  # アドレスの一覧の最大件数
+DOMAIN_MAX_COUNT = 50    # 送信を許可するドメインの最大件数
+_DOMAIN_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+_DOMAIN_SPLIT = re.compile(r"[\s,;、，；]+")
 
 _CONFIG_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _ADDR = r"[^\s@<>()\[\],;:\"\\]+@[^\s@<>()\[\],;:\"\\.][^\s@<>()\[\],;:\"\\]*"
@@ -16715,12 +16830,35 @@ def _parse_addresses(field, raw):
         return None, "アドレスは{}件までにしてください。".format(ADDRESS_MAX_COUNT)
     return list(dict.fromkeys(items)), None
 
+def _parse_domains(field, raw):
+    """送信を許可するドメインの一覧(小文字。先頭の「@」・末尾の「.」は除く)。"""
+    result, bad = [], []
+    for item in _DOMAIN_SPLIT.split(raw or ""):
+        if not item:
+            continue
+        if "*" in item:
+            return None, "「*」は使えません（example.com と書くと、サブドメインも含みます）。"
+        domain = item.lstrip("@").rstrip(".").lower()
+        if (not domain.isascii() or len(domain) > 253
+                or not all(_DOMAIN_LABEL_RE.fullmatch(label) for label in domain.split("."))):
+            bad.append(item)
+        elif domain not in result:
+            result.append(domain)
+    if bad:
+        return None, ("ドメインの形式が正しくありません: {}（例: example.com。半角英数字・「-」・「.」で入力します。"
+                      "アドレスではなく「@」の後ろの部分を入力してください。日本語のドメインはピュニコード〔xn--〜〕で"
+                      "入力します）。".format("、".join(b[:80] for b in bad[:3])))
+    if len(result) > DOMAIN_MAX_COUNT:
+        return None, "ドメインは{}件までにしてください。".format(DOMAIN_MAX_COUNT)
+    return result, None
+
 _PARSERS = {
     TYPE_TEXT: _parse_text,
     TYPE_URL: _parse_url,
     TYPE_INT: _parse_int,
     TYPE_ADDRESS: _parse_address,
     TYPE_ADDRESSES: _parse_addresses,
+    TYPE_DOMAINS: _parse_domains,
 }
 
 MSG_RESET_WITH_INPUT = "入力と「初期値に戻す」は同時に指定できません。"
@@ -16876,6 +17014,20 @@ def parse_config_form(form, initial, overrides):
         # 通常の欄: 画面の設定(無ければ空欄)を表示している。空欄のままなら変えない
         raw = form.get(key) if key in form else None
         state[key] = raw if raw is not None else (_display(field, overrides.get(key)) if has_override else "")
+        if field.type == TYPE_DOMAINS:
+            # 「制限しない」: 画面の設定を空の一覧にする(入力欄に表示したままの値は入力とみなさない)
+            clear = form.get("clear_" + key) == "1"
+            state["clear_" + key] = clear
+            if clear:
+                typed = raw is not None and raw.strip() and not (
+                    has_override and _shown_unchanged(field, raw, overrides.get(key)))
+                if reset:
+                    errors[key] = "「制限しない」と「初期値に戻す」は同時に指定できません。"
+                elif typed:
+                    errors[key] = "ドメインの入力と「制限しない」は同時に指定できません。"
+                elif not (has_override and overrides.get(key) == []):
+                    changes[key] = (CHANGE_SET, [])
+                continue
         if reset:
             # 入力欄には今の画面の設定を表示している。表示したままの値(触っていない欄)は入力とみなさず、
             # 「初期値に戻す」だけを行う。別の値を入力していたら、どちらにするか分からないので誤り
@@ -16897,7 +17049,39 @@ def parse_config_form(form, initial, overrides):
         elif not (has_override and same_value(overrides.get(key), value)):
             changes[key] = (CHANGE_SET, value)
     _check_secret_destinations(initial, overrides, changes, errors, confirmed)
+    _check_mail_domains(initial, overrides, changes, errors)
     return changes, errors, state
+
+MAIL_DOMAIN_KEYS = ("MAIL_FROM", "MAIL_TO", "MAIL_CC")
+
+def _check_mail_domains(initial, overrides, changes, errors):
+    """保存の後の差出人・宛先(To)・同報(Cc)が、送信を許可するドメインのアドレスか(この保存で変える項目だけ)。
+
+    送信を許可するドメインを変えるときは、今の差出人・宛先・同報もそのドメインでなければならない
+    (先に直すか、同じ保存で直す)。ほかの項目だけの保存は、ここでは止めない(送信のときに除く。send_mail)。
+    """
+    key = "MAIL_ALLOWED_DOMAINS"
+    if key in errors:
+        return
+    after = effective_values(initial, apply_changes(overrides, changes))
+    domains = mail_domain_list(after.get(key))
+    if not domains:
+        return
+    current = []
+    for name in MAIL_DOMAIN_KEYS:
+        if name in errors or (key not in changes and name not in changes):
+            continue
+        blocked = blocked_by_domain(mail_addresses(after.get(name)), domains)
+        if not blocked:
+            continue
+        shown = "、".join(b[:80] for b in blocked[:3]) + (" ほか{}件".format(len(blocked) - 3) if len(blocked) > 3 else "")
+        if name in changes:
+            errors[name] = "送信を許可するドメイン（{}）以外のアドレスは保存できません: {}".format(domains_label(domains), shown)
+        else:
+            current.append("{}（{}）".format(FIELD_MAP[name].label, shown))
+    if current:
+        errors[key] = ("今の{}に、このドメイン以外のアドレスがあります。そのアドレスを直して一緒に保存してください。".format(
+            "・".join(current)))
 
 # ---- 保存 ----
 def _apply_live(app, values):
@@ -17008,7 +17192,7 @@ def _config_already_saved(app, form, store):
 # ---- 画面表示用の値 ----
 def _display(field, value):
     """入力欄に表示する値(秘密の値には使わない)。"""
-    if field.type == TYPE_ADDRESSES:
+    if field.type in (TYPE_ADDRESSES, TYPE_DOMAINS):
         if isinstance(value, str):
             items = re.split(r"[,;]", value)
         elif isinstance(value, (list, tuple)):
@@ -17028,8 +17212,8 @@ def _summary(field, value):
     if field.secret:
         return "設定あり" if _is_set(value) else "未設定"
     if not _is_set(value):
-        return "未設定"
-    if field.type == TYPE_ADDRESSES:
+        return "未設定（制限なし）" if field.type == TYPE_DOMAINS else "未設定"
+    if field.type in (TYPE_ADDRESSES, TYPE_DOMAINS):
         text = "、".join(_display(field, value).split("\n"))
     else:
         text = str(value)
@@ -17060,6 +17244,21 @@ def _other_rows(app, initial):
             "retired_note": RETIRED_KEYS.get(key, ""),
         })
     return rows
+
+def mail_domain_violations(domains):
+    """送信を許可するドメイン以外の、登録済みのアドレス(送信しない)。無ければ None。
+
+    戻り値: {"members": [メンバーの名前], "reminder_addresses": リマインドの追加の宛先(アドレス)の件数}
+    """
+    if not domains:
+        return None
+    names = {u.id: u.display_name for u in User.query.all()}
+    members = sorted(names.get(uid, "（不明）") for uid, email in user_email_map().items()
+                     if not mail_domain_allowed(email, domains))
+    addresses = sum(len(blocked_by_domain(rem.extra_email_list, domains)) for rem in RoutineReminder.query.all())
+    if not members and not addresses:
+        return None
+    return {"members": members, "reminder_addresses": addresses}
 
 def mask_url_userinfo(url):
     """URL の ID・パスワード(user:pass@)を「***@」にする(画面の入力欄に出すとき。値は表示しない)。"""
@@ -17119,8 +17318,11 @@ def config_form_context(app, state=None, errors=None):
                     # ID・パスワードを含む URL(旧版からの取り込みなど)は、値を HTML に出さない
                     row["value"] = mask_url_userinfo(row["value"])
                     row["notice"] = URL_USERINFO_NOTICE
+                if field.type == TYPE_DOMAINS:
+                    row["violations"] = mail_domain_violations(mail_domain_list(current.get(key)))
                 if not has_override:
-                    row["placeholder"] = "初期値: {}".format(row["initial_text"]) if key in initial else "未設定"
+                    row["placeholder"] = ("初期値: {}".format(row["initial_text"]) if key in initial
+                                          else _summary(field, None))
             rows.append(row)
         groups.append({"key": group_key, "label": group_label, "rows": rows})
 

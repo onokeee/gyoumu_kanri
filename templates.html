@@ -320,6 +320,7 @@
       <div class="form-text">
         半角で、表示名や「&lt; &gt;」は付けずに入力します（例: name@example.com）。
         空にして保存すると削除します（リマインドのメールは届かなくなります）。
+        {% if allowed_domains %}<br>登録できるのは、送信を許可するドメイン（{{ allowed_domains|join('、') }}。サブドメインを含む）のアドレスだけです。{% endif %}
       </div>
       <div class="mt-3 d-flex gap-2">
         <button class="btn btn-primary"><i class="bi bi-check-lg"></i> 保存</button>
@@ -1409,7 +1410,7 @@
     {% for p in reminder.problems if p.kind == '担当者' %}
     <div class="alert alert-warning small py-2">
       <i class="bi bi-exclamation-triangle"></i> 担当者（{{ p.name }}）は{{ p.reason }}のため、この人にはリマインドのメールが送られません（ほかの宛先には送ります）。
-      {% if p.reason == 'メールアドレス未登録' %}{% if p.user_id and current_user.id == p.user_id %}<a href="{{ url_for('account.email') }}">自分のメールアドレスを登録する</a>{% elif current_user.is_manager %}<a href="{{ url_for('departments.manage') }}">チーム管理で登録する</a>{% endif %}{% endif %}
+      {% if p.reason in ('メールアドレス未登録', '送信を許可するドメイン以外のアドレス') %}{% if p.user_id and current_user.id == p.user_id %}<a href="{{ url_for('account.email') }}">自分のメールアドレスを登録する</a>{% elif current_user.is_manager %}<a href="{{ url_for('departments.manage') }}">チーム管理で登録する</a>{% endif %}{% endif %}
     </div>
     {% endfor %}
     {% if reminder.rem.enabled and not reminder.sending_enabled %}
@@ -5293,7 +5294,7 @@
             <th>氏名</th>
             <th>ログインID</th>
             <th>役割</th>
-            <th>メールアドレス</th>
+            <th>メールアドレス{% if allowed_domains %} <span class="small text-muted fw-normal">（送信を許可するドメイン: {{ allowed_domains|join('、') }}）</span>{% endif %}</th>
             <th class="text-end">操作</th>
           </tr>
         </thead>
@@ -5309,10 +5310,12 @@
               <form method="post" action="{{ url_for('departments.save_member_email', user_id=u.id) }}" class="d-flex gap-1">
                 <input type="hidden" name="username" value="{{ u.username }}">
                 <input type="hidden" name="version" value="{{ email_versions[u.id] }}">
-                <input type="email" name="email" class="form-control form-control-sm" value="{{ emails.get(u.id, '') }}"
-                       maxlength="{{ email_max }}" placeholder="未登録" aria-label="{{ u.display_name }}のメールアドレス">
+                <input type="email" name="email" class="form-control form-control-sm {% if u.id in email_outside %}is-invalid{% endif %}" value="{{ emails.get(u.id, '') }}"
+                       maxlength="{{ email_max }}" placeholder="未登録" aria-label="{{ u.display_name }}のメールアドレス"
+                       {% if u.id in email_outside %}title="送信を許可するドメイン以外のアドレスのため、送信しません"{% endif %}>
                 <button class="btn btn-sm btn-outline-primary text-nowrap">保存</button>
               </form>
+              {% if u.id in email_outside %}<div class="small text-danger">送信を許可するドメイン以外のため送信しません</div>{% endif %}
             </td>
             <td class="text-end">
               {% if u.id == current_user.id %}
@@ -5965,6 +5968,23 @@
   <textarea class="form-control form-control-sm {{ invalid }}" id="cfg-{{ f.key }}" name="{{ f.key }}" rows="3"
             autocomplete="off" spellcheck="false" placeholder="{% if row.placeholder %}{{ row.placeholder }}{% else %}name@example.com（1行に1件）{% endif %}">{{ row.value }}</textarea>
   <div class="form-text mt-0">1行に1件。空欄のまま保存すると変更しません。</div>
+  {{ reset_check(row) }}
+{% elif f.type == 'domains' %}
+  <textarea class="form-control form-control-sm {{ invalid }}" id="cfg-{{ f.key }}" name="{{ f.key }}" rows="3"
+            autocomplete="off" spellcheck="false" placeholder="{% if row.placeholder %}{{ row.placeholder }}{% else %}example.com（1行に1件）{% endif %}">{{ row.value }}</textarea>
+  <div class="form-text mt-0">1行に1件（例: example.com。「@」の後ろの部分）。サブドメインも含みます。空欄のまま保存すると変更しません。</div>
+  <div class="form-check mt-1">
+    <input class="form-check-input" type="checkbox" id="cfg-clear-{{ f.key }}" name="clear_{{ f.key }}" value="1"
+           {% if row.clear_checked %}checked{% endif %}>
+    <label class="form-check-label small" for="cfg-clear-{{ f.key }}">制限しない（画面の設定を空にする）</label>
+  </div>
+  {% if row.violations %}
+  <div class="alert alert-warning small py-1 px-2 mt-1 mb-1">
+    <i class="bi bi-exclamation-triangle"></i> このドメイン以外のアドレスが登録されています（これらには送信しません）:
+    {% if row.violations.members %}メンバーのメールアドレス {{ row.violations.members|length }}人（{{ row.violations.members|join('、') }}）{% endif %}{% if row.violations.members and row.violations.reminder_addresses %}・{% endif %}{% if row.violations.reminder_addresses %}定型業務リマインドの追加の宛先 {{ row.violations.reminder_addresses }}件{% endif %}。
+    チーム管理・各業務の「編集」で直してください。
+  </div>
+  {% endif %}
   {{ reset_check(row) }}
 {% elif f.type == 'secret_key' %}
   <div class="mb-1">
