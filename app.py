@@ -5183,7 +5183,8 @@ def _routine_conflict_form(current, changed):
     form = conflict_form(current, [key for key in changed if key != "assignees"], _routine_form_value)
     return form, (current["assignees"] if "assignees" in changed else None)
 
-_ROUTINE_NO_ASSIGNEE = "担当者を1人以上選択してください。"
+_ROUTINE_NO_ASSIGNEE = "担当者を選択してください（複数選べます）。"
+_ROUTINE_STALE_ASSIGNEE = "選んだ担当者は、削除・無効化されたか登録されていません。担当者を選択し直してください。"
 
 def _fill_from_form(rw, form, users, is_new):
     """フォーム値を rw に反映。エラーメッセージのリストを返す。
@@ -5203,11 +5204,13 @@ def _fill_from_form(rw, form, users, is_new):
         keys = form.getlist("assignee_ids") if hasattr(form, "getlist") else []
         if not keys and form.get("assignee_id"):
             keys = [form.get("assignee_id")]
+        keys = [k for k in keys if k]
         chosen, stale = users_from_form_keys(keys, users)
-        if stale:
-            errors.append(_STALE_ASSIGNEE)
-        elif not chosen:
+        if not keys:
             errors.append(_ROUTINE_NO_ASSIGNEE)
+        elif stale or not chosen:
+            # 選択肢に無い値(画面を開いた後に削除・無効化された人・存在しないID)は保存しない(以前の版と同じ案内)
+            errors.append(_ROUTINE_STALE_ASSIGNEE)
         assignees = chosen
     elif is_new:
         assignees = [current_user._get_current_object()]
@@ -9317,9 +9320,9 @@ def convert_skill_scale(app):
 #   step_limit   : 1回の完了で上げる段階の上限(1〜3。既定 1)
 
 STEP_LIMIT_MIN, STEP_LIMIT_MAX = 1, SKILL_MAX_LEVEL
-SKILL_AI_DEFAULTS = {"auto_enabled": True, "step_limit": 1}
+SKILL_AUTO_SETTING_DEFAULTS = {"auto_enabled": True, "step_limit": 1}
 SKILL_AI_SETTINGS = JsonSettings(
-    "skill_ai_settings.json", "スキル（AI）の設定ファイル", SKILL_AI_DEFAULTS,
+    "skill_ai_settings.json", "スキル（AI）の設定ファイル", SKILL_AUTO_SETTING_DEFAULTS,
     [("auto_enabled", _as_bool), ("step_limit", _int_between(STEP_LIMIT_MIN, STEP_LIMIT_MAX))])
 load_skill_ai_settings = SKILL_AI_SETTINGS.load
 
@@ -9443,6 +9446,13 @@ def judgment_is_stale(judgment, now=None):
     return (judgment.status in (JUDGE_PENDING, JUDGE_RUNNING) and judgment.created_at is not None
             and judgment.created_at < now - timedelta(minutes=JUDGE_STALE_MINUTES))
 
+def _judgment_task(judgment):
+    """判定のきっかけのタスク(削除された・同じ番号の後から登録したタスクなら None)。"""
+    task = db.session.get(Task, judgment.task_id)
+    if task is None or (task.created_at and judgment.created_at and task.created_at > judgment.created_at):
+        return None
+    return task
+
 def _skill_order(skills):
     type_order = {t: i for i, t in enumerate(SKILL_TYPE_CHOICES)}
     return sorted(skills, key=lambda s: (type_order.get(s.skill_type, 99), s.sort_order, s.name))
@@ -9463,7 +9473,7 @@ def run_skill_judgment(judgment_id):
         return
     judgment.status = JUDGE_RUNNING
     db.session.commit()
-    task = db.session.get(Task, judgment.task_id)
+    task = _judgment_task(judgment)
     if task is None:
         return _finish_judgment(judgment, JUDGE_SKIPPED, "タスクが削除されたため判定していません。")
     if task.status != STATUS_DONE:
@@ -9503,7 +9513,7 @@ def run_skill_judgment(judgment_id):
     data = parse_json_reply(reply_text, "{", "}")
     if not isinstance(data, dict) or not isinstance(data.get("updates"), list):
         return _finish_judgment(judgment, JUDGE_ERROR, "AIの応答を読み取れませんでした（決められた形の JSON ではありません）。")
-    task = db.session.get(Task, judgment.task_id)
+    task = _judgment_task(judgment)
     if task is None:
         return _finish_judgment(judgment, JUDGE_SKIPPED, "判定の間にタスクが削除されたため反映していません。")
     applied, proposals = apply_judgment(judgment, task, data["updates"], load_skill_ai_settings()["step_limit"])
@@ -10206,7 +10216,7 @@ def rerun_judgment(judgment_id):
         return flash_redirect("この判定の記録は見つかりません。", "warning", back)
     if old.status in (JUDGE_PENDING, JUDGE_RUNNING) and not judgment_is_stale(old):
         return flash_redirect("この判定はまだ処理中です。終わるまでお待ちください。", "info", back)
-    task = db.session.get(Task, old.task_id)
+    task = _judgment_task(old)
     if task is None:
         return flash_redirect("タスクが削除されているため、判定し直せません。", "warning", back)
     if task.status != STATUS_DONE:
