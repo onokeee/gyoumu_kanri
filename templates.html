@@ -67,10 +67,19 @@
       </button>
       <div class="collapse navbar-collapse" id="navbarMain">
         <ul class="navbar-nav me-auto">
+          {%- if current_user.is_manager %}
+          {# マネージャーのトップはマネージャーダッシュボード(個人ダッシュボード main.dashboard はマネージャーをそこへ転送する)。
+             タグの「-」は前の空白・改行を取る(メンバーの画面の HTML を今までと同じにするため) #}
+          <li class="nav-item">
+            <a class="nav-link {% if request.blueprint == 'manager' %}active{% endif %}"
+               href="{{ url_for('manager.dashboard') }}"><i class="bi bi-graph-up-arrow"></i> マネージャーダッシュボード</a>
+          </li>
+          {%- else %}
           <li class="nav-item">
             <a class="nav-link {% if request.blueprint == 'main' %}active{% endif %}"
                href="{{ url_for('main.dashboard') }}"><i class="bi bi-speedometer2"></i> ダッシュボード</a>
           </li>
+          {%- endif %}
           <li class="nav-item">
             <a class="nav-link {% if request.blueprint == 'tasks' %}active{% endif %}"
                href="{{ url_for('tasks.list_tasks') }}"><i class="bi bi-list-task"></i> タスク</a>
@@ -99,8 +108,8 @@
                href="{{ url_for('leaves.calendar_view') }}"><i class="bi bi-calendar-check"></i> 年休</a>
           </li>
           {% if current_user.is_manager %}
-          {# マネージャーだけの管理の画面(スキル・スキルテスト管理・マネージャーダッシュボード・チーム管理・
-             システム設定)は「管理」にまとめる(項目が多く、一般的な画面の幅で名前が途中で折り返さないように) #}
+          {# マネージャーだけの管理の画面(スキル・スキルテスト管理・チーム管理・システム設定)は「管理」にまとめる
+             (項目が多く、一般的な画面の幅で名前が途中で折り返さないように)。マネージャーダッシュボードは一段目の最初の項目 #}
           <li class="nav-item dropdown">
             <a class="nav-link dropdown-toggle {% if request.blueprint in ('skills', 'skilltest', 'manager', 'departments', 'system') %}active{% endif %}"
                href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false"><i class="bi bi-sliders"></i> 管理</a>
@@ -111,8 +120,6 @@
               {# スキルテストの管理(受験履歴・問題プール。設定はシステム設定)。マネージャーは受験しない #}
               <li><a class="dropdown-item {% if request.blueprint == 'skilltest' %}active{% endif %}"
                      href="{{ url_for('skilltest.admin_attempts') }}"><i class="bi bi-patch-check"></i> スキルテスト管理</a></li>
-              <li><a class="dropdown-item {% if request.blueprint == 'manager' %}active{% endif %}"
-                     href="{{ url_for('manager.dashboard') }}"><i class="bi bi-graph-up-arrow"></i> マネージャーダッシュボード</a></li>
               <li><a class="dropdown-item {% if request.blueprint == 'departments' %}active{% endif %}"
                      href="{{ url_for('departments.manage') }}"><i class="bi bi-diagram-3"></i> チーム管理</a></li>
               {# システム設定(基本設定・週報・期限超過通知・スキルテストの設定)はマネージャーのみ #}

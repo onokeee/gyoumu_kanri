@@ -4168,6 +4168,9 @@ def logout():
     return flash_redirect("ログアウトしました。", "info", url_for("auth.login"))
 
 # ==== 5-2. トップページ(ダッシュボード) ===========================================================
+# メンバーの個人ダッシュボード。マネージャーのトップはマネージャーダッシュボード(5-7)のため、
+# マネージャーが開いたときはそこへ転送する(ログイン後・アプリ名のリンク・「トップへ」「戻る」・
+# 定型業務の完了の後の back=dashboard は、どれも main.dashboard を通るのでマネージャーはすべてそちらに着く)。
 # 活動状況・ガントチャート・成果は、マネージャーダッシュボードと同じ集計処理を
 # 「自分の担当分だけ」に絞って再利用している(マネージャーダッシュボード(5-7)の _build_*)。
 # 「今日の定型業務」は、定型業務のリマインド(10 章)の未完了の回のうち自分が担当のもの。
@@ -4177,6 +4180,9 @@ main_bp = Blueprint("main", __name__)
 @main_bp.route("/", endpoint="dashboard")
 @login_required
 def main_dashboard():
+    if current_user.is_manager:
+        # マネージャーのトップはマネージャーダッシュボード(個人ダッシュボードはメンバーの画面)
+        return redirect(url_for("manager.dashboard"))
     my_tasks = (
         Task.query.filter(
             Task.assignees.any(User.id == current_user.id),
