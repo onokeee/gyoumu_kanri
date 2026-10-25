@@ -5994,13 +5994,13 @@
       <div class="mb-3" style="max-width: 24rem;">
         <label class="form-label small mb-1 fw-bold" for="skill-ai-step">1回の完了で上げる段階の上限</label>
         <input type="number" class="form-control form-control-sm" id="skill-ai-step" name="step_limit" value="{{ sa.settings.step_limit }}" min="{{ sa.step_min }}" max="{{ sa.step_max }}" step="1" required>
-        <div class="form-text">{{ sa.step_min }}〜{{ sa.step_max }}（既定 1）。AIの判定がこれより上でも、1回の完了ではこの段階までしか上げません。</div>
+        <div class="form-text">{{ sa.step_min }}〜{{ sa.step_max }}（既定 1）。AIの判定がこれより上でも、1回の完了ではこの段階までしか上げません（同じタスクからは、完了を繰り返しても合計でこの段階まで）。</div>
       </div>
       <div class="small">
         <div class="fw-bold mb-1">判定の決まり</div>
         <ul class="mb-2 ps-3">
           <li>対象は、そのタスクに進捗を記載した有効なメンバーです（担当者かどうかではなく、進捗の記載者とその記載の内容で判断します。マネージャーは対象外）。</li>
-          <li>根拠は本人の記載からの引用です。引用が本人の記載に見つからない判定・有効でないスキルの判定は使いません。</li>
+          <li>根拠は本人の記載からの引用です。引用が本人の記載に連続してそのまま見つからない判定（8文字未満の引用・「…」でつないだ引用も）・有効でないスキルの判定は使いません。</li>
           <li>上げるだけで、下げることはありません（判定の時点の到達度より上のときだけ）。前回の判定と記載が同じなら判定し直しません。</li>
           <li>到達尺度（すべてのスキル共通）: {% for label in sa.scale %}Lv{{ loop.index0 }}「{{ label }}」{% if not loop.last %}・{% endif %}{% endfor %}</li>
           <li>AIの接続先には、タスクの名前・説明・成果・進捗の記載（書いた人の氏名・日時を含む）、対象者の氏名と到達度、スキル項目（説明の先頭）を送ります。</li>

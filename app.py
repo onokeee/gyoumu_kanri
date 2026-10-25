@@ -10227,7 +10227,8 @@ def parse_plan_form(form, users):
 PLAN_VERSION = VersionFields((("kind", "種類"), ("title", "タイトル"), ("body", "内容"), ("target_user_id", "対象"),
                               ("due_date", "期限"), ("status", "状態")))
 
-# ==== 8-6. 画面(スキル管理の Blueprint に足すルート。マネージャーのみ) =============================
+# ==== 8-6. 画面(スキル管理の Blueprint に足すルート) =============================================
+# マネージャーのみ(skills_bp は managers_only)。
 # GET  /skills/history                    到達度の変更と自動更新の判定の一覧(取り消し・判定し直し)
 # POST /skills/changes/<id>/undo          自動更新を取り消す
 # POST /skills/judgments/<id>/rerun       判定し直す(失敗・判定なし・中断した判定。新しい判定の記録を作る)
