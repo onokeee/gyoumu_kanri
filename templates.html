@@ -21,22 +21,19 @@
     年休　　　　　　　  leaves/list.html  leaves/calendar.html  leaves/detail.html  leaves/form.html
     スキル　　　　　　  skills/map.html  skills/member.html  skills/member_edit.html  skills/items.html
                         skills/item_form.html  skills/coverage.html  skills/operations.html
-                        skills/operation_edit.html
-    スキルテスト　　　  skilltest/index.html  skilltest/question.html  skilltest/result.html
-                        skilltest/_admin_nav.html  skilltest/admin_attempts.html
-                        skilltest/admin_attempt.html  skilltest/admin_pool.html
-                        skilltest/admin_pool_skill.html
+                        skills/operation_edit.html  skills/_ai_panel.html  skills/_chat_messages.html
+                        skills/history.html  skills/plan_form.html  skills/plans.html
     マネージャー　　　  manager/dashboard.html  manager/_gantt.html  manager/gantt_full.html
                         manager/analysis.html
     チーム管理　　　　  departments/manage.html
     週報　　　　　　　  weekly/index.html
     期限超過通知　　　  overdue/index.html  overdue/mail.html
     システム設定　　　  system/settings.html  system/_config_tab.html  system/_weekly_tab.html
-                        system/_overdue_tab.html  system/_skilltest_tab.html
+                        system/_overdue_tab.html  system/_skill_ai_tab.html
                         system/_analysis_tab.html  system/_reminder_tab.html
     静的ファイル　　　  static/css/style.css  static/js/sort-table.js  static/js/auto-filter.js
                         static/js/routine-form.js
-                        static/js/skill-item-form.js  static/js/skilltest.js
+                        static/js/skill-item-form.js  static/js/skill-ai.js
                         static/js/weekly-settings.js  static/js/system-settings.js
                         static/js/ai-analysis.js
 #}
@@ -108,30 +105,21 @@
                href="{{ url_for('leaves.calendar_view') }}"><i class="bi bi-calendar-check"></i> 年休</a>
           </li>
           {% if current_user.is_manager %}
-          {# マネージャーだけの管理の画面(スキル・スキルテスト管理・チーム管理・システム設定)は「管理」にまとめる
+          {# マネージャーだけの管理の画面(スキル・チーム管理・システム設定)は「管理」にまとめる
              (項目が多く、一般的な画面の幅で名前が途中で折り返さないように)。マネージャーダッシュボードは一段目の最初の項目 #}
           <li class="nav-item dropdown">
-            <a class="nav-link dropdown-toggle {% if request.blueprint in ('skills', 'skilltest', 'departments', 'system') %}active{% endif %}"
+            <a class="nav-link dropdown-toggle {% if request.blueprint in ('skills', 'departments', 'system') %}active{% endif %}"
                href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false"><i class="bi bi-sliders"></i> 管理</a>
             <ul class="dropdown-menu">
               {# スキルはマネージャーのみ。メンバーにはタブを出さない #}
               <li><a class="dropdown-item {% if request.blueprint == 'skills' %}active{% endif %}"
                      href="{{ url_for('skills.list_skills') }}"><i class="bi bi-mortarboard"></i> スキル</a></li>
-              {# スキルテストの管理(受験履歴・問題プール。設定はシステム設定)。マネージャーは受験しない #}
-              <li><a class="dropdown-item {% if request.blueprint == 'skilltest' %}active{% endif %}"
-                     href="{{ url_for('skilltest.admin_attempts') }}"><i class="bi bi-patch-check"></i> スキルテスト管理</a></li>
               <li><a class="dropdown-item {% if request.blueprint == 'departments' %}active{% endif %}"
                      href="{{ url_for('departments.manage') }}"><i class="bi bi-diagram-3"></i> チーム管理</a></li>
-              {# システム設定(基本設定・週報・期限超過通知・スキルテストの設定)はマネージャーのみ #}
+              {# システム設定(基本設定・週報・期限超過通知・スキル（AI）などの設定)はマネージャーのみ #}
               <li><a class="dropdown-item {% if request.blueprint == 'system' %}active{% endif %}"
                      href="{{ url_for('system.settings') }}"><i class="bi bi-gear"></i> システム設定</a></li>
             </ul>
-          </li>
-          {% elif current_user.is_active and current_user.role == 'member' %}
-          {# スキルテストの受験はメンバーのみ #}
-          <li class="nav-item">
-            <a class="nav-link {% if request.blueprint == 'skilltest' %}active{% endif %}"
-               href="{{ url_for('skilltest.index') }}"><i class="bi bi-patch-question"></i> スキルテスト</a>
           </li>
           {% endif %}
         </ul>
@@ -222,7 +210,7 @@
 
 {# 「AIで分析」で AI の接続先に送る内容(AI分析の画面とシステム設定の「AI分析」タブで同じ文を使う) #}
 {% macro ai_analysis_sent_items() -%}
-  タスクの名前・説明・コメント（書いた人の氏名・日時を含む）・状態の変更（日時を含む）・成果・メンバーの氏名・スキル・スキルテストの結果
+  タスクの名前・説明・コメント（書いた人の氏名・日時を含む）・状態の変更（日時を含む）・成果・メンバーの氏名・スキル（到達度と期間内の変更）
 {%- endmacro %}
 {#=== errors/too_large.html ===#}
 {# 送信された入力が大きすぎる(413)ときの画面。limit_bytes は1回の送信の上限(バイト) #}
@@ -243,7 +231,7 @@
 {% endblock %}
 {#=== errors/http_error.html ===#}
 {# 権限が無い(403)・ページが見つからない(404)・画面として開けない URL(405)・内部エラー(500)の画面。heading / message は app.py の HTTP_ERROR_PAGES(または abort の説明)。
-   confirm_url があれば、続けるためのボタンも表示する(ほかのサイトから開かれた・送り元が分からないスキルテストの出題・ログアウト。
+   confirm_url があれば、続けるためのボタンも表示する(ほかのサイトから開かれた・送り元が分からないログアウト。
    check_same_origin。confirm_post なら POST のフォームのボタン) #}
 {% extends "base.html" %}
 {% block title %}{{ heading }} &middot; {{ app_name }}{% endblock %}
@@ -905,6 +893,28 @@
   </div>
   {% endif %}
 </div>
+
+{# スキルの自動更新の判定(マネージャーだけ。app.py の 8-3) #}
+{% if skill_judgments %}
+<div class="card shadow-sm mt-3">
+  <div class="card-header bg-white fw-bold d-flex justify-content-between align-items-center">
+    <span><i class="bi bi-arrow-up-circle"></i> スキルの自動更新（マネージャーだけに表示）</span>
+    <a href="{{ url_for('skills.history') }}" class="small fw-normal">変更の履歴</a>
+  </div>
+  <ul class="list-group list-group-flush small">
+    {% for j in skill_judgments %}
+    <li class="list-group-item">
+      <span class="text-muted">{{ j.created_at.strftime('%Y/%m/%d %H:%M') if j.created_at else '' }}</span>
+      {% if judgment_stale(j) %}<span class="badge bg-warning text-dark">中断</span>{% else %}<span class="badge bg-{{ j.status_color }}{% if j.status_color == 'light' %} text-dark border{% endif %}">{{ j.status_label }}</span>{% endif %}
+      {{ j.message or ('判定しています…' if j.status in ('pending', 'running') else '') }}
+      {% for c in j.changes %}
+      <div>{{ c.user.display_name if c.user else '' }}「{{ c.skill.name if c.skill else '' }}」Lv{{ c.old_level }}→Lv{{ c.new_level }}{% if c.is_undone %} <span class="text-danger">（取り消し済み）</span>{% endif %} <span class="text-muted">{{ c.reason or '' }}</span></div>
+      {% endfor %}
+    </li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
 
 {# 成果 #}
 <div class="card shadow-sm mt-3">
@@ -2049,6 +2059,9 @@
   </div>
 </div>
 
+{# AIのスキル分析・相談・計画・最近の自動更新(app.py の 8 章) #}
+{% include "skills/_ai_panel.html" %}
+
 {# 見方の切り替え(スキル基準 / 業務基準の対応表) #}
 <div class="btn-group btn-group-sm mb-3" role="group">
   <a href="{{ url_for('skills.list_skills') }}" class="btn btn-outline-primary active">縦=スキル項目</a>
@@ -2121,10 +2134,10 @@
         {% set ns = namespace(rows=0) %}
         {% for grp in groups %}
         {% if is_all %}
-        {# 全スキル表示時は区分ごとに小見出し行(到達尺度が区分で異なるため) #}
+        {# 全スキル表示時は区分ごとに小見出し行 #}
         <tr class="table-{{ grp.color }}">
           <td class="text-start fw-bold" colspan="{{ ncols }}">
-            <span class="sticky-label">{{ grp.label }}（0〜{{ grp.scale|length - 1 }}）</span>
+            <span class="sticky-label">{{ grp.label }}</span>
           </td>
         </tr>
         {% endif %}
@@ -2149,11 +2162,12 @@
           {% for u in users %}
           {% set r = level_by_skill[s.id].get(u.id) %}
           {% set plv = r.level if r else 0 %}
+          {% set auto = auto_cells.get((u.id, s.id)) %}
           <td class="p-1">
             <span class="badge bg-{{ r.level_color if r else 'light' }} {% if not r or r.level == 0 %}text-muted border{% endif %}"
-                  title="{{ u.display_name }} / {{ grp.scale[plv] if plv < grp.scale|length else plv }}{% if r and r.note %} / {{ r.note }}{% endif %}">
+                  title="{{ u.display_name }} / {{ grp.scale[plv] if plv < grp.scale|length else plv }}{% if r and r.note %} / {{ r.note }}{% endif %}{% if auto %} / AIの自動更新（{{ auto.created_at.strftime('%m/%d') if auto.created_at else '' }}・タスク「{{ auto.task_title or '' }}」）{% endif %}">
               {{ plv }}
-            </span>
+            </span>{% if auto %}<i class="bi bi-stars text-primary small" aria-label="AIの自動更新"></i>{% endif %}
           </td>
           {% endfor %}
           {% if show_person %}
@@ -2178,23 +2192,24 @@
   {% endif %}
 </div>
 
-{# 凡例(表示中の区分ごとの到達尺度) #}
+{# 凡例(到達尺度はすべての区分で共通) #}
 <div class="card card-body shadow-sm mt-3">
-  {% for grp in groups %}
-  <div class="small {% if not loop.first %}mt-2 pt-2 border-top{% endif %}">
-    <span class="fw-bold">
-      {% if is_all %}<span class="badge bg-{{ grp.color }}">{{ grp.label }}</span>{% else %}{{ grp.label }}{% endif %}の到達尺度:
-    </span>
-    {% for label in grp.scale %}
-    <span class="ms-2"><span class="badge bg-secondary">{{ loop.index0 }}</span> {{ label }}</span>
+  <div class="small">
+    <span class="fw-bold">到達尺度（すべてのスキル共通）:</span>
+    {% for label in scale %}
+    <span class="ms-2"><span class="badge bg-{{ level_colors.get(loop.index0, 'secondary') }} {% if loop.first %}text-muted border{% endif %}">{{ loop.index0 }}</span> {{ label }}</span>
     {% endfor %}
+    <span class="ms-3 text-muted"><i class="bi bi-stars text-primary"></i> ＝ タスクの完了からのAIの自動更新（取り消していないもの）</span>
   </div>
-  {% endfor %}
 </div>
 <p class="text-muted small mt-2">
   {% if show_person %}<span class="me-3"><i class="bi bi-people"></i> ヒト列＝各メンバーの到達度（名前クリックで個人のスキルの画面。到達度の編集はその画面の「到達度を編集」から）。</span>{% endif %}
   {% if show_op %}<span><i class="bi bi-briefcase"></i> 業務列＝その業務に必要な到達レベル（業務名クリックで編集）。</span>{% endif %}
 </p>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/skill-ai.js') }}"></script>
 {% endblock %}
 {#=== skills/member.html ===#}
 {% extends "base.html" %}
@@ -2214,7 +2229,7 @@
     <span class="text-muted fs-6">{{ member.department_names or '' }}</span>
   </h1>
   <div class="d-flex gap-2">
-    <a href="{{ url_for('skilltest.admin_attempts', user_id=member.id) }}" class="btn btn-outline-secondary"><i class="bi bi-patch-check"></i> スキルテストの受験履歴</a>
+    <a href="{{ url_for('skills.history', member=member.id) }}" class="btn btn-outline-secondary"><i class="bi bi-clock-history"></i> 変更の履歴</a>
     {% if can_edit %}
     <a href="{{ url_for('skills.edit_member', user_id=member.id) }}" class="btn btn-primary"><i class="bi bi-pencil"></i> 到達度を編集</a>
     {% endif %}
@@ -2310,15 +2325,19 @@
           <span class="fw-medium">{{ s.name }}</span>
           {% if s.category %}<span class="text-muted small">({{ s.category }})</span>{% endif %}
         </div>
-        <span class="badge bg-{{ r.level_color if r else 'light' }} {% if not r or r.level == 0 %}text-muted border{% endif %}">
-          Lv{{ lv }}：{{ s.level_labels[lv] if lv < s.level_labels|length else lv }}
+        <span>
+          {% set auto = auto_marks.get(s.id) %}
+          {% if auto %}<span class="badge bg-primary-subtle text-primary-emphasis border" title="{{ auto.reason or '' }}"><i class="bi bi-stars"></i> AIの自動更新（{{ auto.created_at.strftime('%m/%d') if auto.created_at else '' }}）</span>{% endif %}
+          <span class="badge bg-{{ r.level_color if r else 'light' }} {% if not r or r.level == 0 %}text-muted border{% endif %}">
+            Lv{{ lv }}：{{ s.level_labels[lv] if lv < s.level_labels|length else lv }}
+          </span>
         </span>
       </div>
       <div class="progress mt-1" style="height:6px;">
         <div class="progress-bar bg-{{ s.type_color }}" style="width: {{ (lv / s.max_level * 100) if s.max_level else 0 }}%"></div>
       </div>
       {% if r and r.note %}<div class="small text-muted mt-1">{{ r.note }}</div>{% endif %}
-      {% if r %}<div class="small text-muted">最終更新 {{ fmt_date(r.rated_at) }}{% if r.rater %}（{{ r.rater.display_name }}）{% endif %}</div>{% endif %}
+      {% if r %}<div class="small text-muted">最終更新 {{ fmt_date(r.rated_at) }}{% if auto_marks.get(s.id) %}（タスク「{{ auto_marks[s.id].task_title or '' }}」の完了からの自動更新）{% elif r.rater %}（{{ r.rater.display_name }}）{% endif %}</div>{% endif %}
     </li>
     {% else %}
     <li class="list-group-item text-muted small">この区分のスキル項目はありません。</li>
@@ -2326,6 +2345,33 @@
   </ul>
 </div>
 {% endfor %}
+
+{# 到達度の変更の記録(新しい20件。app.py の 8-3) #}
+<div class="card shadow-sm mb-3">
+  <div class="card-header bg-white fw-bold d-flex justify-content-between align-items-center">
+    <span><i class="bi bi-clock-history"></i> 最近の到達度の変更</span>
+    <a href="{{ url_for('skills.history', member=member.id) }}" class="small fw-normal">すべての変更</a>
+  </div>
+  <ul class="list-group list-group-flush small">
+    {% for c in changes %}
+    <li class="list-group-item {% if c.is_undone %}text-muted{% endif %}">
+      <span class="text-muted">{{ fmt_date(c.created_at) }}</span>
+      「{{ c.skill.name if c.skill else '' }}」 <span class="fw-bold">{% if c.is_undone %}<s>Lv{{ c.old_level }}→Lv{{ c.new_level }}</s>{% else %}Lv{{ c.old_level }}→Lv{{ c.new_level }}{% endif %}</span>
+      <span class="badge bg-{{ c.source_color }}{% if c.source_color == 'light' %} text-dark border{% endif %}">{{ c.source_label }}</span>
+      {% if c.task_title %}<span class="text-muted">タスク「{{ c.task_title }}」</span>{% endif %}
+      {% if c.reason %}<div class="text-muted">{{ c.reason }}</div>{% endif %}
+      {% if c.evidence %}<div class="text-muted">根拠: 「{{ c.evidence }}」</div>{% endif %}
+      {% if c.source == 'auto' and not c.is_undone and current_levels.get(c.skill_id, 0) == c.new_level %}
+      <form method="post" action="{{ url_for('skills.undo_change', change_id=c.id) }}" class="mt-1" onsubmit="return confirm('この自動更新を取り消して、Lv{{ c.old_level }} に戻しますか？');">
+        <button class="btn btn-sm btn-outline-danger py-0">取り消す</button>
+      </form>
+      {% endif %}
+    </li>
+    {% else %}
+    <li class="list-group-item text-muted">まだ変更の記録はありません。</li>
+    {% endfor %}
+  </ul>
+</div>
 {% endblock %}
 {#=== skills/member_edit.html ===#}
 {% extends "base.html" %}
@@ -2340,7 +2386,8 @@
   </ol>
 </nav>
 
-<h1 class="h3 mb-3">{{ member.display_name }} さんの到達度を編集</h1>
+<h1 class="h3 mb-1">{{ member.display_name }} さんの到達度を編集</h1>
+<p class="text-muted small">到達尺度はすべてのスキルで共通です（Lv0 未習得／Lv1 先輩と一緒にできる／Lv2 単独でできる（自立）／Lv3 教えることができる（自律））。レベルを変えると、変更の履歴に記録します。</p>
 
 <form method="post">
   {# 画面を開いたときの本人(IDが別の人に再利用された後の古い画面から保存しないように照合する) #}
@@ -2464,7 +2511,7 @@
          ブラウザがあるため、1px に切り取って見えなくする) #}
       <button type="submit" tabindex="-1" aria-hidden="true"
               style="position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0;">{{ '更新' if editing else '追加' }}</button>
-      {% if back %}<input type="hidden" name="back" value="{{ back }}">{% endif %}{% if editing %}
+      {% if editing %}
       {# 画面を開いたときの内容の控え(ほかの操作の変更を古い画面の保存で上書きしない) #}
       <input type="hidden" name="version" value="{{ version }}">{% else %}
       {# 追加の二度押しで同じスキル項目を2件にしないための1回限りの印(「AIで下書き」の再表示でも引き継ぐ) #}
@@ -2514,55 +2561,30 @@
         <textarea name="description" id="item-description" class="form-control" rows="12">{{ val('description') }}</textarea>
         <div id="description-draft-status" class="small mt-1" role="status" aria-live="polite"></div>
         <div class="form-text" data-technical-type="{{ technical_type }}">
-          {# スキルテスト(テクニカルスキルだけ)の案内。追加の画面では区分の選択に合わせて切り替える(skill-item-form.js) #}
-          <p class="mb-1{% if current_type != technical_type %} d-none{% endif %}" data-skilltest="on">
-            <strong>スキルテストの問題は、AIがこの説明を読んで作ります</strong>（スキル名・カテゴリ・到達尺度とあわせて使います）。
-            説明が具体的なほど、範囲外の問題や的外れな問題が減ります。次の見出しで書くことをおすすめします。
+          <p class="mb-1">
+            説明は、到達度（Lv0〜3）を判断するときの基準です。マネージャーが到達度を決めるときと、タスクの完了のときに
+            AIが進捗の記載からスキルを自動で更新するとき（スキルの自動更新）に使います。次の見出しで書くことをおすすめします。
           </p>
-          <ul class="mb-1 ps-3{% if current_type != technical_type %} d-none{% endif %}" data-skilltest="on">
-            <li><strong>■{{ headings[0] }}</strong> … このスキルで扱う知識・作業の範囲（テストで問う範囲）</li>
-            <li><strong>■{{ headings[1] }}</strong> … 例: 表計算ソフト（関数・ピボットテーブル）、Python 3 など</li>
-            <li><strong>■{{ headings[2] }}</strong> … 各レベルで具体的にできること（下の到達尺度を、このスキルの言葉で書く）</li>
-            <li><strong>■{{ headings[3] }}</strong> … テストで問わない内容（ほかのスキルで扱う内容・使わない機能など）</li>
-          </ul>
-          <p class="mb-1{% if current_type == technical_type %} d-none{% endif %}" data-skilltest="off">
-            この区分はスキルテストの対象外です（問題を作るのはテクニカルスキルだけです）。
-            説明は到達度の判断基準として、次の見出しで書くことをおすすめします。
-          </p>
-          <ul class="mb-1 ps-3{% if current_type == technical_type %} d-none{% endif %}" data-skilltest="off">
-            <li><strong>■{{ outline_off[0][0] }}</strong> … このスキルで扱う行動・考え方・知識の範囲（到達度を判断する範囲）</li>
-            <li><strong>■{{ outline_off[1][0] }}</strong> … 各レベルで具体的にできること・見てとれる行動（下の到達尺度を、このスキルの言葉で書く）</li>
-            <li><strong>■{{ outline_off[2][0] }}</strong> … このスキルでは評価しない内容（ほかのスキルで扱う内容など）</li>
+          <ul class="mb-1 ps-3">
+            <li><strong>■対象範囲</strong> … このスキルで扱う知識・作業・行動の範囲（到達度を判断する範囲）</li>
+            <li class="{% if current_type != technical_type %}d-none{% endif %}" data-technical-only="1"><strong>■使う道具・言語・ソフト</strong>（テクニカルスキル） … 例: 表計算ソフト（関数・ピボットテーブル）、Python 3 など</li>
+            <li><strong>■レベルごとの目安（Lv1〜Lv3）</strong> … 各レベルで具体的にできること・見てとれる行動（下の到達尺度を、このスキルの言葉で書く）</li>
+            <li><strong>■対象外の内容</strong> … このスキルでは評価しない内容（ほかのスキルで扱う内容など）</li>
           </ul>
           <p class="mb-1">
             「AIで下書き」を押すと、スキル名・区分・カテゴリと到達尺度（今の説明があればそれも参考）から、AIがこの形の下書きを説明の欄に入れます。
             <strong>保存はされません</strong>。内容を確認・修正してから「{{ '更新' if editing else '追加' }}」を押してください。
             {% if not ai_enabled %}<span class="text-danger">AIが未設定のため使えません（{{ ai_status }}）。</span>{% endif %}
           </p>
-          <p class="mb-1{% if current_type != technical_type %} d-none{% endif %}" data-skilltest="on">
-            説明を変えたときは、古い説明で作られた問題を
-            {% if editing %}<a href="{{ url_for('skilltest.admin_pool_skill', skill_id=skill.id) }}">問題プール</a>{% else %}問題プール{% endif %}
-            の「このスキルの問題をすべて停止」で止めてから、「AIで補充」で作り直してください。
-          </p>
-          <div class="mb-0">{# テクニカルスキルはテストで判定する Lv1〜Lv4、ほかの区分は到達尺度のすべてのレベル #}
-            {% for t, levels in scales.items() %}
-            <span class="skill-scale {% if t != current_type %}d-none{% endif %}" data-skill-type="{{ t }}">
-              到達尺度（Lv1〜Lv{{ levels[-1][0] if levels else 1 }}）:
-              {% if not editing %}<span class="text-muted">{{ type_labels[t] }}</span>{% endif %}
-              {% for lv, label in levels %}Lv{{ lv }}「{{ label }}」{% if not loop.last %}・{% endif %}{% endfor %}
-            </span>
-            {% endfor %}
+          <div class="mb-0">到達尺度（すべてのスキル共通）:
+            {% for label in scale %}{% if not loop.first %}Lv{{ loop.index0 }}「{{ label }}」{% if not loop.last %}・{% endif %}{% endif %}{% endfor %}
           </div>
         </div>
       </div>
 
       <div class="d-flex gap-2">
         <button type="submit" class="btn btn-primary"><i class="bi bi-check-lg"></i> {{ '更新' if editing else '追加' }}</button>
-        {% if back == 'pool' and editing %}
-        <a href="{{ url_for('skilltest.admin_pool_skill', skill_id=skill.id) }}" class="btn btn-outline-secondary">キャンセル</a>
-        {% else %}
         <a href="{{ url_for('skills.items') }}" class="btn btn-outline-secondary">キャンセル</a>
-        {% endif %}
       </div>
     </form>
   </div>
@@ -2781,887 +2803,498 @@
   </div>
 </form>
 {% endblock %}
-{#=== skilltest/index.html ===#}
-{% extends "base.html" %}
-{% from "_macros.html" import fmt_datetime %}
-{% block title %}スキルテスト &middot; {{ app_name }}{% endblock %}
-
-{% block content %}
-<div class="d-flex justify-content-between align-items-center mb-1 flex-wrap gap-2">
-  <h1 class="h3 mb-0"><i class="bi bi-patch-question"></i> スキルテスト</h1>
-</div>
-<p class="text-muted small">
-  テクニカルスキルの理解度を4択問題で確認します。結果のレベルが今の到達度より高ければ、スキルの到達度に自動で登録されます（下がることはありません）。
-</p>
-
-{% if running %}
-<div class="alert alert-primary d-flex justify-content-between align-items-center flex-wrap gap-2">
-  <div>
-    <i class="bi bi-hourglass-split"></i> 受験中のテストがあります:
-    <span class="fw-bold">{{ running.skill.name }}</span>
-    <span class="small">（{{ running.answered_count }}/{{ running.total }} 問回答済み・期限 {{ fmt_datetime(running.deadline_at) }}）</span>
+{#=== skills/_ai_panel.html ===#}
+{# スキルマップの上部: AIの分析コメント・AIに相談(チャット)・計画とメモ・最近の自動更新(app.py の 8 章。マネージャーのみ)。
+   変数 ai(skill_ai_panel_context)・ai_active(最初に開くタブ。analysis / chat) #}
+{% from "_macros.html" import fmt_date, fmt_datetime %}
+{% set an = ai.analysis %}
+<div class="card shadow-sm mb-3" id="skill-ai" data-state-url="{{ url_for('skills.ai_state') }}"
+     data-analysis-running="{{ '1' if an.running else '' }}">
+  <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <span class="fw-bold"><i class="bi bi-stars"></i> AIのスキル分析・相談</span>
+    <span class="small text-muted">{% if ai.ai_enabled %}AI: {{ ai.ai_status }}{% else %}<span class="text-danger">AIが未設定のため使えません（{{ ai.ai_status }}）</span>{% endif %}</span>
   </div>
-  <a href="{{ url_for('skilltest.question', attempt_id=running.id) }}" class="btn btn-primary btn-sm"><i class="bi bi-play-fill"></i> 続きから再開</a>
+  <div class="card-body">
+    <ul class="nav nav-tabs small mb-3" role="tablist">
+      <li class="nav-item" role="presentation">
+        <button class="nav-link {% if ai_active != 'chat' %}active{% endif %}" data-bs-toggle="tab" data-bs-target="#skill-ai-analysis" type="button" role="tab"><i class="bi bi-clipboard-data"></i> 分析コメント</button>
+      </li>
+      <li class="nav-item" role="presentation">
+        <button class="nav-link {% if ai_active == 'chat' %}active{% endif %}" data-bs-toggle="tab" data-bs-target="#skill-ai-chat" type="button" role="tab"><i class="bi bi-chat-dots"></i> AIに相談{% if ai.threads %} <span class="badge bg-secondary">{{ ai.threads|length }}</span>{% endif %}</button>
+      </li>
+      <li class="nav-item" role="presentation">
+        {% set plan_count = namespace(n=0) %}{% for g in ai.plan_groups %}{% set plan_count.n = plan_count.n + g.plans|length %}{% endfor %}
+        <button class="nav-link" data-bs-toggle="tab" data-bs-target="#skill-plans" type="button" role="tab"><i class="bi bi-journal-check"></i> 計画・メモ{% if plan_count.n %} <span class="badge bg-secondary">{{ plan_count.n }}</span>{% endif %}</button>
+      </li>
+      <li class="nav-item" role="presentation">
+        <button class="nav-link" data-bs-toggle="tab" data-bs-target="#skill-ai-updates" type="button" role="tab"><i class="bi bi-arrow-up-circle"></i> 最近の自動更新</button>
+      </li>
+    </ul>
+    <div class="tab-content">
+      {# ---- 分析コメント ---- #}
+      <div class="tab-pane fade {% if ai_active != 'chat' %}show active{% endif %}" id="skill-ai-analysis" role="tabpanel">
+        <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-2">
+          <div class="small text-muted" role="status" aria-live="polite">
+            {% if an.running %}<span class="spinner-border spinner-border-sm" role="status"></span> AIが分析しています（数十秒〜数分）。終わると自動で表示されます。
+            {% elif an.generated_at %}{{ an.generated_at }} 時点の分析（{{ an.by }}{% if an.model %}・{{ an.model }}{% endif %}）
+            {% else %}まだ分析していません。{% endif %}
+          </div>
+          <form method="post" action="{{ url_for('skills.ai_analyze') }}">
+            <button class="btn btn-sm btn-primary" {% if not ai.ai_enabled or an.running %}disabled{% endif %}><i class="bi bi-stars"></i> {% if an.result %}AIで分析し直す{% else %}AIで分析{% endif %}</button>
+          </form>
+        </div>
+        {% if an.status == 'error' and an.error and not an.running %}
+        <div class="alert alert-warning small py-2"><i class="bi bi-exclamation-triangle"></i> 前回の分析は失敗しました: {{ an.error }}{% if an.result %}（下は前の分析の結果です）{% endif %}</div>
+        {% endif %}
+        {% if an.interrupted %}
+        <div class="alert alert-secondary small py-2"><i class="bi bi-info-circle"></i> 前回の分析は途中で止まりました（サーバーの再起動など）。もう一度「AIで分析」を押してください。</div>
+        {% endif %}
+        {% if an.result %}
+        <div class="row g-3">
+          {% for key, label, _limit in ai.analysis_keys %}{% set items = an.result[key] %}{% if items %}
+          <div class="col-md-6">
+            <div class="fw-bold small mb-1">{{ label }}</div>
+            <ul class="small mb-0 ps-3">{% for item in items %}<li>{{ item }}</li>{% endfor %}</ul>
+          </div>
+          {% endif %}{% endfor %}
+        </div>
+        {% if an.result.members %}
+        <div class="mt-3">
+          <div class="fw-bold small mb-1">メンバーごと</div>
+          <div class="table-responsive">
+            <table class="table table-sm small align-middle mb-0">
+              <thead class="table-light"><tr><th>メンバー</th>{% for key, label in ai.member_keys %}<th>{{ label }}</th>{% endfor %}</tr></thead>
+              <tbody>
+                {% for m in an.result.members %}
+                <tr>
+                  <td class="text-nowrap"><a href="{{ url_for('skills.member', user_id=m.user_id) }}">{{ m.name }}</a></td>
+                  {% for key, label in ai.member_keys %}<td>{% for item in m[key] %}<div>・{{ item }}</div>{% endfor %}</td>{% endfor %}
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        {% endif %}
+        <div class="small text-muted mt-2">AIの分析は参考です。残しておきたい内容は「AIに相談」で深めて、「計画に保存」で計画・メモにできます。</div>
+        {% elif not an.running %}
+        <p class="small text-muted mb-1">「AIで分析」を押すと、スキルマップ（メンバーの到達度・業務に必要なスキル・最近の到達度の変更・保存済みの計画とメモ）をAIが読み、チームの強み・弱み・アクションアイテムと、メンバーごとの強み・弱み・次に伸ばすことを表示します。</p>
+        {% endif %}
+        <div class="small text-muted mt-2"><i class="bi bi-info-circle"></i> AIの接続先に送る内容: メンバーの氏名・チーム、スキル項目（説明の先頭）と到達度、最近90日の到達度の変更（きっかけのタスクの名前）、業務と必要なスキル、保存済みの計画・メモ（相談では、話題のメンバーの担当タスクの名前・状態と、それまでのやり取りも）。</div>
+      </div>
+
+      {# ---- AIに相談 ---- #}
+      <div class="tab-pane fade {% if ai_active == 'chat' %}show active{% endif %}" id="skill-ai-chat" role="tabpanel">
+        <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
+          {% if ai.threads %}
+          <form method="get" action="{{ url_for('skills.list_skills') }}" class="d-flex gap-1 align-items-center">
+            {% for key, values in request.args.lists() if key != 'thread' %}{% for v in values %}<input type="hidden" name="{{ key }}" value="{{ v }}">{% endfor %}{% endfor %}
+            <label class="small text-muted text-nowrap" for="skill-chat-thread">会話:</label>
+            <select name="thread" id="skill-chat-thread" class="form-select form-select-sm" onchange="this.form.submit()">
+              {% for t in ai.threads %}
+              <option value="{{ t.id }}" {% if ai.thread and t.id == ai.thread.id %}selected{% endif %}>{{ t.title }}（{{ fmt_datetime(t.updated_at) }}）</option>
+              {% endfor %}
+            </select>
+            <noscript><button class="btn btn-sm btn-outline-secondary">開く</button></noscript>
+          </form>
+          {% endif %}
+          <button class="btn btn-sm btn-outline-primary" type="button" data-bs-toggle="collapse" data-bs-target="#skill-chat-new" aria-expanded="{{ 'false' if ai.threads else 'true' }}"><i class="bi bi-plus-lg"></i> 新しい相談</button>
+        </div>
+        <div class="collapse {% if not ai.threads %}show{% endif %}" id="skill-chat-new">
+          <form method="post" action="{{ url_for('skills.chat_new') }}" class="border rounded p-2 mb-2">
+            <input type="hidden" name="once" value="{{ submit_token() }}">
+            <div class="row g-2 align-items-end">
+              <div class="col-md-5">
+                <label class="form-label small mb-0" for="skill-chat-title">題名（任意）</label>
+                <input type="text" name="title" id="skill-chat-title" class="form-control form-control-sm" maxlength="100" placeholder="例: 山田さんの教育計画">
+              </div>
+              <div class="col-md-4">
+                <label class="form-label small mb-0" for="skill-chat-focus">話題のメンバー（任意）</label>
+                <select name="focus" id="skill-chat-focus" class="form-select form-select-sm">
+                  <option value="">チーム全体</option>
+                  {% for u in ai.plan_users %}<option value="{{ u.form_key }}">{{ u.display_name }}</option>{% endfor %}
+                </select>
+              </div>
+              <div class="col-md-3 d-grid"><button class="btn btn-sm btn-primary">相談を始める</button></div>
+            </div>
+          </form>
+        </div>
+        {% if ai.thread %}
+        {% set th = ai.thread %}
+        <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-1">
+          <div class="small"><span class="fw-bold">{{ th.title }}</span>
+            <span class="text-muted">（話題: {{ th.focus_user.display_name if th.focus_user else 'チーム全体' }}{% if th.created_by %}・{{ th.created_by.display_name }}さんが開始{% endif %}）</span></div>
+          <form method="post" action="{{ url_for('skills.chat_delete', thread_id=th.id) }}" onsubmit="return confirm('この会話を削除しますか？（保存した計画・メモは残ります）');">
+            <input type="hidden" name="row" value="{{ th.row_key }}">
+            <button class="btn btn-sm btn-outline-danger py-0"><i class="bi bi-trash"></i> 会話を削除</button>
+          </form>
+        </div>
+        <div id="skill-chat-messages" class="border rounded p-2 mb-2 skill-chat-box"
+             data-messages-url="{{ url_for('skills.chat_messages_view', thread_id=th.id, row=th.row_key) }}"
+             data-pending="{{ '1' if ai.chat_pending else '' }}">{{ ai.chat_html|safe }}</div>
+        <form method="post" action="{{ url_for('skills.chat_send', thread_id=th.id) }}" id="skill-chat-form">
+          <input type="hidden" name="row" value="{{ th.row_key }}">
+          <input type="hidden" name="once" value="{{ submit_token() }}">
+          <label class="visually-hidden" for="skill-chat-question">質問</label>
+          <textarea name="question" id="skill-chat-question" class="form-control form-control-sm" rows="3" maxlength="{{ ai.question_max }}" required
+                    placeholder="例: {{ th.focus_user.display_name ~ 'さんの強み・弱みと、半年で単独でできる（Lv2）ようにするための教育計画を考えて' if th.focus_user else 'チームの弱みと、対応できる人が少ない業務を減らすためのアクションアイテムを考えて' }}"
+                    {% if not ai.ai_enabled %}disabled{% endif %}></textarea>
+          <div class="d-flex justify-content-between align-items-center mt-1 gap-2">
+            <span class="small text-muted" id="skill-chat-status" role="status" aria-live="polite">Ctrl＋Enter でも送れます。応答は数十秒〜数分かかります。</span>
+            <button class="btn btn-sm btn-primary text-nowrap" {% if not ai.ai_enabled %}disabled{% endif %}><i class="bi bi-send"></i> 送る</button>
+          </div>
+        </form>
+        {% else %}
+        <p class="small text-muted mb-0">「新しい相談」から、チーム全体またはメンバーを話題にしてAIと相談できます。強み・弱みの整理、アクションアイテム・中期計画・教育計画づくりに使い、良い応答は「計画に保存」で残せます。やり取りはマネージャー全員が見られます。</p>
+        {% endif %}
+      </div>
+
+      {# ---- 計画・メモ ---- #}
+      <div class="tab-pane fade" id="skill-plans" role="tabpanel">
+        <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-2">
+          <span class="small text-muted">相談から保存した計画・メモ（進行中）。保存した計画・メモは、次の相談・分析の材料にもなります。</span>
+          <span class="d-flex gap-2">
+            <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('skills.plans') }}"><i class="bi bi-list-ul"></i> すべて（完了 {{ ai.plan_done_count }}件を含む）</a>
+            <button class="btn btn-sm btn-outline-primary" type="button" data-bs-toggle="collapse" data-bs-target="#skill-plan-new"><i class="bi bi-plus-lg"></i> 追加</button>
+          </span>
+        </div>
+        <div class="collapse" id="skill-plan-new">
+          <form method="post" action="{{ url_for('skills.plan_new') }}" class="border rounded p-2 mb-2">
+            <input type="hidden" name="once" value="{{ submit_token() }}">
+            <div class="row g-2">
+              <div class="col-md-3"><select name="kind" class="form-select form-select-sm" aria-label="種類">{% for key, label in ai.plan_kinds %}<option value="{{ key }}">{{ label }}</option>{% endfor %}</select></div>
+              <div class="col-md-3"><select name="target" class="form-select form-select-sm" aria-label="対象"><option value="">チーム全体</option>{% for u in ai.plan_users %}<option value="{{ u.form_key }}">{{ u.display_name }}</option>{% endfor %}</select></div>
+              <div class="col-md-3"><input type="date" name="due_date" class="form-control form-control-sm" aria-label="期限（任意）"></div>
+              <div class="col-12"><input type="text" name="title" class="form-control form-control-sm" maxlength="200" required placeholder="タイトル"></div>
+              <div class="col-12"><textarea name="body" class="form-control form-control-sm" rows="4" placeholder="内容（任意）"></textarea></div>
+              <div class="col-12 text-end"><button class="btn btn-sm btn-primary">保存</button></div>
+            </div>
+          </form>
+        </div>
+        {% for g in ai.plan_groups %}
+        <div class="mb-2">
+          <div class="small fw-bold"><span class="badge bg-{{ g.color }}{% if g.color == 'light' %} text-dark border{% endif %}">{{ g.label }}</span></div>
+          <ul class="list-group list-group-flush small">
+            {% for p in g.plans %}
+            <li class="list-group-item px-1">
+              <div class="d-flex justify-content-between flex-wrap gap-1">
+                <span><span class="fw-medium">{{ p.title }}</span>
+                  <span class="text-muted">（対象: {{ p.target_user.display_name if p.target_user else 'チーム全体' }}{% if p.due_date %}・期限 {{ fmt_date(p.due_date) }}{% endif %}）</span></span>
+                <span class="d-flex gap-1">
+                  <a class="btn btn-sm btn-outline-secondary py-0" href="{{ url_for('skills.plan_edit', plan_id=p.id) }}">編集</a>
+                  <form method="post" action="{{ url_for('skills.plan_status', plan_id=p.id) }}">
+                    <input type="hidden" name="row" value="{{ p.row_key }}"><input type="hidden" name="status" value="done">
+                    <button class="btn btn-sm btn-outline-success py-0">完了にする</button>
+                  </form>
+                </span>
+              </div>
+              {% if p.body %}<details><summary class="text-muted">内容</summary><div class="pre-wrap">{{ p.body }}</div></details>{% endif %}
+            </li>
+            {% endfor %}
+          </ul>
+        </div>
+        {% else %}
+        <p class="small text-muted mb-0">まだ計画・メモはありません。「AIに相談」の応答の「計画に保存」か、「追加」から作れます。</p>
+        {% endfor %}
+      </div>
+
+      {# ---- 最近の自動更新 ---- #}
+      <div class="tab-pane fade" id="skill-ai-updates" role="tabpanel">
+        <p class="small text-muted mb-2">タスクを「完了」にすると、そのタスクに進捗を記載したメンバー（担当者かどうかではなく記載者）の記載から、AIがスキルの到達度を判定して上げます（{% if ai.settings.auto_enabled %}オン。1回の完了で{{ ai.settings.step_limit }}段階まで{% else %}今はオフ{% endif %}。設定はシステム設定の「スキル（AI）」タブ）。根拠は本人の記載の引用で、下げることはありません。上げた到達度は変更の履歴から取り消せます。</p>
+        {% if ai.recent_auto %}
+        <ul class="list-group list-group-flush small mb-2">
+          {% for ch in ai.recent_auto %}
+          <li class="list-group-item px-1">
+            <span class="text-muted">{{ fmt_date(ch.created_at) }}</span> {{ ch.user.display_name if ch.user else '' }}「{{ ch.skill.name if ch.skill else '' }}」
+            <span class="fw-bold">Lv{{ ch.old_level }}→Lv{{ ch.new_level }}</span>
+            {% if ch.task_title %}<span class="text-muted">（タスク「{% if ch.task_id %}<a href="{{ url_for('tasks.detail', task_id=ch.task_id) }}">{{ ch.task_title }}</a>{% else %}{{ ch.task_title }}{% endif %}」）</span>{% endif %}
+            {% if ch.reason %}<div class="text-muted">{{ ch.reason }}</div>{% endif %}
+          </li>
+          {% endfor %}
+        </ul>
+        {% else %}
+        <p class="small text-muted">まだ自動更新はありません。</p>
+        {% endif %}
+        <a class="small" href="{{ url_for('skills.history') }}"><i class="bi bi-clock-history"></i> 変更の履歴と判定の一覧（取り消し・判定し直し）</a>
+      </div>
+    </div>
+  </div>
+</div>
+{#=== skills/_chat_messages.html ===#}
+{# 相談のやり取り(app.py の _chat_messages_html。変数 thread・now・stale・plan_kinds・plan_users) #}
+{% from "_macros.html" import fmt_datetime %}
+{% for m in thread.messages %}
+{% if m.is_ai %}
+<div class="skill-chat-msg skill-chat-ai mb-2" data-status="{{ m.status }}">
+  <div class="small text-muted"><i class="bi bi-stars"></i> AI{% if m.finished_at and m.status == 'done' %}（{{ fmt_datetime(m.finished_at) }}）{% endif %}</div>
+  {% if m.status == 'pending' and not stale(m, now) %}
+  <div class="small"><span class="spinner-border spinner-border-sm" role="status"></span> 応答を作成しています…（この画面を開いたままにすると、できたときに表示されます）</div>
+  {% elif m.status != 'done' %}
+  <div class="small text-danger">{{ m.error or '応答の作成が途中で止まりました（サーバーの再起動など）。' }}</div>
+  <form method="post" action="{{ url_for('skills.chat_retry', message_id=m.id) }}" class="mt-1"><button class="btn btn-sm btn-outline-secondary py-0">もう一度</button></form>
+  {% else %}
+  <div class="pre-wrap small skill-chat-text">{{ m.content }}</div>
+  <details class="small mt-1">
+    <summary class="text-primary">計画に保存</summary>
+    <form method="post" action="{{ url_for('skills.plan_new') }}" class="border rounded p-2 mt-1">
+      <input type="hidden" name="once" value="{{ submit_token() }}">
+      <input type="hidden" name="thread" value="{{ thread.id }}">
+      <input type="hidden" name="source_message" value="{{ m.id }}">
+      <div class="row g-1">
+        <div class="col-md-3"><select name="kind" class="form-select form-select-sm" aria-label="種類">{% for key, label in plan_kinds %}<option value="{{ key }}" {% if key == ('education' if thread.focus_user_id else 'action') %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></div>
+        <div class="col-md-3"><select name="target" class="form-select form-select-sm" aria-label="対象"><option value="">チーム全体</option>{% for u in plan_users %}<option value="{{ u.form_key }}" {% if thread.focus_user_id == u.id %}selected{% endif %}>{{ u.display_name }}</option>{% endfor %}</select></div>
+        <div class="col-md-3"><input type="date" name="due_date" class="form-control form-control-sm" aria-label="期限（任意）"></div>
+        <div class="col-12"><input type="text" name="title" class="form-control form-control-sm" maxlength="200" required aria-label="タイトル"
+                                   value="{{ (m.content.split('\n')[0]|replace('■', '')|replace('・', '')|trim)[:60] }}"></div>
+        <div class="col-12"><textarea name="body" class="form-control form-control-sm" rows="5" aria-label="内容">{{ m.content }}</textarea></div>
+        <div class="col-12 text-end"><button class="btn btn-sm btn-primary">保存</button></div>
+      </div>
+    </form>
+  </details>
+  {% endif %}
+</div>
+{% else %}
+<div class="skill-chat-msg skill-chat-user mb-2">
+  <div class="small text-muted"><i class="bi bi-person"></i> {{ m.author.display_name if m.author else '（不明）' }}（{{ fmt_datetime(m.created_at) }}）</div>
+  <div class="pre-wrap small">{{ m.content }}</div>
 </div>
 {% endif %}
-
-<div class="card shadow-sm mb-4">
-  <div class="card-header bg-white fw-bold"><i class="bi bi-list-check"></i> 受験できるスキル（有効なテクニカルスキル）</div>
-  <div class="table-responsive">
-    <table class="table table-hover align-middle mb-0">
-      <thead class="table-light">
-        <tr>
-          <th style="min-width: 12rem;">スキル</th>
-          <th style="min-width: 9rem;">今の到達度</th>
-          <th class="text-nowrap">前回の受験</th>
-          <th class="text-nowrap">次に受験できる日時</th>
-          <th class="text-end"></th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for row in rows %}
-        <tr>
-          <td>
-            <div class="fw-bold">{{ row.skill.name }}</div>
-            {% if row.skill.category %}<div class="small text-muted">{{ row.skill.category }}</div>{% endif %}
-            {% if row.capped %}
-            <div class="small text-muted"><i class="bi bi-info-circle"></i> 今の到達度がテストで登録できる上限（Lv{{ row.top_level }}）以上のため、受験しても到達度は変わりません。</div>
-            {% endif %}
-          </td>
-          <td>
-            <span class="badge bg-{{ level_colors.get(row.level, 'secondary') }} {% if row.level == 0 %}text-dark border{% endif %}">Lv{{ row.level }}</span>
-            <span class="small">{{ scale[row.level] if row.level < scale|length else '' }}</span>
-          </td>
-          <td class="small text-nowrap">
-            {% if row.last %}
-            {{ fmt_datetime(row.last.started_at) }}<br>
-            <span class="badge bg-{{ row.last.status_color }}">{{ row.last.status_label }}</span>
-            {% if row.last.result_level is not none %}
-            結果 Lv{{ row.last.result_level }}{% if row.last.applied %} <span class="badge bg-success">登録</span>{% endif %}
-            {% endif %}
-            {% else %}<span class="text-muted">未受験</span>{% endif %}
-          </td>
-          <td class="small text-nowrap">
-            {% if row.state == 'resume' %}<span class="text-muted">―（受験中）</span>
-            {% elif row.locked_until %}{{ fmt_datetime(row.locked_until) }}
-            {% else %}<span class="text-muted">いつでも</span>{% endif %}
-          </td>
-          <td class="text-end text-nowrap">
-            {% if row.state == 'resume' %}
-            <a href="{{ url_for('skilltest.question', attempt_id=running.id) }}" class="btn btn-primary btn-sm"><i class="bi bi-play-fill"></i> 再開する</a>
-            {% elif row.state == 'busy' %}
-            <button class="btn btn-outline-secondary btn-sm" disabled title="受験中のテストを先に終えてください">受験中のテストがあります</button>
-            {% elif row.state == 'wait' %}
-            <button class="btn btn-outline-secondary btn-sm" disabled>再受験の間隔中</button>
-            {% else %}
-            <form method="post" action="{{ url_for('skilltest.start', skill_id=row.skill.id) }}" class="d-inline skilltest-start"
-                  data-confirm="「{{ row.skill.name }}」のテストを始めます。全{{ rules.total }}問・{{ rules.duration }}です。始めると時間は進み続けます（画面を閉じても止まりません）。よろしいですか？">
-              <button class="btn btn-success btn-sm"><i class="bi bi-pencil-square"></i> 受験する</button>
-            </form>
-            {% endif %}
-          </td>
-        </tr>
-        {% else %}
-        <tr><td colspan="5" class="text-muted text-center py-4">受験できるスキルがありません（有効なテクニカルスキルが登録されていません）。</td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-</div>
-
-{# ルール #}
-<div class="card shadow-sm mb-4">
-  <div class="card-header bg-white fw-bold"><i class="bi bi-journal-text"></i> テストのルール</div>
-  <div class="card-body small">
-    <ul class="mb-3">
-      <li>1回のテストで1つのスキルを確認します。問題は4択で全{{ rules.total }}問
-        （{% for r in rules.rows %}Lv{{ r.level }} {{ r.count }}問{% if not loop.last %}・{% endif %}{% endfor %}）。
-        やさしい問題（Lv1）から順に出題します。</li>
-      <li>1問ずつの制限時間があります（{% for r in rules.rows %}Lv{{ r.level }} {{ r.limit }}秒{% if not loop.last %}・{% endif %}{% endfor %}。合計 {{ rules.duration }}）。
-        0秒になると、その時点で選んでいる選択肢で自動的に送信して次の問題へ進みます（未選択なら時間切れ＝不正解）。ページを再読み込みしても残り時間は戻りません。</li>
-      <li>1問ずつ回答し、<span class="fw-bold">前の問題には戻れません</span>。選択肢の並びは受験ごとに変わります。</li>
-      <li>途中で画面を閉じた場合は、開き直すと続きから再開します。ただし開始から 約{{ rules.deadline_minutes }}分を過ぎると自動で終了し、未回答の問題は不正解として採点します。</li>
-      <li>判定: あるレベルの正答率が{{ rules.pass_rate }}%以上で、それより下のレベルもすべて合格していれば、そのレベルに合格です。合格した最も高いレベルがテストの結果です（Lv1が不合格なら Lv0）。</li>
-      <li>結果のレベルが今の到達度より高いときだけ、到達度に自動で登録します。今の到達度が下がることはありません。</li>
-      <li>同じスキルの再受験は、前回の受験開始から{{ rules.retake_days }}日後からできます{% if rules.retake_days == 0 %}（現在は制限なし）{% endif %}。受験中のテストは1つだけです。</li>
-      <li>受験中は、ほかのタブやアプリに切り替えないでください。<span class="fw-bold">画面から離れた回数は記録され、マネージャーが確認します。</span>問題文のコピーはできません。</li>
-      <li>結果の画面には、レベルごとの正解数と結果のレベルだけを表示します（各問題の正解は表示しません）。</li>
-    </ul>
-    <div class="alert alert-light border mb-0 py-2">
-      <i class="bi bi-info-circle"></i>
-      テストで判定できるのは Lv{{ rules.top_level }}（{{ scale[rules.top_level] if rules.top_level < scale|length else '' }}）までです。
-      {% for lv in range(rules.top_level + 1, scale|length) %}Lv{{ lv }}（{{ scale[lv] }}）{% if not loop.last %}・{% endif %}{% endfor %}と、コンセプチュアルスキル・ヒューマンスキルは、これまでどおりマネージャーが評価します。
-      4択問題で確かめられるのは知識と判断の一部で、実際に作れること・教えられることまでは測れません。
-    </div>
-  </div>
-</div>
-
-{# 自分の受験履歴 #}
-<div class="card shadow-sm mb-4">
-  <div class="card-header bg-white fw-bold"><i class="bi bi-clock-history"></i> 自分の受験履歴</div>
-  <div class="table-responsive">
-    <table class="table table-sm table-hover align-middle mb-0 sortable">
-      <thead class="table-light">
-        <tr>
-          <th>開始日時</th>
-          <th style="min-width: 10rem;">スキル</th>
-          <th>状態</th>
-          <th data-type="num">正解数</th>
-          <th data-type="num">結果</th>
-          <th>到達度</th>
-          <th data-nosort></th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for a in history %}
-        <tr>
-          <td class="text-nowrap" data-sort="{{ a.started_at.strftime('%Y%m%d%H%M%S') }}">{{ fmt_datetime(a.started_at) }}</td>
-          <td>{{ a.skill.name }}</td>
-          <td><span class="badge bg-{{ a.status_color }}">{{ a.status_label }}</span></td>
-          <td class="text-nowrap" data-sort="{{ a.correct if not a.is_in_progress else '' }}">
-            {% if a.is_in_progress %}―{% else %}{{ a.correct }}/{{ a.total }}{% endif %}
-          </td>
-          <td class="text-nowrap" data-sort="{{ a.result_level if a.result_level is not none else '' }}">
-            {% if a.result_level is not none %}Lv{{ a.result_level }}{% else %}―{% endif %}
-          </td>
-          <td class="small text-nowrap">
-            {% if a.is_in_progress %}―
-            {% elif a.applied %}<span class="badge bg-success">登録</span> Lv{{ a.prev_level }} → Lv{{ a.new_level }}
-            {% else %}<span class="text-muted">変更なし（Lv{{ a.prev_level }}）</span>{% if a.not_applied_note %}<br><span class="text-warning-emphasis" title="{{ a.not_applied_note }}">対象外のため未登録</span>{% endif %}{% endif %}
-          </td>
-          <td class="text-end">
-            {% if a.is_in_progress %}
-            <a href="{{ url_for('skilltest.question', attempt_id=a.id) }}" class="btn btn-sm btn-primary">再開</a>
-            {% else %}
-            <a href="{{ url_for('skilltest.result', attempt_id=a.id) }}" class="btn btn-sm btn-outline-secondary">結果</a>
-            {% endif %}
-          </td>
-        </tr>
-        {% else %}
-        <tr><td colspan="7" class="text-muted text-center py-3">まだ受験していません。</td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-</div>
-
-{# 受験開始時の表示(不足している問題をAIで作る間、待ってもらう) #}
-<div id="skilltestOverlay" class="skilltest-overlay d-none" role="status" aria-live="polite">
-  <div class="skilltest-overlay-box">
-    <div class="spinner-border text-primary mb-3" role="status"></div>
-    <div class="fw-bold">問題を準備しています（1〜2分かかることがあります）</div>
-    <div class="small text-muted mt-1">この画面のままお待ちください。準備ができると1問目が表示されます。</div>
-  </div>
-</div>
-{% endblock %}
-
-{% block scripts %}
-<script src="{{ url_for('static', filename='js/skilltest.js') }}"></script>
-{% endblock %}
-{#=== skilltest/question.html ===#}
+{% else %}
+<div class="small text-muted">まだやり取りはありません。下の欄に質問を入力して「送る」を押してください。</div>
+{% endfor %}
+{#=== skills/history.html ===#}
+{# 到達度の変更の記録と、タスクの完了からの自動更新の判定(app.py の 8-6。マネージャーのみ) #}
 {% extends "base.html" %}
-{% from "_macros.html" import fmt_datetime %}
-{% block title %}スキルテスト（{{ item.seq }}/{{ attempt.total }}） &middot; {{ app_name }}{% endblock %}
-
-{% block content %}
-<div class="skilltest-question mx-auto" style="max-width: 860px;"
-     data-remaining="{{ remaining }}"
-     data-seq="{{ item.seq }}"
-     data-blur-url="{{ url_for('skilltest.blur', attempt_id=attempt.id) }}">
-
-  <div class="d-flex justify-content-between align-items-end flex-wrap gap-2 mb-2">
-    <div>
-      <div class="small text-muted"><i class="bi bi-patch-question"></i> スキルテスト</div>
-      <h1 class="h4 mb-0">{{ attempt.skill.name }}</h1>
-    </div>
-    <div class="text-end">
-      <div class="small text-muted">残り時間（この問題）</div>
-      <div id="skilltestTimer" class="skilltest-timer fw-bold" aria-live="off">
-        {{ '%d:%02d' % (remaining // 60, remaining % 60) }}
-      </div>
-    </div>
-  </div>
-
-  <div class="d-flex justify-content-between small text-muted mb-1">
-    <span>第 {{ item.seq }} 問 / 全 {{ attempt.total }} 問
-      <span class="badge bg-secondary ms-1">Lv{{ item.level }}</span>
-      <span class="ms-1">制限時間 {{ item.time_limit_sec }}秒</span>
-    </span>
-    <span>回答済み {{ answered }} 問</span>
-  </div>
-  <div class="progress mb-3" style="height: 6px;" role="progressbar"
-       aria-valuenow="{{ answered }}" aria-valuemin="0" aria-valuemax="{{ attempt.total }}">
-    <div class="progress-bar" style="width: {{ (answered / attempt.total * 100) if attempt.total else 0 }}%"></div>
-  </div>
-
-  <form method="post" action="{{ url_for('skilltest.answer', attempt_id=attempt.id) }}" id="skilltestAnswerForm">
-    <input type="hidden" name="seq" value="{{ item.seq }}">
-    <div class="card shadow-sm mb-3">
-      <div class="card-body skilltest-noselect">
-        <div class="skilltest-question-text pre-wrap mb-3">{{ item.question }}</div>
-        <div class="list-group">
-          {% for choice in choices %}
-          <label class="list-group-item list-group-item-action d-flex gap-2 align-items-start skilltest-choice">
-            <input class="form-check-input flex-shrink-0 mt-1" type="radio" name="choice" value="{{ loop.index0 }}" required>
-            <span class="fw-bold">{{ letters[loop.index0] }}.</span>
-            <span class="pre-wrap">{{ choice }}</span>
-          </label>
-          {% endfor %}
-        </div>
-      </div>
-      <div class="card-footer bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
-        <span class="small text-muted"><i class="bi bi-exclamation-circle"></i> 回答すると次の問題へ進みます（前の問題には戻れません）。</span>
-        <button class="btn btn-primary" id="skilltestSubmit"><i class="bi bi-check2-circle"></i> 回答する</button>
-      </div>
-    </div>
-  </form>
-
-  <div class="small text-muted">
-    ・時間が0になると、その時点の選択で自動的に送信します（未選択なら時間切れ＝不正解）。<br>
-    ・ほかのタブやアプリに切り替えると記録されます（マネージャーが確認します）。
-    <span id="skilltestBlurNote" class="text-danger d-none">画面から離れたことを記録しました（<span id="skilltestBlurCount">0</span>回）。</span><br>
-    ・全体の期限: {{ fmt_datetime(attempt.deadline_at) }}（過ぎると自動で終了します）
-  </div>
-  <noscript>
-    <div class="alert alert-warning small mt-3">JavaScript が無効のため、残り時間が自動で更新されません。制限時間はサーバーで計っています。</div>
-  </noscript>
-</div>
-{% endblock %}
-
-{% block scripts %}
-<script src="{{ url_for('static', filename='js/skilltest.js') }}"></script>
-{% endblock %}
-{#=== skilltest/result.html ===#}
-{% extends "base.html" %}
-{% from "_macros.html" import fmt_datetime %}
-{% block title %}スキルテストの結果 &middot; {{ app_name }}{% endblock %}
+{% from "_macros.html" import fmt_date, fmt_datetime %}
+{% block title %}スキルの変更の履歴 &middot; {{ app_name }}{% endblock %}
 
 {% block content %}
 <nav aria-label="breadcrumb">
   <ol class="breadcrumb">
-    <li class="breadcrumb-item"><a href="{{ url_for('skilltest.index') }}">スキルテスト</a></li>
-    <li class="breadcrumb-item active">結果</li>
+    <li class="breadcrumb-item"><a href="{{ url_for('skills.list_skills') }}">スキルマップ</a></li>
+    <li class="breadcrumb-item active">変更の履歴</li>
   </ol>
 </nav>
-
-<div class="mx-auto" style="max-width: 860px;">
-  <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
-    <h1 class="h4 mb-0"><i class="bi bi-award"></i> {{ attempt.skill.name }} の結果</h1>
-    <span class="badge bg-{{ attempt.status_color }}">{{ attempt.status_label }}</span>
-  </div>
-
-  <div class="row g-3 mb-3">
-    <div class="col-md-6">
-      <div class="card shadow-sm h-100">
-        <div class="card-body text-center">
-          <div class="small text-muted">テストの結果</div>
-          <div class="display-6 fw-bold">Lv{{ attempt.result_level or 0 }}</div>
-          <div>{{ scale[attempt.result_level or 0] if (attempt.result_level or 0) < scale|length else '' }}</div>
-          <div class="small text-muted mt-2">正解 {{ attempt.correct }} / {{ attempt.total }} 問（正答率 {{ attempt.rate if attempt.rate is not none else 0 }}%）</div>
-        </div>
-      </div>
-    </div>
-    <div class="col-md-6">
-      <div class="card shadow-sm h-100">
-        <div class="card-body">
-          <div class="small text-muted mb-1">スキルの到達度</div>
-          {% if attempt.applied %}
-          <div class="fs-5 fw-bold text-success"><i class="bi bi-arrow-up-circle"></i> Lv{{ attempt.prev_level }} → Lv{{ attempt.new_level }}</div>
-          <div class="small">テストの結果を到達度に登録しました（{{ scale[attempt.new_level] if attempt.new_level < scale|length else '' }}）。</div>
-          {% else %}
-          <div class="fs-5 fw-bold">Lv{{ attempt.prev_level if attempt.prev_level is not none else 0 }}（変更なし）</div>
-          <div class="small text-muted">
-            {% if (attempt.result_level or 0) <= (attempt.prev_level or 0) %}
-            テストの結果が今の到達度より高くないため、到達度は変更していません（下がることはありません）。
-            {% else %}
-            {{ attempt.not_applied_note }}
-            {% endif %}
-          </div>
-          {% endif %}
-          <hr>
-          <div class="small text-muted">
-            開始 {{ fmt_datetime(attempt.started_at) }} ／ 終了 {{ fmt_datetime(attempt.finished_at) }}
-            {% if available %}
-            <br>このスキルの次の受験: {% if available > now %}{{ fmt_datetime(available) }} から{% else %}受験できます{% endif %}
-            {% endif %}
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="card shadow-sm mb-3">
-    <div class="card-header bg-white fw-bold"><i class="bi bi-bar-chart-steps"></i> レベルごとの結果</div>
-    <div class="table-responsive">
-      <table class="table align-middle mb-0">
-        <thead class="table-light">
-          <tr>
-            <th>レベル</th>
-            <th class="text-end">正解数</th>
-            <th class="text-end">正答率</th>
-            <th>判定</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for r in level_results %}
-          <tr>
-            <td>
-              <span class="fw-bold">Lv{{ r.level }}</span>
-              <span class="small text-muted">{{ scale[r.level] if r.level < scale|length else '' }}</span>
-            </td>
-            <td class="text-end text-nowrap">{{ r.correct }} / {{ r.total }}</td>
-            <td class="text-end text-nowrap">{{ r.rate }}%</td>
-            <td class="text-nowrap">
-              {% if r.passed %}<span class="badge bg-success">合格</span>
-              {% elif r.rate_ok %}<span class="badge bg-secondary">基準以上</span> <span class="small text-muted">下のレベルが不合格のため認定なし</span>
-              {% else %}<span class="badge bg-light text-dark border">不合格</span>{% endif %}
-            </td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-    <div class="card-footer bg-white small text-muted">
-      合格ライン: 各レベルの正答率 {{ attempt.settings_dict.get('pass_rate', '') }}%以上、かつ下のレベルがすべて合格。
-      各問題の正解は表示しません。
-    </div>
-  </div>
-
-  <div class="d-flex gap-2">
-    <a href="{{ url_for('skilltest.index') }}" class="btn btn-outline-secondary"><i class="bi bi-arrow-left"></i> スキルテストの一覧へ</a>
-  </div>
-</div>
-{% endblock %}
-{#=== skilltest/_admin_nav.html ===#}
-{# スキルテスト管理(マネージャー)の見出しとタブ。active に 'attempts' / 'pool' を渡す。
-   設定はシステム設定の「スキルテスト」タブにある(ここからはリンクだけ) #}
-<div class="d-flex justify-content-between align-items-center mb-1 flex-wrap gap-2">
-  <h1 class="h3 mb-0"><i class="bi bi-patch-check"></i> スキルテスト管理</h1>
-  <div class="d-flex gap-2">
-    <a href="{{ url_for('export.skilltest_xlsx') }}" class="btn btn-sm btn-outline-success"><i class="bi bi-file-earmark-excel"></i> Excel出力</a>
-    <a href="{{ url_for('skills.list_skills') }}" class="btn btn-sm btn-outline-secondary"><i class="bi bi-mortarboard"></i> スキルマップ</a>
-  </div>
-</div>
-<p class="text-muted small d-flex flex-wrap justify-content-between gap-2">
-  <span>メンバーがAIの作った4択問題でテクニカルスキル（{% if nav_top_level > 1 %}Lv1〜{{ nav_top_level }}{% else %}Lv{{ nav_top_level }}{% endif %}）を受験し、結果が今の到達度より高ければ到達度に自動で登録されます（マネージャーは受験しません）。</span>
-  <a href="{{ url_for('system.settings', tab='skilltest') }}"><i class="bi bi-gear"></i> 設定はシステム設定で変更</a>
+<h1 class="h3 mb-1"><i class="bi bi-clock-history"></i> スキルの変更の履歴</h1>
+<p class="text-muted small">
+  タスクを「完了」にすると、そのタスクに進捗を記載したメンバーの記載から、AIがスキルの到達度を判定して上げます
+  （自動更新は{% if settings.auto_enabled %}オン・1回の完了で{{ settings.step_limit }}段階まで{% else %}<strong>オフ</strong>{% endif %}。
+  設定はシステム設定の「<a href="{{ url_for('system.settings', tab='skill_ai') }}">スキル（AI）</a>」タブ。AI: {{ ai_status }}）。
+  自動更新は「取り消す」で元のレベルに戻せます（その後に到達度が変わっていないときだけ）。
 </p>
-<ul class="nav nav-tabs mb-3">
-  <li class="nav-item">
-    <a class="nav-link {% if active == 'attempts' %}active{% endif %}" href="{{ url_for('skilltest.admin_attempts') }}"><i class="bi bi-clock-history"></i> 受験履歴</a>
-  </li>
-  <li class="nav-item">
-    <a class="nav-link {% if active == 'pool' %}active{% endif %}" href="{{ url_for('skilltest.admin_pool') }}"><i class="bi bi-collection"></i> 問題プール</a>
-  </li>
-</ul>{% if settings_error %}
-<div class="alert alert-danger small">
-  <i class="bi bi-x-octagon"></i> <strong>スキルテストの設定ファイルを読み込めません。</strong> {{ settings_error }}<br>
-  この画面とメンバーの受験には既定値を使っています。ファイルを直すまで、問題の補充はできません（結果を記録できないため）。
-</div>{% endif %}
-{#=== skilltest/admin_attempts.html ===#}
-{% extends "base.html" %}
-{% from "_macros.html" import fmt_datetime %}
-{% block title %}スキルテスト管理 &middot; {{ app_name }}{% endblock %}
-
-{% block content %}
-{% set active = 'attempts' %}
-{% include "skilltest/_admin_nav.html" %}
-
-{# 絞り込み(選択した時点で自動反映) #}
-<form method="get" class="card card-body shadow-sm mb-3 py-2 auto-filter">
-  <div class="row g-2 align-items-end">
-    <div class="col-sm-4 col-md-3">
-      <label class="form-label small mb-1 fw-bold" for="fUser">メンバー</label>
-      <select name="user_id" id="fUser" class="form-select form-select-sm">
-        <option value="">すべて</option>
-        {% for u in users %}
-        <option value="{{ u.id }}" {% if filters.user_id == u.id %}selected{% endif %}>{{ u.display_name }}{% if not u.is_active %}（無効）{% endif %}</option>
-        {% endfor %}
-      </select>
-    </div>
-    <div class="col-sm-4 col-md-3">
-      <label class="form-label small mb-1 fw-bold" for="fSkill">スキル</label>
-      <select name="skill_id" id="fSkill" class="form-select form-select-sm">
-        <option value="">すべて</option>
-        {% for s in skills %}
-        <option value="{{ s.id }}" {% if filters.skill_id == s.id %}selected{% endif %}>{{ s.name }}{% if not s.is_active %}（無効）{% endif %}</option>
-        {% endfor %}
-      </select>
-    </div>
-    <div class="col-sm-4 col-md-2">
-      <label class="form-label small mb-1 fw-bold" for="fStatus">状態</label>
-      <select name="status" id="fStatus" class="form-select form-select-sm">
-        <option value="">すべて</option>
-        {% for key, label in status_labels.items() %}
-        <option value="{{ key }}" {% if filters.status == key %}selected{% endif %}>{{ label }}</option>
-        {% endfor %}
-      </select>
-    </div>
-    <div class="col-md-4 small text-muted">
-      {{ attempts|length }} 件。見出しをクリックすると並び替えます。
-      <noscript><button class="btn btn-sm btn-primary ms-2">絞り込み</button></noscript>
-    </div>
-  </div>
-</form>
 
 <div class="card shadow-sm mb-4">
+  <div class="card-header bg-white fw-bold"><i class="bi bi-robot"></i> 自動更新の判定（新しい30件）</div>
   <div class="table-responsive">
-    <table class="table table-sm table-hover align-middle mb-0 sortable">
+    <table class="table table-sm align-middle mb-0 small">
       <thead class="table-light">
-        <tr>
-          <th>開始日時</th>
-          <th>メンバー</th>
-          <th style="min-width: 10rem;">スキル</th>
-          <th>状態</th>
-          <th data-type="num" class="text-end">正解数</th>
-          <th data-type="num" class="text-end">正答率</th>
-          <th data-type="num">結果</th>
-          <th>到達度</th>
-          <th data-type="num" class="text-end" title="タブ・ウィンドウの切り替えなどで画面から離れた回数">離脱</th>
-          <th data-type="num" class="text-end" title="受験済みの問題を再出題した数（問題プールの不足時）">再出題</th>
-          <th data-nosort></th>
-        </tr>
+        <tr><th class="text-nowrap">日時</th><th>タスク</th><th class="text-nowrap">状態</th><th>対象者（進捗の記載者）</th><th>結果</th><th></th></tr>
       </thead>
       <tbody>
-        {% for a in attempts %}
+        {% for j in judgments %}
+        {% set is_stale = stale(j, now) %}
         <tr>
-          <td class="text-nowrap small" data-sort="{{ a.started_at.strftime('%Y%m%d%H%M%S') }}">{{ fmt_datetime(a.started_at) }}</td>
-          <td class="text-nowrap">{{ a.user.display_name if a.user else '（削除済み）' }}</td>
-          <td>{{ a.skill.name if a.skill else '' }}</td>
-          <td><span class="badge bg-{{ a.status_color }}">{{ a.status_label }}</span></td>
-          <td class="text-end text-nowrap" data-sort="{{ a.correct if not a.is_in_progress else '' }}">
-            {% if a.is_in_progress %}{{ a.answered_count }}/{{ a.total }}問 回答中{% else %}{{ a.correct }}/{{ a.total }}{% endif %}
-          </td>
-          <td class="text-end text-nowrap" data-sort="{{ a.rate if (a.rate is not none and not a.is_in_progress) else '' }}">
-            {% if a.is_in_progress or a.rate is none %}―{% else %}{{ a.rate }}%{% endif %}
-          </td>
-          <td class="text-nowrap" data-sort="{{ a.result_level if a.result_level is not none else '' }}">
-            {% if a.result_level is not none %}Lv{{ a.result_level }}{% else %}―{% endif %}
-          </td>
-          <td class="small text-nowrap">
-            {% if a.is_in_progress %}―
-            {% elif a.applied %}<span class="badge bg-success">自動登録</span> Lv{{ a.prev_level }} → Lv{{ a.new_level }}
-            {% else %}<span class="text-muted">変更なし（Lv{{ a.prev_level }}）</span>{% if a.not_applied_note %}<br><span class="text-warning-emphasis" title="{{ a.not_applied_note }}">対象外のため未登録</span>{% endif %}{% endif %}
-          </td>
-          <td class="text-end {% if a.blur_count %}text-danger fw-bold{% endif %}" data-sort="{{ a.blur_count }}">{{ a.blur_count }}</td>
-          <td class="text-end" data-sort="{{ a.reused_count }}">{{ a.reused_count }}</td>
-          <td class="text-end"><a href="{{ url_for('skilltest.admin_attempt', attempt_id=a.id) }}" class="btn btn-sm btn-outline-secondary">詳細</a></td>
-        </tr>
-        {% else %}
-        <tr><td colspan="11" class="text-muted text-center py-4">受験履歴はありません。</td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-</div>
-{% endblock %}
-{#=== skilltest/admin_attempt.html ===#}
-{% extends "base.html" %}
-{% from "_macros.html" import fmt_datetime %}
-{% block title %}スキルテストの詳細 &middot; {{ app_name }}{% endblock %}
-
-{% block content %}
-<nav aria-label="breadcrumb">
-  <ol class="breadcrumb">
-    <li class="breadcrumb-item"><a href="{{ url_for('skilltest.admin_attempts') }}">スキルテスト管理</a></li>
-    <li class="breadcrumb-item active">受験の詳細 #{{ attempt.id }}</li>
-  </ol>
-</nav>
-
-<div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
-  <h1 class="h4 mb-0">
-    {{ attempt.user.display_name if attempt.user else '（削除済み）' }} ／ {{ attempt.skill.name if attempt.skill else '' }}
-  </h1>
-  <span class="badge bg-{{ attempt.status_color }} fs-6">{{ attempt.status_label }}</span>
-</div>
-
-<div class="row g-3 mb-3">
-  <div class="col-lg-6">
-    <div class="card shadow-sm h-100">
-      <div class="card-header bg-white fw-bold"><i class="bi bi-info-circle"></i> 概要</div>
-      <div class="card-body small">
-        <dl class="row mb-0">
-          <dt class="col-5 text-muted">開始</dt><dd class="col-7">{{ fmt_datetime(attempt.started_at) }}</dd>
-          <dt class="col-5 text-muted">終了</dt><dd class="col-7">{{ fmt_datetime(attempt.finished_at) }}</dd>
-          <dt class="col-5 text-muted">全体の期限</dt><dd class="col-7">{{ fmt_datetime(attempt.deadline_at) }}</dd>
-          <dt class="col-5 text-muted">正解数</dt>
-          <dd class="col-7">
-            {% if attempt.is_in_progress %}受験中（{{ attempt.answered_count }}/{{ attempt.total }}問 回答済み）
-            {% else %}{{ attempt.correct }} / {{ attempt.total }}（{{ attempt.rate if attempt.rate is not none else 0 }}%）{% endif %}
-          </dd>
-          <dt class="col-5 text-muted">結果のレベル</dt>
-          <dd class="col-7">
-            {% if attempt.result_level is not none %}Lv{{ attempt.result_level }}
-            <span class="text-muted">{{ scale[attempt.result_level] if attempt.result_level < scale|length else '' }}</span>{% else %}―{% endif %}
-          </dd>
-          <dt class="col-5 text-muted">到達度</dt>
-          <dd class="col-7">
-            {% if attempt.is_in_progress %}―
-            {% elif attempt.applied %}<span class="badge bg-success">自動登録</span> Lv{{ attempt.prev_level }} → Lv{{ attempt.new_level }}
-            {% else %}変更なし（Lv{{ attempt.prev_level }}）{% endif %}{% if attempt.not_applied_note %}<div class="text-muted">{{ attempt.not_applied_note }}</div>{% endif %}
-          </dd>
-          <dt class="col-5 text-muted">画面から離れた回数</dt>
-          <dd class="col-7 {% if attempt.blur_count %}text-danger fw-bold{% endif %}">{{ attempt.blur_count }} 回</dd>
-          <dt class="col-5 text-muted">再出題した問題</dt>
-          <dd class="col-7">{{ attempt.reused_count }} 問{% if attempt.reused_count %} <span class="text-muted">（問題プールの不足のため、受験済みの問題を出題）</span>{% endif %}</dd>
-        </dl>
-      </div>
-    </div>
-  </div>
-  <div class="col-lg-6">
-    <div class="card shadow-sm h-100">
-      <div class="card-header bg-white fw-bold"><i class="bi bi-bar-chart-steps"></i> レベルごとの結果</div>
-      <div class="table-responsive">
-        <table class="table table-sm align-middle mb-0">
-          <thead class="table-light">
-            <tr><th>レベル</th><th class="text-end">正解</th><th class="text-end">正答率</th><th>判定</th></tr>
-          </thead>
-          <tbody>
-            {% for r in level_results %}
-            <tr>
-              <td>Lv{{ r.level }}</td>
-              <td class="text-end">{{ r.correct }} / {{ r.total }}</td>
-              <td class="text-end">{{ r.rate }}%</td>
-              <td>
-                {% if r.passed %}<span class="badge bg-success">合格</span>
-                {% elif r.rate_ok %}<span class="badge bg-secondary">基準以上（下位が不合格）</span>
-                {% else %}<span class="badge bg-light text-dark border">不合格</span>{% endif %}
-              </td>
-            </tr>
-            {% else %}
-            <tr><td colspan="4" class="text-muted text-center py-3">終了後に表示します。</td></tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-      <div class="card-footer bg-white small text-muted">
-        受験開始時の設定: 合格ライン {{ snapshot.get('pass_rate', '―') }}%
-        ／ 判定レベル Lv1〜{{ (snapshot.get('levels') or ['―'])|last }}
-        ／ 制限時間 {% for lv, sec in (snapshot.get('time_limits') or {}).items() %}Lv{{ lv }} {{ sec }}秒{% if not loop.last %}・{% endif %}{% endfor %}
-        ／ 猶予 {{ snapshot.get('grace_sec', '―') }}秒
-      </div>
-    </div>
-  </div>
-</div>
-
-<div class="card shadow-sm mb-4">
-  <div class="card-header bg-white fw-bold d-flex justify-content-between flex-wrap gap-2">
-    <span><i class="bi bi-list-ol"></i> 出題と回答（全{{ attempt.answers|length }}問）</span>
-    <span class="small fw-normal">
-      <span class="badge bg-success-subtle text-success-emphasis border border-success-subtle">正解の選択肢</span>
-      <span class="badge bg-primary">選んだ選択肢</span>
-    </span>
-  </div>
-  <div class="table-responsive">
-    <table class="table table-sm align-top mb-0">
-      <thead class="table-light">
-        <tr>
-          <th class="text-nowrap">#</th>
-          <th class="text-nowrap">Lv</th>
-          <th>問題と選択肢（表示した順）</th>
-          <th class="text-nowrap">結果</th>
-          <th class="text-nowrap text-end">所要/制限</th>
-          <th class="text-nowrap text-end">離脱</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for a in attempt.answers %}
-        <tr>
-          <td class="text-nowrap">{{ a.seq }}</td>
-          <td class="text-nowrap">Lv{{ a.level }}</td>
-          <td style="min-width: 320px;">
-            <div class="pre-wrap mb-1">{{ a.question }}</div>
-            <ol class="list-unstyled small mb-1">
-              {% for c in a.choice_list %}
-              <li class="px-2 py-1 rounded mb-1 {% if loop.index0 == a.correct_index %}bg-success-subtle border border-success-subtle{% endif %}">
-                <span class="fw-bold">{{ letters[loop.index0] }}.</span> <span class="pre-wrap">{{ c }}</span>
-                {% if loop.index0 == a.correct_index %}<i class="bi bi-check-lg text-success" title="正解"></i>{% endif %}
-                {% if a.selected_index == loop.index0 %}<span class="badge bg-primary">選択</span>{% endif %}
-              </li>
-              {% endfor %}
-            </ol>
-            {% if a.source_question and a.source_question.explanation %}
-            <details class="small text-muted">
-              <summary>解説</summary>
-              <div class="pre-wrap">{{ a.source_question.explanation }}</div>
+          <td class="text-nowrap">{{ fmt_datetime(j.created_at) }}</td>
+          <td><a href="{{ url_for('tasks.detail', task_id=j.task_id) }}">{{ j.task_title or ('タスク ' ~ j.task_id) }}</a></td>
+          <td class="text-nowrap">{% if is_stale %}<span class="badge bg-warning text-dark">中断</span>{% else %}<span class="badge bg-{{ j.status_color }}{% if j.status_color == 'light' %} text-dark border{% endif %}">{{ j.status_label }}</span>{% endif %}</td>
+          <td>{% for t in j.target_list %}{{ t.name }}（記載 {{ t.comments }}件）{% if not loop.last %}、{% endif %}{% else %}<span class="text-muted">―</span>{% endfor %}</td>
+          <td>
+            {% if is_stale %}サーバーの停止・再起動などで中断した可能性があります。{% else %}{{ j.message or '' }}{% endif %}
+            {% if j.proposal_list %}
+            <details><summary class="text-primary">AIの提案（{{ j.proposal_list|length }}件）</summary>
+              <ul class="mb-0 ps-3">
+                {% for p in j.proposal_list %}
+                <li>P{{ p.user_id }}・S{{ p.skill_id }} → Lv{{ p.level }}: {{ p.reason }}{% if p.evidence %} <span class="text-muted">「{{ p.evidence }}」</span>{% endif %} <span class="fw-bold">{{ p.result }}</span></li>
+                {% endfor %}
+              </ul>
             </details>
             {% endif %}
-            <div class="small text-muted">
-              問題 #{{ a.question_id }}{% if a.source_question and not a.source_question.is_active %} <span class="badge bg-light text-dark border">無効化済み</span>{% endif %}
-              ／ 表示 {{ fmt_datetime(a.served_at) }}{% if a.answered_at %} ／ 確定 {{ a.answered_at.strftime('%H:%M:%S') }}{% endif %}
-            </div>
           </td>
           <td class="text-nowrap">
-            {% if a.timed_out %}
-            <span class="badge bg-warning text-dark">{% if a.served_at %}時間切れ{% else %}未表示（時間切れ）{% endif %}</span>
-            {% if a.selected_index is not none %}<div class="small text-muted">選択 {{ a.selected_letter }}（期限後）</div>{% endif %}
-            {% elif a.answered_at is none %}<span class="badge bg-light text-dark border">{% if a.served_at %}回答中{% else %}未表示{% endif %}</span>
-            {% elif a.is_correct %}<span class="badge bg-success">正解</span> <span class="small">{{ a.selected_letter }}</span>
-            {% else %}<span class="badge bg-danger">不正解</span> <span class="small">{{ a.selected_letter }}（正解 {{ a.correct_letter }}）</span>{% endif %}
-          </td>
-          <td class="text-nowrap text-end small">
-            {% if a.elapsed_sec is not none %}{{ '%.1f' % a.elapsed_sec }}秒{% else %}―{% endif %} / {{ a.time_limit_sec }}秒
-          </td>
-          <td class="text-end {% if a.blur_count %}text-danger fw-bold{% endif %}">{{ a.blur_count }}</td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
-</div>
-{% endblock %}
-{#=== skilltest/admin_pool.html ===#}
-{% extends "base.html" %}
-{% block title %}問題プール &middot; スキルテスト管理 &middot; {{ app_name }}{% endblock %}
-
-{% block content %}
-{% set active = 'pool' %}
-{% include "skilltest/_admin_nav.html" %}
-
-<div class="row g-3 mb-3">
-  <div class="col-lg-6">
-    <div class="card shadow-sm h-100">
-      <div class="card-header bg-white fw-bold"><i class="bi bi-robot"></i> 問題の作成（AI）</div>
-      <div class="card-body small">
-        <div class="mb-2">
-          {% if ai_enabled %}<span class="badge bg-success">設定あり</span>{% else %}<span class="badge bg-danger">未設定</span>{% endif %}
-          {{ ai_status }}
-        </div>
-        <ul class="mb-0">
-          <li>「補充」を押すと、そのスキルの各レベルの有効な問題が {{ target }} 問になるまで、AIが問題を作ってプールに追加します（バックグラウンド。数分かかることがあります）。{% if below_need %}目標数が1回の受験に必要な問題数より少ないレベル（{% for lv in below_need %}Lv{{ lv }}{% if not loop.last %}・{% endif %}{% endfor %}）は、必要な問題数まで作ります。{% endif %}</li>
-          <li>受験の開始時に、その人が見たことのない問題が足りなければ、その場でAIが作ります（受験者を1〜2分待たせるため、事前の補充をおすすめします）。</li>
-          <li>AIが使えず問題が足りないときは、その人が以前に解いた問題を再出題します（受験履歴の「再出題」に件数を表示）。それでも足りなければ受験を開始できません。</li>
-          <li>AIの作った問題は誤りを含むことがあります。問題の一覧で内容を確認し、不適切な問題は「無効にする」で出題から外してください。</li>
-          <li>AIは、スキル名・カテゴリ・<strong>説明</strong>・到達尺度をもとに問題を作ります。説明（対象範囲・使う道具・レベルごとの目安・出題しない範囲）を書いておくと、範囲外の問題が減ります（スキル項目の編集の「AIで下書き」で下書きを作れます）。説明を変えたときは、問題の一覧の「このスキルの問題をすべて停止」で古い問題を止めてから補充してください。</li>
-        </ul>
-      </div>
-    </div>
-  </div>
-  <div class="col-lg-6">
-    <div class="card shadow-sm h-100">
-      <div class="card-header bg-white d-flex justify-content-between align-items-center">
-        <span class="fw-bold"><i class="bi bi-clipboard-check"></i> 前回の補充の結果</span>
-        <a href="{{ url_for('skilltest.admin_pool') }}" class="btn btn-sm btn-outline-secondary"><i class="bi bi-arrow-clockwise"></i> 更新</a>
-      </div>
-      <div class="card-body">
-        {% if running %}
-        <div class="alert alert-info py-1 px-2 small mb-2">
-          <span class="spinner-border spinner-border-sm" role="status"></span>
-          「{{ running_name }}」の問題を補充中です。しばらくしてから「更新」を押してください。
-        </div>
-        {% endif %}
-        {% if last %}
-        <div class="mb-1">
-          {% if last.ok %}<span class="badge bg-success">成功</span>{% else %}<span class="badge bg-danger">失敗</span>{% endif %}
-          <span class="small text-muted">{{ last.at }}</span>
-        </div>
-        <div class="small pre-wrap">{{ last.message }}</div>
-        {% else %}
-        <div class="text-muted small">まだ補充していません。</div>
-        {% endif %}
-      </div>
-    </div>
-  </div>
-</div>
-
-<div class="card shadow-sm mb-4">
-  <div class="card-header bg-white fw-bold d-flex justify-content-between flex-wrap gap-2">
-    <span><i class="bi bi-collection"></i> スキル・レベルごとの問題数（有効）</span>
-    <span class="small fw-normal text-muted">赤 = 1回の受験に必要な数より少ない ／ 黄 = 目標（{{ target }}問）より少ない ／（ ）内は無効にした問題</span>
-  </div>
-  <div class="table-responsive">
-    <table class="table table-hover align-middle mb-0">
-      <thead class="table-light">
-        <tr>
-          <th>スキル</th>
-          {% for lv in levels %}
-          <th class="text-center text-nowrap" title="{{ scale[lv] }}">Lv{{ lv }}</th>
-          {% endfor %}
-          <th class="text-end text-nowrap">合計</th>
-          <th></th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for row in rows %}
-        <tr class="{% if not row.testable %}text-muted{% endif %}">
-          <td>
-            <a href="{{ url_for('skilltest.admin_pool_skill', skill_id=row.skill.id) }}" class="fw-bold">{{ row.skill.name }}</a>
-            {% if row.skill.category %}<span class="small text-muted">{{ row.skill.category }}</span>{% endif %}
-            {% if not row.testable %}<span class="badge bg-light text-dark border">無効（受験の対象外）</span>{% endif %}
-            {% if row.no_description %}
-            <div class="small text-warning-emphasis">
-              <i class="bi bi-exclamation-triangle"></i> 説明なし（問題の精度が下がります）
-              <a href="{{ url_for('skills.edit_item', skill_id=row.skill.id, back='pool') }}">説明を書く</a>
-            </div>
-            {% endif %}
-          </td>
-          {% for c in row.cells %}
-          <td class="text-center text-nowrap">
-            <span class="fw-bold {% if row.testable and c.active < c.need %}text-danger{% elif row.testable and c.active < target %}text-warning-emphasis{% endif %}">{{ c.active }}</span>
-            {% if c.inactive %}<span class="small text-muted">（{{ c.inactive }}）</span>{% endif %}
-          </td>
-          {% endfor %}
-          <td class="text-end text-nowrap">{{ row.total }}{% if row.total_inactive %}<span class="small text-muted">（{{ row.total_inactive }}）</span>{% endif %}</td>
-          <td class="text-end text-nowrap">
-            <a href="{{ url_for('skilltest.admin_pool_skill', skill_id=row.skill.id) }}" class="btn btn-sm btn-outline-secondary">問題の一覧</a>
-            {% if row.testable %}
-            <form method="post" action="{{ url_for('skilltest.admin_topup', skill_id=row.skill.id) }}" class="d-inline">
-              <button class="btn btn-sm btn-outline-primary" {% if running or not ai_enabled %}disabled{% endif %}
-                      title="各レベルの有効な問題が{{ target }}問になるまでAIで作成します"><i class="bi bi-plus-circle"></i> 補充</button>
+            {% if j.status in ('error', 'skipped') or is_stale %}
+            <form method="post" action="{{ url_for('skills.rerun_judgment', judgment_id=j.id) }}">
+              <button class="btn btn-sm btn-outline-secondary py-0" {% if not ai_enabled %}disabled title="AIが未設定です"{% endif %}>判定し直す</button>
             </form>
             {% endif %}
           </td>
         </tr>
         {% else %}
-        <tr><td colspan="{{ levels|length + 3 }}" class="text-muted text-center py-4">テクニカルスキルが登録されていません（スキルマップの「スキル項目の管理」で追加します）。</td></tr>
+        <tr><td colspan="6" class="text-muted py-3 text-center">まだ判定はありません（タスクを「完了」にすると判定します）。</td></tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
-  <div class="card-footer bg-white small text-muted">
-    1回の受験に必要な問題数: {% for lv in levels %}Lv{{ lv }} {{ settings.questions_per_level[lv|string] }}問{% if not loop.last %}・{% endif %}{% endfor %}
-    （問題数・目標数は<a href="{{ url_for('system.settings', tab='skilltest') }}">システム設定の「スキルテスト」タブ</a>で変更）。
-    同じ人には見たことのない問題を優先して出すため、プールには必要数より多めに用意しておくと、再受験でも新しい問題になります。
+</div>
+
+<h2 class="h5">到達度の変更</h2>
+<form method="get" class="d-flex flex-wrap gap-2 align-items-end mb-2">
+  <div>
+    <label class="form-label small mb-0" for="history-member">メンバー</label>
+    <select name="member" id="history-member" class="form-select form-select-sm">
+      <option value="">すべて</option>
+      {% for u in users %}<option value="{{ u.id }}" {% if filters.member == u.id %}selected{% endif %}>{{ u.display_name }}</option>{% endfor %}
+    </select>
+  </div>
+  <div>
+    <label class="form-label small mb-0" for="history-source">種類</label>
+    <select name="source" id="history-source" class="form-select form-select-sm">
+      <option value="">すべて</option>
+      {% for key, label in source_labels.items() %}<option value="{{ key }}" {% if filters.source == key %}selected{% endif %}>{{ label }}</option>{% endfor %}
+    </select>
+  </div>
+  <button class="btn btn-sm btn-outline-primary"><i class="bi bi-funnel"></i> 絞り込み</button>
+</form>
+<div class="card shadow-sm">
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0 small">
+      <thead class="table-light">
+        <tr><th class="text-nowrap">日時</th><th>メンバー</th><th>スキル</th><th class="text-nowrap">変更</th><th class="text-nowrap">種類</th><th>理由・根拠</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for c in changes %}
+        <tr class="{% if c.is_undone %}text-muted{% endif %}">
+          <td class="text-nowrap">{{ fmt_datetime(c.created_at) }}</td>
+          <td class="text-nowrap">{% if c.user %}<a href="{{ url_for('skills.member', user_id=c.user_id) }}">{{ c.user.display_name }}</a>{% endif %}</td>
+          <td>{{ c.skill.name if c.skill else '' }}</td>
+          <td class="text-nowrap fw-bold">{% if c.is_undone %}<s>Lv{{ c.old_level }}→Lv{{ c.new_level }}</s>{% else %}Lv{{ c.old_level }}→Lv{{ c.new_level }}{% endif %}</td>
+          <td class="text-nowrap"><span class="badge bg-{{ c.source_color }}{% if c.source_color == 'light' %} text-dark border{% endif %}">{{ c.source_label }}</span>{% if c.created_by %}<div class="text-muted">{{ c.created_by.display_name }}</div>{% endif %}</td>
+          <td>
+            {% if c.task_title %}<div>タスク「{% if c.task_id %}<a href="{{ url_for('tasks.detail', task_id=c.task_id) }}">{{ c.task_title }}</a>{% else %}{{ c.task_title }}{% endif %}」</div>{% endif %}
+            {% if c.reason %}<div>{{ c.reason }}</div>{% endif %}
+            {% if c.evidence %}<div class="text-muted">根拠（本人の記載）: 「{{ c.evidence }}」</div>{% endif %}
+            {% if c.is_undone %}<div class="text-danger">取り消し済み（{{ fmt_datetime(c.undone_at) }}{% if c.undone_by %}・{{ c.undone_by.display_name }}{% endif %}）</div>{% endif %}
+          </td>
+          <td class="text-nowrap">
+            {% if c.source == 'auto' and not c.is_undone %}
+            {% if current.get((c.user_id, c.skill_id), 0) == c.new_level %}
+            <form method="post" action="{{ url_for('skills.undo_change', change_id=c.id) }}" onsubmit="return confirm('この自動更新を取り消して、Lv{{ c.old_level }} に戻しますか？');">
+              <button class="btn btn-sm btn-outline-danger py-0">取り消す</button>
+            </form>
+            {% else %}<span class="text-muted" title="この後に到達度が変わっているため取り消せません">取り消し不可</span>{% endif %}
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="text-muted py-3 text-center">該当する変更はありません。</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
   </div>
 </div>
+{% if more %}<p class="small text-muted mt-2">新しい順に {{ changes|length }}件まで表示しています（すべては「Excelデータ出力」の「スキル・業務」で出力できます）。</p>{% endif %}
 {% endblock %}
-{#=== skilltest/admin_pool_skill.html ===#}
+{#=== skills/plan_form.html ===#}
+{# 計画・メモの編集(app.py の plan_edit。マネージャーのみ) #}
 {% extends "base.html" %}
-{% from "_macros.html" import fmt_datetime %}
-{% block title %}{{ skill.name }} の問題 &middot; スキルテスト管理 &middot; {{ app_name }}{% endblock %}
+{% block title %}計画・メモの編集 &middot; {{ app_name }}{% endblock %}
+
+{% macro val(field) -%}
+  {%- if form and form.get(field) is not none -%}{{ form.get(field) }}
+  {%- elif field == 'due_date' -%}{{ plan.due_date.strftime('%Y-%m-%d') if plan.due_date else '' }}
+  {%- else -%}{{ plan[field] if plan[field] is not none else '' }}{%- endif -%}
+{%- endmacro %}
 
 {% block content %}
 <nav aria-label="breadcrumb">
   <ol class="breadcrumb">
-    <li class="breadcrumb-item"><a href="{{ url_for('skilltest.admin_attempts') }}">スキルテスト管理</a></li>
-    <li class="breadcrumb-item"><a href="{{ url_for('skilltest.admin_pool') }}">問題プール</a></li>
-    <li class="breadcrumb-item active">{{ skill.name }}</li>
+    <li class="breadcrumb-item"><a href="{{ url_for('skills.list_skills') }}">スキルマップ</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('skills.plans') }}">計画・メモ</a></li>
+    <li class="breadcrumb-item active">編集</li>
   </ol>
 </nav>
-
-<div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-2">
-  <h1 class="h4 mb-0"><i class="bi bi-collection"></i> {{ skill.name }} の問題
-    {% if not testable %}<span class="badge bg-light text-dark border fs-6">受験の対象外</span>{% endif %}
-  </h1>
-  <div class="d-flex flex-wrap gap-2">
-    {# 確認文は data-confirm に入れる(スキル名を onclick の JavaScript に直接書くと、「'」を含む名前で
-       確認なしに送信されたり、名前に書いたスクリプトが動いたりするため) #}
-    <form method="post" action="{{ url_for('skilltest.admin_deactivate_all', skill_id=skill.id) }}">
-      <button class="btn btn-sm btn-outline-danger" {% if not active_total or running_this %}disabled{% endif %}
-              title="{{ 'このスキルの問題を補充中のため、補充が終わってから使えます' if running_this else '説明を変えた後、古い説明で作った問題を入れ替えるときに使います' }}"
-              data-confirm="「{{ skill.name }}」の有効な問題 {{ active_total }}問をすべて停止（無効）にします。今後は出題しません（受験履歴には残り、1問ずつ有効に戻せます）。{% if testable and not ai_enabled %}AIが未設定のため新しい問題は作れず、有効に戻すまでメンバーはこのスキルのテストを受験できません。{% endif %}よろしいですか？"
-              onclick="return confirm(this.dataset.confirm);">
-        <i class="bi bi-slash-circle"></i> このスキルの問題をすべて停止
-      </button>
+<div class="row justify-content-center">
+  <div class="col-lg-8">
+    <h1 class="h4 mb-3">計画・メモの編集</h1>
+    <form method="post" class="card card-body shadow-sm">
+      <input type="hidden" name="version" value="{{ version }}">
+      <div class="row g-2 mb-2">
+        <div class="col-md-4">
+          <label class="form-label small mb-0" for="plan-kind">種類</label>
+          <select name="kind" id="plan-kind" class="form-select form-select-sm">
+            {% for key, label in kinds %}<option value="{{ key }}" {% if val('kind') == key %}selected{% endif %}>{{ label }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="col-md-4">
+          <label class="form-label small mb-0" for="plan-target">対象</label>
+          {% set chosen = form.get('target') if form else (plan.target_user.form_key if plan.target_user else '') %}
+          <select name="target" id="plan-target" class="form-select form-select-sm">
+            <option value="">チーム全体</option>
+            {% for u in users %}<option value="{{ u.form_key }}" {% if chosen == u.form_key %}selected{% endif %}>{{ u.display_name }}{% if not u.is_active %}［無効］{% endif %}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="col-md-4">
+          <label class="form-label small mb-0" for="plan-due">期限（任意）</label>
+          <input type="date" name="due_date" id="plan-due" class="form-control form-control-sm" value="{{ val('due_date') }}">
+        </div>
+      </div>
+      <div class="mb-2">
+        <label class="form-label small mb-0" for="plan-title">タイトル <span class="text-danger">*</span></label>
+        <input type="text" name="title" id="plan-title" class="form-control" maxlength="200" required value="{{ val('title') }}">
+      </div>
+      <div class="mb-2">
+        <label class="form-label small mb-0" for="plan-body">内容</label>
+        <textarea name="body" id="plan-body" class="form-control" rows="12">{{ val('body') }}</textarea>
+      </div>
+      <div class="mb-3">
+        <label class="form-label small mb-0" for="plan-status">状態</label>
+        <select name="status" id="plan-status" class="form-select form-select-sm" style="max-width: 12rem;">
+          {% for key, label in statuses.items() %}<option value="{{ key }}" {% if val('status') == key %}selected{% endif %}>{{ label }}</option>{% endfor %}
+        </select>
+      </div>
+      <div class="d-flex gap-2">
+        <button class="btn btn-primary"><i class="bi bi-check-lg"></i> 保存</button>
+        <a href="{{ url_for('skills.list_skills') }}#skill-plans" class="btn btn-outline-secondary">キャンセル</a>
+      </div>
     </form>
-    {% if testable %}
-    <form method="post" action="{{ url_for('skilltest.admin_topup', skill_id=skill.id) }}">
-      <input type="hidden" name="back" value="skill">
-      <button class="btn btn-sm btn-outline-primary" {% if running or not ai_enabled %}disabled{% endif %}
-              {%- if running and not running_this %} title="別のスキル（{{ running_name }}）を補充中のため、終わってから補充できます"{% endif %}>
-        <i class="bi bi-plus-circle"></i> AIで補充（各レベル {{ target }}問まで{% if below_need %}。1回の受験に必要な数より少ないレベルは必要な数まで{% endif %}）
-      </button>
+    <form method="post" action="{{ url_for('skills.plan_delete', plan_id=plan.id) }}" class="mt-2 text-end"
+          onsubmit="return confirm('この計画・メモを削除しますか？');">
+      <input type="hidden" name="row" value="{{ plan.row_key }}">
+      <button class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i> 削除</button>
     </form>
-    {% endif %}
-  </div>
-</div>{% if settings_error %}
-<div class="alert alert-danger small">
-  <i class="bi bi-x-octagon"></i> <strong>スキルテストの設定ファイルを読み込めません。</strong> {{ settings_error }}<br>
-  この画面とメンバーの受験には既定値を使っています。ファイルを直すまで、問題の補充はできません（結果を記録できないため）。
-</div>{% endif %}
-
-{# スキルの説明(AIが問題を作るときの出題範囲の基準)。説明なしの警告は受験の対象のスキルだけ #}
-{% if not (skill.description or '').strip() %}{% if testable %}
-<div class="alert alert-warning small py-2">
-  <i class="bi bi-exclamation-triangle"></i> <strong>説明なし（問題の精度が下がります）</strong>
-  AIはスキル名とカテゴリだけから問題を作るため、範囲外の問題が出やすくなります。
-  <a href="{{ url_for('skills.edit_item', skill_id=skill.id, back='pool') }}">説明を書く</a>（「AIで下書き」で下書きを作れます）。
-</div>{% endif %}
-{% else %}
-{% set missing = headings|reject('in', found_headings)|list %}
-<details class="card shadow-sm mb-2 small">
-  <summary class="card-header bg-white py-1">
-    スキルの説明（AIが問題を作るときの出題範囲の基準）
-    {% if missing %}<span class="text-warning-emphasis ms-1"><i class="bi bi-exclamation-triangle"></i> 見出しなし: {{ missing|join('・') }}</span>{% endif %}
-    <a href="{{ url_for('skills.edit_item', skill_id=skill.id, back='pool') }}" class="ms-2">説明を編集</a>
-  </summary>
-  <div class="card-body py-2 pre-wrap">{{ skill.description }}</div>
-</details>
-{% endif %}
-<p class="small text-muted mb-2">
-  {% for lv in levels %}
-  {% set c = counts.get(lv, {}) %}
-  Lv{{ lv }}: 有効 {{ c.get('active', 0) }}問{% if c.get('inactive', 0) %}（無効 {{ c.get('inactive', 0) }}問）{% endif %}{% if not loop.last %} ／ {% endif %}
-  {% endfor %}
-  {% if running_this %}<span class="ms-2 text-info"><span class="spinner-border spinner-border-sm"></span> 補充中（問題プールの画面で結果を確認できます）</span>
-  {%- elif running %}<span class="ms-2 text-muted"><i class="bi bi-hourglass-split"></i> 別のスキル（{{ running_name }}）を補充中のため、終わってから補充できます</span>{% endif %}
-</p>
-
-<form method="get" class="card card-body shadow-sm mb-3 py-2 auto-filter">
-  <div class="row g-2 align-items-end">
-    <div class="col-sm-4 col-md-3">
-      <label class="form-label small mb-1 fw-bold" for="fLevel">レベル</label>
-      <select name="level" id="fLevel" class="form-select form-select-sm">
-        <option value="">すべて</option>
-        {% for lv in levels %}
-        <option value="{{ lv }}" {% if filters.level == lv %}selected{% endif %}>Lv{{ lv }}（{{ scale[lv] }}）</option>
-        {% endfor %}
-      </select>
-    </div>
-    <div class="col-sm-4 col-md-3">
-      <label class="form-label small mb-1 fw-bold" for="fState">状態</label>
-      <select name="state" id="fState" class="form-select form-select-sm">
-        <option value="">すべて</option>
-        <option value="active" {% if filters.state == 'active' %}selected{% endif %}>有効</option>
-        <option value="inactive" {% if filters.state == 'inactive' %}selected{% endif %}>無効</option>
-      </select>
-    </div>
-    <div class="col-md-6 small text-muted">
-      {{ questions|length }} 問。無効にした問題は今後出題しません（受験履歴には残ります）。
-      <noscript><button class="btn btn-sm btn-primary ms-2">絞り込み</button></noscript>
-    </div>
-  </div>
-</form>
-
-{% for q in questions %}
-{% set u = usage.get(q.id, {}) %}
-<div class="card shadow-sm mb-2 {% if not q.is_active %}opacity-75{% endif %}" id="q{{ q.id }}">
-  <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2 py-1 small">
-    <span>
-      <span class="fw-bold">#{{ q.id }}</span>
-      <span class="badge bg-secondary">Lv{{ q.level }}</span>
-      {% if q.is_active %}<span class="badge bg-success">有効</span>{% else %}<span class="badge bg-light text-dark border">無効</span>{% endif %}
-      <span class="text-muted">作成 {{ fmt_datetime(q.created_at) }}（{{ q.source_label }}{% if q.model %}・{{ q.model }}{% endif %}）</span>
-      <span class="text-muted">／ 出題 {{ u.get('served', 0) }}回{% if u.get('served') %}・正解 {{ u.get('correct', 0) }}回{% endif %}</span>
-    </span>
-    <form method="post" action="{{ url_for('skilltest.admin_toggle_question', question_id=q.id) }}" class="d-inline">
-      <input type="hidden" name="level" value="{{ filters.level or '' }}">
-      <input type="hidden" name="state" value="{{ filters.state }}">
-      <input type="hidden" name="active" value="{{ '0' if q.is_active else '1' }}">
-      {% if q.is_active %}
-      <button class="btn btn-sm btn-outline-danger py-0"><i class="bi bi-slash-circle"></i> 無効にする</button>
-      {% else %}
-      <button class="btn btn-sm btn-outline-success py-0"><i class="bi bi-arrow-counterclockwise"></i> 有効に戻す</button>
-      {% endif %}
-    </form>
-  </div>
-  <div class="card-body py-2">
-    <div class="pre-wrap mb-1">{{ q.question }}</div>
-    <ol class="list-unstyled small mb-1">
-      {% for c in q.choice_list %}
-      <li class="px-2 py-1 rounded mb-1 {% if loop.index0 == q.answer_index %}bg-success-subtle border border-success-subtle{% endif %}">
-        <span class="fw-bold">{{ letters[loop.index0] }}.</span> <span class="pre-wrap">{{ c }}</span>
-        {% if loop.index0 == q.answer_index %}<i class="bi bi-check-lg text-success" title="正解"></i>{% endif %}
-      </li>
-      {% endfor %}
-    </ol>
-    {% if q.explanation %}<div class="small text-muted pre-wrap"><span class="fw-bold">解説:</span> {{ q.explanation }}</div>{% endif %}
+    <p class="small text-muted mt-2">作成: {{ plan.created_by.display_name if plan.created_by else '―' }}（{{ plan.created_at.strftime('%Y/%m/%d %H:%M') if plan.created_at else '' }}）{% if plan.updated_by %} ／ 最終更新: {{ plan.updated_by.display_name }}（{{ plan.updated_at.strftime('%Y/%m/%d %H:%M') if plan.updated_at else '' }}）{% endif %}</p>
   </div>
 </div>
-{% else %}
-<div class="card card-body shadow-sm text-muted text-center">
-  {% if (filters.level or filters.state) and counts %}絞り込みの条件に合う問題はありません。{% else %}問題がありません。{% if testable and ai_enabled %}「AIで補充」で作成するか、メンバーが受験を始めたときに不足分が自動で作成されます。{% elif testable %}AIが未設定のため、問題を作成できません（メンバーが受験を始めても問題が無いため受験できません）。AIは<a href="{{ url_for('system.settings', tab='config') }}">システム設定の「基本設定」タブ</a>で設定します。{% endif %}{% endif %}
+{% endblock %}
+{#=== skills/plans.html ===#}
+{# 計画・メモの一覧(完了したものも。app.py の plans。マネージャーのみ) #}
+{% extends "base.html" %}
+{% from "_macros.html" import fmt_date %}
+{% block title %}計画・メモ &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('skills.list_skills') }}">スキルマップ</a></li>
+    <li class="breadcrumb-item active">計画・メモ</li>
+  </ol>
+</nav>
+<h1 class="h3 mb-1"><i class="bi bi-journal-check"></i> 計画・メモ</h1>
+<p class="text-muted small">スキルマップの「AIに相談」から保存した計画・メモです（完了したものを含む）。進行中のものは、AIの相談・分析の材料になります。</p>
+{% for g in groups %}
+<div class="card shadow-sm mb-3">
+  <div class="card-header bg-white fw-bold"><span class="badge bg-{{ g.color }}{% if g.color == 'light' %} text-dark border{% endif %}">{{ g.label }}</span></div>
+  <ul class="list-group list-group-flush small">
+    {% for p in g.plans %}
+    <li class="list-group-item {% if p.status == 'done' %}text-muted{% endif %}">
+      <div class="d-flex justify-content-between flex-wrap gap-1">
+        <span>{% if p.status == 'done' %}<span class="badge bg-success">完了</span> {% endif %}<span class="fw-medium">{{ p.title }}</span>
+          <span class="text-muted">（対象: {{ p.target_user.display_name if p.target_user else 'チーム全体' }}{% if p.due_date %}・期限 {{ fmt_date(p.due_date) }}{% endif %}）</span></span>
+        <span class="d-flex gap-1">
+          <a class="btn btn-sm btn-outline-secondary py-0" href="{{ url_for('skills.plan_edit', plan_id=p.id) }}">編集</a>
+          <form method="post" action="{{ url_for('skills.plan_status', plan_id=p.id) }}">
+            <input type="hidden" name="row" value="{{ p.row_key }}">
+            <input type="hidden" name="status" value="{{ 'active' if p.status == 'done' else 'done' }}">
+            <button class="btn btn-sm btn-outline-{{ 'secondary' if p.status == 'done' else 'success' }} py-0">{{ '進行中に戻す' if p.status == 'done' else '完了にする' }}</button>
+          </form>
+        </span>
+      </div>
+      {% if p.body %}<details><summary class="text-muted">内容</summary><div class="pre-wrap">{{ p.body }}</div></details>{% endif %}
+    </li>
+    {% endfor %}
+  </ul>
 </div>
+{% else %}
+<p class="text-muted">まだ計画・メモはありません。</p>
 {% endfor %}
 {% endblock %}
 {#=== manager/dashboard.html ===#}
@@ -3683,7 +3316,6 @@
       <li><a class="dropdown-item" href="{{ url_for('export.tasks_xlsx') }}">タスク（履歴含む）</a></li>
       <li><a class="dropdown-item" href="{{ url_for('export.routine_xlsx') }}">定型・定期業務</a></li>
       <li><a class="dropdown-item" href="{{ url_for('export.skills_xlsx') }}">スキル・業務</a></li>
-      <li><a class="dropdown-item" href="{{ url_for('export.skilltest_xlsx') }}">スキルテスト（受験履歴・回答・問題）</a></li>
       <li><a class="dropdown-item" href="{{ url_for('export.leaves_xlsx') }}">年休</a></li>
       <li><a class="dropdown-item" href="{{ url_for('export.teams_xlsx') }}">チーム・メンバー</a></li>
     </ul>
@@ -4312,7 +3944,6 @@
   {%- elif t.kind == 'person' -%}<a href="{{ url_for('tasks.list_tasks', assignee=t.id) }}"><i class="bi bi-person"></i> {{ t.label }}</a>
   {%- elif t.kind == 'skill' -%}<a href="{{ url_for('skills.list_skills', type=t.skill_type) }}"><i class="bi bi-mortarboard"></i> {{ t.label }}</a>
   {%- elif t.kind == 'operation' -%}<a href="{{ url_for('skills.coverage') }}"><i class="bi bi-diagram-3"></i> {{ t.label }}</a>
-  {%- elif t.kind == 'skilltest' -%}<a href="{{ url_for('skilltest.admin_attempts', user_id=t.id) if t.id else url_for('skilltest.admin_attempts') }}"><i class="bi bi-patch-check"></i> {{ t.label }}</a>
   {%- else -%}{{ t.label }}{%- endif -%}
 {%- endmacro %}
 
@@ -4866,75 +4497,57 @@
 
 {# ===== ② スキル状況 ===== #}
 {% set sk = a.skills %}
-{% set ts = sk.tests %}
+{% set up = sk.updates %}
 <h2 class="h4 mt-4 mb-1" id="skills"><i class="bi bi-mortarboard"></i> ② スキル状況</h2>
-<p class="text-muted small mb-2">スキルテストは期間内（受験を始めた日）、スキルの分布と偏りは現時点の到達度です。保有者は Lv{{ sk.proficient }} 以上（単独で実務可能）のメンバーです。</p>
+<p class="text-muted small mb-2">スキルの更新は期間内（変更の日時）、スキルの分布と偏りは現時点の到達度です。保有者は Lv{{ sk.proficient }} 以上（単独でできる〔自立〕）のメンバーです。</p>
 {{ ai_box(a.ai_summary.skills if a.ai_summary else none) }}
 {% if sk.ai %}
 {% set skill_lines = [] %}
 {% for key, label in skills_ai_keys %}{% for line in sk.ai[key] or [] %}{% set _ = skill_lines.append(label ~ '：' ~ line) %}{% endfor %}{% endfor %}
-{{ ai_box(skill_lines, 'AIがスキルの材料（分布・偏り・受験の内容）を読んだ結果') }}
+{{ ai_box(skill_lines, 'AIがスキルの材料（分布・偏り・期間内の更新）を読んだ結果') }}
 {% endif %}
 
 <div class="card shadow-sm mb-3">
   <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
-    <span class="fw-bold"><i class="bi bi-patch-check"></i> スキルテストの状況（期間内）</span>
-    <a href="{{ url_for('skilltest.admin_attempts') }}" class="btn btn-sm btn-outline-secondary">受験履歴</a>
+    <span class="fw-bold"><i class="bi bi-graph-up-arrow"></i> スキルの更新（期間内）</span>
+    <a href="{{ url_for('skills.history') }}" class="btn btn-sm btn-outline-secondary">変更の履歴</a>
   </div>
   <div class="table-responsive">
     <table class="table table-sm table-hover align-middle mb-0 text-center small">
       <thead class="table-light">
         <tr>
           <th class="text-start">ヒト</th>
-          <th class="text-nowrap">受験</th>
-          <th class="text-nowrap">終了</th>
-          <th class="text-nowrap">時間切れ・<br>途中で終了</th>
-          <th class="text-nowrap">受験中</th>
-          <th class="text-nowrap">レベル<br>アップ</th>
-          <th class="text-nowrap">離脱が多い<br>（{{ ts.blur_many }}回以上）</th>
-          <th class="text-nowrap">最後の受験<br>（期間の終わりまで）</th>
+          <th class="text-nowrap">自動更新で<br>上がった</th>
+          <th class="text-nowrap">マネージャーが<br>上げた</th>
+          <th class="text-nowrap">マネージャーが<br>下げた</th>
+          <th class="text-nowrap">最後の更新<br>（期間内）</th>
         </tr>
       </thead>
       <tbody>
-        {% for r in ts.rows %}
+        {% for r in up.rows %}
         <tr>
           <td class="text-start text-nowrap">{{ r.name }}</td>
-          <td>{{ r.attempts or '―' }}</td>
-          <td>{{ r.finished or '―' }}</td>
-          <td class="{% if r.expired %}text-warning-emphasis fw-bold{% endif %}">{{ r.expired or '―' }}</td>
-          <td>{{ r.in_progress or '―' }}</td>
-          <td class="{% if r.level_ups %}text-success fw-bold{% endif %}">{{ r.level_ups or '―' }}</td>
-          <td class="{% if r.many_blur %}text-danger fw-bold{% endif %}">{{ r.many_blur or '―' }}</td>
-          <td class="text-nowrap">{% if r.last_at %}{{ fmt_date(r.last_at) }}{% else %}<span class="text-muted">未受験</span>{% endif %}</td>
+          <td class="{% if r.auto_ups %}text-success fw-bold{% endif %}">{{ r.auto_ups or '―' }}</td>
+          <td>{{ r.manual_ups or '―' }}</td>
+          <td>{{ r.manual_downs or '―' }}</td>
+          <td class="text-nowrap">{% if r.last_at %}{{ fmt_date(r.last_at) }}{% else %}<span class="text-muted">なし</span>{% endif %}</td>
         </tr>
         {% else %}
-        <tr><td colspan="8" class="text-muted py-3">対象のメンバーがいません。</td></tr>
+        <tr><td colspan="5" class="text-muted py-3">対象のメンバーがいません。</td></tr>
         {% endfor %}
       </tbody>
       <tfoot class="table-light fw-bold">
         <tr>
           <td class="text-start">チーム</td>
-          <td>{{ ts.team.attempts }}</td>
-          <td>{{ ts.team.finished }}</td>
-          <td>{{ ts.team.expired }}</td>
-          <td>{{ ts.team.in_progress }}</td>
-          <td>{{ ts.team.level_ups }}</td>
-          <td>{{ ts.team.many_blur }}</td>
+          <td>{{ up.team.auto_ups }}</td>
+          <td>{{ up.team.manual_ups }}</td>
+          <td>{{ up.team.manual_downs }}</td>
           <td></td>
         </tr>
       </tfoot>
     </table>
   </div>
-  <div class="card-footer bg-white small">
-    {% if not ts.testable_count %}
-    <span class="text-muted">テストの対象スキル（有効なテクニカルスキル）がありません。</span>
-    {% else %}
-    <div><span class="fw-bold">一度も受験していない（期間の終わりの時点）:</span>
-      {% for r in ts.never %}{{ r.name }}{% if not loop.last %}、{% endif %}{% else %}<span class="text-muted">なし</span>{% endfor %}</div>
-    <div><span class="fw-bold">期間内に受験していない（以前は受験）:</span>
-      {% for r in ts.none_in_period %}{{ r.name }}（最後 {{ fmt_date(r.last_at) }}）{% if not loop.last %}、{% endif %}{% else %}<span class="text-muted">なし</span>{% endfor %}</div>
-    {% endif %}
-  </div>
+  <div class="card-footer bg-white small text-muted">タスクの完了からの自動更新（取り消したものを除く）と、マネージャーの到達度の変更を数えています。</div>
 </div>
 
 <div class="row g-3 mb-3">
@@ -5917,8 +5530,8 @@
   <div class="tab-pane fade {% if tab == 'overdue' %}show active{% endif %}" id="pane-overdue" role="tabpanel" aria-labelledby="tab-overdue">
     {{ file_error_alert(od) }}{% include "system/_overdue_tab.html" %}
   </div>
-  <div class="tab-pane fade {% if tab == 'skilltest' %}show active{% endif %}" id="pane-skilltest" role="tabpanel" aria-labelledby="tab-skilltest">
-    {{ file_error_alert(st) }}{% include "system/_skilltest_tab.html" %}
+  <div class="tab-pane fade {% if tab == 'skill_ai' %}show active{% endif %}" id="pane-skill_ai" role="tabpanel" aria-labelledby="tab-skill_ai">
+    {{ file_error_alert(sa) }}{% include "system/_skill_ai_tab.html" %}
   </div>
   <div class="tab-pane fade {% if tab == 'analysis' %}show active{% endif %}" id="pane-analysis" role="tabpanel" aria-labelledby="tab-analysis">
     {{ file_error_alert(an) }}{% include "system/_analysis_tab.html" %}
@@ -6351,96 +5964,61 @@
     </div>
   </div>
 </form>
-{#=== system/_skilltest_tab.html ===#}
-{# システム設定「スキルテスト」タブ(instance/skilltest_settings.json に保存)。入力チェックは app.py の parse_skilltest_form #}
+{#=== system/_skill_ai_tab.html ===#}
+{# システム設定「スキル（AI）」タブ(instance/skill_ai_settings.json に保存)。入力チェックは app.py の parse_skill_ai_form #}
 <p class="small text-muted d-flex flex-wrap justify-content-between gap-2">
   <span>
-    スキルテストの出題・判定・再受験・問題プールの設定です。
-    設定は <code>instance/skilltest_settings.json</code> に保存され、DB には保存しません。受験中・受験済みのテストは、開始時の設定のまま採点します。
+    タスクの完了からのスキルの自動更新の設定です。スキルマップの上部の「AIのスキル分析・相談」も、「基本設定」タブの AI の接続先を使います。
+    設定は <code>instance/skill_ai_settings.json</code> に保存され、DB には保存しません。
   </span>
-  <a href="{{ url_for('skilltest.admin_attempts') }}"><i class="bi bi-box-arrow-up-right"></i> スキルテスト管理（受験履歴・問題プール）</a>
+  <a href="{{ url_for('skills.history') }}"><i class="bi bi-box-arrow-up-right"></i> スキルの変更の履歴</a>
 </p>
-
-<form method="post" action="{{ url_for('system.save_skilltest') }}">
-  <input type="hidden" name="version" value="{{ st.version }}">
-  <div class="card shadow-sm mb-3">
-    <div class="card-header bg-white fw-bold d-flex justify-content-between flex-wrap gap-2">
-      <span><i class="bi bi-list-ol"></i> 出題（レベルごと）</span>
-      <span class="small fw-normal text-muted">{% set saved_st = st.saved or st %}保存済みの設定: 全{{ saved_st.plan_total }}問・合計 {{ saved_st.plan_duration }}</span>
-    </div>
-    <div class="table-responsive">
-      <table class="table align-middle mb-0">
-        <thead class="table-light">
-          <tr>
-            <th>レベル</th>
-            <th>到達度の目安</th>
-            <th style="width: 160px;">問題数（{{ st.limits.QUESTIONS_MIN }}〜{{ st.limits.QUESTIONS_MAX }}）</th>
-            <th style="width: 200px;">1問の制限時間（秒・{{ st.limits.TIME_LIMIT_MIN }}〜{{ st.limits.TIME_LIMIT_MAX }}）</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for lv in st.levels %}
-          <tr>
-            <td class="fw-bold">Lv{{ lv }}</td>
-            <td class="small">{{ st.scale[lv] }}</td>
-            <td>
-              <input type="number" class="form-control form-control-sm" name="questions_{{ lv }}" aria-label="Lv{{ lv }}の問題数"
-                     value="{{ st.settings.questions_per_level[lv|string] }}" min="{{ st.limits.QUESTIONS_MIN }}" max="{{ st.limits.QUESTIONS_MAX }}" step="1" required>
-            </td>
-            <td>
-              <input type="number" class="form-control form-control-sm" name="limit_{{ lv }}" aria-label="Lv{{ lv }}の1問の制限時間（秒）"
-                     value="{{ st.settings.time_limits[lv|string] }}" min="{{ st.limits.TIME_LIMIT_MIN }}" max="{{ st.limits.TIME_LIMIT_MAX }}" step="1" required>
-            </td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-    <div class="card-footer bg-white small text-muted">
-      問題はやさしい順（Lv1から）に出題し、同じレベルの中はランダムな順です。
-      制限時間を{{ st.grace_sec }}秒（通信の遅れの分）過ぎた回答は時間切れ（不正解）になります。
-      全体の期限は「各問の制限時間の合計＋{{ st.margin_min }}分」で、過ぎた受験は自動で終了します。
-    </div>
-  </div>
-
-  <div class="card shadow-sm mb-3">
-    <div class="card-header bg-white fw-bold"><i class="bi bi-sliders"></i> 判定・受験・問題プール</div>
+{% if not sa.ai_enabled %}
+<div class="alert alert-warning small py-2"><i class="bi bi-exclamation-triangle"></i> AIが未設定のため、自動更新の判定・スキルマップのAIは行いません（{{ sa.ai_status }}）。判定の記録には「AIが未設定」と残り、設定の後に変更の履歴の「判定し直す」で判定できます。</div>
+{% endif %}
+<form method="post" action="{{ url_for('system.save_skill_ai') }}">
+  <input type="hidden" name="version" value="{{ sa.version }}">
+  <div class="card shadow-sm mb-4">
+    <div class="card-header bg-white fw-bold"><i class="bi bi-arrow-up-circle"></i> タスクの完了からのスキルの自動更新</div>
     <div class="card-body">
-      <div class="row g-3">
-        <div class="col-sm-6 col-lg-3">
-          <label class="form-label small mb-1 fw-bold" for="skilltest-pass_rate">合格ライン（正答率 %）</label>
-          <input type="number" class="form-control form-control-sm" id="skilltest-pass_rate" name="pass_rate"
-                 value="{{ st.settings.pass_rate }}" min="{{ st.limits.PASS_RATE_MIN }}" max="{{ st.limits.PASS_RATE_MAX }}" step="1" required>
-          <div class="form-text">各レベルの正答率がこの値以上で、下のレベルもすべて合格ならそのレベルに合格。</div>
-        </div>
-        <div class="col-sm-6 col-lg-3">
-          <label class="form-label small mb-1 fw-bold" for="skilltest-retake_days">再受験までの日数</label>
-          <input type="number" class="form-control form-control-sm" id="skilltest-retake_days" name="retake_days"
-                 value="{{ st.settings.retake_days }}" min="{{ st.limits.RETAKE_DAYS_MIN }}" max="{{ st.limits.RETAKE_DAYS_MAX }}" step="1" required>
-          <div class="form-text">同じスキルは、前回の受験開始からこの日数が過ぎると再受験できます（0 なら制限なし）。</div>
-        </div>
-        <div class="col-sm-6 col-lg-3">
-          <label class="form-label small mb-1 fw-bold" for="skilltest-max_auto_level">判定・自動登録するレベルの上限</label>
-          <select class="form-select form-select-sm" id="skilltest-max_auto_level" name="max_auto_level">
-            {% for lv in range(st.limits.AUTO_LEVEL_MIN, st.limits.AUTO_LEVEL_MAX + 1) %}
-            <option value="{{ lv }}" {% if st.settings.max_auto_level == lv %}selected{% endif %}>Lv{{ lv }}（{{ st.scale[lv] }}）</option>
-            {% endfor %}
-          </select>
-          <div class="form-text">テストはLv1からこのレベルまでを出題・判定します。Lv5・6はマネージャーが評価します。</div>
-        </div>
-        <div class="col-sm-6 col-lg-3">
-          <label class="form-label small mb-1 fw-bold" for="skilltest-pool_target_per_level">問題プールの目標数（レベルごと）</label>
-          <input type="number" class="form-control form-control-sm" id="skilltest-pool_target_per_level" name="pool_target_per_level"
-                 value="{{ st.settings.pool_target_per_level }}" min="{{ st.limits.POOL_TARGET_MIN }}" max="{{ st.limits.POOL_TARGET_MAX }}" step="1" required>
-          <div class="form-text">問題プールの「補充」で、各レベルの有効な問題がこの数になるまでAIで作成します（1回の受験に必要な問題数より少ないレベルは、必要な問題数まで作成します）。</div>
-        </div>
+      <div class="form-check mb-3">
+        <input class="form-check-input" type="checkbox" id="skill-ai-auto" name="auto_enabled" value="1" {% if sa.settings.auto_enabled %}checked{% endif %}>
+        <label class="form-check-label" for="skill-ai-auto">タスクを「完了」にしたとき、そのタスクに進捗を記載したメンバーのスキルを、記載の内容からAIが判定して自動で上げる</label>
+      </div>
+      <div class="mb-3" style="max-width: 24rem;">
+        <label class="form-label small mb-1 fw-bold" for="skill-ai-step">1回の完了で上げる段階の上限</label>
+        <input type="number" class="form-control form-control-sm" id="skill-ai-step" name="step_limit" value="{{ sa.settings.step_limit }}" min="{{ sa.step_min }}" max="{{ sa.step_max }}" step="1" required>
+        <div class="form-text">{{ sa.step_min }}〜{{ sa.step_max }}（既定 1）。AIの判定がこれより上でも、1回の完了ではこの段階までしか上げません。</div>
+      </div>
+      <div class="small">
+        <div class="fw-bold mb-1">判定の決まり</div>
+        <ul class="mb-2 ps-3">
+          <li>対象は、そのタスクに進捗を記載した有効なメンバーです（担当者かどうかではなく、進捗の記載者とその記載の内容で判断します。マネージャーは対象外）。</li>
+          <li>根拠は本人の記載からの引用です。引用が本人の記載に見つからない判定・有効でないスキルの判定は使いません。</li>
+          <li>上げるだけで、下げることはありません（判定の時点の到達度より上のときだけ）。前回の判定と記載が同じなら判定し直しません。</li>
+          <li>到達尺度（すべてのスキル共通）: {% for label in sa.scale %}Lv{{ loop.index0 }}「{{ label }}」{% if not loop.last %}・{% endif %}{% endfor %}</li>
+          <li>AIの接続先には、タスクの名前・説明・成果・進捗の記載（書いた人の氏名・日時を含む）、対象者の氏名と到達度、スキル項目（説明の先頭）を送ります。</li>
+          <li>上げた到達度は、スキルの「変更の履歴」から取り消せます。</li>
+        </ul>
       </div>
     </div>
     <div class="card-footer bg-white d-flex justify-content-end">
-      <button class="btn btn-primary btn-sm"><i class="bi bi-save"></i> スキルテストの設定を保存</button>
+      <button class="btn btn-primary btn-sm"><i class="bi bi-save"></i> スキル（AI）の設定を保存</button>
     </div>
   </div>
 </form>
+<div class="card shadow-sm mb-4">
+  <div class="card-header bg-white fw-bold"><i class="bi bi-robot"></i> 最近の判定</div>
+  <ul class="list-group list-group-flush small">
+    {% for j in sa.recent %}
+    <li class="list-group-item">{{ j.created_at.strftime('%Y/%m/%d %H:%M') if j.created_at else '' }}
+      「{{ j.task_title or ('タスク ' ~ j.task_id) }}」 <span class="badge bg-{{ j.status_color }}{% if j.status_color == 'light' %} text-dark border{% endif %}">{{ j.status_label }}</span>
+      <span class="text-muted">{{ j.message or '' }}</span></li>
+    {% else %}
+    <li class="list-group-item text-muted">まだ判定はありません。</li>
+    {% endfor %}
+  </ul>
+</div>
 {#=== system/_analysis_tab.html ===#}
 {# システム設定「AI分析」タブ(instance/ai_analysis_settings.json に保存)。入力チェックは app.py の parse_ai_analysis_form #}
 {% from '_macros.html' import ai_analysis_sent_items %}
@@ -6898,46 +6476,23 @@ a:hover {
   min-width: 3.2rem;
 }
 
-/* スキルテスト: 残り時間・選択肢・問題文の選択/印刷の抑止・準備中の表示 */
-.skilltest-timer {
-  font-size: 1.75rem;
-  font-variant-numeric: tabular-nums;
-  line-height: 1.1;
+/* スキルマップの「AIに相談」: やり取りの欄(高さを決めてスクロール) */
+.skill-chat-box {
+  max-height: 32rem;
+  overflow-y: auto;
+  background: var(--bs-tertiary-bg, #f8f9fa);
 }
-.skilltest-question-text {
-  font-size: 1.05rem;
-}
-.skilltest-choice {
-  cursor: pointer;
-}
-.skilltest-noselect {
-  -webkit-user-select: none;
-  user-select: none;
-}
-@media print {
-  .skilltest-noselect {
-    display: none !important;
-  }
-}
-.skilltest-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 2000;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(255, 255, 255, 0.85);
-}
-.skilltest-overlay.d-none {
-  display: none !important;
-}
-.skilltest-overlay-box {
-  max-width: 420px;
-  padding: 1.5rem 2rem;
-  text-align: center;
+.skill-chat-msg {
+  padding: 0.4rem 0.6rem;
+  border-radius: 0.375rem;
   background: #fff;
-  border-radius: 0.5rem;
-  box-shadow: 0 0.5rem 1.5rem rgba(0, 0, 0, 0.15);
+}
+.skill-chat-user {
+  margin-left: 15%;
+  background: #eef4ff;
+}
+.skill-chat-ai {
+  margin-right: 5%;
 }
 {#=== static/js/sort-table.js ===#}
 /* 表の並び替え(共通)。
@@ -7124,8 +6679,8 @@ a:hover {
  * ・「AIで下書き」: 入力中のスキル名・区分・カテゴリ・説明をサーバー(/skills/items/description-draft)に
  *   送り、AIの下書きを説明の欄に入れる(保存はしない。保存は「更新」「追加」のボタンで行う)。
  *   説明の欄に入力がある場合は、置き換える前に確認する。
- * ・区分を選び直したときに、その区分の到達尺度(テクニカルは Lv1〜Lv4、ほかの区分はすべてのレベル)と、
- *   スキルテストの案内・説明の見出しの案内(data-skilltest)を切り替える。
+ * ・区分を選び直したときに、テクニカルスキルだけの説明の見出し(使う道具・言語・ソフト。data-technical-only)の
+ *   案内を切り替える(到達尺度はすべての区分で共通)。
  *
  * JavaScript が無効でも、「AIで下書き」は入力を残したまま下書きを入れた画面を表示する(サーバー側)。
  */
@@ -7197,28 +6752,23 @@ a:hover {
     });
   }
 
-  function setupScales() {
+  function setupTypeNotes() {
     var select = document.getElementById("item-type");
     if (!select || select.tagName !== "SELECT") return;
-    var scales = document.querySelectorAll(".skill-scale[data-skill-type]");
-    // スキルテストの案内はテクニカルスキルだけに出す(data-skilltest="on" / "off")
+    // テクニカルスキルだけの見出しの案内(data-technical-only)
     var holder = document.querySelector("[data-technical-type]");
     var technical = holder ? holder.getAttribute("data-technical-type") : "";
-    var testNotes = document.querySelectorAll("[data-skilltest]");
+    var notes = document.querySelectorAll("[data-technical-only]");
     select.addEventListener("change", function () {
-      scales.forEach(function (el) {
-        el.classList.toggle("d-none", el.getAttribute("data-skill-type") !== select.value);
-      });
-      var isTechnical = select.value === technical;
-      testNotes.forEach(function (el) {
-        el.classList.toggle("d-none", (el.getAttribute("data-skilltest") === "on") !== isTechnical);
+      notes.forEach(function (el) {
+        el.classList.toggle("d-none", select.value !== technical);
       });
     });
   }
 
   function init() {
     setupDraft();
-    setupScales();
+    setupTypeNotes();
   }
 
   if (document.readyState === "loading") {
@@ -7227,191 +6777,131 @@ a:hover {
     init();
   }
 })();
-{#=== static/js/skilltest.js ===#}
-/* スキルテスト(受験画面)。
+{#=== static/js/skill-ai.js ===#}
+/* スキルマップの上部「AIのスキル分析・相談」(skills/_ai_panel.html)用。
  *
- * 一覧画面: <form class="skilltest-start" data-confirm="確認文"> の送信前に確認し、
- *           「問題を準備しています」の表示(#skilltestOverlay)を出す(AIで問題を作る間の待ち)。
- *
- * 出題画面(.skilltest-question):
- *   ・残り時間の表示(data-remaining 秒から数える)。0 になったら、その時点の選択で自動送信する
- *     (時間はサーバーで計っているので、ここでの表示は目安。再読み込みしても戻らない)
- *   ・ほかのタブ/ウィンドウへの切り替え(visibilitychange / blur)を data-blur-url に送って記録する
- *     (再読み込み・リンクでの画面遷移は数えない)
- *   ・問題文の選択・コピー・右クリックを抑止する(軽い対策。完全には防げない)
- *   ・二重送信の防止
+ * ・URL の #skill-plans などで、そのタブを開く
+ * ・分析の実行中は状態(/skills/ai/state)を見て、終わったら画面を読み直す
+ * ・相談: 「送る」を画面を移動せずに送り、応答の作成中はやり取り(/skills/chat/<id>/messages)を読み直して表示する
+ *   (Ctrl＋Enter でも送る)
+ * JavaScript が無効でも、フォームの送信と画面の再読み込みで使える。
  */
 (function () {
   "use strict";
 
-  function setupStartForms() {
-    var overlay = document.getElementById("skilltestOverlay");
-    document.querySelectorAll("form.skilltest-start").forEach(function (form) {
-      form.addEventListener("submit", function (event) {
-        if (form.dataset.sending === "1") {
-          event.preventDefault();
-          return;
-        }
-        var message = form.dataset.confirm;
-        if (message && !window.confirm(message)) {
-          event.preventDefault();
-          return;
-        }
-        form.dataset.sending = "1";
-        if (overlay) overlay.classList.remove("d-none");
-        // ほかの「受験する」も押せないようにする(送信そのものは止めない)
-        window.setTimeout(function () {
-          document.querySelectorAll("form.skilltest-start button").forEach(function (b) {
-            b.disabled = true;
-          });
-        }, 0);
-      });
-    });
-    // 戻るボタンで一覧に戻ったときに待ち表示が残らないようにする
-    window.addEventListener("pageshow", function () {
-      if (overlay) overlay.classList.add("d-none");
-      document.querySelectorAll("form.skilltest-start").forEach(function (form) {
-        form.dataset.sending = "";
-        form.querySelectorAll("button").forEach(function (b) {
-          b.disabled = false;
-        });
-      });
+  var POLL_MS = 3000;
+  var LOGIN_EXPIRED = "ログインの有効期限が切れています。画面を開き直してください。";
+
+  function getJson(url) {
+    return fetch(url, { credentials: "same-origin", headers: { "Accept": "application/json" } }).then(function (r) {
+      if (r.status === 401 || r.redirected) throw new Error(LOGIN_EXPIRED);
+      return r.json();
     });
   }
 
-  function format(sec) {
-    var m = Math.floor(sec / 60);
-    var s = sec % 60;
-    return m + ":" + (s < 10 ? "0" : "") + s;
+  function showTabFromHash() {
+    var hash = window.location.hash;
+    if (!hash || !window.bootstrap) return;
+    var button = document.querySelector('#skill-ai [data-bs-target="' + hash + '"]');
+    if (button) {
+      window.bootstrap.Tab.getOrCreateInstance(button).show();
+      var panel = document.getElementById("skill-ai");
+      if (panel) panel.scrollIntoView();
+    }
   }
 
-  function setupQuestion(root) {
-    var form = document.getElementById("skilltestAnswerForm");
-    var timer = document.getElementById("skilltestTimer");
-    var button = document.getElementById("skilltestSubmit");
-    var blurNote = document.getElementById("skilltestBlurNote");
-    var blurCount = document.getElementById("skilltestBlurCount");
-    var remaining = parseInt(root.dataset.remaining, 10);
-    if (isNaN(remaining) || remaining < 0) remaining = 0;
-    var endAt = Date.now() + remaining * 1000;
-    var submitting = false;
-    var away = false;
-    var reported = 0;
-
-    function lock() {
-      submitting = true;
-      window.setTimeout(function () {
-        if (button) button.disabled = true;
-      }, 0);
-    }
-
-    // 時間切れ: その時点の選択で送信する(未選択なら時間切れとして記録される)
-    function autoSubmit() {
-      if (submitting || !form) return;
-      lock();
-      form.submit();
-    }
-
-    if (form) {
-      form.addEventListener("submit", function (event) {
-        if (submitting) {
-          event.preventDefault();
-          return;
+  function watchAnalysis(panel) {
+    if (panel.getAttribute("data-analysis-running") !== "1") return;
+    var url = panel.getAttribute("data-state-url");
+    var timer = setInterval(function () {
+      getJson(url).then(function (data) {
+        if (!data.analysis_running) {
+          clearInterval(timer);
+          window.location.reload();
         }
-        lock();
+      }).catch(function () { clearInterval(timer); });
+    }, POLL_MS);
+  }
+
+  function setupChat() {
+    var box = document.getElementById("skill-chat-messages");
+    if (!box) return;
+    var form = document.getElementById("skill-chat-form");
+    var status = document.getElementById("skill-chat-status");
+    var url = box.getAttribute("data-messages-url");
+    var timer = null;
+
+    function setStatus(text, kind) {
+      if (!status) return;
+      status.textContent = text;
+      status.className = "small " + (kind ? "text-" + kind : "text-muted");
+    }
+    function scrollDown() { box.scrollTop = box.scrollHeight; }
+    function stop() { if (timer) { clearInterval(timer); timer = null; } }
+    function refresh() {
+      getJson(url).then(function (data) {
+        box.innerHTML = data.html;
+        scrollDown();
+        if (!data.pending) {
+          stop();
+          setStatus("応答が届きました。", "success");
+        }
+      }).catch(function (error) {
+        stop();
+        setStatus(error.message, "danger");
       });
     }
+    function start() { if (!timer) timer = setInterval(refresh, POLL_MS); }
 
-    function tick() {
-      var left = Math.max(0, Math.ceil((endAt - Date.now()) / 1000));
-      if (timer) {
-        timer.textContent = format(left);
-        timer.classList.toggle("text-danger", left <= 10);
+    scrollDown();
+    if (box.getAttribute("data-pending") === "1") start();
+    if (!form || !window.fetch || !window.FormData) return;
+    var textarea = form.elements["question"];
+    var button = form.querySelector("button");
+    textarea.addEventListener("keydown", function (event) {
+      if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+        event.preventDefault();
+        if (form.requestSubmit) { form.requestSubmit(); } else { form.dispatchEvent(new Event("submit", { cancelable: true })); }
       }
-      if (left <= 0) {
-        autoSubmit();
+    });
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      if (!textarea.value.trim()) {
+        setStatus("質問を入力してください。", "danger");
         return;
       }
-      window.setTimeout(tick, 250);
-    }
-    tick();
-
-    // 画面から離れたことを記録する(タブ・ウィンドウの切り替え)。
-    // 再読み込み・リンクでの画面遷移でもページを閉じる時に visibilitychange(hidden) が起きるため、
-    // すぐには送らず少し待ち、その間にページを閉じた(pagehide)ら送らない
-    // (閉じられたページでは待ちの処理は実行されない)。送信中(回答・自動送信)も数えない。
-    var BLUR_DELAY_MS = 300;
-    var leaving = false;
-    var pending = null;
-
-    function send() {
-      pending = null;
-      if (submitting || leaving) return;
-      reported += 1;
-      if (blurNote) blurNote.classList.remove("d-none");
-      if (blurCount) blurCount.textContent = String(reported);
-      var url = root.dataset.blurUrl;
-      if (!url) return;
-      var data = new FormData();
-      data.append("seq", root.dataset.seq || "");
-      try {
-        if (navigator.sendBeacon && navigator.sendBeacon(url, data)) return;
-      } catch (e) {
-        /* sendBeacon が使えなければ fetch で送る */
-      }
-      if (window.fetch) {
-        window.fetch(url, { method: "POST", body: data, credentials: "same-origin", keepalive: true })
-          .catch(function () {});
-      }
-    }
-    function report() {
-      if (submitting || leaving || away) return;
-      away = true;
-      if (pending === null) pending = window.setTimeout(send, BLUR_DELAY_MS);
-    }
-    function back() {
-      away = false;
-    }
-    function leave() {
-      leaving = true;
-      if (pending !== null) {
-        window.clearTimeout(pending);
-        pending = null;
-      }
-    }
-    document.addEventListener("visibilitychange", function () {
-      if (document.hidden) report();
-      else back();
-    });
-    window.addEventListener("blur", report);
-    window.addEventListener("focus", back);
-    window.addEventListener("pagehide", leave);
-    // 戻る・進むボタンでページが復元された場合は、再び記録する
-    window.addEventListener("pageshow", function () {
-      leaving = false;
-      away = false;
-    });
-
-    // 問題文・選択肢の選択・コピー・右クリックを抑止する(軽い対策)
-    root.querySelectorAll(".skilltest-noselect").forEach(function (area) {
-      ["copy", "cut", "contextmenu", "dragstart", "selectstart"].forEach(function (name) {
-        area.addEventListener(name, function (event) {
-          event.preventDefault();
-        });
+      button.disabled = true;
+      setStatus("送っています…", "muted");
+      fetch(form.action, {
+        method: "POST", body: new FormData(form), credentials: "same-origin",
+        headers: { "Accept": "application/json" }
+      }).then(function (r) {
+        if (r.status === 401 || r.redirected) throw new Error(LOGIN_EXPIRED);
+        return r.json().then(function (data) { return { ok: r.ok, data: data }; });
+      }).then(function (res) {
+        if (res.ok && res.data.ok) {
+          box.innerHTML = res.data.html;
+          textarea.value = "";
+          scrollDown();
+          setStatus("AIが応答を作成しています（数十秒〜数分）…", "muted");
+          start();
+        } else {
+          setStatus(res.data.message || "送れませんでした。", "danger");
+        }
+      }).catch(function (error) {
+        setStatus("送れませんでした: " + error.message, "danger");
+      }).then(function () {
+        button.disabled = false;
       });
-    });
-    document.addEventListener("keydown", function (event) {
-      var key = (event.key || "").toLowerCase();
-      if ((event.ctrlKey || event.metaKey) && (key === "c" || key === "x" || key === "p" || key === "s")) {
-        event.preventDefault();
-      }
     });
   }
 
   function init() {
-    setupStartForms();
-    var root = document.querySelector(".skilltest-question");
-    if (root) setupQuestion(root);
+    var panel = document.getElementById("skill-ai");
+    if (!panel) return;
+    showTabFromHash();
+    watchAnalysis(panel);
+    setupChat();
   }
 
   if (document.readyState === "loading") {
