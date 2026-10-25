@@ -1516,8 +1516,8 @@
         <label class="form-label">業務名 <span class="text-danger">*</span></label>
         <input type="text" name="name" class="form-control" required value="{{ val('name') }}">
       </div>
-      <div class="mb-3">
-        <label class="form-label">担当者 <span class="text-danger">*</span>{% if can_assign %} <span class="text-muted small">（複数選択可）</span>{% endif %}</label>
+      <fieldset class="mb-3">
+        <legend class="form-label fs-6 mb-2">担当者 <span class="text-danger">*</span>{% if can_assign %} <span class="text-muted small">（複数選択可）</span>{% endif %}</legend>
         {% if can_assign %}
         {# 担当者の欄を送ったことの印(チェックをすべて外した送信と、この欄の無い送信を見分ける) #}
         <input type="hidden" name="assignees_sent" value="1">
@@ -1537,7 +1537,7 @@
         <div class="form-control-plaintext py-1">{{ routine.assignee_labels if editing else current_user.display_name }}</div>
         <div class="form-text">{{ '担当者はマネージャーが変更します。' if editing else '登録すると自分が担当者になります（担当者の追加・変更はマネージャーが行います）。' }}</div>
         {% endif %}
-      </div>
+      </fieldset>
 
       <div class="mb-3">
         <label class="form-label">目的</label>
@@ -2167,7 +2167,7 @@
             <span class="badge bg-{{ r.level_color if r else 'light' }} {% if not r or r.level == 0 %}text-muted border{% endif %}"
                   title="{{ u.display_name }} / {{ grp.scale[plv] if plv < grp.scale|length else plv }}{% if r and r.note %} / {{ r.note }}{% endif %}{% if auto %} / AIの自動更新（{{ auto.created_at.strftime('%m/%d') if auto.created_at else '' }}・タスク「{{ auto.task_title or '' }}」）{% endif %}">
               {{ plv }}
-            </span>{% if auto %}<i class="bi bi-stars text-primary small" aria-label="AIの自動更新"></i>{% endif %}
+            </span>{% if auto %}<i class="bi bi-stars text-primary small" role="img" aria-label="AIの自動更新"></i>{% endif %}
           </td>
           {% endfor %}
           {% if show_person %}
@@ -2361,7 +2361,7 @@
       {% if c.task_title %}<span class="text-muted">タスク「{{ c.task_title }}」</span>{% endif %}
       {% if c.reason %}<div class="text-muted">{{ c.reason }}</div>{% endif %}
       {% if c.evidence %}<div class="text-muted">根拠: 「{{ c.evidence }}」</div>{% endif %}
-      {% if c.source == 'auto' and not c.is_undone and current_levels.get(c.skill_id, 0) == c.new_level %}
+      {% if c.id in undoable %}
       <form method="post" action="{{ url_for('skills.undo_change', change_id=c.id) }}" class="mt-1" onsubmit="return confirm('この自動更新を取り消して、Lv{{ c.old_level }} に戻しますか？');">
         <button class="btn btn-sm btn-outline-danger py-0">取り消す</button>
       </form>
@@ -2812,29 +2812,29 @@
      data-analysis-running="{{ '1' if an.running else '' }}">
   <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
     <span class="fw-bold"><i class="bi bi-stars"></i> AIのスキル分析・相談</span>
-    <span class="small text-muted">{% if ai.ai_enabled %}AI: {{ ai.ai_status }}{% else %}<span class="text-danger">AIが未設定のため使えません（{{ ai.ai_status }}）</span>{% endif %}</span>
+    <span class="small text-muted">{% if ai.ai_enabled %}AI: {{ ai.ai_status }}{% else %}<span class="text-danger">AIが未設定のため使えません</span>（システム設定の「基本設定」タブで、AI の接続先とモデル名を設定します）{% endif %}</span>
   </div>
   <div class="card-body">
     <ul class="nav nav-tabs small mb-3" role="tablist">
       <li class="nav-item" role="presentation">
-        <button class="nav-link {% if ai_active != 'chat' %}active{% endif %}" data-bs-toggle="tab" data-bs-target="#skill-ai-analysis" type="button" role="tab"><i class="bi bi-clipboard-data"></i> 分析コメント</button>
+        <button class="nav-link {% if ai_active != 'chat' %}active{% endif %}" id="skill-ai-analysis-tab" data-bs-toggle="tab" data-bs-target="#skill-ai-analysis" type="button" role="tab" aria-controls="skill-ai-analysis" aria-selected="{{ 'false' if ai_active == 'chat' else 'true' }}"><i class="bi bi-clipboard-data"></i> 分析コメント</button>
       </li>
       <li class="nav-item" role="presentation">
-        <button class="nav-link {% if ai_active == 'chat' %}active{% endif %}" data-bs-toggle="tab" data-bs-target="#skill-ai-chat" type="button" role="tab"><i class="bi bi-chat-dots"></i> AIに相談{% if ai.threads %} <span class="badge bg-secondary">{{ ai.threads|length }}</span>{% endif %}</button>
+        <button class="nav-link {% if ai_active == 'chat' %}active{% endif %}" id="skill-ai-chat-tab" data-bs-toggle="tab" data-bs-target="#skill-ai-chat" type="button" role="tab" aria-controls="skill-ai-chat" aria-selected="{{ 'true' if ai_active == 'chat' else 'false' }}"><i class="bi bi-chat-dots"></i> AIに相談{% if ai.threads %} <span class="badge bg-secondary">{{ ai.threads|length }}</span>{% endif %}</button>
       </li>
       <li class="nav-item" role="presentation">
         {% set plan_count = namespace(n=0) %}{% for g in ai.plan_groups %}{% set plan_count.n = plan_count.n + g.plans|length %}{% endfor %}
-        <button class="nav-link" data-bs-toggle="tab" data-bs-target="#skill-plans" type="button" role="tab"><i class="bi bi-journal-check"></i> 計画・メモ{% if plan_count.n %} <span class="badge bg-secondary">{{ plan_count.n }}</span>{% endif %}</button>
+        <button class="nav-link" id="skill-plans-tab" data-bs-toggle="tab" data-bs-target="#skill-plans" type="button" role="tab" aria-controls="skill-plans" aria-selected="false"><i class="bi bi-journal-check"></i> 計画・メモ{% if plan_count.n %} <span class="badge bg-secondary">{{ plan_count.n }}</span>{% endif %}</button>
       </li>
       <li class="nav-item" role="presentation">
-        <button class="nav-link" data-bs-toggle="tab" data-bs-target="#skill-ai-updates" type="button" role="tab"><i class="bi bi-arrow-up-circle"></i> 最近の自動更新</button>
+        <button class="nav-link" id="skill-ai-updates-tab" data-bs-toggle="tab" data-bs-target="#skill-ai-updates" type="button" role="tab" aria-controls="skill-ai-updates" aria-selected="false"><i class="bi bi-arrow-up-circle"></i> 最近の自動更新</button>
       </li>
     </ul>
     <div class="tab-content">
       {# ---- 分析コメント ---- #}
-      <div class="tab-pane fade {% if ai_active != 'chat' %}show active{% endif %}" id="skill-ai-analysis" role="tabpanel">
+      <div class="tab-pane fade {% if ai_active != 'chat' %}show active{% endif %}" id="skill-ai-analysis" role="tabpanel" aria-labelledby="skill-ai-analysis-tab">
         <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-2">
-          <div class="small text-muted" role="status" aria-live="polite">
+          <div class="small text-muted" role="status" aria-live="polite" id="skill-ai-analysis-status">
             {% if an.running %}<span class="spinner-border spinner-border-sm" role="status"></span> AIが分析しています（数十秒〜数分）。終わると自動で表示されます。
             {% elif an.generated_at %}{{ an.generated_at }} 時点の分析（{{ an.by }}{% if an.model %}・{{ an.model }}{% endif %}）
             {% else %}まだ分析していません。{% endif %}
@@ -2884,18 +2884,18 @@
       </div>
 
       {# ---- AIに相談 ---- #}
-      <div class="tab-pane fade {% if ai_active == 'chat' %}show active{% endif %}" id="skill-ai-chat" role="tabpanel">
+      <div class="tab-pane fade {% if ai_active == 'chat' %}show active{% endif %}" id="skill-ai-chat" role="tabpanel" aria-labelledby="skill-ai-chat-tab">
         <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
           {% if ai.threads %}
           <form method="get" action="{{ url_for('skills.list_skills') }}" class="d-flex gap-1 align-items-center">
             {% for key, values in request.args.lists() if key != 'thread' %}{% for v in values %}<input type="hidden" name="{{ key }}" value="{{ v }}">{% endfor %}{% endfor %}
             <label class="small text-muted text-nowrap" for="skill-chat-thread">会話:</label>
-            <select name="thread" id="skill-chat-thread" class="form-select form-select-sm" onchange="this.form.submit()">
+            <select name="thread" id="skill-chat-thread" class="form-select form-select-sm">
               {% for t in ai.threads %}
               <option value="{{ t.id }}" {% if ai.thread and t.id == ai.thread.id %}selected{% endif %}>{{ t.title }}（{{ fmt_datetime(t.updated_at) }}）</option>
               {% endfor %}
             </select>
-            <noscript><button class="btn btn-sm btn-outline-secondary">開く</button></noscript>
+            <button class="btn btn-sm btn-outline-secondary text-nowrap">開く</button>
           </form>
           {% endif %}
           <button class="btn btn-sm btn-outline-primary" type="button" data-bs-toggle="collapse" data-bs-target="#skill-chat-new" aria-expanded="{{ 'false' if ai.threads else 'true' }}"><i class="bi bi-plus-lg"></i> 新しい相談</button>
@@ -2950,7 +2950,7 @@
       </div>
 
       {# ---- 計画・メモ ---- #}
-      <div class="tab-pane fade" id="skill-plans" role="tabpanel">
+      <div class="tab-pane fade" id="skill-plans" role="tabpanel" aria-labelledby="skill-plans-tab">
         <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-2">
           <span class="small text-muted">相談から保存した計画・メモ（進行中）。保存した計画・メモは、次の相談・分析の材料にもなります。</span>
           <span class="d-flex gap-2">
@@ -2980,13 +2980,13 @@
               <div class="d-flex justify-content-between flex-wrap gap-1">
                 <span><span class="fw-medium">{{ p.title }}</span>
                   <span class="text-muted">（対象: {{ p.target_user.display_name if p.target_user else 'チーム全体' }}{% if p.due_date %}・期限 {{ fmt_date(p.due_date) }}{% endif %}）</span></span>
-                <span class="d-flex gap-1">
+                <div class="d-flex gap-1">
                   <a class="btn btn-sm btn-outline-secondary py-0" href="{{ url_for('skills.plan_edit', plan_id=p.id) }}">編集</a>
                   <form method="post" action="{{ url_for('skills.plan_status', plan_id=p.id) }}">
                     <input type="hidden" name="row" value="{{ p.row_key }}"><input type="hidden" name="status" value="done">
                     <button class="btn btn-sm btn-outline-success py-0">完了にする</button>
                   </form>
-                </span>
+                </div>
               </div>
               {% if p.body %}<details><summary class="text-muted">内容</summary><div class="pre-wrap">{{ p.body }}</div></details>{% endif %}
             </li>
@@ -2999,7 +2999,7 @@
       </div>
 
       {# ---- 最近の自動更新 ---- #}
-      <div class="tab-pane fade" id="skill-ai-updates" role="tabpanel">
+      <div class="tab-pane fade" id="skill-ai-updates" role="tabpanel" aria-labelledby="skill-ai-updates-tab">
         <p class="small text-muted mb-2">タスクを「完了」にすると、そのタスクに進捗を記載したメンバー（担当者かどうかではなく記載者）の記載から、AIがスキルの到達度を判定して上げます（{% if ai.settings.auto_enabled %}オン。1回の完了で{{ ai.settings.step_limit }}段階まで{% else %}今はオフ{% endif %}。設定はシステム設定の「スキル（AI）」タブ）。根拠は本人の記載の引用で、下げることはありません。上げた到達度は変更の履歴から取り消せます。</p>
         {% if ai.recent_auto %}
         <ul class="list-group list-group-flush small mb-2">
@@ -3024,8 +3024,9 @@
 {# 相談のやり取り(app.py の _chat_messages_html。変数 thread・now・stale・plan_kinds・plan_users) #}
 {% from "_macros.html" import fmt_datetime %}
 {% for m in thread.messages %}
+{% set shown_status = 'stale' if (m.status == 'pending' and stale(m, now)) else m.status %}
 {% if m.is_ai %}
-<div class="skill-chat-msg skill-chat-ai mb-2" data-status="{{ m.status }}">
+<div class="skill-chat-msg skill-chat-ai mb-2" data-msg-id="{{ m.id }}" data-status="{{ shown_status }}">
   <div class="small text-muted"><i class="bi bi-stars"></i> AI{% if m.finished_at and m.status == 'done' %}（{{ fmt_datetime(m.finished_at) }}）{% endif %}</div>
   {% if m.status == 'pending' and not stale(m, now) %}
   <div class="small"><span class="spinner-border spinner-border-sm" role="status"></span> 応答を作成しています…（この画面を開いたままにすると、できたときに表示されます）</div>
@@ -3044,8 +3045,10 @@
         <div class="col-md-3"><select name="kind" class="form-select form-select-sm" aria-label="種類">{% for key, label in plan_kinds %}<option value="{{ key }}" {% if key == ('education' if thread.focus_user_id else 'action') %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></div>
         <div class="col-md-3"><select name="target" class="form-select form-select-sm" aria-label="対象"><option value="">チーム全体</option>{% for u in plan_users %}<option value="{{ u.form_key }}" {% if thread.focus_user_id == u.id %}selected{% endif %}>{{ u.display_name }}</option>{% endfor %}</select></div>
         <div class="col-md-3"><input type="date" name="due_date" class="form-control form-control-sm" aria-label="期限（任意）"></div>
+        {% set first_line = (m.content or '').split('\n')[0]|trim %}
+        {% if first_line[:1] in ('■', '・') %}{% set first_line = first_line[1:]|trim %}{% endif %}
         <div class="col-12"><input type="text" name="title" class="form-control form-control-sm" maxlength="200" required aria-label="タイトル"
-                                   value="{{ (m.content.split('\n')[0]|replace('■', '')|replace('・', '')|trim)[:60] }}"></div>
+                                   value="{{ first_line[:60] }}"></div>
         <div class="col-12"><textarea name="body" class="form-control form-control-sm" rows="5" aria-label="内容">{{ m.content }}</textarea></div>
         <div class="col-12 text-end"><button class="btn btn-sm btn-primary">保存</button></div>
       </div>
@@ -3054,13 +3057,13 @@
   {% endif %}
 </div>
 {% else %}
-<div class="skill-chat-msg skill-chat-user mb-2">
+<div class="skill-chat-msg skill-chat-user mb-2" data-msg-id="{{ m.id }}" data-status="{{ shown_status }}">
   <div class="small text-muted"><i class="bi bi-person"></i> {{ m.author.display_name if m.author else '（不明）' }}（{{ fmt_datetime(m.created_at) }}）</div>
   <div class="pre-wrap small">{{ m.content }}</div>
 </div>
 {% endif %}
 {% else %}
-<div class="small text-muted">まだやり取りはありません。下の欄に質問を入力して「送る」を押してください。</div>
+<div class="small text-muted" data-empty="1">まだやり取りはありません。下の欄に質問を入力して「送る」を押してください。</div>
 {% endfor %}
 {#=== skills/history.html ===#}
 {# 到達度の変更の記録と、タスクの完了からの自動更新の判定(app.py の 8-6。マネージャーのみ) #}
@@ -3104,7 +3107,7 @@
             <details><summary class="text-primary">AIの提案（{{ j.proposal_list|length }}件）</summary>
               <ul class="mb-0 ps-3">
                 {% for p in j.proposal_list %}
-                <li>P{{ p.user_id }}・S{{ p.skill_id }} → Lv{{ p.level }}: {{ p.reason }}{% if p.evidence %} <span class="text-muted">「{{ p.evidence }}」</span>{% endif %} <span class="fw-bold">{{ p.result }}</span></li>
+                <li>{{ user_names.get(p.user_id, 'P' ~ p.user_id) }}「{{ skill_names.get(p.skill_id, 'S' ~ p.skill_id) }}」→ Lv{{ p.level }}: {{ p.reason }}{% if p.evidence %} <span class="text-muted">「{{ p.evidence }}」</span>{% endif %} <span class="fw-bold">{{ p.result }}</span></li>
                 {% endfor %}
               </ul>
             </details>
@@ -3166,7 +3169,7 @@
           </td>
           <td class="text-nowrap">
             {% if c.source == 'auto' and not c.is_undone %}
-            {% if current.get((c.user_id, c.skill_id), 0) == c.new_level %}
+            {% if c.id in undoable %}
             <form method="post" action="{{ url_for('skills.undo_change', change_id=c.id) }}" onsubmit="return confirm('この自動更新を取り消して、Lv{{ c.old_level }} に戻しますか？');">
               <button class="btn btn-sm btn-outline-danger py-0">取り消す</button>
             </form>
@@ -3207,6 +3210,7 @@
     <h1 class="h4 mb-3">計画・メモの編集</h1>
     <form method="post" class="card card-body shadow-sm">
       <input type="hidden" name="version" value="{{ version }}">
+      {% if back %}<input type="hidden" name="back" value="{{ back }}">{% endif %}
       <div class="row g-2 mb-2">
         <div class="col-md-4">
           <label class="form-label small mb-0" for="plan-kind">種類</label>
@@ -3243,12 +3247,13 @@
       </div>
       <div class="d-flex gap-2">
         <button class="btn btn-primary"><i class="bi bi-check-lg"></i> 保存</button>
-        <a href="{{ url_for('skills.list_skills') }}#skill-plans" class="btn btn-outline-secondary">キャンセル</a>
+        <a href="{{ url_for('skills.plans') if back else url_for('skills.list_skills') ~ '#skill-plans' }}" class="btn btn-outline-secondary">キャンセル</a>
       </div>
     </form>
     <form method="post" action="{{ url_for('skills.plan_delete', plan_id=plan.id) }}" class="mt-2 text-end"
           onsubmit="return confirm('この計画・メモを削除しますか？');">
       <input type="hidden" name="row" value="{{ plan.row_key }}">
+      {% if back %}<input type="hidden" name="back" value="{{ back }}">{% endif %}
       <button class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i> 削除</button>
     </form>
     <p class="small text-muted mt-2">作成: {{ plan.created_by.display_name if plan.created_by else '―' }}（{{ plan.created_at.strftime('%Y/%m/%d %H:%M') if plan.created_at else '' }}）{% if plan.updated_by %} ／ 最終更新: {{ plan.updated_by.display_name }}（{{ plan.updated_at.strftime('%Y/%m/%d %H:%M') if plan.updated_at else '' }}）{% endif %}</p>
@@ -3279,14 +3284,15 @@
       <div class="d-flex justify-content-between flex-wrap gap-1">
         <span>{% if p.status == 'done' %}<span class="badge bg-success">完了</span> {% endif %}<span class="fw-medium">{{ p.title }}</span>
           <span class="text-muted">（対象: {{ p.target_user.display_name if p.target_user else 'チーム全体' }}{% if p.due_date %}・期限 {{ fmt_date(p.due_date) }}{% endif %}）</span></span>
-        <span class="d-flex gap-1">
-          <a class="btn btn-sm btn-outline-secondary py-0" href="{{ url_for('skills.plan_edit', plan_id=p.id) }}">編集</a>
+        <div class="d-flex gap-1">
+          <a class="btn btn-sm btn-outline-secondary py-0" href="{{ url_for('skills.plan_edit', plan_id=p.id, back='plans') }}">編集</a>
           <form method="post" action="{{ url_for('skills.plan_status', plan_id=p.id) }}">
             <input type="hidden" name="row" value="{{ p.row_key }}">
+            <input type="hidden" name="back" value="plans">
             <input type="hidden" name="status" value="{{ 'active' if p.status == 'done' else 'done' }}">
             <button class="btn btn-sm btn-outline-{{ 'secondary' if p.status == 'done' else 'success' }} py-0">{{ '進行中に戻す' if p.status == 'done' else '完了にする' }}</button>
           </form>
-        </span>
+        </div>
       </div>
       {% if p.body %}<details><summary class="text-muted">内容</summary><div class="pre-wrap">{{ p.body }}</div></details>{% endif %}
     </li>
@@ -6780,10 +6786,10 @@ a:hover {
 {#=== static/js/skill-ai.js ===#}
 /* スキルマップの上部「AIのスキル分析・相談」(skills/_ai_panel.html)用。
  *
- * ・URL の #skill-plans などで、そのタブを開く
- * ・分析の実行中は状態(/skills/ai/state)を見て、終わったら画面を読み直す
- * ・相談: 「送る」を画面を移動せずに送り、応答の作成中はやり取り(/skills/chat/<id>/messages)を読み直して表示する
- *   (Ctrl＋Enter でも送る)
+ * ・URL の #skill-plans などで、そのタブを開く(会話のタブを開いたときは、やり取りの最後を表示する)
+ * ・分析の実行中は状態(/skills/ai/state)を見て、終わったら画面を読み直す(欄に入力中なら、読み直さずに案内を出す)
+ * ・相談: 「送る」を画面を移動せずに送り、応答の作成中はやり取り(/skills/chat/<id>/messages)を見て、変わった
+ *   発言だけを入れ替える(開いている「計画に保存」の入力は、その発言が変わらない限り残る。Ctrl＋Enter でも送る)
  * JavaScript が無効でも、フォームの送信と画面の再読み込みで使える。
  */
 (function () {
@@ -6791,12 +6797,23 @@ a:hover {
 
   var POLL_MS = 3000;
   var LOGIN_EXPIRED = "ログインの有効期限が切れています。画面を開き直してください。";
+  var dirty = false;  // AIの欄の入力欄に入力したか(分析が終わったときに画面を読み直してよいか)
+
+  function readJson(response) {
+    if (response.status === 401 || response.redirected) throw new Error(LOGIN_EXPIRED);
+    return response.json().catch(function () {
+      throw new Error(response.status === 404 ? "見つかりません（削除された可能性があります）。画面を開き直してください。"
+                                              : "サーバーの応答を読み取れませんでした（" + response.status + "）。");
+    }).then(function (data) {
+      if (!response.ok && !(data && data.message)) {
+        throw new Error("処理できませんでした（" + response.status + "）。画面を開き直してください。");
+      }
+      return { ok: response.ok, data: data };
+    });
+  }
 
   function getJson(url) {
-    return fetch(url, { credentials: "same-origin", headers: { "Accept": "application/json" } }).then(function (r) {
-      if (r.status === 401 || r.redirected) throw new Error(LOGIN_EXPIRED);
-      return r.json();
-    });
+    return fetch(url, { credentials: "same-origin", headers: { "Accept": "application/json" } }).then(readJson);
   }
 
   function showTabFromHash() {
@@ -6813,14 +6830,32 @@ a:hover {
   function watchAnalysis(panel) {
     if (panel.getAttribute("data-analysis-running") !== "1") return;
     var url = panel.getAttribute("data-state-url");
-    var timer = setInterval(function () {
-      getJson(url).then(function (data) {
-        if (!data.analysis_running) {
-          clearInterval(timer);
-          window.location.reload();
+    var status = document.getElementById("skill-ai-analysis-status");
+    function poll() {
+      getJson(url).then(function (res) {
+        if (res.data.analysis_running) {
+          setTimeout(poll, POLL_MS);
+          return;
         }
-      }).catch(function () { clearInterval(timer); });
-    }, POLL_MS);
+        if (!dirty) {
+          window.location.reload();
+          return;
+        }
+        // 入力中の内容を消さないよう、読み直しはボタンで行う
+        if (status) {
+          status.textContent = "分析が終わりました。";
+          var button = document.createElement("button");
+          button.type = "button";
+          button.className = "btn btn-sm btn-outline-primary ms-2 py-0";
+          button.textContent = "画面を更新して表示する（入力中の内容は消えます）";
+          button.addEventListener("click", function () { window.location.reload(); });
+          status.appendChild(button);
+        }
+      }).catch(function () {
+        if (status) status.textContent = "分析の状態を確かめられませんでした。画面を更新してください。";
+      });
+    }
+    setTimeout(poll, POLL_MS);
   }
 
   function setupChat() {
@@ -6829,32 +6864,74 @@ a:hover {
     var form = document.getElementById("skill-chat-form");
     var status = document.getElementById("skill-chat-status");
     var url = box.getAttribute("data-messages-url");
-    var timer = null;
+    var polling = false;
+    var lastSig = null;
 
     function setStatus(text, kind) {
       if (!status) return;
       status.textContent = text;
       status.className = "small " + (kind ? "text-" + kind : "text-muted");
     }
+    function nearBottom() { return box.scrollHeight - box.scrollTop - box.clientHeight < 60; }
     function scrollDown() { box.scrollTop = box.scrollHeight; }
-    function stop() { if (timer) { clearInterval(timer); timer = null; } }
-    function refresh() {
-      getJson(url).then(function (data) {
-        box.innerHTML = data.html;
-        scrollDown();
-        if (!data.pending) {
-          stop();
+
+    // 新しいやり取りの HTML のうち、印(data-msg-id と data-status)が変わった発言だけを入れ替える
+    function merge(html) {
+      var follow = nearBottom();
+      var holder = document.createElement("div");
+      holder.innerHTML = html;
+      var incoming = holder.querySelectorAll("[data-msg-id]");
+      if (!incoming.length) {
+        box.innerHTML = html;
+        return;
+      }
+      var empty = box.querySelector("[data-empty]");
+      if (empty) empty.parentNode.removeChild(empty);
+      Array.prototype.forEach.call(incoming, function (el) {
+        var id = el.getAttribute("data-msg-id");
+        var current = box.querySelector('[data-msg-id="' + id + '"]');
+        if (!current) {
+          box.appendChild(el);
+          follow = true;
+        } else if (current.getAttribute("data-status") !== el.getAttribute("data-status")) {
+          current.parentNode.replaceChild(el, current);
+        }
+      });
+      if (follow) scrollDown();
+    }
+
+    function poll() {
+      getJson(url).then(function (res) {
+        var data = res.data;
+        if (data.sig !== lastSig) {
+          lastSig = data.sig;
+          merge(data.html);
+        }
+        if (data.pending) {
+          setTimeout(poll, POLL_MS);
+          return;
+        }
+        polling = false;
+        if (data.last_status === "done") {
           setStatus("応答が届きました。", "success");
+        } else if (data.last_status) {
+          setStatus("応答を作れませんでした（やり取りの中の案内を見てください）。", "danger");
         }
       }).catch(function (error) {
-        stop();
+        polling = false;
         setStatus(error.message, "danger");
       });
     }
-    function start() { if (!timer) timer = setInterval(refresh, POLL_MS); }
+    function startPolling() {
+      if (polling) return;
+      polling = true;
+      setTimeout(poll, POLL_MS);
+    }
 
     scrollDown();
-    if (box.getAttribute("data-pending") === "1") start();
+    var chatTab = document.getElementById("skill-ai-chat-tab");
+    if (chatTab) chatTab.addEventListener("shown.bs.tab", scrollDown);
+    if (box.getAttribute("data-pending") === "1") startPolling();
     if (!form || !window.fetch || !window.FormData) return;
     var textarea = form.elements["question"];
     var button = form.querySelector("button");
@@ -6875,18 +6952,18 @@ a:hover {
       fetch(form.action, {
         method: "POST", body: new FormData(form), credentials: "same-origin",
         headers: { "Accept": "application/json" }
-      }).then(function (r) {
-        if (r.status === 401 || r.redirected) throw new Error(LOGIN_EXPIRED);
-        return r.json().then(function (data) { return { ok: r.ok, data: data }; });
-      }).then(function (res) {
-        if (res.ok && res.data.ok) {
-          box.innerHTML = res.data.html;
+      }).then(readJson).then(function (res) {
+        var data = res.data;
+        if (res.ok && data.ok) {
+          lastSig = data.sig;
+          box.innerHTML = data.html;
+          if (data.once && form.elements["once"]) form.elements["once"].value = data.once;
           textarea.value = "";
           scrollDown();
           setStatus("AIが応答を作成しています（数十秒〜数分）…", "muted");
-          start();
+          startPolling();
         } else {
-          setStatus(res.data.message || "送れませんでした。", "danger");
+          setStatus(data.message || "送れませんでした。", "danger");
         }
       }).catch(function (error) {
         setStatus("送れませんでした: " + error.message, "danger");
@@ -6899,6 +6976,7 @@ a:hover {
   function init() {
     var panel = document.getElementById("skill-ai");
     if (!panel) return;
+    panel.addEventListener("input", function () { dirty = true; });
     showTabFromHash();
     watchAnalysis(panel);
     setupChat();
