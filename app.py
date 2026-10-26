@@ -129,6 +129,7 @@ import re
 import secrets
 import smtplib
 import socket
+import ssl
 import statistics
 import sys
 import tempfile
@@ -3165,9 +3166,26 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 # ---- ここから下が差し替え対象(HTTP通信部分) ----
+def _ai_tls_context():
+    """AI の接続先が https のときの接続の設定(接続先の証明書は確認しない。requests の verify=False と同じ)。
+
+    URL と API キーだけで接続できるようにする: 接続先が公的でない認証局・自己署名の証明書を使っていても、
+    証明書を登録せずに使える(確認すると、Python の知らない発行元の証明書は CERTIFICATE_VERIFY_FAILED で
+    接続できない)。安全な再ネゴシエーション(RFC 5746)に対応していない接続先・中継装置にも接続する
+    (OpenSSL 3 を使う Python の UNSAFE_LEGACY_RENEGOTIATION_DISABLED で接続できなくならないように)。
+    """
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False  # 先に外す(ホスト名の確認が有効なままでは CERT_NONE にできない)
+    context.verify_mode = ssl.CERT_NONE
+    # Python 3.12 より前は定数の名前が無いため、OpenSSL の値(0x4)を使う
+    context.options |= getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
+    return context
+
 def _call_chat_api(messages):
     """チャット補完APIを呼び出して本文テキストを返す。
 
+    送る内容: POST、ヘッダー Content-Type: application/json と Authorization: Bearer <APIキー>(キーが空なら
+    付けない)、本文 {"model": ..., "messages": [...], "temperature": 0.3}。応答の choices[0].message.content を返す。
     独自APIに差し替える場合は、この関数だけをそのAPIの仕様に合わせて書き換える。
     (認証ヘッダ・リクエスト形式・レスポンスの取り出し方など)
     例外はそのまま送出し、呼び出し元の ai_chat() で文言に変換する。
@@ -3185,12 +3203,13 @@ def _call_chat_api(messages):
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         method="POST",
     )
-    request_obj.add_header("Content-Type", "application/json; charset=utf-8")
+    request_obj.add_header("Content-Type", "application/json")
     if values["api_key"]:
         request_obj.add_header("Authorization", "Bearer {}".format(values["api_key"]))
 
-    # 接続先がリダイレクトを返しても従わない(Authorization〔APIキー〕を別の接続先へ送らないため)
-    opener = urllib.request.build_opener(_NoRedirect)
+    # https の接続先の証明書は確認しない(_ai_tls_context)。接続先がリダイレクトを返しても従わない
+    # (Authorization〔APIキー〕を別の接続先へ送らないため)
+    opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=_ai_tls_context()), _NoRedirect)
     with opener.open(request_obj, timeout=values["timeout"]) as response:
         data = json.loads(response.read().decode("utf-8"))
 
