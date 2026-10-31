@@ -19,7 +19,6 @@
     定型業務　　　　　  routine/list.html  routine/detail.html  routine/form.html
                         routine/occurrence.html  routine/reminder_mail.html
     出勤表・年休　　　  leaves/list.html  leaves/calendar.html（出勤表）  leaves/detail.html  leaves/form.html
-                        leaves/shifts.html  leaves/shift_month.html
     スキル　　　　　　  skills/map.html  skills/member.html  skills/member_edit.html  skills/items.html
                         skills/item_form.html  skills/coverage.html  skills/operations.html
                         skills/operation_edit.html  skills/_ai_panel.html  skills/_chat_messages.html
@@ -29,10 +28,11 @@
     チーム管理　　　　  departments/manage.html
     週報　　　　　　　  weekly/index.html
     期限超過通知　　　  overdue/index.html  overdue/mail.html
-    システム設定　　　  system/settings.html  system/_config_tab.html  system/_weekly_tab.html
+    システム設定　　　  system/settings.html  system/_recipients_tab.html（メールの宛先）  system/_weekly_tab.html
                         system/_overdue_tab.html  system/_skill_ai_tab.html
                         system/_analysis_tab.html  system/_reminder_tab.html
-                        system/_env_config_tab.html（ほかの環境の基本設定）  system/_envs_tab.html（環境）
+    システム管理(admin) admin/_layout.html  admin/home.html  admin/envs.html  admin/settings.html
+                        system/_config_tab.html（基本設定のフォーム）  admin/shifts.html  admin/shift_month.html
     静的ファイル　　　  static/css/style.css  static/js/sort-table.js  static/js/auto-filter.js
                         static/js/routine-form.js  static/js/task-form.js
                         static/js/skill-item-form.js  static/js/skill-ai.js
@@ -54,7 +54,7 @@
   <link href="{{ url_for('static', filename='css/style.css') }}" rel="stylesheet">
 </head>
 <body class="bg-light">
-  {% if current_user.is_authenticated %}
+  {% block navbar %}{% if current_user.is_authenticated %}
   {# マネージャーは項目が多いため、横に並べるのは幅 1200px 以上(それより狭い画面はメニューのボタンで開く) #}
   <nav class="navbar {{ 'navbar-expand-xl' if current_user.is_manager else 'navbar-expand-lg' }} navbar-dark bg-primary">
     <div class="container-fluid">
@@ -123,7 +123,9 @@
                      href="{{ url_for('system.settings') }}"><i class="bi bi-gear"></i> システム設定</a></li>
             </ul>
           </li>
-          {% endif %}
+          {% endif %}{% if admin_url %}
+          {# 固定ローカル管理者(admin): システム管理(すべての環境の一覧・共通の設定) #}
+          <li class="nav-item"><a class="nav-link" href="{{ admin_url }}"><i class="bi bi-shield-lock"></i> システム管理</a></li>{% endif %}
         </ul>
         <ul class="navbar-nav">
           <li class="nav-item dropdown">
@@ -137,7 +139,9 @@
               <li><hr class="dropdown-divider"></li>
               {% endif %}
               {# 自分のメールアドレス(定型業務のリマインドの宛先) #}
-              <li><a class="dropdown-item {% if request.blueprint == 'account' %}active{% endif %}" href="{{ url_for('account.email') }}"><i class="bi bi-envelope"></i> メールアドレス</a></li>{% if env_nav %}
+              <li><a class="dropdown-item {% if request.blueprint == 'account' %}active{% endif %}" href="{{ url_for('account.email') }}"><i class="bi bi-envelope"></i> メールアドレス</a></li>{% if admin_url %}
+              {# 固定ローカル管理者(admin): ほかの環境はシステム管理の一覧から開く #}
+              <li><a class="dropdown-item" href="{{ admin_url }}"><i class="bi bi-shield-lock"></i> システム管理</a></li>{% elif env_nav %}
               {# 複数の環境(グループ)のとき: 使う環境の選び直し(環境の選択の画面) #}
               <li><a class="dropdown-item" href="{{ env_nav.switch_url }}"><i class="bi bi-arrow-left-right"></i> 環境の切り替え</a></li>{% endif %}
               <li><a class="dropdown-item" href="{{ url_for('auth.logout') }}"><i class="bi bi-box-arrow-right"></i> ログアウト</a></li>
@@ -147,7 +151,7 @@
       </div>
     </div>
   </nav>
-  {% endif %}
+  {% endif %}{% endblock %}
 
   <main class="{% block main_class %}container{% endblock %} py-4">
     {% with messages = get_flashed_messages(with_categories=true) %}
@@ -1072,18 +1076,17 @@
         <button type="button" class="btn btn-sm btn-outline-primary" id="mail-file-button">ファイルを選ぶ</button>
         <input type="file" id="mail-file" class="d-none" tabindex="-1" aria-hidden="true" accept=".msg,.eml,message/rfc822,application/vnd.ms-outlook">
       </div>
-      {% if ai_enabled %}
-      <div class="form-check small mt-2 mb-0">
-        <input class="form-check-input" type="checkbox" id="mail-use-ai" checked>
-        <label class="form-check-label" for="mail-use-ai">AIで整える（件名・本文・差出人・宛先・添付のファイル名と、スキル項目の一覧を AI の接続先に送ります）</label>
+      {# 下書きは AI で作る(件名・本文などを AI の接続先に送る)。AI が未設定のときは決まった読み取り方で作る(app.py の 15-4) #}
+      <div class="small mt-2 mb-0 {{ 'text-muted' if ai_enabled else 'text-warning-emphasis' }}" id="mail-ai-note" data-ai="{{ '1' if ai_enabled else '0' }}">
+        {% if ai_enabled %}<i class="bi bi-stars"></i> AIで下書き（タイトル・内容のまとめ・日付・優先度・規模・必要スキル）を作ります。件名・本文・差出人・宛先・添付のファイル名と、スキル項目の一覧を AI の接続先に送ります（{{ ai_status }}）。
+        {% else %}<i class="bi bi-exclamation-triangle"></i> AIが未設定のため、メールの内容から決まった読み取り方で下書きを作ります（AI を使うには、固定ローカル管理者 admin がシステム管理の「基本設定」で AI の接続先を設定します）。{% endif %}
       </div>
-      {% endif %}
       <div id="mail-status" class="small mt-2" role="status" aria-live="polite"></div>
     </div>
     {% endif %}
 
     <form method="post" class="card card-body shadow-sm" id="task-form"
-          {% if can_plan %}data-recommend-url="{{ url_for('tasks.recommend') }}"{% if editing %} data-task-id="{{ task.id }}"{% endif %}{% endif %}>
+          {% if can_plan %}data-recommend-url="{{ url_for('tasks.recommend') }}" data-capacity-url="{{ url_for('tasks.capacity') }}"{% if editing %} data-task-id="{{ task.id }}"{% endif %}{% endif %}>
       {% if can_plan %}
       {# Enter キーでの送信は保存にする(フォームの最初の送信ボタンが使われるため。下の「推奨の担当者を表示」より前に置く) #}
       <button type="submit" class="visually-hidden" tabindex="-1" aria-hidden="true"></button>
@@ -1184,6 +1187,10 @@
           {% if can_plan %}<div class="form-text">担当者が完了までに要する工数の目安。スキル・キャパを考慮して選択。</div>{% endif %}
         </div>
       </div>
+      {% if can_plan %}
+      {# 規模が開始日〜期限の出勤日数を超えるときの案内(app.py の 15-2。JavaScript が有効なときは入力を変えるたびに確かめる) #}
+      <div id="capacity-alert" class="alert alert-warning small py-2{% if not capacity %} d-none{% endif %}" role="alert"><i class="bi bi-exclamation-triangle"></i> <span id="capacity-text">{{ capacity or '' }}</span></div>
+      {% endif %}
 
       <div class="mb-3">
         <label class="form-label">担当者(複数選択可){% if not can_plan %} <span class="text-muted small">（マネージャーのみ変更可）</span>{% endif %}</label>
@@ -1291,13 +1298,14 @@
 {#=== tasks/_recommend.html ===#}
 {# 担当者の推奨(app.py の 15-2)。tasks/form.html と GET /tasks/recommend の応答で使う。変数 rec(recommend_assignees の戻り値) #}
 {% if not rec.has_input %}
-<p class="text-muted small mb-0">必要スキル・開始日・期限を入れると、スキルの到達度と出勤表（年休・勤務表）から担当者の候補を表示します。</p>
+<p class="text-muted small mb-0">必要スキル・開始日・期限・規模を入れると、スキルの到達度・出勤表（年休・勤務表）・負荷から担当者の候補を表示します。</p>
 {% elif not rec.members %}
 <p class="text-muted small mb-0">スキル管理の対象のメンバー（有効なメンバー）がいません。</p>
 {% else %}
 <div class="small mb-1">
   {% if rec.period %}期間: {{ rec.period_label }}{% elif rec.dates_reversed %}<span class="text-danger">開始日が期限より後のため、休みは確かめていません。</span>{% else %}<span class="text-muted">開始日・期限が無いため、休みは確かめていません。</span>{% endif %}
   {%- if rec.requirements %} ／ 必要スキル: {% for r in rec.requirements %}{{ r.skill.name }}（Lv{{ r.need }}）{% if not loop.last %}、{% endif %}{% endfor %}{% endif %}
+  ／ {% if rec.scale_label %}規模: {{ rec.scale_label }}（このタスクの負荷 約{{ rec.task_h }}h/月）{% else %}<span class="text-muted">規模が未設定のため、このタスクの負荷は足していません</span>{% endif %}
   ／ 推奨 {{ rec.recommended }}名
 </div>
 <div class="table-responsive position-relative">
@@ -1309,21 +1317,24 @@
         {% if rec.requirements %}<th scope="col">必要スキル（到達度/必要）</th>{% endif %}
         <th scope="col">期間中の休み</th>
         {% if rec.counts_workdays %}<th scope="col" class="text-end">出勤日数</th>{% endif %}
-        <th scope="col" class="text-end">担当中</th>
+        <th scope="col" class="text-end text-nowrap">負荷（h/月）</th>
+        <th scope="col" class="text-end text-nowrap">{% if rec.scale_label %}担当した後{% else %}余力{% endif %}</th>
         <th scope="col"><span class="visually-hidden">操作</span></th>
       </tr>
     </thead>
     <tbody>
       {% for row in rec.rows %}
       <tr class="{% if not row.recommended %}recommend-muted{% endif %}">
-        <td class="text-nowrap">{% if row.recommended %}<span class="badge bg-success">推奨</span>{% elif row.has_leave %}<span class="badge bg-secondary">休みあり</span>{% elif row.no_workday %}<span class="badge bg-secondary">出勤なし</span>{% endif %}</td>
+        <td class="text-nowrap">{% if row.recommended %}<span class="badge bg-success">推奨</span>{% elif row.has_leave %}<span class="badge bg-secondary">休みあり</span>{% elif row.no_workday %}<span class="badge bg-secondary">出勤なし</span>{% elif row.overload %}<span class="badge bg-secondary">負荷超過</span>{% endif %}</td>
         <td class="text-nowrap">{{ row.user.display_name }}{% if row.shift %}<div class="small text-muted">{{ row.shift.name }}</div>{% endif %}</td>
         {% if rec.requirements %}
         <td>{% for d in row.detail %}<span class="badge {{ 'text-bg-primary' if d.ok else 'text-bg-danger' }} me-1" title="{{ d.skill.name }}: 到達度 Lv{{ d.have }}（{{ d.have_label }}）／必要 Lv{{ d.need }}">{{ d.skill.name }} {{ d.have }}/{{ d.need }}</span>{% endfor %}</td>
         {% endif %}
         <td class="small">{% if row.leaves %}{{ row.leaves|join('、') }}{% if row.more_leaves %} ほか{{ row.more_leaves }}日{% endif %}{% elif rec.period %}なし{% else %}―{% endif %}</td>
         {% if rec.counts_workdays %}<td class="text-end text-nowrap">{{ row.workdays }}日</td>{% endif %}
-        <td class="text-end text-nowrap">{{ row.open_tasks }}件</td>
+        <td class="text-end text-nowrap">{{ row.load_h }}h <span class="badge text-bg-{{ row.load_level.color }}">{{ row.load_level.label }}</span><div class="small text-muted">担当中 {{ row.open_tasks }}件</div></td>
+        <td class="text-end text-nowrap">{% if rec.scale_label %}{{ row.after_h }}h <span class="badge text-bg-{{ row.after_level.color }}">{{ row.after_level.label }}</span>{% endif %}
+          <div class="small {{ 'text-danger' if row.overload else 'text-muted' }}">{% if row.overload %}{{ row.spare_h }}h 超過{% else %}余力 {{ row.spare_h }}h{% endif %}</div></td>
         <td class="text-end"><button type="button" class="btn btn-sm btn-outline-primary text-nowrap d-none" data-assign="{{ row.user.id }}" data-name="{{ row.user.display_name }}">担当にする</button></td>
       </tr>
       {% endfor %}
@@ -1333,7 +1344,8 @@
 {% if rec.more %}<div class="small text-muted">ほか {{ rec.more }} 名（上位 {{ rec.rows|length }} 名を表示）</div>{% endif %}
 {% if rec.ignored %}<div class="small text-muted">無効にしたスキル（{{ rec.ignored|map(attribute='name')|join('、') }}）は比べていません。</div>{% endif %}
 {% if rec.long_period %}<div class="small text-muted">期間が長いため、出勤日数と勤務表の休みの日は数えていません（登録された年休だけ確かめています）。</div>{% endif %}
-<div class="small text-muted">推奨: 期間中に休み（年休・勤務表の年休の日）が無く、出勤日があり、必要スキルの到達度をすべて満たすメンバー（スキル管理の対象のメンバー）。担当中は未完了のタスクの数です。</div>
+<div class="small text-muted">推奨: 期間中に休み（年休・勤務表の年休の日）が無く、出勤日があり、必要スキルの到達度をすべて満たし、このタスクを担当しても月の負荷がフルタイム（{{ rec.load_full }}h）を超えないメンバー（スキル管理の対象のメンバー）。
+負荷は未完了のタスク（規模を期間で月あたりにならしたもの。複数担当は等分）と定型業務の月の工数の合計で、マネージャーダッシュボードの「ヒト別 負荷・案件状況」と同じです（編集中のこのタスクは含めません）。「担当した後」は、このタスクを1人で担当したときの負荷です。担当中は未完了のタスクの数です。</div>
 {% endif %}
 {#=== routine/list.html ===#}
 {% extends "base.html" %}
@@ -2041,9 +2053,12 @@
 <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
   <h1 class="h3 mb-0"><i class="bi bi-calendar-check"></i> 出勤表</h1>
   <div class="d-flex gap-2 flex-wrap">
+    {% if shift_admin_urls %}
+    {# 勤務パターン(すべての環境で共通)は admin だけ(システム管理の画面) #}
+    <a href="{{ shift_admin_urls.month }}" class="btn btn-outline-primary"><i class="bi bi-grid-3x3"></i> 勤務表の入力</a>
+    <a href="{{ shift_admin_urls.settings }}" class="btn btn-outline-secondary"><i class="bi bi-gear"></i> 勤務の設定</a>
+    {% endif %}
     {% if current_user.is_manager %}
-    <a href="{{ url_for('leaves.shift_month', month=month_key) }}" class="btn btn-outline-primary"><i class="bi bi-grid-3x3"></i> 勤務表の入力</a>
-    <a href="{{ url_for('leaves.shifts') }}" class="btn btn-outline-secondary"><i class="bi bi-gear"></i> 勤務の設定</a>
     <a href="{{ url_for('export.leaves_xlsx') }}" class="btn btn-outline-success"><i class="bi bi-file-earmark-excel"></i> Excel出力</a>
     {% endif %}
     <a href="{{ url_for('leaves.list_leaves') }}" class="btn btn-outline-secondary"><i class="bi bi-list-ul"></i> 年休の一覧</a>
@@ -2138,7 +2153,7 @@
   <span>（無効化したチームは、同じ日に休む人数を判定しません）</span>{% endfor %}
 </div>
 {% if not roster.has_shifts and current_user.is_manager %}
-<p class="small text-muted mt-2 mb-0"><i class="bi bi-info-circle"></i> 勤務がまだありません。「勤務の設定」で勤務（例: 1班 A・日勤）と勤務表の記号を設定し、チームの管理でメンバーの勤務を選ぶと、勤務帯・勤務ごとに並びます。</p>
+<p class="small text-muted mt-2 mb-0"><i class="bi bi-info-circle"></i> 勤務がまだありません。固定ローカル管理者（admin）がシステム管理の「勤務パターン」で勤務（例: 1班 A・日勤）と勤務表の記号を設定し、チームの管理でメンバーの勤務を選ぶと、勤務帯・勤務ごとに並びます。</p>
 {% endif %}
 {% endblock %}
 {#=== leaves/detail.html ===#}
@@ -2247,28 +2262,29 @@
   </div>
 </div>
 {% endblock %}
-{#=== leaves/shifts.html ===#}
-{% extends "base.html" %}
-{% block title %}勤務の設定 &middot; {{ app_name }}{% endblock %}
+{#=== admin/shifts.html ===#}
+{# システム管理の「勤務パターン」: 勤務の設定(すべての環境で共通。admin だけ。app.py の 16-3) #}
+{% extends "admin/_layout.html" %}
+{% block title %}勤務の設定 &middot; システム管理 &middot; {{ app_name }}{% endblock %}
 
 {% block content %}
 <nav aria-label="breadcrumb">
   <ol class="breadcrumb">
-    <li class="breadcrumb-item"><a href="{{ url_for('leaves.calendar_view') }}">出勤表</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('admin.home') }}">システム管理</a></li>
     <li class="breadcrumb-item active">勤務の設定</li>
   </ol>
 </nav>
 <div class="d-flex justify-content-between align-items-center mb-1 flex-wrap gap-2">
   <h1 class="h3 mb-0"><i class="bi bi-gear"></i> 勤務の設定</h1>
-  <a href="{{ url_for('leaves.shift_month', month=this_month) }}" class="btn btn-outline-primary"><i class="bi bi-grid-3x3"></i> 勤務表の入力</a>
+  <a href="{{ url_for('admin.shift_month', month=this_month) }}" class="btn btn-outline-primary"><i class="bi bi-grid-3x3"></i> 勤務表の入力</a>
 </div>
-<p class="text-muted small">交替勤務の班・日勤などの勤務と、勤務表の記号を設定します。メンバーの勤務は「チームの管理」で選びます。マネージャーのみ。</p>
+<p class="text-muted small">交替勤務の班・日勤などの勤務と、勤務表の記号を設定します。勤務パターンは会社の中で共通のため、すべての環境の出勤表で使います（固定ローカル管理者 admin だけが変更できます）。メンバーの勤務は、各環境のマネージャーが「チームの管理」で選びます。人数はすべての環境の合計です。</p>
 
 <div class="card shadow-sm mb-4">
   <div class="card-header bg-white fw-bold">勤務の一覧</div>
   <div class="card-body">
     {% for s in shifts %}
-    <form method="post" action="{{ url_for('leaves.save_shift', shift_id=s.id) }}" class="row g-2 align-items-center mb-2">
+    <form method="post" action="{{ url_for('admin.save_shift', shift_id=s.id) }}" class="row g-2 align-items-center mb-2">
       {# 開いたときの内容の控え(ほかの操作の変更を古い画面の値で上書きしない) #}
       <input type="hidden" name="version" value="{{ versions[s.id] }}">
       <div class="col-md-3"><input type="text" name="name" class="form-control form-control-sm" value="{{ s.name }}" maxlength="{{ name_max }}" aria-label="勤務の名前" required></div>
@@ -2277,7 +2293,7 @@
       <div class="col-md-2">{% if s.is_active %}<span class="badge bg-success">有効</span>{% else %}<span class="badge bg-secondary">無効</span>{% endif %} <span class="text-muted small">{{ counts.get(s.id, 0) }}名</span></div>
       <div class="col-md-2"><button class="btn btn-sm btn-outline-primary">保存</button></div>
     </form>
-    <form method="post" action="{{ url_for('leaves.toggle_shift', shift_id=s.id) }}" class="mb-3">
+    <form method="post" action="{{ url_for('admin.toggle_shift', shift_id=s.id) }}" class="mb-3">
       <input type="hidden" name="active" value="{{ '0' if s.is_active else '1' }}">
       <button class="btn btn-sm btn-outline-{{ 'danger' if s.is_active else 'success' }}">{{ '無効化' if s.is_active else '有効化' }}</button>
     </form>
@@ -2286,7 +2302,7 @@
     {% endfor %}
 
     <hr>
-    <form method="post" action="{{ url_for('leaves.new_shift') }}" class="row g-2 align-items-end">
+    <form method="post" action="{{ url_for('admin.new_shift') }}" class="row g-2 align-items-end">
       {# 追加の二度押しで「既にあります」だけが表示されないようにする1回限りの印 #}
       <input type="hidden" name="once" value="{{ submit_token() }}">
       <div class="col-md-3">
@@ -2312,7 +2328,7 @@
   <div class="card-header bg-white fw-bold">勤務表の記号</div>
   <div class="card-body">
     <p class="small text-muted">勤務表に書く記号（1文字）と、その名前・種類です。種類は、出勤表の色と担当者の推奨に使います（出勤・臨時出勤＝出勤の日、休日＝休み、年休＝休み〔担当者の推奨で、その日がある期間は対応できない〕）。勤務表で使っている記号は消せません（名前・種類は変えられます）。{% if not codes_saved %}<strong>まだ保存していません。</strong>例を入れてあるので、名前を勤務表の凡例に合わせて「記号を保存」を押してください。{% endif %}</p>
-    <form method="post" action="{{ url_for('leaves.save_shift_codes') }}">
+    <form method="post" action="{{ url_for('admin.save_shift_codes') }}">
       <input type="hidden" name="codes_version" value="{{ codes_version }}">
       <input type="hidden" name="rows" value="{{ code_rows|length }}">
       <div class="table-responsive">
@@ -2341,35 +2357,36 @@
   </div>
 </div>
 {% endblock %}
-{#=== leaves/shift_month.html ===#}
-{% extends "base.html" %}
-{% block title %}勤務表の入力（{{ year }}年{{ month }}月） &middot; {{ app_name }}{% endblock %}
+{#=== admin/shift_month.html ===#}
+{# システム管理の「勤務パターン」: 勤務表の入力(すべての環境で共通。admin だけ。app.py の 16-3) #}
+{% extends "admin/_layout.html" %}
+{% block title %}勤務表の入力（{{ year }}年{{ month }}月） &middot; システム管理 &middot; {{ app_name }}{% endblock %}
 
 {% block content %}
 <nav aria-label="breadcrumb">
   <ol class="breadcrumb">
-    <li class="breadcrumb-item"><a href="{{ url_for('leaves.calendar_view', year=year, month=month) }}">出勤表</a></li>
-    <li class="breadcrumb-item"><a href="{{ url_for('leaves.shifts') }}">勤務の設定</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('admin.home') }}">システム管理</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('admin.shifts') }}">勤務の設定</a></li>
     <li class="breadcrumb-item active">勤務表の入力</li>
   </ol>
 </nav>
 <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
   <h1 class="h3 mb-0"><i class="bi bi-grid-3x3"></i> 勤務表の入力（{{ year }}年 {{ month }}月）</h1>
   <div class="btn-group">
-    {% if prev %}<a class="btn btn-outline-secondary btn-sm" href="{{ url_for('leaves.shift_month', month=prev) }}">&laquo; 前月</a>{% endif %}
-    <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('leaves.shift_month') }}">今月</a>
-    {% if next %}<a class="btn btn-outline-secondary btn-sm" href="{{ url_for('leaves.shift_month', month=next) }}">次月 &raquo;</a>{% endif %}
+    {% if prev %}<a class="btn btn-outline-secondary btn-sm" href="{{ url_for('admin.shift_month', month=prev) }}">&laquo; 前月</a>{% endif %}
+    <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('admin.shift_month') }}">今月</a>
+    {% if next %}<a class="btn btn-outline-secondary btn-sm" href="{{ url_for('admin.shift_month', month=next) }}">次月 &raquo;</a>{% endif %}
   </div>
 </div>
 <p class="small text-muted">勤務ごとに、1日から順に記号を入力します（{{ days|length }}日分）。Excel の勤務表の1行（日のセル）をコピーして、そのまま貼り付けられます。空白・「,」で区切っても、区切らずに続けて入力してもかまいません。記号の無い日は「-」です（記号の無い日は、土日・祝日を休み、それ以外を出勤として扱います）。</p>
-{% if not codes %}<div class="alert alert-warning small">勤務表の記号がまだありません。先に「<a href="{{ url_for('leaves.shifts') }}">勤務の設定</a>」で記号を保存してください。</div>{% endif %}
-{% if not items %}<div class="alert alert-info small">有効な勤務がありません。「<a href="{{ url_for('leaves.shifts') }}">勤務の設定</a>」で勤務を追加してください。</div>{% endif %}
+{% if not codes %}<div class="alert alert-warning small">勤務表の記号がまだありません。先に「<a href="{{ url_for('admin.shifts') }}">勤務の設定</a>」で記号を保存してください。</div>{% endif %}
+{% if not items %}<div class="alert alert-info small">有効な勤務がありません。「<a href="{{ url_for('admin.shifts') }}">勤務の設定</a>」で勤務を追加してください。</div>{% endif %}
 {% if codes %}
 <div class="small mb-1">記号: {% for c in codes %}<span class="badge bg-light text-dark border me-1">{{ c.code }} {{ c.label }}（{{ c.kind }}）</span>{% endfor %}</div>
 {% endif %}
 <div class="small text-muted mb-3">日付: {% for d in days %}<span class="{% if d.sun %}text-danger{% elif d.sat %}text-primary{% endif %}">{{ d.day }}{{ d.weekday }}</span>{% if not loop.last %} {% endif %}{% endfor %}</div>
 
-<form method="post" action="{{ url_for('leaves.shift_month', month=key) }}">
+<form method="post" action="{{ url_for('admin.shift_month', month=key) }}">
   <input type="hidden" name="month" value="{{ key }}">
   {% for item in items %}
   <div class="row g-2 align-items-center mb-2">
@@ -2384,7 +2401,7 @@
   {% endfor %}
   <div class="d-flex gap-2 mt-3">
     {% if items %}<button class="btn btn-primary"><i class="bi bi-check-lg"></i> 保存</button>{% endif %}
-    <a href="{{ url_for('leaves.calendar_view', year=year, month=month) }}" class="btn btn-outline-secondary">出勤表へ</a>
+    <a href="{{ url_for('admin.shifts') }}" class="btn btn-outline-secondary">勤務の設定へ</a>
   </div>
 </form>
 {% endblock %}
@@ -3159,7 +3176,7 @@
      data-analysis-running="{{ '1' if an.running else '' }}">
   <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
     <span class="fw-bold"><i class="bi bi-stars"></i> AIのスキル分析・相談</span>
-    <span class="small text-muted">{% if ai.ai_enabled %}AI: {{ ai.ai_status }}{% else %}<span class="text-danger">AIが未設定のため使えません</span>（システム設定の「基本設定」タブで、AI の接続先とモデル名を設定します）{% endif %}</span>
+    <span class="small text-muted">{% if ai.ai_enabled %}AI: {{ ai.ai_status }}{% else %}<span class="text-danger">AIが未設定のため使えません</span>（固定ローカル管理者 admin がシステム管理の「基本設定」で、AI の接続先とモデル名を設定します）{% endif %}</span>
   </div>
   <div class="card-body">
     <ul class="nav nav-tabs small mb-3" role="tablist">
@@ -4404,7 +4421,7 @@
       <input type="hidden" name="from" value="{{ period.start.strftime('%Y-%m-%d') }}">
       <input type="hidden" name="to" value="{{ period.end.strftime('%Y-%m-%d') }}">
       <button class="btn btn-sm btn-primary" {% if not ai_configured or ai_run.running %}disabled{% endif %}
-              title="{{ '表示している期間（' ~ period.label ~ '）で、AIが本文を読んで分析します' if ai_configured else 'AIが未設定です（システム設定の「基本設定」タブ）' }}">
+              title="{{ '表示している期間（' ~ period.label ~ '）で、AIが本文を読んで分析します' if ai_configured else 'AIが未設定です（システム管理の「基本設定」。admin）' }}">
         <i class="bi bi-stars"></i> AIで分析
       </button>
     </form>
@@ -4466,7 +4483,7 @@
     <div class="text-muted mt-2">
       <i class="bi bi-shield-exclamation"></i>
       「AIで分析」を押すと、{{ ai_analysis_sent_items() }}が、
-      システム設定の「基本設定」で設定したAIの接続先に送られます{% if ai_configured %}（{{ ai_status }}）{% endif %}。
+      システム管理の「基本設定」で設定したAIの接続先に送られます{% if ai_configured %}（{{ ai_status }}）{% endif %}。
       結果は <code>instance/ai_analysis.json</code> に最新の1回分だけを保存します（DB には保存しません。メンバーは見られません）。
       {% if not ai_configured %}<br><span class="text-danger"><i class="bi bi-exclamation-circle"></i> AIが未設定のため、「AIで分析」は使えません（{{ ai_status }}）。</span>{% endif %}
     </div>
@@ -5303,7 +5320,7 @@
               {% if u.id == current_user.id %}
               <span class="text-muted small">（自分）</span>
               {% elif u.username in local_usernames %}
-              <span class="text-muted small" title="ログインのたびに有効に戻るため、削除・無効化できません（ログインを止めるにはシステム設定の「基本設定」タブで ADMIN_PASSWORD を変更）">（固定ローカル管理者）</span>
+              <span class="text-muted small" title="ログインのたびに有効に戻るため、削除・無効化できません（ログインを止めるにはシステム管理の「基本設定」で ADMIN_PASSWORD を変更）">（固定ローカル管理者）</span>
               {% else %}
               {# 確認文は data-confirm に入れる(表示名を onsubmit の JavaScript に直接書かない) #}
               <form method="post" action="{{ url_for('departments.delete_member', user_id=u.id) }}"
@@ -5498,7 +5515,7 @@
     </div>
   </div>
 
-  {# メール・AIの設定状況(読み取り専用。変更はシステム設定の「基本設定」タブ) #}
+  {# メール・AIの設定状況(読み取り専用。変更はシステム管理の「基本設定」〔admin〕・宛先は「メールの宛先」タブ) #}
   <div class="col-lg-4">
     <div class="card shadow-sm h-100">
       <div class="card-header bg-white fw-bold"><i class="bi bi-gear"></i> メール・AIの設定（読み取り専用）</div>
@@ -5526,8 +5543,8 @@
         </dl>
         <hr>
         <div class="text-muted">
-          メール（<code>MAIL_〜</code>）・AI（<code>AI_〜</code>）の設定は、
-          <a href="{{ url_for('system.settings', tab='config') }}">システム設定の「基本設定」タブ</a>で変更します。
+          宛先は <a href="{{ url_for('system.settings', tab='recipients') }}">システム設定の「メールの宛先」タブ</a>で変更します。
+          メールの送信サーバー・差出人（<code>MAIL_〜</code>）・AI（<code>AI_〜</code>）は、すべての環境で共通の設定のため、固定ローカル管理者（admin）がシステム管理の「基本設定」で変更します。
         </div>
       </div>
     </div>
@@ -5626,7 +5643,7 @@
 {% if link_problem %}
 <div class="alert alert-warning small py-2">
   <i class="bi bi-exclamation-triangle"></i> {{ link_problem }}
-  <a href="{{ url_for('system.settings', tab='config') }}">基本設定を開く</a>
+  （リンクの基準URLは、固定ローカル管理者 admin がシステム管理の「基本設定」で設定します）
 </div>
 {% endif %}
 
@@ -5692,7 +5709,7 @@
     </div>
   </div>
 
-  {# メール・リンクの設定状況(読み取り専用。変更はシステム設定の「基本設定」タブ) #}
+  {# メール・リンクの設定状況(読み取り専用。変更はシステム管理の「基本設定」〔admin〕・宛先は「メールの宛先」タブ) #}
   <div class="col-lg-4">
     <div class="card shadow-sm h-100">
       <div class="card-header bg-white fw-bold"><i class="bi bi-gear"></i> メール・リンクの設定（読み取り専用）</div>
@@ -5721,8 +5738,8 @@
         </dl>
         <hr>
         <div class="text-muted">
-          これらは <a href="{{ url_for('system.settings', tab='config') }}">システム設定の「基本設定」タブ</a>で変更します
-          （送信サーバー・差出人は「メール送信」、宛先は「宛先」〔週報と同じ〕、リンクは「リンク」の「リンクの基準URL」）。
+          宛先は <a href="{{ url_for('system.settings', tab='recipients') }}">システム設定の「メールの宛先」タブ</a>（週報と同じ）で変更します。
+          送信サーバー・差出人・リンクの基準URLは、すべての環境で共通の設定のため、固定ローカル管理者（admin）がシステム管理の「基本設定」で変更します。
         </div>
       </div>
     </div>
@@ -5864,27 +5881,10 @@
   <h1 class="h3 mb-0"><i class="bi bi-gear"></i> システム設定</h1>
 </div>
 <p class="text-muted small">
-  アプリの設定をこの画面でまとめて変更します。マネージャーのみ。
+  この環境の機能の設定とメールの宛先を、この画面でまとめて変更します。マネージャーのみ。
   タブごとにフォームが分かれていて、保存ボタンを押したタブの内容だけを保存します（ほかのタブの入力は保存されません）。
+  すべての環境で共通の設定（AI・メールの送信サーバーなど）は、固定ローカル管理者（admin）がシステム管理の「基本設定」で変更します。
 </p>
-
-{% if cfg.file_error %}
-<div class="alert alert-danger small">
-  <i class="bi bi-x-octagon"></i> <strong>画面の設定のファイル（<code>instance/settings.json</code>）を読み込めません。</strong> {{ cfg.file_error }}
-  基本設定は画面から保存できません（初期値と実行中の値を表示しています）。ファイルを直すか、名前を変えて（画面の設定を捨てて）ください。上書きはしません。
-</div>
-{% endif %}
-
-{% if cfg.pending %}
-<div class="alert alert-warning small">
-  <i class="bi bi-arrow-repeat"></i> <strong>再起動が必要な変更があります。</strong>
-  次の項目は、保存した値（有効な値）と実行中の値が異なります。サーバーを再起動すると反映されます:
-  {% for f in cfg.pending %}<code>{{ f.key }}</code>（{{ f.label }}）{% if not loop.last %}、{% endif %}{% endfor %}
-  {% if cfg.pending_secret_key %}
-  <div class="mt-1"><i class="bi bi-exclamation-triangle"></i> <code>SECRET_KEY</code> が変わるため、再起動すると全員がログアウトされます。</div>
-  {% endif %}
-</div>
-{% endif %}
 
 <ul class="nav nav-tabs" id="system-tabs" role="tablist">
   {% for key, label, icon in tabs %}
@@ -5898,8 +5898,8 @@
 </ul>
 
 <div class="tab-content pt-3">
-  <div class="tab-pane fade {% if tab == 'config' %}show active{% endif %}" id="pane-config" role="tabpanel" aria-labelledby="tab-config">
-    {% if env_main %}{% include "system/_config_tab.html" %}{% else %}{{ file_error_alert(rc) }}{% include "system/_env_config_tab.html" %}{% endif %}
+  <div class="tab-pane fade {% if tab == 'recipients' %}show active{% endif %}" id="pane-recipients" role="tabpanel" aria-labelledby="tab-recipients">
+    {{ file_error_alert(rc) }}{% include "system/_recipients_tab.html" %}
   </div>
   <div class="tab-pane fade {% if tab == 'weekly' %}show active{% endif %}" id="pane-weekly" role="tabpanel" aria-labelledby="tab-weekly">
     {{ file_error_alert(wk) }}{% include "system/_weekly_tab.html" %}
@@ -5915,10 +5915,7 @@
   </div>
   <div class="tab-pane fade {% if tab == 'reminder' %}show active{% endif %}" id="pane-reminder" role="tabpanel" aria-labelledby="tab-reminder">
     {{ file_error_alert(rm) }}{% include "system/_reminder_tab.html" %}
-  </div>{% if ev %}
-  <div class="tab-pane fade {% if tab == 'envs' %}show active{% endif %}" id="pane-envs" role="tabpanel" aria-labelledby="tab-envs">
-    {% include "system/_envs_tab.html" %}
-  </div>{% endif %}
+  </div>
 </div>
 {% endblock %}
 
@@ -5927,7 +5924,8 @@
 <script src="{{ url_for('static', filename='js/system-settings.js') }}"></script>
 {% endblock %}
 {#=== system/_config_tab.html ===#}
-{# システム設定「基本設定（config）」タブ。項目の定義は app.py の FIELDS。
+{# システム管理の「基本設定」のフォーム(admin だけ。admin/settings.html から読む)。項目の定義は app.py の FIELDS。
+   宛先(MAIL_TO・MAIL_CC)は環境ごとの設定(各環境の「メールの宛先」タブ)のため、ここには出さない。
    値は2つの層(初期値 config.py ＋ 画面の設定 instance/settings.json)から決まり、画面で編集するのは画面の設定の層だけ #}
 {% macro layer_line(row) %}
 {% set f = row.field %}
@@ -6026,12 +6024,6 @@
 <div class="form-text">{{ f.help }}</div>
 {% endmacro %}
 
-{% if env_nav %}
-<div class="alert alert-info small py-2">
-  <i class="bi bi-collection"></i> 複数の環境（グループ）で使っています。ここの設定は<strong>すべての環境で共通</strong>です
-  （宛先の <code>MAIL_TO</code>・<code>MAIL_CC</code> だけは、この環境〈{{ env_nav.name }}〉の週報・期限超過通知の宛先です。ほかの環境の宛先は、その環境のシステム設定で設定します）。
-</div>
-{% endif -%}
 <p class="small text-muted">
   環境ごとの設定（接続先・宛先・パスワードなど）です。値は <strong>初期値</strong>（<code>config.py</code>。app.py と同じフォルダ）と
   <strong>画面の設定</strong>（<code>instance/settings.json</code>。この画面で保存した値）の2つの層から決まり、
@@ -6042,7 +6034,7 @@
   {% if cfg.updated_at %}<br>画面の設定の最終更新: {{ cfg.updated_at }}（{{ cfg.updated_by }}）{% endif %}
 </p>
 
-<form method="post" action="{{ url_for('system.save_config') }}" id="config-form" autocomplete="off" novalidate>
+<form method="post" action="{{ url_for('admin.save_settings') }}" id="config-form" autocomplete="off" novalidate>
   <input type="hidden" name="version" value="{{ cfg.version }}">
   {# 保存のボタンの二度押しの2回目を「ほかの人の保存」と案内しないための1回限りの印 #}
   <input type="hidden" name="once" value="{{ submit_token() }}">
@@ -6112,7 +6104,7 @@
     <p class="small text-muted">保存済みの設定（有効な値）で接続を確かめます。入力中の値は使わないため、変更した場合は先に保存してください。</p>
     <div class="row g-3">
       <div class="col-md-6">
-        <form method="post" action="{{ url_for('system.test_mail') }}">
+        <form method="post" action="{{ url_for('admin.test_mail') }}">
           <button class="btn btn-sm btn-outline-primary" {% if cfg.mail_test_problem %}disabled{% endif %}>
             <i class="bi bi-envelope-check"></i> メール接続テスト
           </button>
@@ -6125,7 +6117,7 @@
         {% endif %}
       </div>
       <div class="col-md-6">
-        <form method="post" action="{{ url_for('system.test_ai') }}">
+        <form method="post" action="{{ url_for('admin.test_ai') }}">
           <button class="btn btn-sm btn-outline-primary" {% if not cfg.ai_enabled %}disabled{% endif %}>
             <i class="bi bi-robot"></i> AI接続テスト
           </button>
@@ -6294,7 +6286,7 @@
       </div>
       <div class="form-text">
         ファイル名・件名・メール本文で使えます。ファイル名に使えない文字（\ / : * ? " &lt; &gt; |）は「_」に置き換え、拡張子 .docx は自動で付けます。
-        メールの宛先は「基本設定」タブの「宛先」で設定します。
+        メールの宛先は「メールの宛先」タブで設定します。
       </div>
     </div>
   </div>
@@ -6342,7 +6334,7 @@
         </div>
       </div>
       <div class="form-text mt-3">
-        宛先は「基本設定」タブの「宛先」（週報と同じ <code>MAIL_TO</code> / <code>MAIL_CC</code>）、タスクへのリンクは「リンク」の「リンクの基準URL」で設定します。
+        宛先は「メールの宛先」タブ（週報と同じ <code>MAIL_TO</code> / <code>MAIL_CC</code>）、タスクへのリンクはシステム管理の「基本設定」（admin）の「リンクの基準URL」で設定します。
       </div>
     </div>
     <div class="card-footer bg-white d-flex justify-content-end">
@@ -6354,7 +6346,7 @@
 {# システム設定「スキル（AI）」タブ(instance/skill_ai_settings.json に保存)。入力チェックは app.py の parse_skill_ai_form #}
 <p class="small text-muted d-flex flex-wrap justify-content-between gap-2">
   <span>
-    タスクの完了からのスキルの自動更新の設定です。スキルマップの上部の「AIのスキル分析・相談」も、「基本設定」タブの AI の接続先を使います。
+    タスクの完了からのスキルの自動更新の設定です。スキルマップの上部の「AIのスキル分析・相談」も、システム管理の「基本設定」（admin）の AI の接続先を使います。
     設定は <code>instance/skill_ai_settings.json</code> に保存され、DB には保存しません。
   </span>
   <a href="{{ url_for('skills.history') }}"><i class="bi bi-box-arrow-up-right"></i> スキルの変更の履歴</a>
@@ -6448,7 +6440,7 @@
       </div>
       <div class="form-text mt-2">
         「AIで分析」を押すと、{{ ai_analysis_sent_items() }}が、
-        「基本設定」タブの AI の接続先に送られます。結果は <code>instance/ai_analysis.json</code> に最新の1回分だけを保存します。
+        システム管理の「基本設定」（admin）の AI の接続先に送られます。結果は <code>instance/ai_analysis.json</code> に最新の1回分だけを保存します。
       </div>
     </div>
     <div class="card-footer bg-white d-flex justify-content-end">
@@ -6480,7 +6472,7 @@
 {% if rm_status.link_problem %}
 <div class="alert alert-warning small py-2">
   <i class="bi bi-exclamation-triangle"></i> リンクの基準URL（<code>APP_BASE_URL</code>）が未設定・不正のため、メールに業務の画面・完了の入力へのリンクを付けられません（業務名だけを載せます）。
-  「基本設定」タブの「リンク」で設定してください。
+  システム管理の「基本設定」（admin）の「リンク」で設定してください。
 </div>
 {% endif %}
 
@@ -6514,7 +6506,7 @@
       </div>
       <div class="form-text mt-3">
         それぞれの時刻に1日1回送ります（2つの時刻は違う時刻にします。その日に送った後に時刻を変えても、その時刻の分は翌日から送ります）。経過日数は土日祝を除いた営業日で数えます。
-        差出人は「基本設定」タブの差出人（<code>MAIL_FROM</code>）、業務へのリンクは「リンク」の「リンクの基準URL」です。宛先の <code>MAIL_TO</code> / <code>MAIL_CC</code> は使いません。
+        差出人はシステム管理の「基本設定」（admin）の差出人（<code>MAIL_FROM</code>）、業務へのリンクは「リンク」の「リンクの基準URL」です。宛先の <code>MAIL_TO</code> / <code>MAIL_CC</code> は使いません。
       </div>
     </div>
     <div class="card-footer bg-white d-flex justify-content-end">
@@ -6641,12 +6633,12 @@
     <div class="small text-muted mt-2">HTMLを表示できないメールソフトではテキスト版が表示されます。件名の件数は、その宛先に送る回の数です。</div>
   </div>
 </div>
-{#=== system/_env_config_tab.html ===#}
-{# ほかの環境(グループ)のシステム設定「基本設定」タブ(app.py の 17 章)。rc は env_mail_form_context の値。
-   この環境の宛先(instance/envs/<キー>/env_mail_settings.json)だけを編集し、すべての環境で共通の設定は読み取り専用で表示する #}
+{#=== system/_recipients_tab.html ===#}
+{# システム設定「メールの宛先」タブ(app.py の 11-3)。rc は env_mail_form_context の値。この環境の宛先
+   (instance/env_mail_settings.json。ほかの環境は instance/envs/<キー>/)を編集し、すべての環境で共通の設定は読み取り専用で表示する #}
 <p class="small text-muted">
-  この環境（{{ rc.env_name }}）の週報・期限超過通知の宛先と、すべての環境で共通の設定です。
-  共通の設定（AI・メールの送信サーバー・差出人・送信を許可するドメイン・リンクの基準URL）は、メインの環境のマネージャーがメインの環境のシステム設定で変更します。
+  週報・期限超過通知のメールの宛先です{% if env_nav %}（この環境: {{ rc.env_name }}）{% endif %}。定型業務リマインドは担当者のメールアドレスに送るため、この宛先は使いません。
+  すべての環境で共通の設定（AI・メールの送信サーバー・差出人・送信を許可するドメイン・リンクの基準URL）は、固定ローカル管理者（admin）がシステム管理の「基本設定」で変更します。
 </p>
 {% if rc.mail_problem %}
 <div class="alert alert-warning small py-2"><i class="bi bi-exclamation-triangle"></i> {{ rc.mail_problem }}</div>
@@ -6702,23 +6694,114 @@
     </div>
   </div>
 </div>
-{#=== system/_envs_tab.html ===#}
-{# システム設定「環境」タブ(メインの環境だけ。app.py の 17 章)。ev は envs_tab_context の値。
-   環境(グループ)ごとに DB・設定が別。ログインは共通で、ログインの後に使う環境を選ぶ #}
+{#=== admin/_layout.html ===#}
+{# システム管理の画面(固定ローカル管理者 admin だけ。app.py の 18 章)の共通の枠。ナビはシステム管理の項目だけ #}
+{% extends "base.html" %}
+{% block navbar %}
+<nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+  <div class="container-fluid">
+    <a class="navbar-brand fw-bold" href="{{ url_for('admin.home') }}">
+      <i class="bi bi-shield-lock"></i> {{ app_name }} <span class="badge bg-warning text-dark align-middle env-badge">システム管理</span>
+    </a>
+    <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarAdmin"
+            aria-controls="navbarAdmin" aria-expanded="false" aria-label="メニュー">
+      <span class="navbar-toggler-icon"></span>
+    </button>
+    <div class="collapse navbar-collapse" id="navbarAdmin">
+      <ul class="navbar-nav me-auto">
+        <li class="nav-item"><a class="nav-link {% if request.endpoint == 'admin.home' %}active{% endif %}" href="{{ url_for('admin.home') }}"><i class="bi bi-house"></i> トップ</a></li>
+        <li class="nav-item"><a class="nav-link {% if request.endpoint in ('admin.envs', 'admin.create_env') %}active{% endif %}" href="{{ url_for('admin.envs') }}"><i class="bi bi-collection"></i> 環境</a></li>
+        <li class="nav-item"><a class="nav-link {% if request.endpoint in ('admin.settings', 'admin.save_settings') %}active{% endif %}" href="{{ url_for('admin.settings') }}"><i class="bi bi-sliders"></i> 基本設定</a></li>
+        <li class="nav-item"><a class="nav-link {% if request.endpoint in ('admin.shifts', 'admin.shift_month', 'admin.new_shift', 'admin.save_shift_codes') %}active{% endif %}" href="{{ url_for('admin.shifts') }}"><i class="bi bi-calendar3"></i> 勤務パターン</a></li>
+      </ul>
+      <ul class="navbar-nav">
+        <li class="nav-item"><span class="navbar-text small me-3"><i class="bi bi-person-badge"></i> {{ current_user.display_name }}（admin）</span></li>
+        <li class="nav-item"><a class="nav-link" href="{{ url_for('auth.logout') }}"><i class="bi bi-box-arrow-right"></i> ログアウト</a></li>
+      </ul>
+    </div>
+  </div>
+</nav>
+{% endblock %}
+{#=== admin/home.html ===#}
+{# システム管理のトップ(すべての環境の一覧と開く・共通の設定への入口)。ev は app.py の envs_tab_context の値 #}
+{% extends "admin/_layout.html" %}
+{% block title %}システム管理 &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<h1 class="h3 mb-1"><i class="bi bi-shield-lock"></i> システム管理</h1>
+<p class="text-muted small">
+  固定ローカル管理者（admin）だけの画面です。すべての環境（グループ）を開いて、その環境のマネージャーと同じように編集できます。
+  すべての環境で共通の設定（基本設定・勤務パターン）と、環境の追加・停止はここで行います。各環境のマネージャーは、その環境の中だけを編集します。
+</p>
+{% if ev.error %}
+<div class="alert alert-danger small"><i class="bi bi-x-octagon"></i> <strong>環境の一覧のファイル（<code>instance/environments.json</code>）を読み込めません。</strong> {{ ev.error }}</div>
+{% endif %}
+<div class="card shadow-sm mb-4">
+  <div class="card-header bg-white fw-bold d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <span><i class="bi bi-collection"></i> 環境（グループ）</span>
+    <a class="btn btn-sm btn-outline-primary" href="{{ url_for('admin.envs') }}"><i class="bi bi-gear"></i> 環境の追加・名前の変更・停止</a>
+  </div>
+  <div class="list-group list-group-flush">
+    {% for e in ev.envs %}
+    <div class="list-group-item d-flex justify-content-between align-items-center flex-wrap gap-2">
+      <div class="text-break">
+        <span class="fw-bold">{{ e.name }}</span>
+        {% if e.key == 'main' %}<span class="badge bg-primary">メイン</span>{% elif not e.active %}<span class="badge bg-secondary">停止中</span>{% endif %}
+        <div class="small text-muted"><code>{{ e.url }}</code>・メンバー {% if e.members is none %}―{% else %}{{ e.members }}人{% endif %}</div>
+      </div>
+      {% if e.open_url %}<a class="btn btn-sm btn-primary" href="{{ e.open_url }}"><i class="bi bi-box-arrow-in-right"></i> 開く</a>{% else %}<span class="small text-muted">停止中（開けません）</span>{% endif %}
+    </div>
+    {% endfor %}
+  </div>
+</div>
+<div class="row g-3 mb-4">
+  <div class="col-md-6">
+    <div class="card shadow-sm h-100">
+      <div class="card-body">
+        <h2 class="h6 fw-bold"><i class="bi bi-sliders"></i> 基本設定</h2>
+        <p class="small text-muted mb-2">AI の接続先・メールの送信サーバー・差出人・送信を許可するドメイン・リンクの基準URL・admin のパスワードなど、すべての環境で共通の設定です（メールの宛先は各環境で設定します）。</p>
+        <a class="btn btn-sm btn-outline-primary" href="{{ url_for('admin.settings') }}">基本設定を開く</a>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-6">
+    <div class="card shadow-sm h-100">
+      <div class="card-body">
+        <h2 class="h6 fw-bold"><i class="bi bi-calendar3"></i> 勤務パターン</h2>
+        <p class="small text-muted mb-2">勤務（交替勤務の班・日勤など）・勤務表の記号・月ごとの勤務表です。会社の中で共通のため、すべての環境の出勤表で使います（メンバーの勤務は各環境のチーム管理で選びます）。</p>
+        <a class="btn btn-sm btn-outline-primary" href="{{ url_for('admin.shifts') }}">勤務の設定</a>
+        <a class="btn btn-sm btn-outline-primary" href="{{ url_for('admin.shift_month') }}">勤務表の入力</a>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{#=== admin/envs.html ===#}
+{# システム管理の「環境」(環境の一覧・開く・追加〔名前だけ〕・名前の変更・停止/再開。admin だけ)。ev は envs_tab_context の値 #}
+{% extends "admin/_layout.html" %}
+{% block title %}環境 &middot; システム管理 &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('admin.home') }}">システム管理</a></li>
+    <li class="breadcrumb-item active">環境</li>
+  </ol>
+</nav>
+<h1 class="h3 mb-1"><i class="bi bi-collection"></i> 環境（グループ）</h1>
 <p class="small text-muted">
-  ほかのグループ（マネージャーごとのチーム）も、このサーバーを別の環境として使えます。環境ごとにタスク・メンバー・スキル・出勤表・定期メールの設定が分かれ、
-  ログインの画面は1つです（ログインの後に、自分が登録されている環境を選びます。admin はすべての環境に入れます）。
-  基本設定（AI・メールの送信サーバーなど）はすべての環境で共通で、宛先（<code>MAIL_TO</code>・<code>MAIL_CC</code>）だけが環境ごとです。
-  環境を追加するときに、その環境の最初のマネージャーを登録します（メンバーは、そのマネージャーがその環境のチーム管理で登録します）。
+  グループ（マネージャーごとのチーム）ごとに、このサーバーを別の環境として使えます。環境ごとにタスク・メンバー・スキル・出勤表・定期メールの設定とメールの宛先が分かれ、
+  ログインの画面は1つです（ログインの後に、自分が登録されている環境に入ります）。基本設定と勤務パターンはすべての環境で共通です。
+  環境を追加したら「開く」からその環境に入り、チーム管理でメンバー（マネージャーを含む）を登録してください。
 </p>
 {% if ev.error %}
 <div class="alert alert-danger small"><i class="bi bi-x-octagon"></i> <strong>環境の一覧のファイル（<code>instance/environments.json</code>）を読み込めません。</strong> {{ ev.error }} ファイルを直すまで、環境の追加・変更はできません。</div>
 {% endif %}
 {% if not ev.multi %}
-<div class="alert alert-light border small py-2">今は1つの環境だけで使っています（今までと同じ動き）。環境を追加すると、ログインの後に環境を選ぶ画面になります（ログイン中の人はそのまま使えます）。</div>
+<div class="alert alert-light border small py-2">今は1つの環境だけで使っています（今までと同じ動き）。環境を追加すると、ログインの後に、登録されている環境に入る（複数なら選ぶ）ようになります（ログイン中の人はそのまま使えます）。</div>
 {% endif %}
 <div class="card shadow-sm mb-3">
-  <div class="card-header bg-white fw-bold"><i class="bi bi-collection"></i> 環境の一覧</div>
+  <div class="card-header bg-white fw-bold"><i class="bi bi-list-ul"></i> 環境の一覧</div>
   <div class="card-body">
     <div class="table-responsive">
       <table class="table table-sm align-middle mb-0">
@@ -6727,7 +6810,7 @@
           {% for e in ev.envs %}
           <tr>
             <td style="min-width: 14rem;">
-              <form method="post" action="{{ url_for('system.rename_env', key=e.key) }}" class="d-flex gap-1">
+              <form method="post" action="{{ url_for('admin.rename_env', key=e.key) }}" class="d-flex gap-1">
                 <input type="hidden" name="version" value="{{ ev.version }}">
                 <input type="text" class="form-control form-control-sm" name="name" value="{{ e.name }}" maxlength="{{ ev.name_max }}"
                        required aria-label="環境の名前（{{ e.name }}）">
@@ -6739,8 +6822,9 @@
             <td class="text-end">{% if e.members is none %}―{% else %}{{ e.members }}人{% endif %}</td>
             <td class="small text-muted text-nowrap ps-3">{{ e.created_at or '―' }}{% if e.created_by %}<div>{{ e.created_by }}</div>{% endif %}</td>
             <td class="text-nowrap">
+              {% if e.open_url %}<a class="btn btn-sm btn-primary" href="{{ e.open_url }}"><i class="bi bi-box-arrow-in-right"></i> 開く</a>{% endif %}
               {% if e.key != 'main' %}
-              <form method="post" action="{{ url_for('system.toggle_env', key=e.key) }}" class="d-inline"
+              <form method="post" action="{{ url_for('admin.toggle_env', key=e.key) }}" class="d-inline"
                     data-confirm="{% if e.active %}環境「{{ e.name }}」を停止します。この環境の画面は開けなくなり、定期メールも送りません（データは残り、再開できます）。よろしいですか？{% else %}環境「{{ e.name }}」を再開します。よろしいですか？{% endif %}"
                     onsubmit="return confirm(this.dataset.confirm);">
                 <input type="hidden" name="version" value="{{ ev.version }}">
@@ -6759,33 +6843,64 @@
 <div class="card shadow-sm mb-4">
   <div class="card-header bg-white fw-bold"><i class="bi bi-plus-circle"></i> 環境を追加</div>
   <div class="card-body">
-    <form method="post" action="{{ url_for('system.create_env') }}" autocomplete="off">
+    <form method="post" action="{{ url_for('admin.create_env') }}" autocomplete="off" class="row g-2 align-items-end">
       <input type="hidden" name="version" value="{{ ev.version }}">
       <input type="hidden" name="once" value="{{ submit_token() }}">
-      <div class="row g-2">
-        <div class="col-md-4">
-          <label class="form-label small fw-bold mb-0" for="env-new-name">環境の名前</label>
-          <input type="text" class="form-control form-control-sm" id="env-new-name" name="name" maxlength="{{ ev.name_max }}" required
-                 value="{{ ev.inputs.name or '' }}" placeholder="例: 〇〇グループ">
-        </div>
-        <div class="col-md-4">
-          <label class="form-label small fw-bold mb-0" for="env-new-username">最初のマネージャーのログインID</label>
-          <input type="text" class="form-control form-control-sm" id="env-new-username" name="username" maxlength="64" required
-                 value="{{ ev.inputs.username or '' }}" spellcheck="false">
-        </div>
-        <div class="col-md-4">
-          <label class="form-label small fw-bold mb-0" for="env-new-display">その人の氏名</label>
-          <input type="text" class="form-control form-control-sm" id="env-new-display" name="display_name" maxlength="128" required
-                 value="{{ ev.inputs.display_name or '' }}">
-        </div>
+      <div class="col-md-6">
+        <label class="form-label small fw-bold mb-0" for="env-new-name">環境の名前</label>
+        <input type="text" class="form-control form-control-sm" id="env-new-name" name="name" maxlength="{{ ev.name_max }}" required
+               value="{{ ev.inputs.name or '' }}" placeholder="例: 〇〇グループ">
       </div>
-      <div class="form-text">新しい環境の DB（<code>instance/envs/&lt;キー&gt;/app.db</code>）を作り、このマネージャーを登録します。URL は <code>/env/&lt;キー&gt;/</code> です。環境は削除できません（使わなくなったら停止します）。</div>
-      <div class="d-flex justify-content-end mt-2">
+      <div class="col-md-6">
         <button class="btn btn-primary" {% if ev.error %}disabled{% endif %}><i class="bi bi-plus-lg"></i> 環境を追加</button>
       </div>
     </form>
+    <div class="form-text">新しい環境の DB（<code>instance/envs/&lt;キー&gt;/app.db</code>）を作ります。URL は <code>/env/&lt;キー&gt;/</code> です。環境は削除できません（使わなくなったら停止します）。</div>
   </div>
 </div>
+{% endblock %}
+{#=== admin/settings.html ===#}
+{# システム管理の「基本設定」(すべての環境で共通の設定。admin だけ)。cfg は app.py の config_form_context の値 #}
+{% extends "admin/_layout.html" %}
+{% block title %}基本設定 &middot; システム管理 &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('admin.home') }}">システム管理</a></li>
+    <li class="breadcrumb-item active">基本設定</li>
+  </ol>
+</nav>
+<h1 class="h3 mb-1"><i class="bi bi-sliders"></i> 基本設定</h1>
+<p class="text-muted small">
+  すべての環境で共通の設定です（固定ローカル管理者 admin だけが変更できます）。
+  メールの宛先（<code>MAIL_TO</code>・<code>MAIL_CC</code>）は環境ごとの設定のため、各環境のシステム設定の「メールの宛先」タブで、その環境のマネージャーが設定します。
+</p>
+
+{% if cfg.file_error %}
+<div class="alert alert-danger small">
+  <i class="bi bi-x-octagon"></i> <strong>画面の設定のファイル（<code>instance/settings.json</code>）を読み込めません。</strong> {{ cfg.file_error }}
+  基本設定は画面から保存できません（初期値と実行中の値を表示しています）。ファイルを直すか、名前を変えて（画面の設定を捨てて）ください。上書きはしません。
+</div>
+{% endif %}
+
+{% if cfg.pending %}
+<div class="alert alert-warning small">
+  <i class="bi bi-arrow-repeat"></i> <strong>再起動が必要な変更があります。</strong>
+  次の項目は、保存した値（有効な値）と実行中の値が異なります。サーバーを再起動すると反映されます:
+  {% for f in cfg.pending %}<code>{{ f.key }}</code>（{{ f.label }}）{% if not loop.last %}、{% endif %}{% endfor %}
+  {% if cfg.pending_secret_key %}
+  <div class="mt-1"><i class="bi bi-exclamation-triangle"></i> <code>SECRET_KEY</code> が変わるため、再起動すると全員がログアウトされます。</div>
+  {% endif %}
+</div>
+{% endif %}
+
+{% include "system/_config_tab.html" %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/system-settings.js') }}"></script>
+{% endblock %}
 {#=== static/css/style.css ===#}
 /* 業務管理アプリ 追加スタイル */
 
@@ -7344,10 +7459,12 @@ a:hover {
 {#=== static/js/task-form.js ===#}
 /* タスクの登録・編集の画面(tasks/form.html。マネージャー)用(app.py の 15 章)。
  *
- * ・推奨の担当者: 必要スキル(req_skill_<スキルID>)・開始日・期限を変えるたびに、GET /tasks/recommend で表を作り直す
+ * ・推奨の担当者: 必要スキル(req_skill_<スキルID>)・開始日・期限・規模を変えるたびに、GET /tasks/recommend で表を作り直す
  *   (少し待ってから。続けて変えたときは最後の1回だけ使う)。表の「担当にする」は担当者のチェックを付け外しする。
  *   JavaScript が無効なときは「推奨の担当者を表示」のボタン(入力を残したまま画面を表示し直す。保存しない)。
  * ・必要スキル: 選んだスキルを見出し(summary)に出す。
+ * ・規模の案内: 規模・開始日・期限・担当者を変えるたびに、GET /tasks/capacity で、規模が期間の出勤日数を超えるかを
+ *   確かめて欄の下に出す。超えるまま保存するときは、保存の前に確かめる(保存は止めない)。
  * ・メールから下書き(登録の画面だけ): メールのファイル(.msg・.eml)をこの画面にドロップする(または「ファイルを選ぶ」)と、
  *   POST /tasks/draft-from-mail にファイルそのものを送り、返ってきた下書きをタイトル・内容・優先度・日付・必要スキルの
  *   欄に入れる(保存はしない。下書きに無い日付・必要スキルは今の入力のまま)。入力中の内容があれば、置き換える前に確認する。
@@ -7434,7 +7551,7 @@ a:hover {
       skillSelects(form).forEach(function (el) {
         if (el.value) params.append(el.name, el.value);
       });
-      ["start_date", "due_date"].forEach(function (name) {
+      ["start_date", "due_date", "scale"].forEach(function (name) {
         var el = form.elements[name];
         if (el && el.value) params.append(name, el.value);
       });
@@ -7470,7 +7587,7 @@ a:hover {
       if (SKILL_FIELD.test(target.name)) {
         updateSkillSummary(form);
         schedule();
-      } else if (target.name === "start_date" || target.name === "due_date") {
+      } else if (target.name === "start_date" || target.name === "due_date" || target.name === "scale") {
         schedule();
       } else if (target.name === "assignee_ids") {
         syncAssignButtons(panel);
@@ -7498,7 +7615,8 @@ a:hover {
     var status = byId("mail-status");
     var fileInput = byId("mail-file");
     var fileButton = byId("mail-file-button");
-    var useAi = byId("mail-use-ai");
+    var aiNote = byId("mail-ai-note");
+    var ai = !!(aiNote && aiNote.getAttribute("data-ai") === "1");
     var busy = false;
     var FIELDS = ["title", "description", "priority", "start_date", "due_date"];
 
@@ -7565,6 +7683,7 @@ a:hover {
       if (data.priority) setValue("priority", data.priority);
       if (data.start_date) setValue("start_date", data.start_date);
       if (data.due_date) setValue("due_date", data.due_date);
+      if (data.scale) setValue("scale", data.scale);
       if (data.skills && data.skills.length) {
         var levels = {};
         data.skills.forEach(function (skill) { levels["req_skill_" + skill.id] = String(skill.level); });
@@ -7574,6 +7693,7 @@ a:hover {
       }
       updateSkillSummary(form);
       if (refreshRecommend) refreshRecommend();
+      if (refreshCapacity) refreshCapacity();
     }
 
     function showResult(data) {
@@ -7614,10 +7734,9 @@ a:hover {
       }
       busy = true;
       var before = snapshot();
-      var ai = !!(useAi && useAi.checked);
-      setStatus(status, "「" + name + "」を読み取っています" + (ai ? "（AIで整えるため、数十秒かかることがあります）" : "") +
+      setStatus(status, "「" + name + "」を読み取っています" + (ai ? "（AIで下書きを作るため、数十秒かかることがあります）" : "") +
         (count > 1 ? "（ドロップした " + count + " 件のうち最初の1件）" : "") + "…", "muted");
-      fetch(url + (ai ? "?ai=1" : ""), {
+      fetch(url, {
         method: "POST",
         body: file,
         credentials: "same-origin",
@@ -7646,11 +7765,63 @@ a:hover {
     }
   }
 
+  // 規模が開始日〜期限の出勤日数を超えるかの案内(欄の下)と、超えるまま保存するときの確かめ
+  function setupCapacity(form) {
+    var url = form.getAttribute("data-capacity-url");
+    var box = byId("capacity-alert");
+    var text = byId("capacity-text");
+    if (!url || !box || !text || !window.fetch || !window.URLSearchParams) return null;
+    var timer = null;
+    var seq = 0;
+
+    function refresh() {
+      var params = new URLSearchParams();
+      ["scale", "start_date", "due_date", "status"].forEach(function (name) {
+        var el = form.elements[name];
+        if (el && el.value) params.append(name, el.value);
+      });
+      Array.prototype.forEach.call(form.querySelectorAll("input[name='assignee_ids']:checked"), function (el) {
+        params.append("assignee_ids", el.value);
+      });
+      var mine = ++seq;
+      fetch(url + "?" + params.toString(), {
+        headers: { "Accept": "application/json" },
+        credentials: "same-origin"
+      }).then(readJson).then(function (data) {
+        if (mine !== seq || !data.ok) return;
+        text.textContent = data.message || "";
+        box.classList.toggle("d-none", !data.message);
+      }).catch(function () {
+        // 確かめられなかったときは今の表示のまま(保存の後にもサーバーが確かめて案内する)
+      });
+    }
+
+    function schedule() {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(refresh, 300);
+    }
+
+    form.addEventListener("change", function (event) {
+      var name = event.target && event.target.name;
+      if (name === "scale" || name === "start_date" || name === "due_date" || name === "assignee_ids" || name === "status") schedule();
+    });
+    form.addEventListener("submit", function (event) {
+      var submitter = event.submitter;
+      if (submitter && submitter.name === "recommend") return;  // 推奨の表示(保存しない)
+      if (box.classList.contains("d-none") || !text.textContent) return;
+      if (!window.confirm(text.textContent + "\n\nこのまま保存しますか？")) event.preventDefault();
+    });
+    return refresh;
+  }
+
+  var refreshCapacity = null;
+
   function init() {
     var form = byId("task-form");
     if (!form) return;
     updateSkillSummary(form);
     var refresh = setupRecommend(form);
+    refreshCapacity = setupCapacity(form);
     setupMailDrop(form, refresh);
   }
 
@@ -8063,7 +8234,7 @@ a:hover {
  *
  * ・開いているタブを URL(?tab=...)に残す(再読み込み・ブックマークでも同じタブを開く)。
  *   #weekly のような URL の末尾(フラグメント)でもタブを指定できる。
- * ・基本設定で admin のパスワードを空にする・初期値に戻す、新しい SECRET_KEY を生成するときは、保存前に確認する。
+ * ・基本設定(システム管理の画面)で admin のパスワードを空にする・初期値に戻す、新しい SECRET_KEY を生成するときは、保存前に確認する。
  * ・基本設定の「初期値に戻す」にチェックすると、その項目の入力欄(今の画面の設定を表示している)を空にして入力できなくする
  *   (チェックを外すと元の表示に戻す。表示したままの値なら、JavaScript が無くてもサーバー側は「初期値に戻す」として受け付ける)。
  *
