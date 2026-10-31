@@ -21,8 +21,7 @@
     出勤表・年休　　　  leaves/list.html  leaves/calendar.html（出勤表）  leaves/detail.html  leaves/form.html
     スキル　　　　　　  skills/map.html  skills/member.html  skills/member_edit.html  skills/items.html
                         skills/item_form.html  skills/coverage.html  skills/operations.html
-                        skills/operation_edit.html  skills/_ai_panel.html  skills/_chat_messages.html
-                        skills/history.html  skills/plan_form.html  skills/plans.html
+                        skills/operation_edit.html  skills/_ai_panel.html  skills/history.html
     マネージャー　　　  manager/dashboard.html  manager/_gantt.html  manager/gantt_full.html
                         manager/analysis.html
     チーム管理　　　　  departments/manage.html
@@ -37,7 +36,7 @@
                         static/js/routine-form.js  static/js/task-form.js
                         static/js/skill-item-form.js  static/js/skill-ai.js
                         static/js/weekly-settings.js  static/js/system-settings.js
-                        static/js/ai-analysis.js  static/js/shift-month.js
+                        static/js/shift-month.js  static/js/ai-analysis.js
 #}
 {#=== base.html ===#}
 <!doctype html>
@@ -3013,27 +3012,19 @@
 </form>
 {% endblock %}
 {#=== skills/_ai_panel.html ===#}
-{# スキルマップの上部: AIの分析コメント・AIに相談(チャット)・計画とメモ・最近の自動更新(app.py の 8 章。マネージャーのみ)。
-   変数 ai(skill_ai_panel_context)・ai_active(最初に開くタブ。analysis / chat) #}
+{# スキルマップの上部: AIの分析コメント・最近の自動更新(app.py の 8 章。マネージャーのみ)。変数 ai(skill_ai_panel_context) #}
 {% from "_macros.html" import fmt_date, fmt_datetime %}
 {% set an = ai.analysis %}
 <div class="card shadow-sm mb-3" id="skill-ai" data-state-url="{{ url_for('skills.ai_state') }}"
      data-analysis-running="{{ '1' if an.running else '' }}">
   <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
-    <span class="fw-bold"><i class="bi bi-stars"></i> AIのスキル分析・相談</span>
+    <span class="fw-bold"><i class="bi bi-stars"></i> AIのスキル分析</span>
     <span class="small text-muted">{% if ai.ai_enabled %}AI: {{ ai.ai_status }}{% else %}<span class="text-danger">AIが未設定のため使えません</span>（固定ローカル管理者 admin がシステム管理の「基本設定」で、AI の接続先とモデル名を設定します）{% endif %}</span>
   </div>
   <div class="card-body">
     <ul class="nav nav-tabs small mb-3" role="tablist">
       <li class="nav-item" role="presentation">
-        <button class="nav-link {% if ai_active != 'chat' %}active{% endif %}" id="skill-ai-analysis-tab" data-bs-toggle="tab" data-bs-target="#skill-ai-analysis" type="button" role="tab" aria-controls="skill-ai-analysis" aria-selected="{{ 'false' if ai_active == 'chat' else 'true' }}"><i class="bi bi-clipboard-data"></i> 分析コメント</button>
-      </li>
-      <li class="nav-item" role="presentation">
-        <button class="nav-link {% if ai_active == 'chat' %}active{% endif %}" id="skill-ai-chat-tab" data-bs-toggle="tab" data-bs-target="#skill-ai-chat" type="button" role="tab" aria-controls="skill-ai-chat" aria-selected="{{ 'true' if ai_active == 'chat' else 'false' }}"><i class="bi bi-chat-dots"></i> AIに相談{% if ai.threads %} <span class="badge bg-secondary">{{ ai.threads|length }}</span>{% endif %}</button>
-      </li>
-      <li class="nav-item" role="presentation">
-        {% set plan_count = namespace(n=0) %}{% for g in ai.plan_groups %}{% set plan_count.n = plan_count.n + g.plans|length %}{% endfor %}
-        <button class="nav-link" id="skill-plans-tab" data-bs-toggle="tab" data-bs-target="#skill-plans" type="button" role="tab" aria-controls="skill-plans" aria-selected="false"><i class="bi bi-journal-check"></i> 計画・メモ{% if plan_count.n %} <span class="badge bg-secondary">{{ plan_count.n }}</span>{% endif %}</button>
+        <button class="nav-link active" id="skill-ai-analysis-tab" data-bs-toggle="tab" data-bs-target="#skill-ai-analysis" type="button" role="tab" aria-controls="skill-ai-analysis" aria-selected="true"><i class="bi bi-clipboard-data"></i> 分析コメント</button>
       </li>
       <li class="nav-item" role="presentation">
         <button class="nav-link" id="skill-ai-updates-tab" data-bs-toggle="tab" data-bs-target="#skill-ai-updates" type="button" role="tab" aria-controls="skill-ai-updates" aria-selected="false"><i class="bi bi-arrow-up-circle"></i> 最近の自動更新</button>
@@ -3041,7 +3032,7 @@
     </ul>
     <div class="tab-content">
       {# ---- 分析コメント ---- #}
-      <div class="tab-pane fade {% if ai_active != 'chat' %}show active{% endif %}" id="skill-ai-analysis" role="tabpanel" aria-labelledby="skill-ai-analysis-tab">
+      <div class="tab-pane fade show active" id="skill-ai-analysis" role="tabpanel" aria-labelledby="skill-ai-analysis-tab">
         <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-2">
           <div class="small text-muted" role="status" aria-live="polite" id="skill-ai-analysis-status">
             {% if an.running %}<span class="spinner-border spinner-border-sm" role="status"></span> AIが分析しています（数十秒〜数分）。終わると自動で表示されます。
@@ -3085,126 +3076,11 @@
           </div>
         </div>
         {% endif %}
-        <div class="small text-muted mt-2">AIの分析は参考です。残しておきたい内容は「AIに相談」で深めて、「計画に保存」で計画・メモにできます。</div>
+        <div class="small text-muted mt-2">AIの分析は参考です。</div>
         {% elif not an.running %}
-        <p class="small text-muted mb-1">「AIで分析」を押すと、スキルマップ（メンバーの到達度・業務に必要なスキル・最近の到達度の変更・保存済みの計画とメモ）をAIが読み、チームの強み・弱み・アクションアイテムと、メンバーごとの強み・弱み・次に伸ばすことを表示します。</p>
+        <p class="small text-muted mb-1">「AIで分析」を押すと、スキルマップ（メンバーの到達度・業務に必要なスキル・最近の到達度の変更）をAIが読み、チームの強み・弱み・アクションアイテムと、メンバーごとの強み・弱み・次に伸ばすことを表示します。</p>
         {% endif %}
-        <div class="small text-muted mt-2"><i class="bi bi-info-circle"></i> AIの接続先に送る内容: メンバーの氏名・チーム、スキル項目（説明の先頭）と到達度、最近90日の到達度の変更（きっかけのタスクの名前）、業務と必要なスキル、保存済みの計画・メモ（相談では、話題のメンバーの担当タスクの名前・状態と、それまでのやり取りも）。</div>
-      </div>
-
-      {# ---- AIに相談 ---- #}
-      <div class="tab-pane fade {% if ai_active == 'chat' %}show active{% endif %}" id="skill-ai-chat" role="tabpanel" aria-labelledby="skill-ai-chat-tab">
-        <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
-          {% if ai.threads %}
-          <form method="get" action="{{ url_for('skills.list_skills') }}" class="d-flex gap-1 align-items-center">
-            {% for key, values in request.args.lists() if key != 'thread' %}{% for v in values %}<input type="hidden" name="{{ key }}" value="{{ v }}">{% endfor %}{% endfor %}
-            <label class="small text-muted text-nowrap" for="skill-chat-thread">会話:</label>
-            <select name="thread" id="skill-chat-thread" class="form-select form-select-sm">
-              {% for t in ai.threads %}
-              <option value="{{ t.id }}" {% if ai.thread and t.id == ai.thread.id %}selected{% endif %}>{{ t.title }}（{{ fmt_datetime(t.updated_at) }}）</option>
-              {% endfor %}
-            </select>
-            <button class="btn btn-sm btn-outline-secondary text-nowrap">開く</button>
-          </form>
-          {% endif %}
-          <button class="btn btn-sm btn-outline-primary" type="button" data-bs-toggle="collapse" data-bs-target="#skill-chat-new" aria-expanded="{{ 'false' if ai.threads else 'true' }}"><i class="bi bi-plus-lg"></i> 新しい相談</button>
-        </div>
-        <div class="collapse {% if not ai.threads %}show{% endif %}" id="skill-chat-new">
-          <form method="post" action="{{ url_for('skills.chat_new') }}" class="border rounded p-2 mb-2">
-            <input type="hidden" name="once" value="{{ submit_token() }}">
-            <div class="row g-2 align-items-end">
-              <div class="col-md-5">
-                <label class="form-label small mb-0" for="skill-chat-title">題名（任意）</label>
-                <input type="text" name="title" id="skill-chat-title" class="form-control form-control-sm" maxlength="100" placeholder="例: 山田さんの教育計画">
-              </div>
-              <div class="col-md-4">
-                <label class="form-label small mb-0" for="skill-chat-focus">話題のメンバー（任意）</label>
-                <select name="focus" id="skill-chat-focus" class="form-select form-select-sm">
-                  <option value="">チーム全体</option>
-                  {% for u in ai.plan_users %}<option value="{{ u.form_key }}">{{ u.display_name }}</option>{% endfor %}
-                </select>
-              </div>
-              <div class="col-md-3 d-grid"><button class="btn btn-sm btn-primary">相談を始める</button></div>
-            </div>
-          </form>
-        </div>
-        {% if ai.thread %}
-        {% set th = ai.thread %}
-        <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-1">
-          <div class="small"><span class="fw-bold">{{ th.title }}</span>
-            <span class="text-muted">（話題: {{ th.focus_user.display_name if th.focus_user else 'チーム全体' }}{% if th.created_by %}・{{ th.created_by.display_name }}さんが開始{% endif %}）</span></div>
-          <form method="post" action="{{ url_for('skills.chat_delete', thread_id=th.id) }}" onsubmit="return confirm('この会話を削除しますか？（保存した計画・メモは残ります）');">
-            <input type="hidden" name="row" value="{{ th.row_key }}">
-            <button class="btn btn-sm btn-outline-danger py-0"><i class="bi bi-trash"></i> 会話を削除</button>
-          </form>
-        </div>
-        <div id="skill-chat-messages" class="border rounded p-2 mb-2 skill-chat-box"
-             data-messages-url="{{ url_for('skills.chat_messages_view', thread_id=th.id, row=th.row_key) }}"
-             data-pending="{{ '1' if ai.chat_pending else '' }}">{{ ai.chat_html|safe }}</div>
-        <form method="post" action="{{ url_for('skills.chat_send', thread_id=th.id) }}" id="skill-chat-form">
-          <input type="hidden" name="row" value="{{ th.row_key }}">
-          <input type="hidden" name="once" value="{{ submit_token() }}">
-          <label class="visually-hidden" for="skill-chat-question">質問</label>
-          <textarea name="question" id="skill-chat-question" class="form-control form-control-sm" rows="3" maxlength="{{ ai.question_max }}" required
-                    placeholder="例: {{ th.focus_user.display_name ~ 'さんの強み・弱みと、半年で単独でできる（Lv2）ようにするための教育計画を考えて' if th.focus_user else 'チームの弱みと、対応できる人が少ない業務を減らすためのアクションアイテムを考えて' }}"
-                    {% if not ai.ai_enabled %}disabled{% endif %}></textarea>
-          <div class="d-flex justify-content-between align-items-center mt-1 gap-2">
-            <span class="small text-muted" id="skill-chat-status" role="status" aria-live="polite">Ctrl＋Enter でも送れます。応答は数十秒〜数分かかります。</span>
-            <button class="btn btn-sm btn-primary text-nowrap" {% if not ai.ai_enabled %}disabled{% endif %}><i class="bi bi-send"></i> 送る</button>
-          </div>
-        </form>
-        {% else %}
-        <p class="small text-muted mb-0">「新しい相談」から、チーム全体またはメンバーを話題にしてAIと相談できます。強み・弱みの整理、アクションアイテム・中期計画・教育計画づくりに使い、良い応答は「計画に保存」で残せます。やり取りはマネージャー全員が見られます。</p>
-        {% endif %}
-      </div>
-
-      {# ---- 計画・メモ ---- #}
-      <div class="tab-pane fade" id="skill-plans" role="tabpanel" aria-labelledby="skill-plans-tab">
-        <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-2">
-          <span class="small text-muted">相談から保存した計画・メモ（進行中）。保存した計画・メモは、次の相談・分析の材料にもなります。</span>
-          <span class="d-flex gap-2">
-            <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('skills.plans') }}"><i class="bi bi-list-ul"></i> すべて（完了 {{ ai.plan_done_count }}件を含む）</a>
-            <button class="btn btn-sm btn-outline-primary" type="button" data-bs-toggle="collapse" data-bs-target="#skill-plan-new"><i class="bi bi-plus-lg"></i> 追加</button>
-          </span>
-        </div>
-        <div class="collapse" id="skill-plan-new">
-          <form method="post" action="{{ url_for('skills.plan_new') }}" class="border rounded p-2 mb-2">
-            <input type="hidden" name="once" value="{{ submit_token() }}">
-            <div class="row g-2">
-              <div class="col-md-3"><select name="kind" class="form-select form-select-sm" aria-label="種類">{% for key, label in ai.plan_kinds %}<option value="{{ key }}">{{ label }}</option>{% endfor %}</select></div>
-              <div class="col-md-3"><select name="target" class="form-select form-select-sm" aria-label="対象"><option value="">チーム全体</option>{% for u in ai.plan_users %}<option value="{{ u.form_key }}">{{ u.display_name }}</option>{% endfor %}</select></div>
-              <div class="col-md-3"><input type="date" name="due_date" class="form-control form-control-sm" aria-label="期限（任意）"></div>
-              <div class="col-12"><input type="text" name="title" class="form-control form-control-sm" maxlength="200" required placeholder="タイトル"></div>
-              <div class="col-12"><textarea name="body" class="form-control form-control-sm" rows="4" placeholder="内容（任意）"></textarea></div>
-              <div class="col-12 text-end"><button class="btn btn-sm btn-primary">保存</button></div>
-            </div>
-          </form>
-        </div>
-        {% for g in ai.plan_groups %}
-        <div class="mb-2">
-          <div class="small fw-bold"><span class="badge bg-{{ g.color }}{% if g.color == 'light' %} text-dark border{% endif %}">{{ g.label }}</span></div>
-          <ul class="list-group list-group-flush small">
-            {% for p in g.plans %}
-            <li class="list-group-item px-1">
-              <div class="d-flex justify-content-between flex-wrap gap-1">
-                <span><span class="fw-medium">{{ p.title }}</span>
-                  <span class="text-muted">（対象: {{ p.target_user.display_name if p.target_user else 'チーム全体' }}{% if p.due_date %}・期限 {{ fmt_date(p.due_date) }}{% endif %}）</span></span>
-                <div class="d-flex gap-1">
-                  <a class="btn btn-sm btn-outline-secondary py-0" href="{{ url_for('skills.plan_edit', plan_id=p.id) }}">編集</a>
-                  <form method="post" action="{{ url_for('skills.plan_status', plan_id=p.id) }}">
-                    <input type="hidden" name="row" value="{{ p.row_key }}"><input type="hidden" name="status" value="done">
-                    <button class="btn btn-sm btn-outline-success py-0">完了にする</button>
-                  </form>
-                </div>
-              </div>
-              {% if p.body %}<details><summary class="text-muted">内容</summary><div class="pre-wrap">{{ p.body }}</div></details>{% endif %}
-            </li>
-            {% endfor %}
-          </ul>
-        </div>
-        {% else %}
-        <p class="small text-muted mb-0">まだ計画・メモはありません。「AIに相談」の応答の「計画に保存」か、「追加」から作れます。</p>
-        {% endfor %}
+        <div class="small text-muted mt-2"><i class="bi bi-info-circle"></i> AIの接続先に送る内容: メンバーの氏名・チーム、スキル項目（説明の先頭）と到達度、最近90日の到達度の変更（きっかけのタスクの名前）、業務と必要なスキル、前回の分析コメント。</div>
       </div>
 
       {# ---- 最近の自動更新 ---- #}
@@ -3229,51 +3105,6 @@
     </div>
   </div>
 </div>
-{#=== skills/_chat_messages.html ===#}
-{# 相談のやり取り(app.py の _chat_messages_html。変数 thread・now・stale・plan_kinds・plan_users) #}
-{% from "_macros.html" import fmt_datetime %}
-{% for m in thread.messages %}
-{% set shown_status = 'stale' if (m.status == 'pending' and stale(m, now)) else m.status %}
-{% if m.is_ai %}
-<div class="skill-chat-msg skill-chat-ai mb-2" data-msg-id="{{ m.id }}" data-status="{{ shown_status }}">
-  <div class="small text-muted"><i class="bi bi-stars"></i> AI{% if m.finished_at and m.status == 'done' %}（{{ fmt_datetime(m.finished_at) }}）{% endif %}</div>
-  {% if m.status == 'pending' and not stale(m, now) %}
-  <div class="small"><span class="spinner-border spinner-border-sm" role="status"></span> 応答を作成しています…（この画面を開いたままにすると、できたときに表示されます）</div>
-  {% elif m.status != 'done' %}
-  <div class="small text-danger">{{ m.error or '応答の作成が途中で止まりました（サーバーの再起動など）。' }}</div>
-  <form method="post" action="{{ url_for('skills.chat_retry', message_id=m.id) }}" class="mt-1"><button class="btn btn-sm btn-outline-secondary py-0">もう一度</button></form>
-  {% else %}
-  <div class="pre-wrap small skill-chat-text">{{ m.content }}</div>
-  <details class="small mt-1">
-    <summary class="text-primary">計画に保存</summary>
-    <form method="post" action="{{ url_for('skills.plan_new') }}" class="border rounded p-2 mt-1">
-      <input type="hidden" name="once" value="{{ submit_token() }}">
-      <input type="hidden" name="thread" value="{{ thread.id }}">
-      <input type="hidden" name="source_message" value="{{ m.id }}">
-      <div class="row g-1">
-        <div class="col-md-3"><select name="kind" class="form-select form-select-sm" aria-label="種類">{% for key, label in plan_kinds %}<option value="{{ key }}" {% if key == ('education' if thread.focus_user_id else 'action') %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></div>
-        <div class="col-md-3"><select name="target" class="form-select form-select-sm" aria-label="対象"><option value="">チーム全体</option>{% for u in plan_users %}<option value="{{ u.form_key }}" {% if thread.focus_user_id == u.id %}selected{% endif %}>{{ u.display_name }}</option>{% endfor %}</select></div>
-        <div class="col-md-3"><input type="date" name="due_date" class="form-control form-control-sm" aria-label="期限（任意）"></div>
-        {% set first_line = (m.content or '').split('\n')[0]|trim %}
-        {% if first_line[:1] in ('■', '・') %}{% set first_line = first_line[1:]|trim %}{% endif %}
-        <div class="col-12"><input type="text" name="title" class="form-control form-control-sm" maxlength="200" required aria-label="タイトル"
-                                   value="{{ first_line[:60] }}"></div>
-        <div class="col-12"><textarea name="body" class="form-control form-control-sm" rows="5" aria-label="内容">{{ m.content }}</textarea></div>
-        <div class="col-12 text-end"><button class="btn btn-sm btn-primary">保存</button></div>
-      </div>
-    </form>
-  </details>
-  {% endif %}
-</div>
-{% else %}
-<div class="skill-chat-msg skill-chat-user mb-2" data-msg-id="{{ m.id }}" data-status="{{ shown_status }}">
-  <div class="small text-muted"><i class="bi bi-person"></i> {{ m.author.display_name if m.author else '（不明）' }}（{{ fmt_datetime(m.created_at) }}）</div>
-  <div class="pre-wrap small">{{ m.content }}</div>
-</div>
-{% endif %}
-{% else %}
-<div class="small text-muted" data-empty="1">まだやり取りはありません。下の欄に質問を入力して「送る」を押してください。</div>
-{% endfor %}
 {#=== skills/history.html ===#}
 {# 到達度の変更の記録と、タスクの完了からの自動更新の判定(app.py の 8-6。マネージャーのみ) #}
 {% extends "base.html" %}
@@ -3394,123 +3225,6 @@
   </div>
 </div>
 {% if more %}<p class="small text-muted mt-2">新しい順に {{ changes|length }}件まで表示しています（すべては「Excelデータ出力」の「スキル・業務」で出力できます）。</p>{% endif %}
-{% endblock %}
-{#=== skills/plan_form.html ===#}
-{# 計画・メモの編集(app.py の plan_edit。マネージャーのみ) #}
-{% extends "base.html" %}
-{% block title %}計画・メモの編集 &middot; {{ app_name }}{% endblock %}
-
-{% macro val(field) -%}
-  {%- if form and form.get(field) is not none -%}{{ form.get(field) }}
-  {%- elif field == 'due_date' -%}{{ plan.due_date.strftime('%Y-%m-%d') if plan.due_date else '' }}
-  {%- else -%}{{ plan[field] if plan[field] is not none else '' }}{%- endif -%}
-{%- endmacro %}
-
-{% block content %}
-<nav aria-label="breadcrumb">
-  <ol class="breadcrumb">
-    <li class="breadcrumb-item"><a href="{{ url_for('skills.list_skills') }}">スキルマップ</a></li>
-    <li class="breadcrumb-item"><a href="{{ url_for('skills.plans') }}">計画・メモ</a></li>
-    <li class="breadcrumb-item active">編集</li>
-  </ol>
-</nav>
-<div class="row justify-content-center">
-  <div class="col-lg-8">
-    <h1 class="h4 mb-3">計画・メモの編集</h1>
-    <form method="post" class="card card-body shadow-sm">
-      <input type="hidden" name="version" value="{{ version }}">
-      {% if back %}<input type="hidden" name="back" value="{{ back }}">{% endif %}
-      <div class="row g-2 mb-2">
-        <div class="col-md-4">
-          <label class="form-label small mb-0" for="plan-kind">種類</label>
-          <select name="kind" id="plan-kind" class="form-select form-select-sm">
-            {% for key, label in kinds %}<option value="{{ key }}" {% if val('kind') == key %}selected{% endif %}>{{ label }}</option>{% endfor %}
-          </select>
-        </div>
-        <div class="col-md-4">
-          <label class="form-label small mb-0" for="plan-target">対象</label>
-          {% set chosen = form.get('target') if form else (plan.target_user.form_key if plan.target_user else '') %}
-          <select name="target" id="plan-target" class="form-select form-select-sm">
-            <option value="">チーム全体</option>
-            {% for u in users %}<option value="{{ u.form_key }}" {% if chosen == u.form_key %}selected{% endif %}>{{ u.display_name }}{% if not u.is_active %}［無効］{% endif %}</option>{% endfor %}
-          </select>
-        </div>
-        <div class="col-md-4">
-          <label class="form-label small mb-0" for="plan-due">期限（任意）</label>
-          <input type="date" name="due_date" id="plan-due" class="form-control form-control-sm" value="{{ val('due_date') }}">
-        </div>
-      </div>
-      <div class="mb-2">
-        <label class="form-label small mb-0" for="plan-title">タイトル <span class="text-danger">*</span></label>
-        <input type="text" name="title" id="plan-title" class="form-control" maxlength="200" required value="{{ val('title') }}">
-      </div>
-      <div class="mb-2">
-        <label class="form-label small mb-0" for="plan-body">内容</label>
-        <textarea name="body" id="plan-body" class="form-control" rows="12">{{ val('body') }}</textarea>
-      </div>
-      <div class="mb-3">
-        <label class="form-label small mb-0" for="plan-status">状態</label>
-        <select name="status" id="plan-status" class="form-select form-select-sm" style="max-width: 12rem;">
-          {% for key, label in statuses.items() %}<option value="{{ key }}" {% if val('status') == key %}selected{% endif %}>{{ label }}</option>{% endfor %}
-        </select>
-      </div>
-      <div class="d-flex gap-2">
-        <button class="btn btn-primary"><i class="bi bi-check-lg"></i> 保存</button>
-        <a href="{{ url_for('skills.plans') if back else url_for('skills.list_skills') ~ '#skill-plans' }}" class="btn btn-outline-secondary">キャンセル</a>
-      </div>
-    </form>
-    <form method="post" action="{{ url_for('skills.plan_delete', plan_id=plan.id) }}" class="mt-2 text-end"
-          onsubmit="return confirm('この計画・メモを削除しますか？');">
-      <input type="hidden" name="row" value="{{ plan.row_key }}">
-      {% if back %}<input type="hidden" name="back" value="{{ back }}">{% endif %}
-      <button class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i> 削除</button>
-    </form>
-    <p class="small text-muted mt-2">作成: {{ plan.created_by.display_name if plan.created_by else '―' }}（{{ plan.created_at.strftime('%Y/%m/%d %H:%M') if plan.created_at else '' }}）{% if plan.updated_by %} ／ 最終更新: {{ plan.updated_by.display_name }}（{{ plan.updated_at.strftime('%Y/%m/%d %H:%M') if plan.updated_at else '' }}）{% endif %}</p>
-  </div>
-</div>
-{% endblock %}
-{#=== skills/plans.html ===#}
-{# 計画・メモの一覧(完了したものも。app.py の plans。マネージャーのみ) #}
-{% extends "base.html" %}
-{% from "_macros.html" import fmt_date %}
-{% block title %}計画・メモ &middot; {{ app_name }}{% endblock %}
-
-{% block content %}
-<nav aria-label="breadcrumb">
-  <ol class="breadcrumb">
-    <li class="breadcrumb-item"><a href="{{ url_for('skills.list_skills') }}">スキルマップ</a></li>
-    <li class="breadcrumb-item active">計画・メモ</li>
-  </ol>
-</nav>
-<h1 class="h3 mb-1"><i class="bi bi-journal-check"></i> 計画・メモ</h1>
-<p class="text-muted small">スキルマップの「AIに相談」から保存した計画・メモです（完了したものを含む）。進行中のものは、AIの相談・分析の材料になります。</p>
-{% for g in groups %}
-<div class="card shadow-sm mb-3">
-  <div class="card-header bg-white fw-bold"><span class="badge bg-{{ g.color }}{% if g.color == 'light' %} text-dark border{% endif %}">{{ g.label }}</span></div>
-  <ul class="list-group list-group-flush small">
-    {% for p in g.plans %}
-    <li class="list-group-item {% if p.status == 'done' %}text-muted{% endif %}">
-      <div class="d-flex justify-content-between flex-wrap gap-1">
-        <span>{% if p.status == 'done' %}<span class="badge bg-success">完了</span> {% endif %}<span class="fw-medium">{{ p.title }}</span>
-          <span class="text-muted">（対象: {{ p.target_user.display_name if p.target_user else 'チーム全体' }}{% if p.due_date %}・期限 {{ fmt_date(p.due_date) }}{% endif %}）</span></span>
-        <div class="d-flex gap-1">
-          <a class="btn btn-sm btn-outline-secondary py-0" href="{{ url_for('skills.plan_edit', plan_id=p.id, back='plans') }}">編集</a>
-          <form method="post" action="{{ url_for('skills.plan_status', plan_id=p.id) }}">
-            <input type="hidden" name="row" value="{{ p.row_key }}">
-            <input type="hidden" name="back" value="plans">
-            <input type="hidden" name="status" value="{{ 'active' if p.status == 'done' else 'done' }}">
-            <button class="btn btn-sm btn-outline-{{ 'secondary' if p.status == 'done' else 'success' }} py-0">{{ '進行中に戻す' if p.status == 'done' else '完了にする' }}</button>
-          </form>
-        </div>
-      </div>
-      {% if p.body %}<details><summary class="text-muted">内容</summary><div class="pre-wrap">{{ p.body }}</div></details>{% endif %}
-    </li>
-    {% endfor %}
-  </ul>
-</div>
-{% else %}
-<p class="text-muted">まだ計画・メモはありません。</p>
-{% endfor %}
 {% endblock %}
 {#=== manager/dashboard.html ===#}
 {% extends "base.html" %}
@@ -5863,24 +5577,6 @@
     <button class="btn btn-primary"><i class="bi bi-save"></i> 宛先を保存</button>
   </div>
 </form>
-<div class="card shadow-sm mb-4">
-  <div class="card-header bg-white fw-bold">すべての環境で共通の設定（読み取り専用）</div>
-  <div class="card-body small">
-    <div class="table-responsive">
-      <table class="table table-sm align-middle mb-0">
-        <thead class="table-light"><tr><th>項目</th><th>値</th></tr></thead>
-        <tbody>
-          {% for row in rc.shared %}
-          <tr>
-            <td>{{ row.field.label }}<div class="text-muted"><code>{{ row.field.key }}</code></div></td>
-            <td class="text-break">{{ row.text }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-  </div>
-</div>
 {#=== system/_weekly_tab.html ===#}
 {# システム設定「週報」タブ(instance/weekly_settings.json に保存)。入力チェックは app.py の parse_weekly_form #}
 <p class="small text-muted d-flex flex-wrap justify-content-between gap-2">
@@ -7246,24 +6942,6 @@ a:hover {
   min-width: 3.2rem;
 }
 
-/* スキルマップの「AIに相談」: やり取りの欄(高さを決めてスクロール) */
-.skill-chat-box {
-  max-height: 32rem;
-  overflow-y: auto;
-  background: var(--bs-tertiary-bg, #f8f9fa);
-}
-.skill-chat-msg {
-  padding: 0.4rem 0.6rem;
-  border-radius: 0.375rem;
-  background: #fff;
-}
-.skill-chat-user {
-  margin-left: 15%;
-  background: #eef4ff;
-}
-.skill-chat-ai {
-  margin-right: 5%;
-}
 /* タスクの登録の画面: メールから下書きのドロップ先・必要スキル(app.py の 15 章) */
 .mail-drop {
   border: 2px dashed #9ec5fe;
@@ -8124,12 +7802,10 @@ a:hover {
   }
 })();
 {#=== static/js/skill-ai.js ===#}
-/* スキルマップの上部「AIのスキル分析・相談」(skills/_ai_panel.html)用。
+/* スキルマップの上部「AIのスキル分析」(skills/_ai_panel.html)用。
  *
- * ・URL の #skill-plans などで、そのタブを開く(会話のタブを開いたときは、やり取りの最後を表示する)
+ * ・URL の #skill-ai-updates などで、そのタブを開く
  * ・分析の実行中は状態(/skills/ai/state)を見て、終わったら画面を読み直す(欄に入力中なら、読み直さずに案内を出す)
- * ・相談: 「送る」を画面を移動せずに送り、応答の作成中はやり取り(/skills/chat/<id>/messages)を見て、変わった
- *   発言だけを入れ替える(開いている「計画に保存」の入力は、その発言が変わらない限り残る。Ctrl＋Enter でも送る)
  * JavaScript が無効でも、フォームの送信と画面の再読み込みで使える。
  */
 (function () {
@@ -8198,128 +7874,12 @@ a:hover {
     setTimeout(poll, POLL_MS);
   }
 
-  function setupChat() {
-    var box = document.getElementById("skill-chat-messages");
-    if (!box) return;
-    var form = document.getElementById("skill-chat-form");
-    var status = document.getElementById("skill-chat-status");
-    var url = box.getAttribute("data-messages-url");
-    var polling = false;
-    var lastSig = null;
-
-    function setStatus(text, kind) {
-      if (!status) return;
-      status.textContent = text;
-      status.className = "small " + (kind ? "text-" + kind : "text-muted");
-    }
-    function nearBottom() { return box.scrollHeight - box.scrollTop - box.clientHeight < 60; }
-    function scrollDown() { box.scrollTop = box.scrollHeight; }
-
-    // 新しいやり取りの HTML のうち、印(data-msg-id と data-status)が変わった発言だけを入れ替える
-    function merge(html) {
-      var follow = nearBottom();
-      var holder = document.createElement("div");
-      holder.innerHTML = html;
-      var incoming = holder.querySelectorAll("[data-msg-id]");
-      if (!incoming.length) {
-        box.innerHTML = html;
-        return;
-      }
-      var empty = box.querySelector("[data-empty]");
-      if (empty) empty.parentNode.removeChild(empty);
-      Array.prototype.forEach.call(incoming, function (el) {
-        var id = el.getAttribute("data-msg-id");
-        var current = box.querySelector('[data-msg-id="' + id + '"]');
-        if (!current) {
-          box.appendChild(el);
-          follow = true;
-        } else if (current.getAttribute("data-status") !== el.getAttribute("data-status")) {
-          current.parentNode.replaceChild(el, current);
-        }
-      });
-      if (follow) scrollDown();
-    }
-
-    function poll() {
-      getJson(url).then(function (res) {
-        var data = res.data;
-        if (data.sig !== lastSig) {
-          lastSig = data.sig;
-          merge(data.html);
-        }
-        if (data.pending) {
-          setTimeout(poll, POLL_MS);
-          return;
-        }
-        polling = false;
-        if (data.last_status === "done") {
-          setStatus("応答が届きました。", "success");
-        } else if (data.last_status) {
-          setStatus("応答を作れませんでした（やり取りの中の案内を見てください）。", "danger");
-        }
-      }).catch(function (error) {
-        polling = false;
-        setStatus(error.message, "danger");
-      });
-    }
-    function startPolling() {
-      if (polling) return;
-      polling = true;
-      setTimeout(poll, POLL_MS);
-    }
-
-    scrollDown();
-    var chatTab = document.getElementById("skill-ai-chat-tab");
-    if (chatTab) chatTab.addEventListener("shown.bs.tab", scrollDown);
-    if (box.getAttribute("data-pending") === "1") startPolling();
-    if (!form || !window.fetch || !window.FormData) return;
-    var textarea = form.elements["question"];
-    var button = form.querySelector("button");
-    textarea.addEventListener("keydown", function (event) {
-      if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
-        event.preventDefault();
-        if (form.requestSubmit) { form.requestSubmit(); } else { form.dispatchEvent(new Event("submit", { cancelable: true })); }
-      }
-    });
-    form.addEventListener("submit", function (event) {
-      event.preventDefault();
-      if (!textarea.value.trim()) {
-        setStatus("質問を入力してください。", "danger");
-        return;
-      }
-      button.disabled = true;
-      setStatus("送っています…", "muted");
-      fetch(form.action, {
-        method: "POST", body: new FormData(form), credentials: "same-origin",
-        headers: { "Accept": "application/json" }
-      }).then(readJson).then(function (res) {
-        var data = res.data;
-        if (res.ok && data.ok) {
-          lastSig = data.sig;
-          box.innerHTML = data.html;
-          if (data.once && form.elements["once"]) form.elements["once"].value = data.once;
-          textarea.value = "";
-          scrollDown();
-          setStatus("AIが応答を作成しています（数十秒〜数分）…", "muted");
-          startPolling();
-        } else {
-          setStatus(data.message || "送れませんでした。", "danger");
-        }
-      }).catch(function (error) {
-        setStatus("送れませんでした: " + error.message, "danger");
-      }).then(function () {
-        button.disabled = false;
-      });
-    });
-  }
-
   function init() {
     var panel = document.getElementById("skill-ai");
     if (!panel) return;
     panel.addEventListener("input", function () { dirty = true; });
     showTabFromHash();
     watchAnalysis(panel);
-    setupChat();
   }
 
   if (document.readyState === "loading") {
