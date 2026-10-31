@@ -657,12 +657,12 @@ def _unauthorized():
     path = request.script_root + request.path
     changed_for = g.get("local_password_changed")
     if not changed_for and multi_env_enabled() and portal_state()[0] is not None:
-        # 複数の環境で、共通のログインは有効(この環境のログインが無い・切れた): 案内を出さずにこの環境に入り直す(17 章)
-        next_url = request.url
+        # 複数の環境で、共通のログインは有効(この環境のログインが無い・切れた): 案内を出さずにこの環境に入り直す(17 章)。
+        # 送信(GET 以外)は行わず、入り直した後に「直前の操作は行われていません」と案内する(ログインの後と同じ。
+        # 戻る先は _redirect_after_login が GET で開ける画面にする)
         if request.method not in ("GET", "HEAD", "OPTIONS"):
             session[DROPPED_REQUEST_KEY] = path
-            next_url, _post_only = _page_for_next(path)
-        return redirect(url_for("auth.enter", next=_next_path(next_url)) if next_url else url_for("auth.enter"))
+        return redirect(url_for("auth.enter", next=_next_path(request.url)))
     if changed_for:
         # 固定ローカル管理者(admin など)のパスワードが、このブラウザでログインした後に変わった(自分の基本設定の
         # 保存・ほかのマネージャーの変更)。保存のボタンの二度押しの2回目もここに来る(1回目で変わった)ため、
@@ -3701,8 +3701,12 @@ def check_mail_settings(test=False, to=None, to_label="宛先（MAIL_TO）", sen
     if not actual_to and not test:
         missing.append(to_label)
     if missing:
-        return "メールの設定が不足しています: {}。システム設定の「基本設定」タブで設定してください。".format(
-            "、".join(missing))
+        where = "システム設定の「基本設定」タブで設定してください。"
+        if not is_main_env() and (not values["server"] or not values["mail_from"]):
+            # ほかの環境(17 章): 送信サーバー・差出人はすべての環境で共通(メインの環境で設定する)
+            where = ("送信サーバー・差出人はメインの環境のシステム設定（すべての環境で共通）で、宛先はこの環境のシステム設定の"
+                     "「基本設定」タブで設定します。")
+        return "メールの設定が不足しています: {}。{}".format("、".join(missing), where)
     # ポート番号が無い・正しくない(config.py を直接編集した値など): 違うポートに接続しないよう送らない
     if values["port_error"]:
         return values["port_error"]

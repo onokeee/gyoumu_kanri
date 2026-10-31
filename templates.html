@@ -6722,7 +6722,7 @@
   <div class="card-body">
     <div class="table-responsive">
       <table class="table table-sm align-middle mb-0">
-        <thead class="table-light"><tr><th>名前</th><th>URL</th><th>状態</th><th class="text-end">メンバー</th><th>追加</th><th>操作</th></tr></thead>
+        <thead class="table-light"><tr><th>名前</th><th>URL</th><th>状態</th><th class="text-end">メンバー</th><th class="ps-3">追加</th><th>操作</th></tr></thead>
         <tbody>
           {% for e in ev.envs %}
           <tr>
@@ -6737,7 +6737,7 @@
             <td class="small text-break"><code>{{ e.url }}</code><div class="text-muted">{{ e.folder }}</div></td>
             <td class="text-nowrap">{% if e.key == 'main' %}<span class="badge bg-primary">メイン</span>{% elif e.active %}<span class="badge bg-success">使用中</span>{% else %}<span class="badge bg-secondary">停止中</span>{% endif %}</td>
             <td class="text-end">{% if e.members is none %}―{% else %}{{ e.members }}人{% endif %}</td>
-            <td class="small text-muted text-nowrap">{{ e.created_at or '―' }}{% if e.created_by %}<div>{{ e.created_by }}</div>{% endif %}</td>
+            <td class="small text-muted text-nowrap ps-3">{{ e.created_at or '―' }}{% if e.created_by %}<div>{{ e.created_by }}</div>{% endif %}</td>
             <td class="text-nowrap">
               {% if e.key != 'main' %}
               <form method="post" action="{{ url_for('system.toggle_env', key=e.key) }}" class="d-inline"
@@ -7146,6 +7146,21 @@ a:hover {
 }
 .shift-codes {
   resize: vertical;
+}
+/* 複数の環境(グループ): ナビの環境の名前。長い名前は省略し、狭い画面ではメニューのボタンと同じ行に収める */
+.env-badge {
+  max-width: 14rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@media (max-width: 575.98px) {
+  .navbar-brand:has(.env-badge) {
+    font-size: 1rem;
+  }
+  .env-badge {
+    max-width: 7.5rem;
+  }
 }
 {#=== static/js/sort-table.js ===#}
 /* 表の並び替え(共通)。
