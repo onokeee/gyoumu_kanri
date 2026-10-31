@@ -15,10 +15,11 @@
     ログイン　　　　　  auth/login.html
     メールアドレス　　  account/email.html
     個人ダッシュボード  main/dashboard.html
-    タスク　　　　　　  tasks/list.html  tasks/detail.html  tasks/form.html
+    タスク　　　　　　  tasks/list.html  tasks/detail.html  tasks/form.html  tasks/_recommend.html
     定型業務　　　　　  routine/list.html  routine/detail.html  routine/form.html
                         routine/occurrence.html  routine/reminder_mail.html
-    年休　　　　　　　  leaves/list.html  leaves/calendar.html  leaves/detail.html  leaves/form.html
+    出勤表・年休　　　  leaves/list.html  leaves/calendar.html（出勤表）  leaves/detail.html  leaves/form.html
+                        leaves/shifts.html  leaves/shift_month.html
     スキル　　　　　　  skills/map.html  skills/member.html  skills/member_edit.html  skills/items.html
                         skills/item_form.html  skills/coverage.html  skills/operations.html
                         skills/operation_edit.html  skills/_ai_panel.html  skills/_chat_messages.html
@@ -32,7 +33,7 @@
                         system/_overdue_tab.html  system/_skill_ai_tab.html
                         system/_analysis_tab.html  system/_reminder_tab.html
     静的ファイル　　　  static/css/style.css  static/js/sort-table.js  static/js/auto-filter.js
-                        static/js/routine-form.js
+                        static/js/routine-form.js  static/js/task-form.js
                         static/js/skill-item-form.js  static/js/skill-ai.js
                         static/js/weekly-settings.js  static/js/system-settings.js
                         static/js/ai-analysis.js
@@ -102,7 +103,7 @@
           {% endif %}
           <li class="nav-item">
             <a class="nav-link {% if request.blueprint == 'leaves' %}active{% endif %}"
-               href="{{ url_for('leaves.calendar_view') }}"><i class="bi bi-calendar-check"></i> 年休</a>
+               href="{{ url_for('leaves.calendar_view') }}"><i class="bi bi-calendar-check"></i> 出勤表</a>
           </li>
           {% if current_user.is_manager %}
           {# マネージャーだけの管理の画面(スキル・チーム管理・システム設定)は「管理」にまとめる
@@ -771,6 +772,8 @@
           <td class="text-nowrap" data-sort="{{ task.scale_hours if task.scale_label else '' }}">
             {% if task.scale_label %}{{ task.scale_label }} <small class="text-muted">（約{{ task.scale_hours }}h）</small>{% else %}―{% endif %}
           </td>
+          {% elif key == 'skills' %}
+          <td class="small">{{ task.skill_req_labels or '―' }}</td>
           {% elif key == 'outcome_estimate' %}
           <td class="small">
             {%- if task.outcome_quant_estimate_label %}{{ task.outcome_quant_estimate_label }}{% endif -%}
@@ -852,6 +855,9 @@
 
       <dt class="col-sm-3 text-muted">規模（負荷目安）</dt>
       <dd class="col-sm-9">{% if task.scale_label %}{{ task.scale_label }}（約{{ task.scale_hours }}h）{% else %}―{% endif %}</dd>
+
+      <dt class="col-sm-3 text-muted">必要スキル</dt>
+      <dd class="col-sm-9">{% for r in task.sorted_skill_reqs %}<span class="badge bg-light text-dark border me-1">{{ r.label }}</span>{% else %}―{% endfor %}</dd>
 
       <dt class="col-sm-3 text-muted">内容・詳細</dt>
       <dd class="col-sm-9 pre-wrap">{{ task.description or '―' }}</dd>
@@ -1014,10 +1020,39 @@
 
 {% block content %}
 <div class="row justify-content-center">
-  <div class="col-lg-8">
+  <div class="col-lg-9">
     <h1 class="h3 mb-3">{{ 'タスク編集' if editing else 'タスク追加' }}</h1>
 
-    <form method="post" class="card card-body shadow-sm">
+    {% if not editing and can_plan %}
+    {# メールから下書き(app.py の 15-4)。JavaScript が有効なときに表示する(task-form.js)。保存は「登録」で行う #}
+    <div id="mail-drop" class="mail-drop card card-body shadow-sm mb-3 d-none" data-url="{{ url_for('tasks.draft_from_mail') }}"
+         data-max-mb="{{ mail_max_mb }}">
+      <div class="d-flex flex-wrap align-items-center gap-2">
+        <i class="bi bi-envelope-paper fs-3 text-primary" aria-hidden="true"></i>
+        <div class="flex-grow-1">
+          <div class="fw-bold">メールから下書き</div>
+          <div class="small text-muted">メールのファイル（Outlook の .msg・.eml）をこの画面にドロップすると、件名・本文から下書きを入れます（保存は「登録」を押したときです。{{ mail_max_mb }}MB まで）。Outlook の一覧から直接ドラッグできないときは、メールをファイルに保存してからドロップしてください。</div>
+        </div>
+        <label class="btn btn-sm btn-outline-primary mb-0">ファイルを選ぶ
+          <input type="file" id="mail-file" class="d-none" accept=".msg,.eml,message/rfc822,application/vnd.ms-outlook">
+        </label>
+      </div>
+      {% if ai_enabled %}
+      <div class="form-check small mt-2 mb-0">
+        <input class="form-check-input" type="checkbox" id="mail-use-ai" checked>
+        <label class="form-check-label" for="mail-use-ai">AIで整える（件名・本文・差出人・宛先・添付のファイル名と、スキル項目の一覧を AI の接続先に送ります）</label>
+      </div>
+      {% endif %}
+      <div id="mail-status" class="small mt-2" role="status" aria-live="polite"></div>
+    </div>
+    {% endif %}
+
+    <form method="post" class="card card-body shadow-sm" id="task-form"
+          {% if can_plan %}data-recommend-url="{{ url_for('tasks.recommend') }}"{% if editing %} data-task-id="{{ task.id }}"{% endif %}{% endif %}>
+      {% if can_plan %}
+      {# Enter キーでの送信は保存にする(フォームの最初の送信ボタンが使われるため。下の「推奨の担当者を表示」より前に置く) #}
+      <button type="submit" class="d-none" tabindex="-1" aria-hidden="true"></button>
+      {% endif %}
       {% if editing %}
       {# 画面を開いたタスクの印(IDの再利用の取り違え防止)と、開いたときの内容の控え(ほかの操作の変更を上書きしない) #}
       <input type="hidden" name="row" value="{{ task.row_key }}">
@@ -1027,34 +1062,51 @@
       <input type="hidden" name="once" value="{{ submit_token() }}">
       {% endif %}
       <div class="mb-3">
-        <label class="form-label">タイトル <span class="text-danger">*</span></label>
-        <input type="text" name="title" class="form-control" required value="{{ val('title') }}">
+        <label class="form-label" for="task-title">タイトル <span class="text-danger">*</span></label>
+        <input type="text" name="title" id="task-title" class="form-control" required value="{{ val('title') }}">
       </div>
 
       <div class="mb-3">
-        <label class="form-label">内容・詳細</label>
-        <textarea name="description" class="form-control" rows="4">{{ val('description') }}</textarea>
+        <label class="form-label" for="task-description">内容・詳細</label>
+        <textarea name="description" id="task-description" class="form-control" rows="4">{{ val('description') }}</textarea>
       </div>
 
+      {# 必要スキル(app.py の 15-1)。担当者に必要な到達度の下限。変えられるのはマネージャーだけ #}
       <div class="mb-3">
-        <label class="form-label">担当者(複数選択可){% if not can_plan %} <span class="text-muted small">（マネージャーのみ変更可）</span>{% endif %}</label>
-        <div class="row row-cols-2 row-cols-md-3 g-1 border rounded p-2">
-          {% for u in users %}
-          <div class="col">
-            <div class="form-check">
-              <input class="form-check-input" type="checkbox" name="assignee_ids" value="{{ u.form_key }}"
-                     id="asg{{ u.id }}" {% if u.id in selected_assignees %}checked{% endif %}
-                     {% if not can_plan %}disabled{% endif %}>
-              <label class="form-check-label small" for="asg{{ u.id }}">{{ u.display_name }}{% if not u.is_active %} <span class="text-muted">［無効］</span>{% endif %}</label>
+        <div class="form-label">必要スキル（担当者に必要な到達度。複数可）{% if not can_plan %} <span class="text-muted small">（マネージャーのみ変更可）</span>{% endif %}</div>
+        {% if can_plan %}
+        <details class="task-skills border rounded" id="task-skills" {% if selected_skills %}open{% endif %}>
+          <summary class="px-2 py-1 small"><span data-skill-summary>{% if selected_skills %}{{ selected_skills|length }}件を選択中{% else %}選んでいません（開いて選ぶ）{% endif %}</span></summary>
+          <div class="px-2 pb-2">
+            {% for stype, type_label, items in skill_groups %}
+            <div class="fw-bold small mt-2">{{ type_label }}</div>
+            <div class="row row-cols-1 row-cols-md-2 g-1">
+              {% for s in items %}
+              {% set chosen = selected_skills.get(s.id) %}
+              <div class="col d-flex align-items-center gap-2">
+                <label class="small flex-grow-1 mb-0" for="req{{ s.id }}">{{ s.name }}{% if s.category %} <span class="text-muted">({{ s.category }})</span>{% endif %}{% if not s.is_active %} <span class="text-muted">［無効］</span>{% endif %}</label>
+                <select name="req_skill_{{ s.id }}" id="req{{ s.id }}" class="form-select form-select-sm w-auto" data-skill-name="{{ s.name }}">
+                  <option value="">不要</option>
+                  {% for level in skill_levels %}
+                  <option value="{{ level }}" {% if chosen == level %}selected{% endif %}>Lv{{ level }} {{ skill_scale[level] }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+              {% endfor %}
             </div>
+            {% else %}
+            <p class="text-muted small mb-0 mt-2">スキル項目がまだありません（スキル管理の「スキル項目」で追加できます）。</p>
+            {% endfor %}
           </div>
-          {% endfor %}
-        </div>{% if can_plan and users|rejectattr('is_active')|list %}
-        <div class="form-text">［無効］は無効化されたメンバーです（担当のまま残します。外す場合はチェックを外してください）。</div>{% endif %}
+        </details>
+        <div class="form-text">選んだ到達度以上の人を、下の「推奨の担当者」に出します（到達度はスキルマップの値）。</div>
+        {% else %}
+        <div>{% for r in task.sorted_skill_reqs %}<span class="badge bg-light text-dark border me-1">{{ r.label }}</span>{% else %}<span class="text-muted">なし</span>{% endfor %}</div>
+        {% endif %}
       </div>
 
       {% if not can_plan %}
-      <p class="text-muted small mb-2"><i class="bi bi-info-circle"></i> 優先度・開始日・期限・規模・担当者はマネージャーが設定します。メンバーはステータス・内容・成果を更新できます。</p>
+      <p class="text-muted small mb-2"><i class="bi bi-info-circle"></i> 優先度・開始日・期限・規模・担当者・必要スキルはマネージャーが設定します。メンバーはステータス・内容・成果を更新できます。</p>
       {% endif %}
       <div class="row">
         <div class="col-md-6 mb-3">
@@ -1096,6 +1148,36 @@
           {% if can_plan %}<div class="form-text">担当者が完了までに要する工数の目安。スキル・キャパを考慮して選択。</div>{% endif %}
         </div>
       </div>
+
+      <div class="mb-3">
+        <label class="form-label">担当者(複数選択可){% if not can_plan %} <span class="text-muted small">（マネージャーのみ変更可）</span>{% endif %}</label>
+        <div class="row row-cols-2 row-cols-md-3 g-1 border rounded p-2">
+          {% for u in users %}
+          <div class="col">
+            <div class="form-check">
+              <input class="form-check-input" type="checkbox" name="assignee_ids" value="{{ u.form_key }}"
+                     id="asg{{ u.id }}" {% if u.id in selected_assignees %}checked{% endif %}
+                     {% if not can_plan %}disabled{% endif %}>
+              <label class="form-check-label small" for="asg{{ u.id }}">{{ u.display_name }}{% if not u.is_active %} <span class="text-muted">［無効］</span>{% endif %}</label>
+            </div>
+          </div>
+          {% endfor %}
+        </div>{% if can_plan and users|rejectattr('is_active')|list %}
+        <div class="form-text">［無効］は無効化されたメンバーです（担当のまま残します。外す場合はチェックを外してください）。</div>{% endif %}
+      </div>
+
+      {% if can_plan %}
+      {# 担当者の推奨(app.py の 15-2)。JavaScript が有効なときは、必要スキル・日付を変えるたびに作り直す #}
+      <div class="mb-3">
+        <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-1">
+          <div class="form-label mb-0"><i class="bi bi-person-check"></i> 推奨の担当者（スキルと出勤表から）</div>
+          <button type="submit" name="recommend" value="1" formnovalidate class="btn btn-sm btn-outline-secondary" id="recommend-button">推奨の担当者を表示</button>
+        </div>
+        <div id="recommend-panel" class="border rounded p-2" aria-live="polite">
+          {% include "tasks/_recommend.html" %}
+        </div>
+      </div>
+      {% endif %}
 
       {# 成果(定量) #}
       <div class="mb-3">
@@ -1164,6 +1246,58 @@
   </div>
 </div>
 {% endblock %}
+{% block scripts %}
+{% if can_plan %}
+<script src="{{ url_for('static', filename='js/task-form.js') }}"></script>
+{% endif %}
+{% endblock %}
+{#=== tasks/_recommend.html ===#}
+{# 担当者の推奨(app.py の 15-2)。tasks/form.html と GET /tasks/recommend の応答で使う。変数 rec(recommend_assignees の戻り値) #}
+{% if not rec.has_input %}
+<p class="text-muted small mb-0">必要スキル・開始日・期限を入れると、スキルの到達度と出勤表（年休・勤務表）から担当者の候補を表示します。</p>
+{% elif not rec.members %}
+<p class="text-muted small mb-0">スキル管理の対象のメンバー（有効なメンバー）がいません。</p>
+{% else %}
+<div class="small mb-1">
+  {% if rec.period %}期間: {{ rec.period_label }}{% elif rec.dates_reversed %}<span class="text-danger">開始日が期限より後のため、休みは確かめていません。</span>{% else %}<span class="text-muted">開始日・期限が無いため、休みは確かめていません。</span>{% endif %}
+  {%- if rec.requirements %} ／ 必要スキル: {% for r in rec.requirements %}{{ r.skill.name }}（Lv{{ r.need }}）{% if not loop.last %}、{% endif %}{% endfor %}{% endif %}
+  ／ 推奨 {{ rec.recommended }}名
+</div>
+<div class="table-responsive">
+  <table class="table table-sm align-middle mb-1 recommend-table">
+    <thead class="table-light">
+      <tr>
+        <th scope="col"><span class="visually-hidden">推奨</span></th>
+        <th scope="col">メンバー</th>
+        {% if rec.requirements %}<th scope="col">必要スキル（到達度/必要）</th>{% endif %}
+        <th scope="col">期間中の休み</th>
+        {% if rec.counts_workdays %}<th scope="col" class="text-end">出勤日数</th>{% endif %}
+        <th scope="col" class="text-end">担当中</th>
+        <th scope="col"><span class="visually-hidden">操作</span></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in rec.rows %}
+      <tr class="{% if not row.recommended %}text-muted{% endif %}">
+        <td class="text-nowrap">{% if row.recommended %}<span class="badge bg-success">推奨</span>{% elif row.has_leave %}<span class="badge bg-secondary">休みあり</span>{% elif row.no_workday %}<span class="badge bg-secondary">出勤なし</span>{% endif %}</td>
+        <td class="text-nowrap">{{ row.user.display_name }}{% if row.shift %}<div class="small text-muted">{{ row.shift.name }}</div>{% endif %}</td>
+        {% if rec.requirements %}
+        <td>{% for d in row.detail %}<span class="badge {{ 'text-bg-primary' if d.ok else 'text-bg-danger' }} me-1" title="{{ d.skill.name }}: 到達度 Lv{{ d.have }}（{{ d.have_label }}）／必要 Lv{{ d.need }}">{{ d.skill.name }} {{ d.have }}/{{ d.need }}</span>{% endfor %}</td>
+        {% endif %}
+        <td class="small">{% if row.leaves %}{{ row.leaves|join('、') }}{% if row.more_leaves %} ほか{{ row.more_leaves }}日{% endif %}{% elif rec.period %}なし{% else %}―{% endif %}</td>
+        {% if rec.counts_workdays %}<td class="text-end text-nowrap">{{ row.workdays }}日</td>{% endif %}
+        <td class="text-end text-nowrap">{{ row.open_tasks }}件</td>
+        <td class="text-end"><button type="button" class="btn btn-sm btn-outline-primary text-nowrap d-none" data-assign="{{ row.user.id }}">担当にする</button></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% if rec.more %}<div class="small text-muted">ほか {{ rec.more }} 名（上位 {{ rec.rows|length }} 名を表示）</div>{% endif %}
+{% if rec.ignored %}<div class="small text-muted">無効にしたスキル（{{ rec.ignored|map(attribute='name')|join('、') }}）は比べていません。</div>{% endif %}
+{% if rec.long_period %}<div class="small text-muted">期間が長いため、出勤日数は数えていません。</div>{% endif %}
+<div class="small text-muted">推奨: 期間中に休み（年休・勤務表の年休の日）が無く、出勤日があり、必要スキルの到達度をすべて満たすメンバー（スキル管理の対象のメンバー）。担当中は未完了のタスクの数です。</div>
+{% endif %}
 {#=== routine/list.html ===#}
 {% extends "base.html" %}
 {% from "_macros.html" import fmt_date, occurrence_complete_button %}
@@ -1850,16 +1984,32 @@
 {% endblock %}
 {#=== leaves/calendar.html ===#}
 {% extends "base.html" %}
-{% block title %}年休カレンダー &middot; {{ app_name }}{% endblock %}
+{% block title %}出勤表 &middot; {{ app_name }}{% endblock %}
+
+{# 人の行(年休の印と休みの日の色。自分の行の出勤の日は「＋」で年休の登録へ) #}
+{% macro person_cells(p) %}
+  <th scope="row" class="roster-name roster-sticky2 roster-person">{{ p.user.name_label }}</th>
+  {% for c in p.cells %}
+  <td class="roster-cell {% if c.off %}roster-off{% endif %}">
+    {%- if c.leave -%}
+    <a href="{{ url_for('leaves.detail', leave_id=c.leave.id) }}" class="roster-leave {{ 'roster-leave-full' if c.leave.leave_type == '全休' else 'roster-leave-half' }}" title="{{ p.user.display_name }} / {{ c.leave.leave_type }}">{{ c.mark }}</a>
+    {%- elif p.me and not c.off -%}
+    <a href="{{ url_for('leaves.new_leave', date=c.date.isoformat()) }}" class="roster-add" title="{{ c.date.strftime('%m/%d') }}の年休を登録" aria-label="{{ c.date.strftime('%m/%d') }}の年休を登録">＋</a>
+    {%- endif -%}
+  </td>
+  {% endfor %}
+{% endmacro %}
 
 {% block content %}
 <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
-  <h1 class="h3 mb-0"><i class="bi bi-calendar-check"></i> 年休カレンダー</h1>
-  <div class="d-flex gap-2">
+  <h1 class="h3 mb-0"><i class="bi bi-calendar-check"></i> 出勤表</h1>
+  <div class="d-flex gap-2 flex-wrap">
     {% if current_user.is_manager %}
+    <a href="{{ url_for('leaves.shift_month', month=month_key) }}" class="btn btn-outline-primary"><i class="bi bi-grid-3x3"></i> 勤務表の入力</a>
+    <a href="{{ url_for('leaves.shifts') }}" class="btn btn-outline-secondary"><i class="bi bi-gear"></i> 勤務の設定</a>
     <a href="{{ url_for('export.leaves_xlsx') }}" class="btn btn-outline-success"><i class="bi bi-file-earmark-excel"></i> Excel出力</a>
     {% endif %}
-    <a href="{{ url_for('leaves.list_leaves') }}" class="btn btn-outline-secondary"><i class="bi bi-list-ul"></i> 一覧</a>
+    <a href="{{ url_for('leaves.list_leaves') }}" class="btn btn-outline-secondary"><i class="bi bi-list-ul"></i> 年休の一覧</a>
     <a href="{{ url_for('leaves.new_leave') }}" class="btn btn-primary"><i class="bi bi-plus-lg"></i> 年休を登録</a>
   </div>
 </div>
@@ -1867,16 +2017,16 @@
 {# 月ナビ + チームフィルタ #}
 <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
   <div class="btn-group">
-    <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('leaves.calendar_view', year=prev[0], month=prev[1], dept=dept_id) }}">&laquo; 前月</a>
+    {% if prev %}<a class="btn btn-outline-secondary btn-sm" href="{{ url_for('leaves.calendar_view', year=prev[0], month=prev[1], dept=dept_id) }}">&laquo; 前月</a>{% endif %}
     <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('leaves.calendar_view', dept=dept_id) }}">今月</a>
-    <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('leaves.calendar_view', year=next[0], month=next[1], dept=dept_id) }}">次月 &raquo;</a>
+    {% if next %}<a class="btn btn-outline-secondary btn-sm" href="{{ url_for('leaves.calendar_view', year=next[0], month=next[1], dept=dept_id) }}">次月 &raquo;</a>{% endif %}
   </div>
   <h2 class="h4 mb-0">{{ year }}年 {{ month }}月</h2>
   <form method="get" class="d-flex align-items-center gap-1">
     <input type="hidden" name="year" value="{{ year }}">
     <input type="hidden" name="month" value="{{ month }}">
-    <label class="small text-muted mb-0">チーム:</label>
-    <select name="dept" class="form-select form-select-sm" onchange="this.form.submit()" style="width:auto;">
+    <label class="small text-muted mb-0" for="roster-dept">チーム:</label>
+    <select name="dept" id="roster-dept" class="form-select form-select-sm" onchange="this.form.submit()" style="width:auto;">
       <option value="">全体</option>
       {% for d in departments %}
       <option value="{{ d.id }}" {% if dept_id == d.id %}selected{% endif %}>{{ d.name }}{% if not d.is_active %}［無効］{% endif %}</option>
@@ -1887,53 +2037,68 @@
 
 <div class="card shadow-sm">
   <div class="table-responsive">
-    <table class="table table-bordered text-center mb-0 align-top" style="table-layout:fixed;">
+    <table class="table table-bordered table-sm roster mb-0">
       <thead>
         <tr>
-          {% for label in weekday_labels %}
-          <th class="{% if loop.index0 == 0 %}text-danger{% elif loop.index0 == 6 %}text-primary{% endif %}">{{ label }}</th>
+          <th scope="col" colspan="2" rowspan="2" class="roster-corner roster-sticky">{{ month }}月</th>
+          {% for d in roster.days %}
+          <th scope="col" class="roster-day {% if d.sun %}roster-sun{% elif d.sat %}roster-sat{% endif %} {% if d.today %}roster-today{% endif %}"{% if d.holiday %} title="{{ d.holiday }}"{% endif %}>{{ d.day }}</th>
+          {% endfor %}
+        </tr>
+        <tr>
+          {% for d in roster.days %}
+          <th scope="col" class="roster-day {% if d.sun %}roster-sun{% elif d.sat %}roster-sat{% endif %} {% if d.today %}roster-today{% endif %}">{{ d.weekday }}</th>
           {% endfor %}
         </tr>
       </thead>
       <tbody>
-        {% for week in weeks %}
-        <tr>
-          {% for cell in week %}
-          <td class="p-1 {% if cell.is_weekend %}leave-weekend{% endif %} {% if not cell.in_month %}leave-outside text-muted{% endif %} {% if cell.warn %}table-danger{% endif %}"
-              style="height:90px; vertical-align:top;">
-            <div class="d-flex justify-content-between align-items-center">
-              <span class="small fw-bold
-                {% if cell.weekday == 6 %}text-danger{% elif cell.weekday == 5 %}text-primary{% endif %}
-                {% if cell.is_today %}badge bg-warning text-dark{% endif %}">{{ cell.date.day }}</span>
-              <span class="text-nowrap">
-                {% if cell.warn %}<i class="bi bi-people-fill text-danger small" title="同日に休む人数が多いチームがあります"></i>{% endif %}
-                {% if cell.leaves %}<span class="badge rounded-pill bg-light text-muted" style="font-size:0.62rem;">{{ cell.leaves|length }}名</span>{% endif %}
-              </span>
-            </div>
-            <div class="d-grid gap-1 mt-1">
-              {% for lv in cell.leaves %}
-              <a href="{{ url_for('leaves.detail', leave_id=lv.id) }}"
-                 class="badge bg-{{ lv.type_color }} text-truncate text-decoration-none d-block text-start"
-                 title="{{ lv.user.display_name }} / {{ lv.leave_type }}">
-                {{ lv.user.display_name }}{% if lv.leave_type != '全休' %}<small>({{ lv.leave_type[:2] }})</small>{% endif %}
-              </a>
-              {% endfor %}
-            </div>
-          </td>
+        {% for g in roster.groups %}
+        {% for item in g.shifts %}
+        <tr class="roster-shift-row">
+          {% if loop.first %}<th scope="rowgroup" rowspan="{{ g.rows }}" class="roster-group roster-sticky">{{ g.name or '―' }}</th>{% endif %}
+          <th scope="row" class="roster-name roster-sticky2">{{ item.shift.label }}</th>
+          {% for c in item.cells %}
+          <td class="roster-code roster-kind-{{ kind_css.get(c.kind, 'none') }}"{% if c.label %} title="{{ c.label }}"{% endif %}>{{ c.code }}</td>
           {% endfor %}
         </tr>
+        {% for p in item.people %}
+        <tr>{{ person_cells(p) }}</tr>
         {% endfor %}
+        {% endfor %}
+        {% endfor %}
+        {% for p in roster.no_shift %}
+        <tr>
+          {% if loop.first %}<th scope="rowgroup" rowspan="{{ roster.no_shift|length }}" class="roster-group roster-sticky">勤務の登録なし</th>{% endif %}
+          {{ person_cells(p) }}
+        </tr>
+        {% endfor %}
+        {% if not roster.groups and not roster.no_shift %}
+        <tr><td colspan="{{ roster.days|length + 2 }}" class="text-muted small text-start">表示する人がいません。</td></tr>
+        {% endif %}
       </tbody>
+      <tfoot>
+        <tr>
+          <th scope="row" colspan="2" class="roster-sticky roster-corner">年休（人）</th>
+          {% for t in roster.totals %}
+          <td class="roster-total {% if t.warn %}table-danger{% endif %}">{% if t.warn %}<i class="bi bi-people-fill text-danger" title="同日に休む人数が多いチームがあります"></i>{% endif %}{{ t.count }}</td>
+          {% endfor %}
+        </tr>
+      </tfoot>
     </table>
   </div>
 </div>
-<div class="small text-muted mt-2">
-  <span class="badge bg-primary">全休</span>
-  <span class="badge bg-info">半休</span>
-  <span class="ms-2"><span class="leave-weekend-swatch"></span> 土日(休日)</span>
-  <span class="ms-2 text-danger"><i class="bi bi-people-fill"></i> 同じチームで同日{{ daily_limit }}名超</span>{% for d in departments if d.id == dept_id and not d.is_active %}
-  <span class="ms-2">（無効化したチームは、同じ日に休む人数を判定しません）</span>{% endfor %}
+<div class="small text-muted mt-2 d-flex flex-wrap gap-3">
+  {% for c in roster.codes %}<span><span class="roster-legend roster-kind-{{ kind_css.get(c.kind, 'none') }}">{{ c.code }}</span> {{ c.label }}</span>{% endfor %}
+  <span><span class="roster-leave roster-leave-full">{{ leave_marks['全休'] }}</span> 年休（全休）</span>
+  <span><span class="roster-leave roster-leave-half">{{ leave_marks['午前半休'] }}</span> 午前半休 <span class="roster-leave roster-leave-half">{{ leave_marks['午後半休'] }}</span> 午後半休</span>
+  <span><span class="roster-legend roster-off-swatch"></span> 休み（勤務表の休日・年休の日。勤務表の記号が無い日は土日・祝日）</span>
+  <span>自分の行の「＋」から、その日の年休を登録できます</span>
+  <span class="text-danger"><i class="bi bi-people-fill"></i> 同じチームで同日{{ daily_limit }}名超</span>{% for d in departments if d.id == dept_id and not d.is_active %}
+  <span>（無効化したチームは、同じ日に休む人数を判定しません）</span>{% endfor %}
 </div>
+{% if not roster.has_shifts and current_user.is_manager %}
+<p class="small text-muted mt-2 mb-0"><i class="bi bi-info-circle"></i> 勤務がまだありません。「勤務の設定」で勤務（例: 1班 A・日勤）と勤務表の記号を設定し、チームの管理でメンバーの勤務を選ぶと、勤務帯・勤務ごとに並びます。</p>
+{% endif %}
 {% endblock %}
 {#=== leaves/detail.html ===#}
 {% extends "base.html" %}
@@ -2014,7 +2179,7 @@
         <label class="form-label">取得日 <span class="text-danger">*</span></label>
         <input type="date" name="leave_date" class="form-control" required min="{{ year_min }}-01-01" max="{{ year_max }}-12-31"
                value="{% if form %}{{ form.get('leave_date','') }}{% elif leave %}{{ leave.leave_date.strftime('%Y-%m-%d') }}{% endif %}">
-        <div class="form-text">土日・祝日（振替休日を含む）は登録できません。</div>
+        <div class="form-text">土日・祝日（振替休日を含む）は登録できません。ただし勤務表で出勤の日は登録でき、勤務表で休日・年休の日は登録できません。</div>
       </div>
 
       <div class="mb-3">
@@ -2040,6 +2205,147 @@
     </form>
   </div>
 </div>
+{% endblock %}
+{#=== leaves/shifts.html ===#}
+{% extends "base.html" %}
+{% block title %}勤務の設定 &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('leaves.calendar_view') }}">出勤表</a></li>
+    <li class="breadcrumb-item active">勤務の設定</li>
+  </ol>
+</nav>
+<div class="d-flex justify-content-between align-items-center mb-1 flex-wrap gap-2">
+  <h1 class="h3 mb-0"><i class="bi bi-gear"></i> 勤務の設定</h1>
+  <a href="{{ url_for('leaves.shift_month', month=this_month) }}" class="btn btn-outline-primary"><i class="bi bi-grid-3x3"></i> 勤務表の入力</a>
+</div>
+<p class="text-muted small">交替勤務の班・日勤などの勤務と、勤務表の記号を設定します。メンバーの勤務は「チームの管理」で選びます。マネージャーのみ。</p>
+
+<div class="card shadow-sm mb-4">
+  <div class="card-header bg-white fw-bold">勤務の一覧</div>
+  <div class="card-body">
+    {% for s in shifts %}
+    <form method="post" action="{{ url_for('leaves.save_shift', shift_id=s.id) }}" class="row g-2 align-items-center mb-2">
+      {# 開いたときの内容の控え(ほかの操作の変更を古い画面の値で上書きしない) #}
+      <input type="hidden" name="version" value="{{ versions[s.id] }}">
+      <div class="col-md-3"><input type="text" name="name" class="form-control form-control-sm" value="{{ s.name }}" maxlength="{{ name_max }}" aria-label="勤務の名前" required></div>
+      <div class="col-md-3"><input type="text" name="group_name" class="form-control form-control-sm" value="{{ s.group_name }}" maxlength="{{ name_max }}" placeholder="勤務帯（任意）" aria-label="勤務帯"></div>
+      <div class="col-md-2"><input type="number" name="sort_order" class="form-control form-control-sm" value="{{ s.sort_order }}" title="並び順" aria-label="並び順"></div>
+      <div class="col-md-2">{% if s.is_active %}<span class="badge bg-success">有効</span>{% else %}<span class="badge bg-secondary">無効</span>{% endif %} <span class="text-muted small">{{ counts.get(s.id, 0) }}名</span></div>
+      <div class="col-md-2"><button class="btn btn-sm btn-outline-primary">保存</button></div>
+    </form>
+    <form method="post" action="{{ url_for('leaves.toggle_shift', shift_id=s.id) }}" class="mb-3">
+      <input type="hidden" name="active" value="{{ '0' if s.is_active else '1' }}">
+      <button class="btn btn-sm btn-outline-{{ 'danger' if s.is_active else 'success' }}">{{ '無効化' if s.is_active else '有効化' }}</button>
+    </form>
+    {% else %}
+    <p class="text-muted small">勤務はまだありません。</p>
+    {% endfor %}
+
+    <hr>
+    <form method="post" action="{{ url_for('leaves.new_shift') }}" class="row g-2 align-items-end">
+      {# 追加の二度押しで「既にあります」だけが表示されないようにする1回限りの印 #}
+      <input type="hidden" name="once" value="{{ submit_token() }}">
+      <div class="col-md-3">
+        <label class="form-label small mb-1" for="new-shift-name">新しい勤務の名前</label>
+        <input type="text" name="name" id="new-shift-name" class="form-control form-control-sm" maxlength="{{ name_max }}" placeholder="例: 1班 A" required>
+      </div>
+      <div class="col-md-3">
+        <label class="form-label small mb-1" for="new-shift-group">勤務帯（出勤表の行のまとまり。任意）</label>
+        <input type="text" name="group_name" id="new-shift-group" class="form-control form-control-sm" maxlength="{{ name_max }}" placeholder="例: 1班">
+      </div>
+      <div class="col-md-2">
+        <label class="form-label small mb-1" for="new-shift-sort">並び順</label>
+        <input type="number" name="sort_order" id="new-shift-sort" class="form-control form-control-sm" value="0">
+      </div>
+      <div class="col-md-2">
+        <button class="btn btn-sm btn-primary"><i class="bi bi-plus-lg"></i> 追加</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="card shadow-sm mb-4">
+  <div class="card-header bg-white fw-bold">勤務表の記号</div>
+  <div class="card-body">
+    <p class="small text-muted">勤務表に書く記号（1文字）と、その名前・種類です。種類は、出勤表の色と担当者の推奨に使います（出勤・臨時出勤＝出勤の日、休日＝休み、年休＝休み〔担当者の推奨で、その日がある期間は対応できない〕）。勤務表で使っている記号は消せません（名前・種類は変えられます）。{% if not codes_saved %}<strong>まだ保存していません。</strong>例を入れてあるので、名前を勤務表の凡例に合わせて「記号を保存」を押してください。{% endif %}</p>
+    <form method="post" action="{{ url_for('leaves.save_shift_codes') }}">
+      <input type="hidden" name="codes_version" value="{{ codes_version }}">
+      <input type="hidden" name="rows" value="{{ code_rows|length }}">
+      <div class="table-responsive">
+        <table class="table table-sm align-middle mb-2" style="max-width:640px;">
+          <thead class="table-light">
+            <tr><th scope="col" style="width:5em;">記号</th><th scope="col">名前</th><th scope="col" style="width:9em;">種類</th></tr>
+          </thead>
+          <tbody>
+            {% for r in code_rows %}
+            <tr>
+              <td><input type="text" name="code_{{ loop.index0 }}" value="{{ r.code }}" maxlength="1" class="form-control form-control-sm text-center" aria-label="記号"></td>
+              <td><input type="text" name="label_{{ loop.index0 }}" value="{{ r.label }}" maxlength="{{ label_max }}" class="form-control form-control-sm" aria-label="名前"></td>
+              <td>
+                <select name="kind_{{ loop.index0 }}" class="form-select form-select-sm" aria-label="種類">
+                  {% for k in kinds %}<option value="{{ k }}" {% if r.kind == k %}selected{% endif %}>{{ k }}</option>{% endfor %}
+                </select>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="small text-muted mb-2">記号と名前を空にした行は消します（空の行が足りないときは、いったん保存すると増えます）。</div>
+      <button class="btn btn-primary btn-sm"><i class="bi bi-check-lg"></i> 記号を保存</button>
+    </form>
+  </div>
+</div>
+{% endblock %}
+{#=== leaves/shift_month.html ===#}
+{% extends "base.html" %}
+{% block title %}勤務表の入力（{{ year }}年{{ month }}月） &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('leaves.calendar_view', year=year, month=month) }}">出勤表</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('leaves.shifts') }}">勤務の設定</a></li>
+    <li class="breadcrumb-item active">勤務表の入力</li>
+  </ol>
+</nav>
+<div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+  <h1 class="h3 mb-0"><i class="bi bi-grid-3x3"></i> 勤務表の入力（{{ year }}年 {{ month }}月）</h1>
+  <div class="btn-group">
+    {% if prev %}<a class="btn btn-outline-secondary btn-sm" href="{{ url_for('leaves.shift_month', month=prev) }}">&laquo; 前月</a>{% endif %}
+    <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('leaves.shift_month') }}">今月</a>
+    {% if next %}<a class="btn btn-outline-secondary btn-sm" href="{{ url_for('leaves.shift_month', month=next) }}">次月 &raquo;</a>{% endif %}
+  </div>
+</div>
+<p class="small text-muted">勤務ごとに、1日から順に記号を入力します（{{ days|length }}日分）。Excel の勤務表の1行（日のセル）をコピーして、そのまま貼り付けられます。空白・「,」で区切っても、区切らずに続けて入力してもかまいません。記号の無い日は「-」です（記号の無い日は、土日・祝日を休み、それ以外を出勤として扱います）。</p>
+{% if not codes %}<div class="alert alert-warning small">勤務表の記号がまだありません。先に「<a href="{{ url_for('leaves.shifts') }}">勤務の設定</a>」で記号を保存してください。</div>{% endif %}
+{% if not items %}<div class="alert alert-info small">有効な勤務がありません。「<a href="{{ url_for('leaves.shifts') }}">勤務の設定</a>」で勤務を追加してください。</div>{% endif %}
+{% if codes %}
+<div class="small mb-1">記号: {% for c in codes %}<span class="badge bg-light text-dark border me-1">{{ c.code }} {{ c.label }}（{{ c.kind }}）</span>{% endfor %}</div>
+{% endif %}
+<div class="small text-muted mb-3">日付: {% for d in days %}<span class="{% if d.sun %}text-danger{% elif d.sat %}text-primary{% endif %}">{{ d.day }}{{ d.weekday }}</span>{% if not loop.last %} {% endif %}{% endfor %}</div>
+
+<form method="post" action="{{ url_for('leaves.shift_month', month=key) }}">
+  <input type="hidden" name="month" value="{{ key }}">
+  {% for item in items %}
+  <div class="row g-2 align-items-center mb-2">
+    <label class="col-md-2 col-form-label col-form-label-sm" for="codes{{ item.shift.id }}">{{ item.shift.name }}{% if item.shift.group_name %} <span class="text-muted small">（{{ item.shift.group_name }}）</span>{% endif %}</label>
+    <div class="col-md-10">
+      {# 画面を開いたときの内容(ほかの操作で変わった行を、この画面の古い内容で上書きしない) #}
+      <input type="hidden" name="orig_{{ item.shift.id }}" value="{{ item.orig }}">
+      <textarea id="codes{{ item.shift.id }}" name="codes_{{ item.shift.id }}" rows="1" wrap="off" class="form-control form-control-sm font-monospace shift-codes"
+                placeholder="例: 2 2 ● ● ● 3 3 3 …（{{ days|length }}日分）" autocomplete="off" spellcheck="false">{{ item.value }}</textarea>
+    </div>
+  </div>
+  {% endfor %}
+  <div class="d-flex gap-2 mt-3">
+    {% if items %}<button class="btn btn-primary"><i class="bi bi-check-lg"></i> 保存</button>{% endif %}
+    <a href="{{ url_for('leaves.calendar_view', year=year, month=month) }}" class="btn btn-outline-secondary">出勤表へ</a>
+  </div>
+</form>
 {% endblock %}
 {#=== skills/map.html ===#}
 {% extends "base.html" %}
@@ -4913,6 +5219,7 @@
             <th>氏名</th>
             <th>ログインID</th>
             <th>役割</th>
+            <th>勤務</th>
             <th>メールアドレス{% if allowed_domains %} <span class="small text-muted fw-normal">（送信を許可するドメイン: {{ allowed_domains|join('、') }}）</span>{% endif %}</th>
             <th class="text-end">操作</th>
           </tr>
@@ -4923,6 +5230,21 @@
             <td>{{ u.display_name }}</td>
             <td><code>{{ u.username }}</code></td>
             <td><span class="badge bg-light text-dark">{{ u.role_label }}</span></td>
+            <td>
+              {# 勤務(app.py の 16 章。出勤表の行・担当者の推奨に使う)。開いたときの勤務(orig)とログインID(画面を開いた後の
+                 削除・IDの再利用の確認)を一緒に送る。無効にした勤務は、その人の今の勤務のときだけ選択肢に残す #}
+              {% set cur = user_shifts.get(u.id) %}
+              <form method="post" action="{{ url_for('departments.save_member_shift', user_id=u.id) }}" class="d-flex gap-1">
+                <input type="hidden" name="username" value="{{ u.username }}">
+                <input type="hidden" name="orig" value="{{ cur.id if cur else '' }}">
+                <select name="shift_id" class="form-select form-select-sm" aria-label="{{ u.display_name }}の勤務">
+                  <option value="">勤務なし</option>
+                  {% for s in shift_options %}<option value="{{ s.id }}" {% if cur and cur.id == s.id %}selected{% endif %}>{{ s.name }}</option>{% endfor %}
+                  {% if cur and not cur.is_active %}<option value="{{ cur.id }}" selected>{{ cur.label }}</option>{% endif %}
+                </select>
+                <button class="btn btn-sm btn-outline-primary text-nowrap">保存</button>
+              </form>
+            </td>
             <td>
               {# 定型業務のリマインドの宛先。空にして保存すると削除。開いたときのアドレスの控え(version)と
                  ログインID(画面を開いた後の削除・IDの再利用の確認)を一緒に送る #}
@@ -4970,18 +5292,26 @@
         <label class="form-label small mb-1">ログインID</label>
         <input type="text" name="username" class="form-control form-control-sm" placeholder="ログインID" required>
       </div>
-      <div class="col-md-3">
+      <div class="col-md-2">
         <label class="form-label small mb-1">役割</label>
         <select name="role" class="form-select form-select-sm">
           <option value="{{ role_member }}" selected>{{ role_labels[role_member] }}</option>
           <option value="{{ role_manager }}">{{ role_labels[role_manager] }}</option>
         </select>
       </div>
-      <div class="col-md-3 d-grid">
+      <div class="col-md-2">
+        <label class="form-label small mb-1">勤務</label>
+        <select name="shift_id" class="form-select form-select-sm">
+          <option value="">勤務なし</option>
+          {% for s in shift_options %}<option value="{{ s.id }}">{{ s.name }}</option>{% endfor %}
+        </select>
+      </div>
+      <div class="col-md-2 d-grid">
         <button class="btn btn-sm btn-primary"><i class="bi bi-person-plus"></i> 追加</button>
       </div>
     </form>
     <p class="text-muted small mb-0 mt-2"><i class="bi bi-info-circle"></i> 追加したメンバーへのチーム割り当ては、下の「メンバーの紐づけ」で行います。認証は本番LDAPに準拠します。</p>
+    <p class="text-muted small mb-0"><i class="bi bi-calendar-check"></i> 勤務は出勤表の並びと、タスクの担当者の推奨（勤務表の休み・出勤日数）に使います。勤務の追加と勤務表の入力は「出勤表」の「勤務の設定」で行います。</p>
     <p class="text-muted small mb-0"><i class="bi bi-envelope"></i> メールアドレスは定型業務のリマインドの宛先です（空にして保存すると削除）。各メンバーもユーザーメニューの「メールアドレス」で自分の分を変更できます。</p>
 
     {% if inactive_members %}
@@ -6500,6 +6830,121 @@ a:hover {
 .skill-chat-ai {
   margin-right: 5%;
 }
+/* タスクの登録の画面: メールから下書きのドロップ先・必要スキル(app.py の 15 章) */
+.mail-drop {
+  border: 2px dashed #9ec5fe;
+}
+.mail-drop.mail-drop-over {
+  background-color: #e7f1ff;
+  border-color: #0d6efd;
+}
+.task-skills > summary {
+  cursor: pointer;
+}
+/* 出勤表(leaves/calendar.html。横軸=日付・縦軸=勤務帯と人。app.py の 16 章) */
+.roster {
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+.roster th,
+.roster td {
+  text-align: center;
+  vertical-align: middle;
+  padding: 0.15rem 0.2rem;
+}
+.roster .roster-day {
+  min-width: 1.9rem;
+}
+.roster .roster-sat {
+  color: #0d6efd;
+  background-color: #eef5ff;
+}
+.roster .roster-sun {
+  color: #dc3545;
+  background-color: #fff0f1;
+}
+.roster .roster-today {
+  box-shadow: inset 0 0 0 2px #ffc107;
+}
+.roster .roster-group,
+.roster .roster-corner {
+  background-color: #f8f9fa;
+}
+.roster .roster-group {
+  width: 5rem;
+  min-width: 5rem;
+  max-width: 5rem;
+  white-space: normal;
+}
+.roster .roster-name {
+  text-align: left;
+  min-width: 7rem;
+  background-color: #fff;
+}
+.roster .roster-sticky {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+}
+.roster .roster-sticky2 {
+  position: sticky;
+  left: 5rem;
+  z-index: 2;
+}
+.roster .roster-shift-row th.roster-name,
+.roster .roster-shift-row td {
+  background-color: #e8f3df;
+}
+.roster .roster-code.roster-kind-off {
+  color: #212529;
+}
+.roster .roster-code.roster-kind-extra {
+  color: #b02a37;
+  font-weight: bold;
+}
+.roster .roster-code.roster-kind-leave {
+  color: #6f42c1;
+  font-weight: bold;
+}
+.roster .roster-cell.roster-off {
+  background-color: #eceff1;
+}
+.roster-leave {
+  display: inline-block;
+  min-width: 1.3rem;
+  border-radius: 0.25rem;
+  text-align: center;
+  text-decoration: none;
+  font-weight: bold;
+  color: #fff;
+  background-color: #0d6efd;
+}
+.roster-leave.roster-leave-half {
+  color: #000;
+  background-color: #0dcaf0;
+}
+.roster .roster-add {
+  color: #adb5bd;
+  text-decoration: none;
+  opacity: 0;
+}
+.roster tr:hover .roster-add,
+.roster .roster-add:focus {
+  opacity: 1;
+}
+.roster-legend {
+  display: inline-block;
+  min-width: 1.3rem;
+  text-align: center;
+  border: 1px solid #ced4da;
+  background-color: #e8f3df;
+}
+.roster-legend.roster-off-swatch {
+  background-color: #eceff1;
+}
+.shift-codes {
+  resize: vertical;
+}
 {#=== static/js/sort-table.js ===#}
 /* 表の並び替え(共通)。
  *
@@ -6677,6 +7122,290 @@ a:hover {
     document.addEventListener("DOMContentLoaded", setup);
   } else {
     setup();
+  }
+})();
+{#=== static/js/task-form.js ===#}
+/* タスクの登録・編集の画面(tasks/form.html。マネージャー)用(app.py の 15 章)。
+ *
+ * ・推奨の担当者: 必要スキル(req_skill_<スキルID>)・開始日・期限を変えるたびに、GET /tasks/recommend で表を作り直す
+ *   (少し待ってから。続けて変えたときは最後の1回だけ使う)。表の「担当にする」は担当者のチェックを付け外しする。
+ *   JavaScript が無効なときは「推奨の担当者を表示」のボタン(入力を残したまま画面を表示し直す。保存しない)。
+ * ・必要スキル: 選んだスキルを見出し(summary)に出す。
+ * ・メールから下書き(登録の画面だけ): メールのファイル(.msg・.eml)をこの画面にドロップする(または「ファイルを選ぶ」)と、
+ *   POST /tasks/draft-from-mail にファイルそのものを送り、返ってきた下書きをタイトル・内容・優先度・日付・必要スキルの
+ *   欄に入れる(保存はしない。下書きに無い日付・必要スキルは今の入力のまま)。入力中の内容があれば、置き換える前に確認する。
+ */
+(function () {
+  "use strict";
+
+  var LOGIN_EXPIRED = "ログインの有効期限が切れています。別のタブでログインし直してから、もう一度操作してください" +
+    "（入力中の内容はまだ保存されていません。この画面を開き直すと消えます）。";
+  var SKILL_FIELD = /^req_skill_\d+$/;
+
+  function byId(id) { return document.getElementById(id); }
+
+  function setStatus(box, text, kind) {
+    if (!box) return;
+    box.textContent = text;
+    box.className = "small mt-2" + (kind ? " text-" + kind : "");
+  }
+
+  function readJson(response) {
+    if (response.status === 401 || response.redirected) {
+      throw new Error(LOGIN_EXPIRED);
+    }
+    return response.json().catch(function () {
+      throw new Error("サーバーの応答を読み取れませんでした（" + response.status + "）");
+    });
+  }
+
+  function skillSelects(form) {
+    return Array.prototype.filter.call(form.querySelectorAll("select"), function (el) {
+      return SKILL_FIELD.test(el.name);
+    });
+  }
+
+  function updateSkillSummary(form) {
+    var box = form.querySelector("[data-skill-summary]");
+    if (!box) return;
+    var names = skillSelects(form).filter(function (el) { return el.value; }).map(function (el) {
+      return (el.getAttribute("data-skill-name") || "") + "（Lv" + el.value + "）";
+    });
+    box.textContent = names.length ? names.length + "件を選択中: " + names.join("、") : "選んでいません（開いて選ぶ）";
+  }
+
+  // ---- 推奨の担当者 ----
+  function syncAssignButtons(panel) {
+    Array.prototype.forEach.call(panel.querySelectorAll("[data-assign]"), function (button) {
+      var box = byId("asg" + button.getAttribute("data-assign"));
+      if (!box || box.disabled) {
+        button.classList.add("d-none");
+        return;
+      }
+      button.classList.remove("d-none");
+      button.textContent = box.checked ? "選択中" : "担当にする";
+      button.classList.toggle("btn-outline-primary", !box.checked);
+      button.classList.toggle("btn-primary", box.checked);
+      button.setAttribute("aria-pressed", box.checked ? "true" : "false");
+    });
+  }
+
+  function setupRecommend(form) {
+    var url = form.getAttribute("data-recommend-url");
+    var panel = byId("recommend-panel");
+    if (!url || !panel || !window.fetch || !window.URLSearchParams) return;
+    var button = byId("recommend-button");
+    if (button) {
+      button.type = "button";
+      button.classList.add("d-none");
+    }
+    var timer = null;
+    var seq = 0;
+
+    function refresh() {
+      var params = new URLSearchParams();
+      skillSelects(form).forEach(function (el) {
+        if (el.value) params.append(el.name, el.value);
+      });
+      ["start_date", "due_date"].forEach(function (name) {
+        var el = form.elements[name];
+        if (el && el.value) params.append(name, el.value);
+      });
+      var taskId = form.getAttribute("data-task-id");
+      if (taskId) params.append("task", taskId);
+      var mine = ++seq;
+      fetch(url + "?" + params.toString(), {
+        headers: { "Accept": "application/json" },
+        credentials: "same-origin"
+      }).then(readJson).then(function (data) {
+        if (mine !== seq) return;  // 後から送った問い合わせの結果だけを使う
+        if (!data.ok) throw new Error(data.message || "推奨の担当者を表示できませんでした。");
+        panel.innerHTML = data.html;
+        syncAssignButtons(panel);
+      }).catch(function (error) {
+        if (mine !== seq) return;
+        var note = document.createElement("div");
+        note.className = "small text-danger mt-1";
+        note.textContent = error.message;
+        panel.appendChild(note);
+      });
+    }
+
+    function schedule() {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(refresh, 300);
+    }
+
+    form.addEventListener("change", function (event) {
+      var target = event.target;
+      if (!target || !target.name) return;
+      if (SKILL_FIELD.test(target.name)) {
+        updateSkillSummary(form);
+        schedule();
+      } else if (target.name === "start_date" || target.name === "due_date") {
+        schedule();
+      } else if (target.name === "assignee_ids") {
+        syncAssignButtons(panel);
+      }
+    });
+    panel.addEventListener("click", function (event) {
+      var button = event.target && event.target.closest ? event.target.closest("[data-assign]") : null;
+      if (!button) return;
+      var box = byId("asg" + button.getAttribute("data-assign"));
+      if (!box || box.disabled) return;
+      box.checked = !box.checked;
+      syncAssignButtons(panel);
+    });
+    syncAssignButtons(panel);
+    return schedule;
+  }
+
+  // ---- メールから下書き ----
+  function setupMailDrop(form, refreshRecommend) {
+    var zone = byId("mail-drop");
+    if (!zone || !window.fetch) return;
+    zone.classList.remove("d-none");
+    var url = zone.getAttribute("data-url");
+    var maxMb = parseInt(zone.getAttribute("data-max-mb"), 10) || 0;
+    var status = byId("mail-status");
+    var fileInput = byId("mail-file");
+    var useAi = byId("mail-use-ai");
+    var busy = false;
+
+    function hasFiles(event) {
+      var types = event.dataTransfer && event.dataTransfer.types;
+      if (!types) return false;
+      for (var i = 0; i < types.length; i++) {
+        if (types[i] === "Files") return true;
+      }
+      return false;
+    }
+
+    document.addEventListener("dragover", function (event) {
+      if (!hasFiles(event)) return;
+      event.preventDefault();  // ドロップを受け付ける(ブラウザがファイルを開かないように)
+      event.dataTransfer.dropEffect = "copy";
+      zone.classList.add("mail-drop-over");
+    });
+    document.addEventListener("dragleave", function (event) {
+      if (!event.relatedTarget) zone.classList.remove("mail-drop-over");
+    });
+    document.addEventListener("drop", function (event) {
+      if (!hasFiles(event)) return;
+      event.preventDefault();
+      zone.classList.remove("mail-drop-over");
+      var files = event.dataTransfer.files;
+      if (files && files.length) send(files[0]);
+    });
+    if (fileInput) {
+      fileInput.addEventListener("change", function () {
+        if (fileInput.files && fileInput.files.length) send(fileInput.files[0]);
+        fileInput.value = "";
+      });
+    }
+
+    function hasInput() {
+      var filled = ["title", "description", "start_date", "due_date"].some(function (name) {
+        var el = form.elements[name];
+        return el && el.value && el.value.trim();
+      });
+      return filled || skillSelects(form).some(function (el) { return el.value; });
+    }
+
+    function setValue(name, value) {
+      var el = form.elements[name];
+      if (el && !el.disabled) el.value = value;
+    }
+
+    function fill(data) {
+      setValue("title", data.title || "");
+      setValue("description", data.description || "");
+      if (data.priority) setValue("priority", data.priority);
+      if (data.start_date) setValue("start_date", data.start_date);
+      if (data.due_date) setValue("due_date", data.due_date);
+      if (data.skills && data.skills.length) {
+        var levels = {};
+        data.skills.forEach(function (skill) { levels["req_skill_" + skill.id] = String(skill.level); });
+        skillSelects(form).forEach(function (el) { el.value = levels[el.name] || ""; });
+        var details = byId("task-skills");
+        if (details) details.open = true;
+      }
+      updateSkillSummary(form);
+      if (refreshRecommend) refreshRecommend();
+    }
+
+    function showResult(data) {
+      status.textContent = "";
+      status.className = "small mt-2";
+      var main = document.createElement("div");
+      main.className = "text-success";
+      main.textContent = data.message || "下書きを入れました。";
+      status.appendChild(main);
+      if (data.notes && data.notes.length) {
+        var list = document.createElement("ul");
+        list.className = "mb-0 text-muted";
+        data.notes.forEach(function (note) {
+          var item = document.createElement("li");
+          item.textContent = note;
+          list.appendChild(item);
+        });
+        status.appendChild(list);
+      }
+    }
+
+    function send(file) {
+      if (busy) return;
+      var name = file.name || "";
+      if (!/\.(msg|eml)$/i.test(name)) {
+        setStatus(status, "メールのファイル（Outlook の .msg・.eml）を選んでください。", "danger");
+        return;
+      }
+      if (maxMb && file.size > maxMb * 1000000) {
+        setStatus(status, "メールのファイルが大きすぎます（" + maxMb + "MB まで）。添付ファイルを外して保存したメールでお試しください。", "danger");
+        return;
+      }
+      if (hasInput() && !window.confirm("入力中のタイトル・内容などを、メールの下書きで置き換えます（保存するまでは登録されません）。よろしいですか？")) {
+        return;
+      }
+      busy = true;
+      var ai = !!(useAi && useAi.checked);
+      setStatus(status, "「" + name + "」を読み取っています" + (ai ? "（AIで整えるため、数十秒かかることがあります）" : "") + "…", "muted");
+      fetch(url + (ai ? "?ai=1" : ""), {
+        method: "POST",
+        body: file,
+        credentials: "same-origin",
+        headers: {
+          "Accept": "application/json",
+          "Content-Type": "application/octet-stream",
+          "X-File-Name": encodeURIComponent(name)
+        }
+      }).then(readJson).then(function (data) {
+        if (!data.ok) {
+          setStatus(status, data.message || "下書きを作れませんでした。", "danger");
+          return;
+        }
+        fill(data);
+        showResult(data);
+      }).catch(function (error) {
+        setStatus(status, error.message, "danger");
+      }).then(function () {
+        busy = false;
+      });
+    }
+  }
+
+  function init() {
+    var form = byId("task-form");
+    if (!form) return;
+    updateSkillSummary(form);
+    var refresh = setupRecommend(form);
+    setupMailDrop(form, refresh);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
   }
 })();
 {#=== static/js/skill-item-form.js ===#}
