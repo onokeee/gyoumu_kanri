@@ -21152,6 +21152,7 @@ def _render_shift_month(year, month, codes, form=None):
     key, days = month_key(year, month), month_days(year, month)
     shifts = _ordered_shifts(active_only=True)
     rows = {row.shift_id: row for row in WorkShiftMonth.query.filter_by(month=key).all()}
+    dates = [date(year, month, number) for number in range(1, days + 1)]
     items = []
     for shift in shifts:
         saved = (rows[shift.id].code_list() + [""] * days)[:days] if shift.id in rows else [""] * days
@@ -21162,8 +21163,10 @@ def _render_shift_month(year, month, codes, form=None):
                 values = [(value or "").strip() for value in posted]
         orig = shift_codes_text(saved)
         items.append({"shift": shift, "orig": form.get("orig_{}".format(shift.id), orig) if form is not None else orig,
-                      "cells": [{"code": code, "known": code in codes, "kind": codes[code].kind if code in codes else ""}
-                                for code in values]})
+                      # off: 休みの日(記号の種類が休日・年休、記号の無い土日・祝日)。rest: 記号が無ければ休みの日
+                      "cells": [{"code": code, "known": code in codes, "kind": codes[code].kind if code in codes else "",
+                                 "off": day_kind(code, codes, day) not in SHIFT_WORKING_KINDS, "rest": not is_business_day(day)}
+                                for code, day in zip(values, dates)]})
     prev_year, prev_month = (year - 1, 12) if month == 1 else (year, month - 1)
     next_year, next_month = (year + 1, 1) if month == 12 else (year, month + 1)
     return render_template(

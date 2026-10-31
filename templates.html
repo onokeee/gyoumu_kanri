@@ -6967,7 +6967,7 @@
   </div>
 </div>
 <h2 class="h6 fw-bold mt-4">この月の勤務表を修正する</h2>
-<p class="small text-muted">勤務表は上の「Excel で取り込む」で登録します。ここでは、この月の勤務表を見ながら、日ごとに記号を直せます（直したい日の記号を選び直して「保存」。変えた日はオレンジの枠になります）。「-」は記号なしです（記号の無い日は、土日・祝日を休み、それ以外を出勤として扱います）。</p>
+<p class="small text-muted">勤務表は上の「Excel で取り込む」で登録します。ここでは、この月の勤務表を見ながら、日ごとに記号を直せます（直したい日の記号を選び直して「保存」。変えた日はオレンジの枠になります）。灰色は休みの日です。「-」は記号なしです（記号の無い日は、土日・祝日を休み、それ以外を出勤として扱います）。</p>
 {% if not codes %}<div class="alert alert-warning small">勤務表の記号がまだありません。先に「<a href="{{ url_for('admin.shifts') }}">勤務の設定</a>」で記号を保存してください。</div>{% endif %}
 {% if not items %}<div class="alert alert-info small">有効な勤務がありません。「<a href="{{ url_for('admin.shifts') }}">勤務の設定</a>」で勤務を追加してください。</div>{% endif %}
 {% if items %}
@@ -6996,7 +6996,7 @@
               {# 画面を開いたときの内容(ほかの操作で変わった行を、この画面の古い内容で上書きしない) #}
               <input type="hidden" name="orig_{{ item.shift.id }}" value="{{ item.orig }}"></th>
             {% for c in item.cells %}
-            <td class="roster-code roster-kind-{{ kind_css.get(c.kind, 'none') }} shift-edit-cell">
+            <td class="roster-code roster-kind-{{ kind_css.get(c.kind, 'none') }} shift-edit-cell{% if c.off %} shift-off{% endif %}"{% if c.rest %} data-rest="1"{% endif %}>
               <select name="day_{{ item.shift.id }}_{{ loop.index }}" class="shift-cell" data-orig="{{ c.code }}"
                       aria-label="{{ item.shift.name }} {{ month }}月{{ loop.index }}日">
                 <option value="" data-kind="none">-</option>
@@ -7304,6 +7304,9 @@ a:hover {
 .shift-edit .shift-cell:focus {
   outline: 2px solid #0d6efd;
   outline-offset: -2px;
+}
+.shift-edit .shift-off {
+  background-color: #eceff1;
 }
 .shift-edit .shift-changed {
   box-shadow: inset 0 0 0 2px #fd7e14;
@@ -8502,8 +8505,9 @@ a:hover {
   }
 })();
 {#=== static/js/shift-month.js ===#}
-/* 勤務表の修正(admin/shift_month.html): 記号を選び直した日のセルの色を記号の種類に合わせ、開いたときと違う日に
- * 印(shift-changed。オレンジの枠)を付ける。JavaScript が無くても保存はできる。
+/* 勤務表の修正(admin/shift_month.html): 記号を選び直した日のセルの色を記号の種類に合わせ(休みの日は灰色。記号の無い日は
+ * data-rest〔土日・祝日〕なら休み)、開いたときと違う日に印(shift-changed。オレンジの枠)を付ける。
+ * JavaScript が無くても保存はできる。
  */
 (function () {
   "use strict";
@@ -8517,6 +8521,8 @@ a:hover {
       if (name.indexOf("roster-kind-") === 0) cell.classList.remove(name);
     });
     cell.classList.add("roster-kind-" + kind);
+    var off = kind === "off" || kind === "leave" || (select.value === "" && cell.getAttribute("data-rest") === "1");
+    cell.classList.toggle("shift-off", off);
     cell.classList.toggle("shift-changed", select.value !== (select.getAttribute("data-orig") || ""));
   }
 
