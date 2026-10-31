@@ -5857,8 +5857,11 @@ LEAVE_YEAR_MIN = 2000
 LEAVE_YEAR_MAX = 2099
 
 # 同じ人・同じ取得日の重複を防ぐため、登録・更新の「重複の確認→保存」を1つずつ行うロック
-# (既存のテーブルに一意制約を足さないため。同時に送信されても2件にならないように)
+# (既存のテーブルに一意制約を足さないため。同時に送信されても2件にならないように)。環境(17 章)ごと
 _leave_lock = threading.Lock()
+
+def _leave_lock_for():
+    return env_scoped(current_app_or_none(), "leave", threading.Lock, _leave_lock)
 
 def _can_modify_leave(leave):
     return leave.user_id == current_user.id
@@ -6057,7 +6060,7 @@ def new_leave():
             flash(error, "danger")
             return _render_leave_form(None, request.form)
 
-        with _leave_lock:
+        with _leave_lock_for():
             lock_for_write()  # 本人がチーム管理で同時に削除されていたら登録しない(ログイン画面へ)
             dup = _duplicate_on(current_user.id, leave_date)
             calendar_url = url_for("leaves.calendar_view", year=leave_date.year, month=leave_date.month)
@@ -6110,7 +6113,7 @@ def edit_leave(leave_id):
         if error:
             flash(error, "danger")
             return _render_leave_form(leave, request.form)
-        with _leave_lock:
+        with _leave_lock_for():
             # 書き込みのロックを取ってから読み直す(同時に取り消された年休は更新しない。404。
             # ロックの順番は登録と同じ _leave_lock → DB)
             lock_for_write()
@@ -9836,7 +9839,8 @@ def start_skill_judgment(app, judgment_id):
         return
 
     def worker():
-        with SKILL_JUDGE_LOCK:
+        # 1件ずつ(環境ごと。ほかの環境の判定の AI の応答は待たない。17 章)
+        with env_scoped(app, "skill_judge", threading.Lock, SKILL_JUDGE_LOCK):
             with app.app_context():
                 _run_judgment_safely(app, judgment_id)
 
@@ -10523,7 +10527,8 @@ def start_chat_reply(app, message_id):
         return
 
     def worker():
-        with SKILL_CHAT_LOCK:
+        # 1件ずつ(環境ごと。ほかの環境の相談の AI の応答は待たない。17 章)
+        with env_scoped(app, "skill_chat", threading.Lock, SKILL_CHAT_LOCK):
             with app.app_context():
                 _run_chat_safely(app, message_id)
 
@@ -18195,9 +18200,14 @@ def prepare_instance(app, create_tables=True):
     if is_main_env(app):
         _hint_old_config(app, store)
         _hint_admin_password(app)
-    _ensure_secret_key(app)
-    if not is_main_env(app):
-        # ほかの環境(17 章)のクッキーは環境ごと(同じブラウザで別の環境を同時に開ける。メインの環境のクッキーは読むだけ)
+        _ensure_secret_key(app)
+    else:
+        # ほかの環境(17 章): 鍵はメインの環境の実行中の鍵(共通の settings.json は書かず、そのロックも取らない)。
+        # クッキーは環境ごと(同じブラウザで別の環境を同時に開ける。メインの環境のクッキーは読むだけ)
+        main = app.extensions.get(ENV_MAIN_APP_KEY)
+        for key in ("SECRET_KEY", "SECRET_KEY_FALLBACKS"):
+            if main is not None and key in main.config:
+                app.config[key] = main.config[key]
         app.config["SESSION_COOKIE_NAME"] = ENV_COOKIE_PREFIX + env_key(app)
 
     app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///{}".format(instance_db_path(app))
@@ -21458,16 +21468,19 @@ def env_nav_context():
 ENV_ONCE_KIND = "env_create"
 
 def _env_member_counts(entry):
-    """環境の有効なメンバーの数(数えられなければ None)。"""
-    dispatcher = env_dispatcher()
-    if dispatcher is None:
+    """環境の有効なメンバーの数(数えられなければ None)。
+
+    DB を読み取り専用で開いて数える(環境のアプリは作らない。停止した環境の DB を変えない・無いフォルダを作らない)。
+    """
+    path = os.path.join(env_instance_path(shared_instance_path(), entry["key"]), "app.db")
+    if not os.path.isfile(path):
         return None
     try:
-        app = dispatcher.build(entry["key"])
-        with app.app_context():
-            return User.query.filter_by(is_active=True).count()
-    except Exception:
-        current_app.logger.exception("環境 %s のメンバーを数えられませんでした", entry["key"])
+        uri = "file:{}?mode=ro".format(urllib.request.pathname2url(os.path.abspath(path)))
+        with closing(sqlite3.connect(uri, uri=True, timeout=2)) as conn:
+            return conn.execute("SELECT COUNT(*) FROM users WHERE is_active = 1").fetchone()[0]
+    except (sqlite3.Error, OSError):
+        current_app.logger.warning("環境 %s のメンバーを数えられませんでした", entry["key"], exc_info=True)
         return None
 
 def envs_tab_context(inputs=None):
@@ -21521,20 +21534,47 @@ def create_environment(name, username, display_name, created_by, expected_versio
             if problem:
                 raise ValueError(problem)
             key = _next_env_key(registry, shared)
-            app = dispatcher.build(key)
-            with app.app_context():
-                user = User.query.filter_by(username=username).first() or User(username=username)
-                user.display_name = display_name
-                user.role = ROLE_MANAGER
-                user.is_active = True
-                db.session.add(user)
-                db.session.commit()
-            entry = {"key": key, "name": name, "active": True,
-                     "created_at": datetime.now().strftime("%Y/%m/%d %H:%M"), "created_by": str(created_by)[:64]}
-            write_env_registry(shared, registry["envs"] + [entry], created_by, registry["version"])
+            app = None
+            try:
+                app = dispatcher.build(key)
+                with app.app_context():
+                    user = User.query.filter_by(username=username).first() or User(username=username)
+                    user.display_name = display_name
+                    user.role = ROLE_MANAGER
+                    user.is_active = True
+                    db.session.add(user)
+                    db.session.commit()
+                entry = {"key": key, "name": name, "active": True,
+                         "created_at": datetime.now().strftime("%Y/%m/%d %H:%M"), "created_by": str(created_by)[:64]}
+                write_env_registry(shared, registry["envs"] + [entry], created_by, registry["version"])
+            except Exception:
+                _discard_env_build(dispatcher, key, app, shared)
+                raise
         finally:
             _unlock_settings_file(lock_file)
     return entry
+
+def _discard_env_build(dispatcher, key, app, shared):
+    """追加に失敗した環境の後始末: 作ったアプリを忘れ、DB の接続を閉じて、フォルダの名前を「<キー>.failed-日時」に
+    変える(一覧に載っていない DB をその名前のまま残さない。変えられなければそのまま。ログに残す)。
+    """
+    with dispatcher.lock:
+        if dispatcher.apps.get(key) is app:
+            dispatcher.apps.pop(key, None)
+    if app is not None:
+        try:
+            with app.app_context():
+                db.engine.dispose()
+        except Exception:
+            current_app.logger.warning("追加に失敗した環境 %s の DB の接続を閉じられませんでした", key, exc_info=True)
+    folder = env_instance_path(shared, key)
+    if os.path.isdir(folder):
+        target = "{}.failed-{}".format(folder, datetime.now().strftime("%Y%m%d%H%M%S"))
+        try:
+            os.rename(folder, target)
+            current_app.logger.warning("追加に失敗した環境のフォルダの名前を変えました: %s", os.path.basename(target))
+        except OSError:
+            current_app.logger.warning("追加に失敗した環境のフォルダ %s を残しました", folder, exc_info=True)
 
 def change_environment(key, expected_version, username, name=None, active=None):
     """環境の名前・停止/再開を変える。戻り値: 変えた後の行。例外は create_environment と同じ(無い環境は KeyError)。"""
