@@ -2412,12 +2412,26 @@ LEAVE_DAILY_LIMIT = 2
 LEAVE_FULL = "全休"
 LEAVE_AM = "午前半休"
 LEAVE_PM = "午後半休"
-LEAVE_TYPE_CHOICES = [LEAVE_FULL, LEAVE_AM, LEAVE_PM]
+LEAVE_AM_HOURS = "午前時間休"
+LEAVE_PM_HOURS = "午後時間休"
+LEAVE_TYPE_CHOICES = [LEAVE_FULL, LEAVE_AM, LEAVE_PM, LEAVE_AM_HOURS, LEAVE_PM_HOURS]
+LEAVE_HALF_TYPES = (LEAVE_AM, LEAVE_PM)
+# 時間休(午前・午後の数時間の年休。時間は記録しない): 換算日数に数えず、出勤日数では出勤の日として数える。担当者の
+# 推奨の「休み」・同じ日に休む人数(出勤表・登録の案内)にも数えない(出勤表・一覧・推奨の表には表示する)
+LEAVE_HOURLY_TYPES = (LEAVE_AM_HOURS, LEAVE_PM_HOURS)
 LEAVE_TYPE_COLORS = {
     LEAVE_FULL: "primary",
     LEAVE_AM: "info",
     LEAVE_PM: "info",
+    LEAVE_AM_HOURS: "secondary",
+    LEAVE_PM_HOURS: "secondary",
 }
+
+def leave_workday_share(leave):
+    """その日を出勤日数に数える割合(15-2 の推奨・規模の案内): 年休の無い日・時間休=1、全休=0、半休=0.5。"""
+    if leave is None or leave.leave_type in LEAVE_HOURLY_TYPES:
+        return 1
+    return 0 if leave.leave_type == LEAVE_FULL else 0.5
 
 class LeaveRequest(db.Model):
     __tablename__ = "leave_requests"
@@ -2439,8 +2453,20 @@ class LeaveRequest(db.Model):
 
     @property
     def day_count(self):
-        """換算取得日数。全休=1、半休=0.5。"""
-        return 0.5 if self.leave_type in (LEAVE_AM, LEAVE_PM) else 1
+        """換算取得日数。全休=1、半休=0.5、時間休=0(時間は記録しないため、日数には数えない)。"""
+        if self.leave_type in LEAVE_HOURLY_TYPES:
+            return 0
+        return 0.5 if self.leave_type in LEAVE_HALF_TYPES else 1
+
+    @property
+    def is_hourly(self):
+        """時間休(午前時間休・午後時間休)か。"""
+        return self.leave_type in LEAVE_HOURLY_TYPES
+
+    @property
+    def day_label(self):
+        """換算日数の表示(時間休は「時間単位」)。"""
+        return "時間単位" if self.is_hourly else _fmt_num(self.day_count)
 
     @property
     def date_label(self):
@@ -6002,7 +6028,7 @@ def _is_overbooked(user, leave_date, exclude_id=None):
     q = LeaveRequest.query.filter(LeaveRequest.leave_date == leave_date)
     if exclude_id:
         q = q.filter(LeaveRequest.id != exclude_id)
-    others = q.all()
+    others = [lv for lv in q.all() if lv.leave_type not in LEAVE_HOURLY_TYPES]   # 時間休は数えない
     for dept in depts:
         member_ids = {u.id for u in dept.users}
         off_ids = {lv.user_id for lv in others if lv.user_id in member_ids}
@@ -6011,9 +6037,9 @@ def _is_overbooked(user, leave_date, exclude_id=None):
             return True
     return False
 
-def _registration_messages(user, leave_date, exclude_id=None):
-    """登録/更新後に出すメッセージ(同日上限・今週連絡)をflashする。"""
-    if _is_overbooked(user, leave_date, exclude_id=exclude_id):
+def _registration_messages(user, leave_date, exclude_id=None, leave_type=None):
+    """登録/更新後に出すメッセージ(同日上限・今週連絡)をflashする(時間休は同日上限を確かめない)。"""
+    if leave_type not in LEAVE_HOURLY_TYPES and _is_overbooked(user, leave_date, exclude_id=exclude_id):
         flash(
             "チーム内（マネージャー・メンバー）で業務影響ないよう事前にすり合わせて登録するようお願いします。",
             "warning",
@@ -6136,7 +6162,7 @@ def new_leave():
                 # 登録のボタンの二度押しの2回目: 表示されるのはこちらの画面なので、1回目の案内
                 # (同日の人数・今週の連絡のお願い)をもう一度出す
                 flash(_SUBMITTED_TWICE.format("年休"), "info")
-                _registration_messages(current_user, leave_date, exclude_id=dup.id)
+                _registration_messages(current_user, leave_date, exclude_id=dup.id, leave_type=dup.leave_type)
                 return redirect(calendar_url)
             if dup:
                 return flash_redirect("その取得日の年休は既に登録されています。", "warning", url_for("leaves.detail", leave_id=dup.id))
@@ -6147,7 +6173,7 @@ def new_leave():
             db.session.add(leave)
             commit_submitted("leave", calendar_url)
         flash("年休を登録しました。", "success")
-        _registration_messages(current_user, leave_date, exclude_id=leave.id)
+        _registration_messages(current_user, leave_date, exclude_id=leave.id, leave_type=leave_type)
         return redirect(url_for("leaves.calendar_view", year=leave_date.year, month=leave_date.month))
 
     # 出勤表の自分の行の日(?date=YYYY-MM-DD)から開いたときは、その日を取得日に入れておく
@@ -6202,7 +6228,7 @@ def edit_leave(leave_id):
             leave.leave_type = leave_type
             db.session.commit()
         flash("年休を更新しました。", "success")
-        _registration_messages(current_user, leave_date, exclude_id=leave_id)
+        _registration_messages(current_user, leave_date, exclude_id=leave_id, leave_type=leave_type)
         return redirect(url_for("leaves.detail", leave_id=leave_id))
 
     return _render_leave_form(leave)
@@ -19467,7 +19493,10 @@ def recommend_assignees(levels, start, due, task_id=None, today=None, scale=None
             total += level
         user_leaves = leaves.get(user.id, [])
         shift = shift_by_user.get(user.id)
-        rest = {leave.leave_date: _leave_label(leave, today) for leave in user_leaves}  # 日 → 表示(同じ日は1つ)
+        # 休み(推奨にしない): 日 → 表示(同じ日は1つ)。時間休は休みにせず、表に出すだけ
+        rest = {leave.leave_date: _leave_label(leave, today) for leave in user_leaves
+                if leave.leave_type not in LEAVE_HOURLY_TYPES}
+        hourly = [_leave_label(leave, today) for leave in user_leaves if leave.leave_type in LEAVE_HOURLY_TYPES]
         workdays = None
         if period_days:
             workdays = 0
@@ -19478,8 +19507,7 @@ def recommend_assignees(levels, start, due, task_id=None, today=None, scale=None
                 if kind == SHIFT_KIND_LEAVE:
                     rest.setdefault(day, "{}（{}）".format(_date_label(day, today), codes[code].label))
                 elif kind in SHIFT_WORKING_KINDS:
-                    leave = leave_on.get(day)
-                    workdays += 1 if leave is None else (0 if leave.leave_type == LEAVE_FULL else 0.5)
+                    workdays += leave_workday_share(leave_on.get(day))
         rest = sorted(rest.items())
         meets_all = met == len(reqs)
         no_workday = workdays is not None and workdays <= 0
@@ -19490,6 +19518,7 @@ def recommend_assignees(levels, start, due, task_id=None, today=None, scale=None
             "user": user, "shift": shift, "detail": detail, "met": met, "short": short, "total": total,
             "meets_all": meets_all, "leaves": [label for _day, label in rest[:RECOMMEND_LEAVE_SHOWN]],
             "more_leaves": max(0, len(rest) - RECOMMEND_LEAVE_SHOWN), "has_leave": bool(rest),
+            "hourly_leaves": hourly[:RECOMMEND_LEAVE_SHOWN], "more_hourly": max(0, len(hourly) - RECOMMEND_LEAVE_SHOWN),
             "workdays": _fmt_num(workdays) if workdays is not None else "", "workday_count": workdays or 0,
             "no_workday": no_workday, "open_tasks": loads.get(user.id, 0),
             # 負荷(月の目安工数 h)。今・このタスクを足した後・残り(負は超過)と、その水準(低・中・高)
@@ -19546,8 +19575,7 @@ def workdays_by_user(users, first, last):
         while day <= last:
             code = day_codes.get((shift.id, day)) if shift is not None else None
             if day_kind(code, codes, day) in SHIFT_WORKING_KINDS:
-                leave = leave_on.get((user.id, day))
-                count += 1 if leave is None else (0 if leave.leave_type == LEAVE_FULL else 0.5)
+                count += leave_workday_share(leave_on.get((user.id, day)))
             day += timedelta(days=1)
         result[user.id] = count
     return result
@@ -20797,7 +20825,10 @@ def shift_codes_text(codes):
 
 # ==== 16-2. 出勤表(横軸=日付、縦軸=勤務帯・勤務と人) =============================================
 
-ROSTER_LEAVE_MARKS = {LEAVE_FULL: "年", LEAVE_AM: "前", LEAVE_PM: "後"}
+ROSTER_LEAVE_MARKS = {LEAVE_FULL: "年", LEAVE_AM: "前", LEAVE_PM: "後", LEAVE_AM_HOURS: "前", LEAVE_PM_HOURS: "後"}
+# 印の見た目(CSS のクラス)。時間休は枠だけの印(半休と同じ「前」「後」と見分ける)
+ROSTER_LEAVE_CLASSES = {LEAVE_FULL: "roster-leave-full", LEAVE_AM: "roster-leave-half", LEAVE_PM: "roster-leave-half",
+                        LEAVE_AM_HOURS: "roster-leave-hour", LEAVE_PM_HOURS: "roster-leave-hour"}
 
 def _roster_days(year, month):
     today = date.today()
@@ -20847,6 +20878,8 @@ def build_roster(year, month, dept_id=None, viewer=None):
             leave = leave_by.get((user.id, day["date"]))
             cells.append({"date": day["date"], "leave": leave, "kind": kind,
                           "mark": ROSTER_LEAVE_MARKS.get(leave.leave_type, "年") if leave is not None else "",
+                          "mark_class": (ROSTER_LEAVE_CLASSES.get(leave.leave_type, "roster-leave-half")
+                                         if leave is not None else ""),
                           "off": kind not in SHIFT_WORKING_KINDS})
         return {"user": user, "cells": cells, "me": viewer is not None and user.id == viewer.id}
 
@@ -20875,11 +20908,12 @@ def build_roster(year, month, dept_id=None, viewer=None):
                         "order": min(item["shift"].sort_order for item in items)})
     ordered.sort(key=lambda g: (g["order"], g["name"]))
 
-    # 日ごとの年休の人数(半休も1人)と、同じチームで同じ日に休む人数が多いか(以前のカレンダーと同じ基準)
+    # 日ごとの年休の人数(半休も1人。時間休は数えない)と、同じチームで同じ日に休む人数が多いか(以前のカレンダーと
+    # 同じ基準)
     dept_member_ids = {d.id: {u.id for u in d.users} for d in ordered_rows(Department)}
     totals = []
     for day in days:
-        day_leaves = [lv for lv in leaves if lv.leave_date == day["date"]]
+        day_leaves = [lv for lv in leaves if lv.leave_date == day["date"] and lv.leave_type not in LEAVE_HOURLY_TYPES]
         off_ids = {lv.user_id for lv in day_leaves}
         if dept_id:
             warn = dept is not None and dept.is_active and len(off_ids) > LEAVE_DAILY_LIMIT

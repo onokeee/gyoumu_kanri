@@ -1331,7 +1331,8 @@
         {% if rec.requirements %}
         <td>{% for d in row.detail %}<span class="badge {{ 'text-bg-primary' if d.ok else 'text-bg-danger' }} me-1" title="{{ d.skill.name }}: 到達度 Lv{{ d.have }}（{{ d.have_label }}）／必要 Lv{{ d.need }}">{{ d.skill.name }} {{ d.have }}/{{ d.need }}</span>{% endfor %}</td>
         {% endif %}
-        <td class="small">{% if row.leaves %}{{ row.leaves|join('、') }}{% if row.more_leaves %} ほか{{ row.more_leaves }}日{% endif %}{% elif rec.period %}なし{% else %}―{% endif %}</td>
+        <td class="small">{% if row.leaves %}{{ row.leaves|join('、') }}{% if row.more_leaves %} ほか{{ row.more_leaves }}日{% endif %}{% elif rec.period %}なし{% else %}―{% endif %}
+          {%- if row.hourly_leaves %}<div class="text-muted">時間休: {{ row.hourly_leaves|join('、') }}{% if row.more_hourly %} ほか{{ row.more_hourly }}日{% endif %}</div>{% endif %}</td>
         {% if rec.counts_workdays %}<td class="text-end text-nowrap">{{ row.workdays }}日</td>{% endif %}
         <td class="text-end text-nowrap">{{ row.load_h }}h <span class="badge text-bg-{{ row.load_level.color }}">{{ row.load_level.label }}</span><div class="small text-muted">担当中 {{ row.open_tasks }}件</div></td>
         <td class="text-end text-nowrap">{% if rec.scale_label %}{{ row.after_h }}h <span class="badge text-bg-{{ row.after_level.color }}">{{ row.after_level.label }}</span>{% endif %}
@@ -2013,7 +2014,7 @@
           <td><a href="{{ url_for('leaves.detail', leave_id=lv.id) }}">{{ lv.user.display_name }}</a></td>
           <td class="text-nowrap">{{ lv.date_label }}</td>
           <td><span class="badge bg-{{ lv.type_color }}">{{ lv.leave_type }}</span></td>
-          <td class="text-end">{{ lv.day_count }}</td>
+          <td class="text-end">{{ lv.day_label }}</td>
         </tr>
         {% else %}
         <tr><td colspan="4" class="text-center text-muted py-4">該当する年休はありません。</td></tr>
@@ -2042,7 +2043,7 @@
   {% for c in p.cells %}
   <td class="roster-cell {% if c.off %}roster-off{% endif %}">
     {%- if c.leave -%}
-    <a href="{{ url_for('leaves.detail', leave_id=c.leave.id) }}" class="roster-leave {{ 'roster-leave-full' if c.leave.leave_type == '全休' else 'roster-leave-half' }}" title="{{ p.user.display_name }} / {{ c.leave.leave_type }}">{{ c.mark }}</a>
+    <a href="{{ url_for('leaves.detail', leave_id=c.leave.id) }}" class="roster-leave {{ c.mark_class }}" title="{{ p.user.display_name }} / {{ c.leave.leave_type }}">{{ c.mark }}</a>
     {%- elif p.me and not c.off -%}
     <a href="{{ url_for('leaves.new_leave', date=c.date.isoformat()) }}" class="roster-add" title="{{ c.date.strftime('%m/%d') }}の年休を登録" aria-label="{{ c.date.strftime('%m/%d') }}の年休を登録">＋</a>
     {%- endif -%}
@@ -2148,6 +2149,7 @@
   {% for c in roster.codes %}<span><span class="roster-legend roster-kind-{{ kind_css.get(c.kind, 'none') }}">{{ c.code }}</span> {{ c.label }}</span>{% endfor %}
   <span><span class="roster-leave roster-leave-full">{{ leave_marks['全休'] }}</span> 年休（全休）</span>
   <span><span class="roster-leave roster-leave-half">{{ leave_marks['午前半休'] }}</span> 午前半休 <span class="roster-leave roster-leave-half">{{ leave_marks['午後半休'] }}</span> 午後半休</span>
+  <span><span class="roster-leave roster-leave-hour">{{ leave_marks['午前時間休'] }}</span> 午前時間休 <span class="roster-leave roster-leave-hour">{{ leave_marks['午後時間休'] }}</span> 午後時間休（年休の人数には数えません）</span>
   <span><span class="roster-legend roster-off-swatch"></span> 休み（勤務表の休日・年休の日。勤務表の記号が無い日は土日・祝日）</span>
   <span>自分の行の「＋」から、その日の年休を登録できます</span>
   <span class="text-danger"><i class="bi bi-people-fill"></i> 同じチームで同日{{ daily_limit }}名超</span>{% for d in departments if d.id == dept_id and not d.is_active %}
@@ -2182,7 +2184,7 @@
       <dd class="col-sm-9">{{ fmt_date_jp(leave.leave_date) }}</dd>
 
       <dt class="col-sm-3 text-muted">種別</dt>
-      <dd class="col-sm-9">{{ leave.leave_type }}（換算 {{ leave.day_count }} 日）</dd>
+      <dd class="col-sm-9">{{ leave.leave_type }}（{% if leave.is_hourly %}時間単位の年休。換算日数には数えません{% else %}換算 {{ leave.day_label }} 日{% endif %}）</dd>
 
       <dt class="col-sm-3 text-muted">所属チーム</dt>
       <dd class="col-sm-9">{{ leave.user.department_names or '―' }}</dd>
@@ -2247,6 +2249,7 @@
             {% if (form.get('leave_type') if form else (leave.leave_type if leave else '全休')) == t %}selected{% endif %}>{{ t }}</option>
           {% endfor %}
         </select>
+        <div class="form-text">時間休（午前・午後の数時間の年休）は、換算日数と、同じチームで同じ日に休む人数には数えません。</div>
       </div>
 
       <div class="alert alert-secondary small py-2 mb-3">
@@ -7289,6 +7292,12 @@ a:hover {
 .roster-leave.roster-leave-half {
   color: #000;
   background-color: #0dcaf0;
+}
+/* 時間休: 枠だけの印(半休の「前」「後」と見分ける) */
+.roster-leave.roster-leave-hour {
+  color: #087990;
+  background-color: #fff;
+  border: 1px solid #0dcaf0;
 }
 .roster .roster-add {
   color: #adb5bd;
