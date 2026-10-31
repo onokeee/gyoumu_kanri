@@ -5227,7 +5227,7 @@
       </div>
     </form>
     <p class="text-muted small mb-0 mt-2"><i class="bi bi-info-circle"></i> 追加したメンバーへのチーム割り当ては、下の「メンバーの紐づけ」で行います。認証は本番LDAPに準拠します。</p>
-    <p class="text-muted small mb-0"><i class="bi bi-calendar-check"></i> 勤務は出勤表の並びと、タスクの担当者の推奨（勤務表の休み・出勤日数）に使います。勤務の追加と勤務表の入力は「出勤表」の「勤務の設定」で行います。</p>
+    <p class="text-muted small mb-0"><i class="bi bi-calendar-check"></i> 勤務は出勤表の並びと、タスクの担当者の推奨（勤務表の休み・出勤日数）に使います。勤務の追加と勤務表の入力は、すべての環境で共通のため、固定ローカル管理者（admin）がシステム管理の「勤務パターン」で行います。</p>
     <p class="text-muted small mb-0"><i class="bi bi-envelope"></i> メールアドレスは定型業務のリマインドの宛先です（空にして保存すると削除）。各メンバーもユーザーメニューの「メールアドレス」で自分の分を変更できます。</p>
 
     {% if inactive_members %}
@@ -7621,7 +7621,7 @@ a:hover {
     var aiNote = byId("mail-ai-note");
     var ai = !!(aiNote && aiNote.getAttribute("data-ai") === "1");
     var busy = false;
-    var FIELDS = ["title", "description", "priority", "start_date", "due_date"];
+    var FIELDS = ["title", "description", "priority", "start_date", "due_date", "scale"];
 
     function hasFiles(event) {
       var types = event.dataTransfer && event.dataTransfer.types;
@@ -7668,7 +7668,7 @@ a:hover {
     }
 
     function hasInput() {
-      var filled = ["title", "description", "start_date", "due_date"].some(function (name) {
+      var filled = ["title", "description", "start_date", "due_date", "scale"].some(function (name) {
         var el = form.elements[name];
         return el && el.value && el.value.trim();
       });
