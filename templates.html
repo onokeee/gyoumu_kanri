@@ -1033,9 +1033,8 @@
           <div class="fw-bold">メールから下書き</div>
           <div class="small text-muted">メールのファイル（Outlook の .msg・.eml）をこの画面にドロップすると、件名・本文から下書きを入れます（保存は「登録」を押したときです。{{ mail_max_mb }}MB まで）。Outlook の一覧から直接ドラッグできないときは、メールをファイルに保存してからドロップしてください。</div>
         </div>
-        <label class="btn btn-sm btn-outline-primary mb-0">ファイルを選ぶ
-          <input type="file" id="mail-file" class="d-none" accept=".msg,.eml,message/rfc822,application/vnd.ms-outlook">
-        </label>
+        <button type="button" class="btn btn-sm btn-outline-primary" id="mail-file-button">ファイルを選ぶ</button>
+        <input type="file" id="mail-file" class="d-none" tabindex="-1" aria-hidden="true" accept=".msg,.eml,message/rfc822,application/vnd.ms-outlook">
       </div>
       {% if ai_enabled %}
       <div class="form-check small mt-2 mb-0">
@@ -1051,7 +1050,7 @@
           {% if can_plan %}data-recommend-url="{{ url_for('tasks.recommend') }}"{% if editing %} data-task-id="{{ task.id }}"{% endif %}{% endif %}>
       {% if can_plan %}
       {# Enter キーでの送信は保存にする(フォームの最初の送信ボタンが使われるため。下の「推奨の担当者を表示」より前に置く) #}
-      <button type="submit" class="d-none" tabindex="-1" aria-hidden="true"></button>
+      <button type="submit" class="visually-hidden" tabindex="-1" aria-hidden="true"></button>
       {% endif %}
       {% if editing %}
       {# 画面を開いたタスクの印(IDの再利用の取り違え防止)と、開いたときの内容の控え(ほかの操作の変更を上書きしない) #}
@@ -1076,8 +1075,9 @@
         <div class="form-label">必要スキル（担当者に必要な到達度。複数可）{% if not can_plan %} <span class="text-muted small">（マネージャーのみ変更可）</span>{% endif %}</div>
         {% if can_plan %}
         <details class="task-skills border rounded" id="task-skills" {% if selected_skills %}open{% endif %}>
-          <summary class="px-2 py-1 small"><span data-skill-summary>{% if selected_skills %}{{ selected_skills|length }}件を選択中{% else %}選んでいません（開いて選ぶ）{% endif %}</span></summary>
+          <summary class="px-2 py-1 small"><span class="visually-hidden">必要スキル: </span><span data-skill-summary>{% if selected_skills %}{{ selected_skills|length }}件を選択中{% else %}選んでいません（開いて選ぶ）{% endif %}</span></summary>
           <div class="px-2 pb-2">
+            <div class="small text-muted mt-1">{% for level in skill_levels %}Lv{{ level }} {{ skill_scale[level] }}{% if not loop.last %}／{% endif %}{% endfor %}（選んだ到達度以上）</div>
             {% for stype, type_label, items in skill_groups %}
             <div class="fw-bold small mt-2">{{ type_label }}</div>
             <div class="row row-cols-1 row-cols-md-2 g-1">
@@ -1085,10 +1085,10 @@
               {% set chosen = selected_skills.get(s.id) %}
               <div class="col d-flex align-items-center gap-2">
                 <label class="small flex-grow-1 mb-0" for="req{{ s.id }}">{{ s.name }}{% if s.category %} <span class="text-muted">({{ s.category }})</span>{% endif %}{% if not s.is_active %} <span class="text-muted">［無効］</span>{% endif %}</label>
-                <select name="req_skill_{{ s.id }}" id="req{{ s.id }}" class="form-select form-select-sm w-auto" data-skill-name="{{ s.name }}">
+                <select name="req_skill_{{ s.id }}" id="req{{ s.id }}" class="form-select form-select-sm task-skill-level" data-skill-name="{{ s.name }}">
                   <option value="">不要</option>
                   {% for level in skill_levels %}
-                  <option value="{{ level }}" {% if chosen == level %}selected{% endif %}>Lv{{ level }} {{ skill_scale[level] }}</option>
+                  <option value="{{ level }}" title="{{ skill_scale[level] }}" {% if chosen == level %}selected{% endif %}>Lv{{ level }}</option>
                   {% endfor %}
                 </select>
               </div>
@@ -1173,9 +1173,10 @@
           <div class="form-label mb-0"><i class="bi bi-person-check"></i> 推奨の担当者（スキルと出勤表から）</div>
           <button type="submit" name="recommend" value="1" formnovalidate class="btn btn-sm btn-outline-secondary" id="recommend-button">推奨の担当者を表示</button>
         </div>
-        <div id="recommend-panel" class="border rounded p-2" aria-live="polite">
+        <div id="recommend-panel" class="border rounded p-2">
           {% include "tasks/_recommend.html" %}
         </div>
+        <div id="recommend-status" class="small mt-1" role="status" aria-live="polite"></div>
       </div>
       {% endif %}
 
@@ -1263,7 +1264,7 @@
   {%- if rec.requirements %} ／ 必要スキル: {% for r in rec.requirements %}{{ r.skill.name }}（Lv{{ r.need }}）{% if not loop.last %}、{% endif %}{% endfor %}{% endif %}
   ／ 推奨 {{ rec.recommended }}名
 </div>
-<div class="table-responsive">
+<div class="table-responsive position-relative">
   <table class="table table-sm align-middle mb-1 recommend-table">
     <thead class="table-light">
       <tr>
@@ -1278,7 +1279,7 @@
     </thead>
     <tbody>
       {% for row in rec.rows %}
-      <tr class="{% if not row.recommended %}text-muted{% endif %}">
+      <tr class="{% if not row.recommended %}recommend-muted{% endif %}">
         <td class="text-nowrap">{% if row.recommended %}<span class="badge bg-success">推奨</span>{% elif row.has_leave %}<span class="badge bg-secondary">休みあり</span>{% elif row.no_workday %}<span class="badge bg-secondary">出勤なし</span>{% endif %}</td>
         <td class="text-nowrap">{{ row.user.display_name }}{% if row.shift %}<div class="small text-muted">{{ row.shift.name }}</div>{% endif %}</td>
         {% if rec.requirements %}
@@ -1287,7 +1288,7 @@
         <td class="small">{% if row.leaves %}{{ row.leaves|join('、') }}{% if row.more_leaves %} ほか{{ row.more_leaves }}日{% endif %}{% elif rec.period %}なし{% else %}―{% endif %}</td>
         {% if rec.counts_workdays %}<td class="text-end text-nowrap">{{ row.workdays }}日</td>{% endif %}
         <td class="text-end text-nowrap">{{ row.open_tasks }}件</td>
-        <td class="text-end"><button type="button" class="btn btn-sm btn-outline-primary text-nowrap d-none" data-assign="{{ row.user.id }}">担当にする</button></td>
+        <td class="text-end"><button type="button" class="btn btn-sm btn-outline-primary text-nowrap d-none" data-assign="{{ row.user.id }}" data-name="{{ row.user.display_name }}">担当にする</button></td>
       </tr>
       {% endfor %}
     </tbody>
@@ -1295,7 +1296,7 @@
 </div>
 {% if rec.more %}<div class="small text-muted">ほか {{ rec.more }} 名（上位 {{ rec.rows|length }} 名を表示）</div>{% endif %}
 {% if rec.ignored %}<div class="small text-muted">無効にしたスキル（{{ rec.ignored|map(attribute='name')|join('、') }}）は比べていません。</div>{% endif %}
-{% if rec.long_period %}<div class="small text-muted">期間が長いため、出勤日数は数えていません。</div>{% endif %}
+{% if rec.long_period %}<div class="small text-muted">期間が長いため、出勤日数と勤務表の休みの日は数えていません（登録された年休だけ確かめています）。</div>{% endif %}
 <div class="small text-muted">推奨: 期間中に休み（年休・勤務表の年休の日）が無く、出勤日があり、必要スキルの到達度をすべて満たすメンバー（スキル管理の対象のメンバー）。担当中は未完了のタスクの数です。</div>
 {% endif %}
 {#=== routine/list.html ===#}
@@ -1917,7 +1918,7 @@
 <div class="d-flex justify-content-between align-items-center mb-3">
   <h1 class="h3 mb-0"><i class="bi bi-list-ul"></i> 年休一覧</h1>
   <div class="d-flex gap-2">
-    <a href="{{ url_for('leaves.calendar_view') }}" class="btn btn-outline-secondary"><i class="bi bi-calendar-check"></i> カレンダー</a>
+    <a href="{{ url_for('leaves.calendar_view') }}" class="btn btn-outline-secondary"><i class="bi bi-calendar-check"></i> 出勤表</a>
     <a href="{{ url_for('leaves.new_leave') }}" class="btn btn-primary"><i class="bi bi-plus-lg"></i> 年休を登録</a>
   </div>
 </div>
@@ -2051,8 +2052,8 @@
           {% endfor %}
         </tr>
       </thead>
+      {% for g in roster.groups %}
       <tbody>
-        {% for g in roster.groups %}
         {% for item in g.shifts %}
         <tr class="roster-shift-row">
           {% if loop.first %}<th scope="rowgroup" rowspan="{{ g.rows }}" class="roster-group roster-sticky">{{ g.name or '―' }}</th>{% endif %}
@@ -2065,7 +2066,10 @@
         <tr>{{ person_cells(p) }}</tr>
         {% endfor %}
         {% endfor %}
-        {% endfor %}
+      </tbody>
+      {% endfor %}
+      {% if roster.no_shift or not roster.groups %}
+      <tbody>
         {% for p in roster.no_shift %}
         <tr>
           {% if loop.first %}<th scope="rowgroup" rowspan="{{ roster.no_shift|length }}" class="roster-group roster-sticky">勤務の登録なし</th>{% endif %}
@@ -2076,6 +2080,7 @@
         <tr><td colspan="{{ roster.days|length + 2 }}" class="text-muted small text-start">表示する人がいません。</td></tr>
         {% endif %}
       </tbody>
+      {% endif %}
       <tfoot>
         <tr>
           <th scope="row" colspan="2" class="roster-sticky roster-corner">年休（人）</th>
@@ -2108,7 +2113,7 @@
 {% block content %}
 <nav aria-label="breadcrumb">
   <ol class="breadcrumb">
-    <li class="breadcrumb-item"><a href="{{ url_for('leaves.calendar_view') }}">年休</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('leaves.calendar_view') }}">出勤表</a></li>
     <li class="breadcrumb-item active">詳細</li>
   </ol>
 </nav>
@@ -3666,7 +3671,7 @@
     <div class="card shadow-sm h-100">
       <div class="card-header bg-white d-flex justify-content-between align-items-center">
         <span class="fw-bold"><i class="bi bi-calendar-check"></i> 直近1か月の休暇予定</span>
-        <a href="{{ url_for('leaves.calendar_view') }}" class="btn btn-sm btn-outline-secondary">カレンダー</a>
+        <a href="{{ url_for('leaves.calendar_view') }}" class="btn btn-sm btn-outline-secondary">出勤表</a>
       </div>
       <ul class="list-group list-group-flush small" style="max-height:230px; overflow-y:auto;">
         {% for lv in upcoming_leaves %}
@@ -6670,22 +6675,6 @@ a:hover {
   color: #0d6efd;
 }
 
-/* 年休カレンダー: 土日(休日)の背景を変える */
-.leave-weekend {
-  background-color: #fdeef0;
-}
-.leave-weekend.leave-outside {
-  background-color: #f6eef0;
-}
-.leave-weekend-swatch {
-  display: inline-block;
-  width: 14px;
-  height: 14px;
-  background-color: #fdeef0;
-  border: 1px solid #e8c9cf;
-  vertical-align: -2px;
-}
-
 /* ガントチャート */
 .gantt {
   font-size: 0.8rem;
@@ -6841,6 +6830,18 @@ a:hover {
 .task-skills > summary {
   cursor: pointer;
 }
+.task-skill-level {
+  width: 6.5rem;
+  flex-shrink: 0;
+}
+/* 推奨にならない人の行(Bootstrap の表のセルの色を変える) */
+.recommend-table tr.recommend-muted > * {
+  --bs-table-color: var(--bs-secondary-color);
+  color: var(--bs-secondary-color);
+}
+.recommend-panel-stale {
+  opacity: 0.5;
+}
 /* 出勤表(leaves/calendar.html。横軸=日付・縦軸=勤務帯と人。app.py の 16 章) */
 .roster {
   font-size: 0.78rem;
@@ -6895,14 +6896,17 @@ a:hover {
 .roster .roster-shift-row td {
   background-color: #e8f3df;
 }
-.roster .roster-code.roster-kind-off {
+.roster .roster-code.roster-kind-off,
+.roster-legend.roster-kind-off {
   color: #212529;
 }
-.roster .roster-code.roster-kind-extra {
+.roster .roster-code.roster-kind-extra,
+.roster-legend.roster-kind-extra {
   color: #b02a37;
   font-weight: bold;
 }
-.roster .roster-code.roster-kind-leave {
+.roster .roster-code.roster-kind-leave,
+.roster-legend.roster-kind-leave {
   color: #6f42c1;
   font-weight: bold;
 }
@@ -6932,6 +6936,12 @@ a:hover {
 .roster .roster-add:focus {
   opacity: 1;
 }
+/* マウスの無い端末(タッチ)では「＋」を常に表示する */
+@media (hover: none) {
+  .roster .roster-add {
+    opacity: 0.6;
+  }
+}
 .roster-legend {
   display: inline-block;
   min-width: 1.3rem;
@@ -6940,6 +6950,8 @@ a:hover {
   background-color: #e8f3df;
 }
 .roster-legend.roster-off-swatch {
+  height: 1.1rem;
+  vertical-align: -0.2rem;
   background-color: #eceff1;
 }
 .shift-codes {
@@ -7150,6 +7162,14 @@ a:hover {
     box.className = "small mt-2" + (kind ? " text-" + kind : "");
   }
 
+  // fetch そのものの失敗(ネットワーク・サーバーの停止)は英語の文になるため、日本語の案内にする
+  function errorText(error) {
+    if (error && error.name === "TypeError") {
+      return "サーバーに接続できませんでした（ネットワークの状態を確認して、もう一度操作してください）。";
+    }
+    return (error && error.message) || "処理できませんでした。";
+  }
+
   function readJson(response) {
     if (response.status === 401 || response.redirected) {
       throw new Error(LOGIN_EXPIRED);
@@ -7182,17 +7202,19 @@ a:hover {
         button.classList.add("d-none");
         return;
       }
+      var name = button.getAttribute("data-name") || "";
       button.classList.remove("d-none");
       button.textContent = box.checked ? "選択中" : "担当にする";
+      button.setAttribute("aria-label", box.checked ? name + "を担当から外す" : name + "を担当にする");
       button.classList.toggle("btn-outline-primary", !box.checked);
       button.classList.toggle("btn-primary", box.checked);
-      button.setAttribute("aria-pressed", box.checked ? "true" : "false");
     });
   }
 
   function setupRecommend(form) {
     var url = form.getAttribute("data-recommend-url");
     var panel = byId("recommend-panel");
+    var status = byId("recommend-status");
     if (!url || !panel || !window.fetch || !window.URLSearchParams) return;
     var button = byId("recommend-button");
     if (button) {
@@ -7221,13 +7243,14 @@ a:hover {
         if (mine !== seq) return;  // 後から送った問い合わせの結果だけを使う
         if (!data.ok) throw new Error(data.message || "推奨の担当者を表示できませんでした。");
         panel.innerHTML = data.html;
+        panel.classList.remove("recommend-panel-stale");
         syncAssignButtons(panel);
+        setStatus(status, "推奨の担当者を更新しました。", "muted");
       }).catch(function (error) {
         if (mine !== seq) return;
-        var note = document.createElement("div");
-        note.className = "small text-danger mt-1";
-        note.textContent = error.message;
-        panel.appendChild(note);
+        // 古い表は薄くして(入力と合っていないため)、案内は1つだけ出す
+        panel.classList.add("recommend-panel-stale");
+        setStatus(status, "推奨の担当者を更新できませんでした: " + errorText(error), "danger");
       });
     }
 
@@ -7269,8 +7292,10 @@ a:hover {
     var maxMb = parseInt(zone.getAttribute("data-max-mb"), 10) || 0;
     var status = byId("mail-status");
     var fileInput = byId("mail-file");
+    var fileButton = byId("mail-file-button");
     var useAi = byId("mail-use-ai");
     var busy = false;
+    var FIELDS = ["title", "description", "priority", "start_date", "due_date"];
 
     function hasFiles(event) {
       var types = event.dataTransfer && event.dataTransfer.types;
@@ -7295,13 +7320,25 @@ a:hover {
       event.preventDefault();
       zone.classList.remove("mail-drop-over");
       var files = event.dataTransfer.files;
-      if (files && files.length) send(files[0]);
+      if (files && files.length) send(files[0], files.length);
     });
+    if (fileButton && fileInput) {
+      fileButton.addEventListener("click", function () { fileInput.click(); });
+    }
     if (fileInput) {
       fileInput.addEventListener("change", function () {
         if (fileInput.files && fileInput.files.length) send(fileInput.files[0]);
         fileInput.value = "";
       });
+    }
+
+    // 送ったときの入力の控え(読み取り中に入力した内容を、黙って置き換えないように)
+    function snapshot() {
+      var values = FIELDS.map(function (name) {
+        var el = form.elements[name];
+        return el ? el.value : "";
+      });
+      return values.concat(skillSelects(form).map(function (el) { return el.value; })).join("\u0001");
     }
 
     function hasInput() {
@@ -7353,8 +7390,11 @@ a:hover {
       }
     }
 
-    function send(file) {
-      if (busy) return;
+    function send(file, count) {
+      if (busy) {
+        setStatus(status, "前のメールを読み取っています。終わってからもう一度ドロップしてください。", "warning");
+        return;
+      }
       var name = file.name || "";
       if (!/\.(msg|eml)$/i.test(name)) {
         setStatus(status, "メールのファイル（Outlook の .msg・.eml）を選んでください。", "danger");
@@ -7368,8 +7408,10 @@ a:hover {
         return;
       }
       busy = true;
+      var before = snapshot();
       var ai = !!(useAi && useAi.checked);
-      setStatus(status, "「" + name + "」を読み取っています" + (ai ? "（AIで整えるため、数十秒かかることがあります）" : "") + "…", "muted");
+      setStatus(status, "「" + name + "」を読み取っています" + (ai ? "（AIで整えるため、数十秒かかることがあります）" : "") +
+        (count > 1 ? "（ドロップした " + count + " 件のうち最初の1件）" : "") + "…", "muted");
       fetch(url + (ai ? "?ai=1" : ""), {
         method: "POST",
         body: file,
@@ -7384,10 +7426,15 @@ a:hover {
           setStatus(status, data.message || "下書きを作れませんでした。", "danger");
           return;
         }
+        if (snapshot() !== before &&
+            !window.confirm("読み取りの間に入力した内容を、メールの下書きで置き換えます。よろしいですか？")) {
+          setStatus(status, "下書きは入れませんでした（入力した内容のままです）。", "muted");
+          return;
+        }
         fill(data);
         showResult(data);
       }).catch(function (error) {
-        setStatus(status, error.message, "danger");
+        setStatus(status, errorText(error), "danger");
       }).then(function () {
         busy = false;
       });

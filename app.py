@@ -5102,6 +5102,14 @@ def edit_task(task_id):
         if current_user.is_manager:
             chosen_skills, err = read_task_skills(request.form, task_skill_choices(task))
             if err:
+                current = _task_values(task)
+                changed = fields_changed_since(request.form.get("version"), current, TASK_VERSION.keys) or []
+                if "skills" in changed:
+                    # 画面を開いた後にほかの操作で必要スキルが変わっていた: 衝突として今の内容を出す
+                    flash(TASK_VERSION.conflict_message(["skills"]), "warning")
+                    form, selected, skills = _task_conflict_form(task, changed)
+                    return _render_task_form(task, users, form, sel if selected is None else selected,
+                                             version=TASK_VERSION.version(current), skills=skills)
                 flash(err, "danger")
                 return _render_task_form(task, users, request.form, sel)
         description = request.form.get("description", "").strip()
@@ -5650,7 +5658,7 @@ def _can_modify_leave(leave):
     return leave.user_id == current_user.id
 
 _STALE_LEAVE = ("画面を開いた後に、この年休は取消されています（同じ番号が新しい別の年休に使われています）。"
-                "操作は行っていません。カレンダーから開き直してください。")
+                "操作は行っていません。出勤表から開き直してください。")
 
 def _can_cancel_leave(leave):
     """取消できるか: 本人、または無効化したメンバーの年休ならマネージャー。
@@ -18830,15 +18838,19 @@ RECOMMEND_LEAVE_SHOWN = 5   # 1人について表示する休みの日の数(超
 def task_period(start, due, today):
     """年休を確かめる期間 (最初の日, 最後の日)。確かめられないときは None。
 
-    開始日と期限: その間。期限だけ: 今日〜期限(期限が今日より前なら期限の日だけ)。開始日だけ: 開始日の1日。
-    どちらも無い・開始日が期限より後: None。
+    開始日と期限: その間(期限が今日以降なら、今日より前の日は除く。始まっているタスクの過ぎた日の休みで
+    推奨から外さないように)。期限だけ: 今日〜期限(期限が今日より前なら期限の日だけ)。開始日だけ: 開始日の1日
+    (今日より前なら今日)。どちらも無い・開始日が期限より後: None。
     """
     if start and due:
-        return (start, due) if start <= due else None
+        if start > due:
+            return None
+        return (max(start, today), due) if due >= today else (start, due)
     if due:
         return (min(today, due), due)
     if start:
-        return (start, start)
+        day = max(start, today)
+        return (day, day)
     return None
 
 def _period_label(period, today):
@@ -18910,7 +18922,7 @@ def recommend_assignees(levels, start, due, task_id=None, today=None):
             total += level
         user_leaves = leaves.get(user.id, [])
         shift = shift_by_user.get(user.id)
-        rest = [(leave.leave_date, _leave_label(leave, today)) for leave in user_leaves]
+        rest = {leave.leave_date: _leave_label(leave, today) for leave in user_leaves}  # 日 → 表示(同じ日は1つ)
         workdays = None
         if period_days:
             workdays = 0
@@ -18919,11 +18931,11 @@ def recommend_assignees(levels, start, due, task_id=None, today=None):
                 code = day_codes.get((shift.id, day)) if shift is not None else None
                 kind = day_kind(code, codes, day)
                 if kind == SHIFT_KIND_LEAVE:
-                    rest.append((day, "{}（{}）".format(_date_label(day, today), codes[code].label)))
+                    rest.setdefault(day, "{}（{}）".format(_date_label(day, today), codes[code].label))
                 elif kind in SHIFT_WORKING_KINDS:
                     leave = leave_on.get(day)
                     workdays += 1 if leave is None else (0 if leave.leave_type == LEAVE_FULL else 0.5)
-        rest.sort(key=lambda item: item[0])
+        rest = sorted(rest.items())
         meets_all = met == len(reqs)
         no_workday = workdays is not None and workdays <= 0
         rows.append({
@@ -18937,7 +18949,7 @@ def recommend_assignees(levels, start, due, task_id=None, today=None):
     rows.sort(key=lambda r: (not r["recommended"], r["has_leave"] or r["no_workday"], -r["met"], r["short"],
                              r["open_tasks"], -r["workday_count"], -r["total"], r["user"].display_name or ""))
     return {
-        "has_input": bool(reqs) or period is not None,
+        "has_input": bool(reqs) or period is not None or bool(ignored) or bool(start and due and start > due),
         "period": period,
         "period_label": _period_label(period, today) if period is not None else "",
         "dates_reversed": bool(start and due and start > due),
@@ -19957,9 +19969,10 @@ def parse_shift_codes(raw, days, codes):
     「-」「_」(全角も)は記号なし。全角の数字は半角の数字の記号として読む(その記号があるとき)。
     戻り値: (一覧 または None, 誤りの文 または None)。
     """
-    text = str(raw or "").replace("\r", "").replace("\n", "\t")
+    text = str(raw or "").replace("\r", "").strip("\n")
     if "\t" in text:
-        tokens = [t.strip() for t in text.split("\t")]
+        # Excel の1行の貼り付け(タブ区切り)。途中の改行は区切りとして扱う
+        tokens = [t.strip() for t in text.replace("\n", "\t").split("\t")]
         while tokens and not tokens[-1]:
             tokens.pop()
     else:
@@ -20065,7 +20078,7 @@ def build_roster(year, month, dept_id=None, viewer=None):
                         "order": min(item["shift"].sort_order for item in items)})
     ordered.sort(key=lambda g: (g["order"], g["name"]))
 
-    # 日ごとの年休の人数(半休は 0.5)と、同じチームで同じ日に休む人数が多いか(以前のカレンダーと同じ基準)
+    # 日ごとの年休の人数(半休も1人)と、同じチームで同じ日に休む人数が多いか(以前のカレンダーと同じ基準)
     dept_member_ids = {d.id: {u.id for u in d.users} for d in ordered_rows(Department)}
     totals = []
     for day in days:
@@ -20075,8 +20088,7 @@ def build_roster(year, month, dept_id=None, viewer=None):
             warn = dept is not None and dept.is_active and len(off_ids) > LEAVE_DAILY_LIMIT
         else:
             warn = any(len(off_ids & member_ids) > LEAVE_DAILY_LIMIT for member_ids in dept_member_ids.values())
-        totals.append({"count": _fmt_num(sum(lv.day_count for lv in day_leaves)) if day_leaves else "",
-                       "warn": warn})
+        totals.append({"count": len(off_ids) if off_ids else "", "warn": warn})
     return {"days": days, "groups": ordered, "no_shift": no_shift, "totals": totals,
             "codes": list(codes.values()), "has_shifts": bool(shifts)}
 
@@ -20130,6 +20142,8 @@ def _shift_form_values(shift=None):
 def new_shift():
     """勤務を追加する(_add_named_row〔2-2〕。二度押しの2回目は追加済みと案内する)。"""
     values = _shift_form_values()
+    if len(request.form.get("name", "").strip()) > SHIFT_NAME_MAX:
+        return flash_redirect("勤務の名前は{}文字までにしてください。".format(SHIFT_NAME_MAX), "danger", url_for("leaves.shifts"))
     return _add_named_row(WorkShift, "shift", "勤務", _SHIFT_EMPTY, _SHIFT_DUP, url_for("leaves.shifts"),
                           lambda name: WorkShift(name=name, group_name=values["group_name"],
                                                  sort_order=values["sort_order"]))
@@ -20234,6 +20248,13 @@ def shift_month():
         shifts = _ordered_shifts(active_only=True)
         current = {row.shift_id: row for row in WorkShiftMonth.query.filter_by(month=key).all()}
         errors, values = [], {}
+        active_ids = {shift.id for shift in shifts}
+        dropped = []
+        for name in request.form.keys():
+            match = re.match(r"^codes_([0-9]{1,18})$", name)
+            if match and int(match.group(1)) not in active_ids:
+                gone = db.session.get(WorkShift, int(match.group(1)))
+                dropped.append(gone.name if gone is not None else "削除された勤務")
         for shift in shifts:
             raw = request.form.get("codes_{}".format(shift.id))
             if raw is None:
@@ -20256,8 +20277,9 @@ def shift_month():
             shown, _error = parse_shift_codes(request.form.get("orig_{}".format(shift.id), ""), days, codes)
             if values[shift.id] == now:
                 continue
-            if shown is not None and shown != now:
-                kept.append(shift.name)  # 画面を開いた後にほかの操作で変わった行は、今の内容のまま
+            if shown is None or shown != now:
+                # 画面を開いた後にほかの操作で変わった行(開いたときの内容が読めない行も)は、今の内容のまま
+                kept.append(shift.name)
                 continue
             if not any(values[shift.id]):
                 if row is not None:
@@ -20275,7 +20297,9 @@ def shift_month():
         if kept:
             flash("画面を開いた後に、ほかの操作で変更された勤務（{}）は、今の内容のまま残しています。"
                   "確認して、必要ならもう一度入力してください。".format("、".join(kept)), "warning")
-        if not changed and not kept:
+        if dropped:
+            flash("画面を開いた後に無効にされた勤務（{}）の入力は保存していません。".format("、".join(dropped)), "warning")
+        if not changed and not kept and not dropped:
             flash("変更はありません（保存していません）。", "info")
         return redirect(url)
     return _render_shift_month(year, month, codes)
