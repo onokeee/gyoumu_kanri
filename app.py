@@ -20818,6 +20818,17 @@ def parse_shift_codes(raw, days, codes):
         return None, "記号の一覧に無い記号があります（{}）。".format("、".join(_one_line(u, 10) for u in dict.fromkeys(unknown)))
     return result + [""] * (days - len(result)), None
 
+def _posted_month_codes(form, shift_id, days):
+    """勤務表の修正の画面から送られた勤務の1行(無ければ None)。
+
+    日ごとの選択(day_<勤務>_<日>。空は記号なし)はタブ区切りにして parse_shift_codes で読む。以前の画面の1行の入力
+    (codes_<勤務>。記号を続けて入力する欄)が送られたときはそれを読む。
+    """
+    cells = [form.get("day_{}_{}".format(shift_id, number)) for number in range(1, days + 1)]
+    if any(value is not None for value in cells):
+        return "\t".join((value or "").strip() for value in cells)
+    return form.get("codes_{}".format(shift_id))
+
 def shift_codes_text(codes):
     """日ごとの記号の一覧を、入力欄の文字(空白区切り。記号なしは「-」。最後の記号なしは省く)にする。"""
     return " ".join(code or "-" for code in codes).rstrip(" -")
@@ -21061,7 +21072,10 @@ def _read_month(raw):
 
 @admin_bp.route("/shifts/month", methods=["GET", "POST"], endpoint="shift_month")
 def shift_month():
-    """勤務表の入力(月ごと。勤務ごとの日の記号)。変えた行だけを保存し、画面を開いた後にほかの操作で変わった行は上書きしない。"""
+    """勤務表の修正(月ごと。勤務ごとの日の記号を選び直す。登録は Excel の取り込み〔16-4〕)。
+
+    変えた行だけを保存し、画面を開いた後にほかの操作で変わった行は上書きしない。
+    """
     today = date.today()
     picked = _read_month(request.values.get("month")) or (today.year, today.month)
     year, month = picked
@@ -21075,14 +21089,17 @@ def shift_month():
         current = {row.shift_id: row for row in WorkShiftMonth.query.filter_by(month=key).all()}
         errors, values = [], {}
         active_ids = {shift.id for shift in shifts}
-        dropped = []
+        posted_ids = set()
         for name in request.form.keys():
-            match = re.match(r"^codes_([0-9]{1,18})$", name)
-            if match and int(match.group(1)) not in active_ids:
-                gone = db.session.get(WorkShift, int(match.group(1)))
-                dropped.append(gone.name if gone is not None else "削除された勤務")
+            match = re.match(r"^(?:codes_([0-9]{1,18})|day_([0-9]{1,18})_[0-9]{1,2})$", name)
+            if match:
+                posted_ids.add(int(match.group(1) or match.group(2)))
+        dropped = []
+        for shift_id in sorted(posted_ids - active_ids):
+            gone = db.session.get(WorkShift, shift_id)
+            dropped.append(gone.name if gone is not None else "削除された勤務")
         for shift in shifts:
-            raw = request.form.get("codes_{}".format(shift.id))
+            raw = _posted_month_codes(request.form, shift.id, days)
             if raw is None:
                 continue
             parsed, error = parse_shift_codes(raw, days, codes)
@@ -21122,7 +21139,7 @@ def shift_month():
             flash("{}年{}月の勤務表を保存しました（{}）。".format(year, month, "、".join(changed)), "success")
         if kept:
             flash("画面を開いた後に、ほかの操作で変更された勤務（{}）は、今の内容のまま残しています。"
-                  "確認して、必要ならもう一度入力してください。".format("、".join(kept)), "warning")
+                  "確認して、必要ならもう一度修正してください。".format("、".join(kept)), "warning")
         if dropped:
             flash("画面を開いた後に無効にされた勤務（{}）の入力は保存していません。".format("、".join(dropped)), "warning")
         if not changed and not kept and not dropped:
@@ -21131,20 +21148,27 @@ def shift_month():
     return _render_shift_month(year, month, codes)
 
 def _render_shift_month(year, month, codes, form=None):
+    """勤務表の修正の画面。items は勤務ごとの日の記号(cells。form があれば送られた選択)と、開いたときの内容(orig)。"""
     key, days = month_key(year, month), month_days(year, month)
     shifts = _ordered_shifts(active_only=True)
     rows = {row.shift_id: row for row in WorkShiftMonth.query.filter_by(month=key).all()}
     items = []
     for shift in shifts:
-        saved = shift_codes_text((rows[shift.id].code_list() + [""] * days)[:days]) if shift.id in rows else ""
-        items.append({"shift": shift, "saved": saved,
-                      "value": form.get("codes_{}".format(shift.id), saved) if form is not None else saved,
-                      "orig": form.get("orig_{}".format(shift.id), saved) if form is not None else saved})
+        saved = (rows[shift.id].code_list() + [""] * days)[:days] if shift.id in rows else [""] * days
+        values = saved
+        if form is not None:
+            posted = [form.get("day_{}_{}".format(shift.id, number)) for number in range(1, days + 1)]
+            if any(value is not None for value in posted):
+                values = [(value or "").strip() for value in posted]
+        orig = shift_codes_text(saved)
+        items.append({"shift": shift, "orig": form.get("orig_{}".format(shift.id), orig) if form is not None else orig,
+                      "cells": [{"code": code, "known": code in codes, "kind": codes[code].kind if code in codes else ""}
+                                for code in values]})
     prev_year, prev_month = (year - 1, 12) if month == 1 else (year, month - 1)
     next_year, next_month = (year + 1, 1) if month == 12 else (year, month + 1)
     return render_template(
         "admin/shift_month.html", year=year, month=month, key=key, days=_roster_days(year, month), items=items,
-        codes=list(codes.values()), prev=month_key(prev_year, prev_month) if prev_year >= LEAVE_YEAR_MIN else "",
+        codes=list(codes.values()), kind_css=SHIFT_KIND_CSS, prev=month_key(prev_year, prev_month) if prev_year >= LEAVE_YEAR_MIN else "",
         next=month_key(next_year, next_month) if next_year <= LEAVE_YEAR_MAX else "")
 
 # ---- 以前の URL(出勤表の「勤務の設定」「勤務表の入力」)。システム管理の画面へ(POST は 307 で送り直す) ----
