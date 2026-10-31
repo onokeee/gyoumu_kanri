@@ -5330,6 +5330,10 @@ def task_detail(task_id):
     # メールのリンク(?t=印)が、削除されたタスク(同じIDの別の新しいタスク)を指していたら 404
     if not row_key_matches(task, request.args.get("t")):
         abort(404)
+    return _render_task_detail(task)
+
+def _render_task_detail(task, draft=None, status=200):
+    """タスクの詳細の画面。draft は進捗状況の記載の入力(記載できなかったときに残す {"body", "status"})。"""
     comment_versions = {c.id: COMMENT_VERSION.version(c) for c in task.comments}
     # スキルの自動更新の判定(マネージャーだけに表示。8-3)
     judgments = []
@@ -5340,7 +5344,8 @@ def task_detail(task_id):
                      .order_by(SkillAutoJudgment.id.desc()).limit(3).all())
     return render_template("tasks/detail.html", task=task, can_edit=_can_edit(task),
                            comment_versions=comment_versions, skill_judgments=judgments,
-                           judgment_stale=judgment_is_stale)
+                           judgment_stale=judgment_is_stale, status_choices=STATUS_CHOICES,
+                           draft=draft or {}), status
 
 @tasks_bp.route("/<int:task_id>/edit", methods=["GET", "POST"])
 @login_required
@@ -5509,6 +5514,10 @@ def update_status(task_id):
 def add_comment(task_id):
     """進捗状況の記載。担当者・作成者・マネージャーのみ(担当外のメンバーは不可)。
 
+    記載の欄の横でタスクの状態を選ぶ(status。必須。今の状態のままでもよい)。選んだ状態が今と違えば、記載と一緒に
+    状態も変える(一覧の「状態」の変更と同じ決まり: 画面を開いた後にほかの操作で状態が変わっていたら変えない・
+    完了には成果の実績が要る・完了にしたらスキルの自動更新)。状態を選んでいない・変えられないときは記載もせず、
+    入力を残して画面を出し直す。status の欄の無い以前の画面からの送信は、今までどおり記載だけ(状態は変えない)。
     書き込みのロックを取ってからタスクを確かめる(同時に削除されたタスクに記載を残さない)。
     """
     lock_for_write()
@@ -5523,8 +5532,35 @@ def add_comment(task_id):
         return flash_redirect("進捗状況の内容を入力してください。", "danger", back)
     if already_submitted("comment"):
         return flash_redirect(_SUBMITTED_TWICE.format("進捗状況の記載"), "info", back)
+    with_status = "status" in request.form
+    new_status = request.form.get("status", "")
+
+    def keep(message, category, code):
+        """記載せずに、入力を残して詳細の画面を出し直す。"""
+        flash(message, category)
+        return _render_task_detail(task, {"body": body, "status": new_status if new_status in STATUS_CHOICES else ""}, code)
+
+    if with_status:
+        if new_status not in STATUS_CHOICES:
+            return keep("状態を選んでください（進捗状況は、タスクの状態を選んでから記載します。今の状態のままなら"
+                        "「{}」を選びます）。記載していません。".format(task.status), "danger", 400)
+        shown = request.form.get("from")
+        if shown is not None and shown != task.status and new_status != task.status:
+            return keep("画面を開いた後に、ほかの操作で状態が「{}」に変更されています（記載していません）。"
+                        "状態を確かめて、もう一度記載してください。".format(task.status), "warning", 409)
+        if new_status == STATUS_DONE and task.status != STATUS_DONE and not task.has_outcome_actual:
+            return keep(_COMPLETE_NEEDS_OUTCOME + "(タスクの編集画面から入力できます。記載していません)", "warning", 400)
     db.session.add(TaskComment(task_id=task_id, user_id=current_user.id, body=body))
+    changed = with_status and new_status != task.status
+    if changed:
+        task.status = new_status
+        _log_status(task, new_status)  # 変更日を履歴に記録(ガントの色分けに使用)
     commit_submitted("comment", back)
+    if changed:
+        flash("進捗状況を記載し、状態を「{}」に変更しました。".format(new_status), "success")
+        if new_status == STATUS_DONE:
+            # 完了にしたとき: 進捗を記載したメンバーのスキルの自動更新(8-3。オフなら何もしない)
+            queue_skill_judgment_safely(task.id, current_user.id)
     return redirect(back)
 
 COMMENT_VERSION = VersionFields((("body", "進捗状況の内容"),))

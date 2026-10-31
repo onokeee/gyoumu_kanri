@@ -908,19 +908,8 @@
   </div>
 
   {% if can_edit %}
-  <div class="card-footer bg-white d-flex gap-2 align-items-center">
-    {# クイックステータス変更 #}
-    <form method="post" action="{{ url_for('tasks.update_status', task_id=task.id) }}" class="d-flex gap-2 me-auto">
-      <input type="hidden" name="row" value="{{ task.row_key }}">
-      <input type="hidden" name="from" value="{{ task.status }}">{# 画面を開いたときの状態(ほかの操作の変更を上書きしない) #}
-      <select name="status" class="form-select form-select-sm" style="width:auto;">
-        {% for s in ['未着手','進行中','保留','完了'] %}
-        <option value="{{ s }}" {% if task.status == s %}selected{% endif %}>{{ s }}</option>
-        {% endfor %}
-      </select>
-      <button class="btn btn-sm btn-outline-primary">状態を更新</button>
-    </form>
-
+  <div class="card-footer bg-white d-flex gap-2 align-items-center justify-content-end">
+    {# 状態は下の「進捗状況」の記載と一緒に変える(記載の欄の横で選ぶ) #}
     <a href="{{ url_for('tasks.edit_task', task_id=task.id) }}" class="btn btn-sm btn-secondary">
       <i class="bi bi-pencil"></i> 編集
     </a>
@@ -1028,12 +1017,27 @@
     {% endfor %}
 
     {% if can_edit %}
+    {# 進捗状況の記載と状態(必須。選ばないと記載できない。今の状態のままなら「今の状態」を選ぶ) #}
     <form method="post" action="{{ url_for('tasks.add_comment', task_id=task.id) }}">
       <input type="hidden" name="row" value="{{ task.row_key }}">
       <input type="hidden" name="once" value="{{ submit_token() }}">
-      <textarea name="body" class="form-control mb-2" rows="3"
-                placeholder="進捗を記入(動きがあれば記載してください)&#10;複数行で記入できます" required></textarea>
-      <button class="btn btn-primary"><i class="bi bi-pencil-square"></i> 記載</button>
+      <input type="hidden" name="from" value="{{ task.status }}">{# 画面を開いたときの状態(ほかの操作の変更を上書きしない) #}
+      <div class="d-flex flex-wrap flex-md-nowrap gap-2 align-items-start">
+        <textarea name="body" class="form-control" rows="3" aria-label="進捗状況"
+                  placeholder="進捗を記入(動きがあれば記載してください)&#10;複数行で記入できます" required>{{ draft.body or '' }}</textarea>
+        <div class="task-comment-side">
+          <label class="form-label small fw-bold mb-1" for="comment-status">状態 <span class="text-danger">*</span></label>
+          <select name="status" id="comment-status" class="form-select form-select-sm" required>
+            {# 先頭の空の選択肢(必須の選択の見出し)。選ばずに送ると status="" になり、サーバーでも記載しない #}
+            <option value="" {% if not draft.status %}selected{% endif %}>選択してください</option>
+            {% for s in status_choices %}
+            <option value="{{ s }}" {% if draft.status == s %}selected{% endif %}>{{ s }}{% if s == task.status %}（今の状態）{% endif %}</option>
+            {% endfor %}
+          </select>
+          <button class="btn btn-primary btn-sm w-100 mt-2"><i class="bi bi-pencil-square"></i> 記載</button>
+        </div>
+      </div>
+      <div class="form-text">状態を選ばないと記載できません（今の状態のままなら「今の状態」を選びます）。状態を変えると、記載と一緒に状態も変わります（完了にするには成果〔実績〕の入力が要ります）。</div>
     </form>
     {% else %}
     <p class="text-muted small mb-0"><i class="bi bi-info-circle"></i> 進捗状況を記載できるのは担当者・マネージャーのみです。</p>
@@ -6964,6 +6968,16 @@ a:hover {
 }
 .recommend-panel-stale {
   opacity: 0.5;
+}
+/* タスクの詳細の進捗状況の記載: 記載の欄の横の状態の選択と「記載」 */
+.task-comment-side {
+  flex: 0 0 11rem;
+  max-width: 100%;
+}
+@media (max-width: 767.98px) {
+  .task-comment-side {
+    flex-basis: 100%;
+  }
 }
 /* 勤務表の修正(admin/shift_month.html)の表: 日のセルで記号を選び直す(選択の矢印を出さず、記号だけを表示) */
 .shift-edit .shift-edit-cell {
