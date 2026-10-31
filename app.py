@@ -892,8 +892,22 @@ def display_app_name(app=None):
     return name
 
 def get_active_users():
-    """有効なユーザーを表示名順で取得する(担当者・受信者の選択肢用)。"""
+    """有効なユーザーを表示名順で取得する(負荷・成果などの計算用。選択肢・人の一覧は member_choices)。"""
     return User.query.filter_by(is_active=True).order_by(User.display_name).all()
+
+def is_env_member(user):
+    """その環境のメンバーとして、担当者・対象者の選択肢と人の一覧に出す人か。
+
+    固定ローカル管理者(admin)は、アプリ全体の管理者で特定の環境のユーザーではないため出さない(18 章。その環境を
+    開いたときに用意されるユーザーの行はある)。既に担当・選択中のものや、業務の残っているものは、データを隠さない
+    よう呼び出し側で残す。
+    """
+    return getattr(user, "username", None) != ADMIN_USERNAME
+
+def member_choices(keep=()):
+    """担当者・対象者の選択肢(有効なユーザーの表示名順。admin は出さない。keep の人〔既に担当・選択中〕は残す)。"""
+    keep_ids = {u.id for u in keep}
+    return [u for u in get_active_users() if is_env_member(u) or u.id in keep_ids]
 
 def ordered_rows(model, active_only=True):
     """業務(Operation)・チーム(Department)の一覧(並び順・名前の順)。active_only なら有効なものだけ。"""
@@ -907,10 +921,11 @@ def filter_user_choices(selected_ids=(), with_work=None):
     無効化した人は画面で名前に「［無効］」を付ける(User.name_label)。選択中の無効化した人を選択肢に残さないと、
     絞り込みは効いたまま「すべて」と表示されるため。with_work はマネージャーの画面で、担当の付け替えが
     必要な業務を探せるようにするための条件(無効化した人に残っているタスク・定型業務)。
+    固定ローカル管理者(admin)は出さない(is_env_member)。選択中か、with_work に当たる(業務が残っている)ときだけ出す。
     """
-    users = get_active_users()
-    conditions = []
     ids = [i for i in selected_ids if i is not None]
+    users = [u for u in get_active_users() if is_env_member(u) or u.id in ids]
+    conditions = []
     if ids:
         conditions.append(User.id.in_(ids))
     if with_work is not None:
@@ -918,6 +933,9 @@ def filter_user_choices(selected_ids=(), with_work=None):
     if conditions:
         users += User.query.filter(User.is_active.is_(False), db.or_(*conditions)) \
             .order_by(User.display_name).all()
+    if with_work is not None and all(is_env_member(u) for u in users):
+        # 固定ローカル管理者(admin)は選択肢に出さないが、業務が残っていれば(担当の付け替えのため)残す
+        users += User.query.filter(User.username == ADMIN_USERNAME, User.is_active.is_(True), with_work).all()
     return users
 
 def user_filter_choices(raw, with_work=None):
@@ -5041,7 +5059,7 @@ def _assignee_choices(task):
     外れてしまう(担当の履歴・成果・Excel出力・期限超過通知の担当者が消える)。担当のまま残し、
     画面では「［無効］」を付けて表示する(マネージャーがチェックを外したときだけ外す)。
     """
-    users = get_active_users()
+    users = member_choices(task.assignees if task is not None else ())
     if task is None:
         return users
     inactive = [u for u in task.assignees if not u.is_active]
@@ -5236,7 +5254,7 @@ def new_task():
 
     if request.method == "POST" and request.form.get("recommend") == "1":
         # 「推奨の担当者を表示」(JavaScript が無効なとき。15-2): 入力を残したまま推奨を表示し直す(保存しない)
-        users = get_active_users()
+        users = member_choices()
         return _render_task_form(None, users, request.form, [u.id for u in _selected_assignees(users)[0]])
     if request.method == "POST":
         # 担当者の確認から保存までの間に、その人が削除されないように(チーム管理の削除と1つずつにする)
@@ -5244,7 +5262,7 @@ def new_task():
         done = already_submitted("task")
         if done:
             return flash_redirect(_SUBMITTED_TWICE.format("タスク"), "info", done)
-    users = get_active_users()
+    users = member_choices()   # 担当者の選択肢(固定ローカル管理者 admin は出さない)
 
     if request.method == "POST":
         title = request.form.get("title", "").strip()
@@ -5639,7 +5657,7 @@ def _assignee_users(routine=None):
     """
     if not current_user.is_manager:
         return [current_user]
-    users = get_active_users()
+    users = member_choices(routine.assignee_list if routine is not None else ())
     if routine is not None:
         inactive = [u for u in routine.assignee_list if not u.is_active]
         users += sorted(inactive, key=lambda u: u.display_name or "")
@@ -7480,8 +7498,12 @@ def manager_dashboard():
         member_avg.append({"user": u, "avg": avg})
 
     actx = _build_activity(today, users)
+    # 固定ローカル管理者(admin)の行は、記載・業務があるときだけ出す(計算は今までどおり有効なユーザー全員で)
+    actx["activity_rows"] = [r for r in actx["activity_rows"]
+                             if r["user"] is None or is_env_member(r["user"]) or r["tasks"]]
 
     workload_rows, workload_totals = _build_workload(today, users)
+    workload_rows = [r for r in workload_rows if is_env_member(r["user"]) or r["task_open"] or r["routine_cnt"]]
 
     octx = _build_outcomes(today, users)
 
@@ -7565,7 +7587,7 @@ def _member_has_history(user):
 @manager_required
 def manage():
     departments = ordered_rows(Department, active_only=False)
-    users = get_active_users()
+    users = [u for u in get_active_users() if is_env_member(u)]   # 固定ローカル管理者(admin)はこの環境のメンバーではない
     inactive_members = User.query.filter_by(is_active=False).order_by(User.display_name).all()
     membership = {d.id: {u.id for u in d.users} for d in departments}
     versions = {d.id: DEPARTMENT_VERSION.version(d) for d in departments}
@@ -8357,8 +8379,8 @@ def settings_with_input(current, values):
     return current
 
 def weekly_form_context(settings):
-    """週報の設定フォームの表示に使う値。"""
-    users = get_active_users()
+    """週報の設定フォームの表示に使う値(対象者の選択肢に admin は出さない。選択中なら残す)。"""
+    users = [u for u in get_active_users() if is_env_member(u) or is_weekly_target(settings, u)]
     # IDとログインIDの両方が一致する人だけを選択済みにする(IDが再利用された別人は選ばない)
     selected_ids = {u.id for u in users if is_weekly_target(settings, u)}
     return {
@@ -15622,8 +15644,10 @@ def reminder_values(rem):
 REMINDER_VERSION = VersionFields(REMINDER_VERSION_FIELDS, reminder_values, "リマインドの")
 
 def reminder_extra_user_choices(rem):
-    """追加の宛先(メンバー)の選択肢: 有効なユーザーと、設定済みの無効化されたユーザー(画面では「［無効］」)。"""
-    users = get_active_users()
+    """追加の宛先(メンバー)の選択肢: 有効なユーザーと、設定済みの無効化されたユーザー(画面では「［無効］」)。
+    固定ローカル管理者(admin)は出さない(設定済みなら残す)。"""
+    chosen = set(rem.extra_user_id_list) if rem is not None else set()
+    users = [u for u in get_active_users() if is_env_member(u) or u.id in chosen]
     if rem is not None:
         shown = {u.id for u in users}
         for user_id in rem.extra_user_id_list:
@@ -20851,7 +20875,7 @@ def build_roster(year, month, dept_id=None, viewer=None):
     days = _roster_days(year, month)
     first, last = days[0]["date"], days[-1]["date"]
     dept = db.session.get(Department, dept_id) if dept_id else None
-    users = get_active_users()
+    users = [u for u in get_active_users() if is_env_member(u)]   # admin は年休がある月だけ(下の extra)
     leaves = (LeaveRequest.query.filter(LeaveRequest.leave_date >= first, LeaveRequest.leave_date <= last)
               .options(selectinload(LeaveRequest.user)).all())
     if dept_id:
