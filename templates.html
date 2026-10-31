@@ -2148,8 +2148,10 @@
   <span class="text-danger"><i class="bi bi-people-fill"></i> 同じチームで同日{{ daily_limit }}名超</span>{% for d in departments if d.id == dept_id and not d.is_active %}
   <span>（無効化したチームは、同じ日に休む人数を判定しません）</span>{% endfor %}
 </div>
-{% if not roster.has_shifts and current_user.is_manager %}
+{% if current_user.is_manager and not roster.has_shifts %}
 <p class="small text-muted mt-2 mb-0"><i class="bi bi-info-circle"></i> 勤務がまだありません。固定ローカル管理者（admin）がシステム管理の「勤務パターン」で勤務（例: 1班 A・日勤）と勤務表の記号を設定し、チームの管理でメンバーの勤務を選ぶと、勤務ごとに並びます。</p>
+{% elif current_user.is_manager and not roster.shifts and roster.no_shift %}
+<p class="small text-muted mt-2 mb-0"><i class="bi bi-info-circle"></i> メンバーの勤務がまだ選ばれていません。チームの管理でメンバーの勤務を選ぶと、勤務ごとに並びます（出勤表には、メンバーのいる勤務だけを表示します）。</p>
 {% endif %}
 {% endblock %}
 {#=== leaves/detail.html ===#}

@@ -20872,7 +20872,8 @@ def build_roster(year, month, dept_id=None, viewer=None):
     """出勤表の材料。shifts は勤務ごとの行(勤務の行の記号と、その勤務の人の行。並び順・名前の順)、no_shift は勤務の登録の無い人の行。
 
     人の行は有効なユーザー(チームで絞り込むときはそのチームの人)と、その月に年休がある無効化した人。
-    勤務の行は人のいる勤務(チームで絞り込まないときは、人のいない有効な勤務も)。
+    勤務の行は、この出勤表に出す人のいる勤務だけ(人のいない勤務・ほかの環境の人だけの勤務は出さない)。
+    has_shifts は有効な勤務が1つでもあるか(勤務の設定の案内に使う)。
     """
     days = _roster_days(year, month)
     first, last = days[0]["date"], days[-1]["date"]
@@ -20889,9 +20890,6 @@ def build_roster(year, month, dept_id=None, viewer=None):
     users += sorted(extra.values(), key=lambda u: u.display_name or "")
     shift_by_user = user_shift_map([u.id for u in users])
     shifts = {s.id: s for s in shift_by_user.values()}
-    if not dept_id:
-        for shift in WorkShift.query.filter_by(is_active=True).all():
-            shifts.setdefault(shift.id, shift)
     codes = shift_codes()
     day_codes = shift_day_codes(shifts.keys(), first, last)
     leave_by = {(lv.user_id, lv.leave_date): lv for lv in leaves}
@@ -20941,7 +20939,8 @@ def build_roster(year, month, dept_id=None, viewer=None):
             warn = any(len(off_ids & member_ids) > LEAVE_DAILY_LIMIT for member_ids in dept_member_ids.values())
         totals.append({"count": len(off_ids) if off_ids else "", "warn": warn})
     return {"days": days, "shifts": rows, "no_shift": no_shift, "totals": totals,
-            "codes": list(codes.values()), "has_shifts": bool(shifts)}
+            "codes": list(codes.values()),
+            "has_shifts": bool(shifts) or db.session.query(WorkShift.id).filter(WorkShift.is_active.is_(True)).first() is not None}
 
 # ==== 16-3. 画面(勤務の設定・勤務表の入力。システム管理〔admin だけ。18 章〕の Blueprint に足すルート) =======
 # 勤務パターンはすべての環境で共通(3-3)のため、変えられるのは固定ローカル管理者(admin)だけ(システム管理の
