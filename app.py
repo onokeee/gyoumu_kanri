@@ -157,13 +157,13 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from email import encoders, message_from_bytes
 from email import policy as email_policy
+from email.header import decode_header, make_header
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr, formatdate, make_msgid, parseaddr, parsedate_to_datetime
 from functools import lru_cache, partial, wraps
 from html import unescape as html_unescape
-from html.parser import HTMLParser
 from io import BytesIO
 from time import monotonic, sleep
 from typing import Optional
@@ -17967,6 +17967,9 @@ def limit_streamed_body():
             str(environ.get("HTTP_TRANSFER_ENCODING", "")).strip().lower() != "chunked":
         return None
     limit = current_app.config.get("MAX_CONTENT_LENGTH")
+    mail_draft = request.endpoint == "tasks.draft_from_mail"
+    if mail_draft:
+        limit = MAIL_DRAFT_MAX_BYTES  # メールから下書き(15-5)は添付ファイルを含むメールを受け付ける
     if not limit:
         return None
     stream = environ["wsgi.input"]
@@ -17977,6 +17980,8 @@ def limit_streamed_body():
             break
         data.extend(chunk)
     if len(data) > limit:
+        if mail_draft:
+            return jsonify(ok=False, message=_MAIL_TOO_LARGE), 413
         abort(413)
     environ["wsgi.input"] = BytesIO(bytes(data))
     environ["CONTENT_LENGTH"] = str(len(data))
@@ -18984,7 +18989,7 @@ _MSG_BROKEN = ("メールのファイル（.msg）を読み取れませんでし
 _EML_BROKEN = "メールのファイル（.eml）を読み取れませんでした（メールの形式ではありません）。"
 _MAIL_NOT_SUPPORTED = "メールのファイル（Outlook の .msg・.eml）を選んでください。"
 MAIL_TEXT_MAX = 200000      # 本文として読む文字数の上限(これを超えた分は読まない)
-RTF_MAX_BYTES = 2000000     # 戻す RTF の大きさの上限
+RTF_MAX_BYTES = 1000000     # 戻す RTF の大きさの上限
 
 class MailReadError(Exception):
     """メールのファイルを読めない(形式が違う・壊れている)。文は画面にそのまま出す。"""
@@ -19039,51 +19044,72 @@ def _decode_bytes(data, codepage=None, charset=None):
         return data.decode("cp932", "replace")
 
 # ---- HTML・RTF の本文から文字を取り出す ----
-class _HtmlText(HTMLParser):
-    """HTML の本文から文字を取り出す(段落・改行・リストは改行にする。スクリプト・スタイル・head は除く)。"""
-
-    _SKIP = {"script", "style", "head", "title", "xml"}
-    _BLOCK = {"p", "div", "tr", "table", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre",
-              "section", "article", "header", "footer", "hr"}
-
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.parts, self.skip, self.size = [], 0, 0
-
-    def handle_starttag(self, tag, attrs):
-        if tag in self._SKIP:
-            self.skip += 1
-        elif tag == "br":
-            self.parts.append("\n")
-        elif tag == "li":
-            self.parts.append("\n・")
-        elif tag in ("td", "th"):
-            self.parts.append(" ")
-        elif tag in self._BLOCK:
-            self.parts.append("\n")
-
-    def handle_endtag(self, tag):
-        if tag in self._SKIP:
-            self.skip = max(0, self.skip - 1)
-        elif tag in self._BLOCK:
-            self.parts.append("\n")
-
-    def handle_data(self, data):
-        if not self.skip and self.size < MAIL_TEXT_MAX:
-            text = re.sub(r"[ \t\r\n\f]+", " ", data)  # HTML の空白・改行は1つの空白として表示される
-            self.parts.append(text)
-            self.size += len(text)
+# HTML は前から1回だけ読む(標準ライブラリの HTMLParser は、閉じていないコメント・タグが続くと読む量が文字数の
+# 2乗に増え、小さなファイルでも長い時間がかかるため使わない)。
+_HTML_SKIP_TAGS = ("script", "style", "head", "title", "xml")   # 中身を読まない要素
+_HTML_BLOCK_TAGS = {"p", "div", "tr", "table", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre",
+                    "section", "article", "header", "footer", "hr"}   # 前後で改行する要素
+_HTML_TAG_NAME = re.compile(r"</?([A-Za-z][A-Za-z0-9:-]{0,30})")
+_HTML_SPACES = re.compile(r"[ \t\r\n\f]+")
+_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")  # 文字数を変えない小文字
+HTML_MAX_CHARS = 1000000   # 文字にする HTML の文字数の上限
 
 def html_to_text(html_text):
-    """HTML の本文を文字だけにする(読めない HTML はタグを除くだけにする)。"""
-    parser = _HtmlText()
-    try:
-        parser.feed(html_text)
-        parser.close()
-        text = "".join(parser.parts)
-    except Exception:  # noqa: BLE001 (壊れた HTML。標準ライブラリの解析が例外を出すことがある)
-        text = html_unescape(re.sub(r"<[^>]*>", " ", re.sub(r"(?is)<(script|style|head)\b.*?</\1\s*>", " ", html_text)))
-    return tidy_mail_body(text.replace(" ", " "), strip_lines=True)
+    """HTML の本文を文字だけにする(段落・改行・リストは改行に。スクリプト・スタイル・head・コメントは除く)。
+
+    閉じていないコメント・script などは、その後ろを読まない。">" の無い "<" から後ろは文字として扱う。
+    """
+    text = str(html_text or "")[:HTML_MAX_CHARS]
+    lower = text.translate(_ASCII_LOWER)
+    parts, size, pos, length, next_gt = [], 0, 0, len(text), -1
+
+    def add(chunk):
+        nonlocal size
+        chunk = html_unescape(_HTML_SPACES.sub(" ", chunk))  # HTML の空白・改行は1つの空白として表示される
+        parts.append(chunk)
+        size += len(chunk)
+
+    while pos < length and size < MAIL_TEXT_MAX:
+        lt = text.find("<", pos)
+        if lt < 0:
+            add(text[pos:])
+            break
+        if lt > pos:
+            add(text[pos:lt])
+        if text.startswith("<!--", lt):
+            end = text.find("-->", lt + 4)
+            if end < 0:
+                break  # 閉じていないコメントは最後までコメント
+            pos = end + 3
+            continue
+        if next_gt < lt:
+            next_gt = text.find(">", lt)  # 前に探した ">" がまだ後ろにあれば、探し直さない(前から1回だけ読む)
+        if next_gt < 0:
+            add(text[lt:])
+            break
+        tag = text[lt + 1:next_gt]
+        pos = next_gt + 1
+        if tag[:1] in ("!", "?"):
+            continue  # <!DOCTYPE>・<![if ...]>・<?xml ...?> など
+        match = _HTML_TAG_NAME.match(text, lt)
+        name = match.group(1).translate(_ASCII_LOWER) if match else ""
+        closing = tag.startswith("/")
+        if name in _HTML_SKIP_TAGS and not closing and not tag.endswith("/"):
+            end = lower.find("</" + name, pos)
+            if end < 0:
+                break  # 閉じていない script・style などは最後まで読まない
+            close = lower.find(">", end)
+            pos = length if close < 0 else close + 1
+            continue
+        if name == "br":
+            parts.append("\n")
+        elif name == "li" and not closing:
+            parts.append("\n・")
+        elif name in ("td", "th") and not closing:
+            parts.append(" ")
+        elif name in _HTML_BLOCK_TAGS:
+            parts.append("\n")
+    return tidy_mail_body("".join(parts).replace("\u00a0", " "), strip_lines=True)
 
 _RTF_PREBUF = (b"{\\rtf1\\ansi\\mac\\deff0\\deftab720{\\fonttbl;}{\\f0\\fnil \\froman \\fswiss \\fmodern \\fscript "
                b"\\fdecor MS Sans SerifSymbolArialTimes New RomanCourier{\\colortbl\\red0\\green0\\blue0\r\n\\par "
@@ -19232,13 +19258,16 @@ _CFB_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 _CFB_MAXREG = 0xFFFFFFFA    # これより大きい番号は「鎖の終わり」「未使用」などの印
 _CFB_NOSTREAM = 0xFFFFFFFF
 _CFB_STREAM, _CFB_ROOT = 2, 5
-_CFB_MAX_ENTRIES = 100000   # 読むディレクトリの項目の数の上限
+_CFB_MAX_ENTRIES = 20000    # 読むディレクトリの項目の数の上限
+_CFB_MAX_CHILDREN = 20000   # 1つのストレージの直下で読む項目の数の上限(宛先・添付は _MSG_STORAGE_CHILDREN)
 
 class _CompoundFile:
     """複合ファイル(Compound File Binary。MS-CFB)を読む(読み取り専用。.msg 用の最小限)。
 
     entries: ディレクトリの項目 (名前, 種類, 左, 右, 子, 開始のセクタ, 大きさ) の一覧(0 番はルート)。
     セクタの鎖が循環している・ファイルの外を指すなどの壊れたファイルは MailReadError にする。
+    作り替えたファイルで時間・メモリを使い切らないよう、読む量をファイルの大きさで区切る
+    (FAT のセクタは重ねて数えず、ファイルのセクタを指すのに要る数まで。ミニ FAT はミニストリームの大きさまで)。
     """
 
     def __init__(self, data):
@@ -19250,6 +19279,7 @@ class _CompoundFile:
         self.data = data
         self.size = 1 << sector_shift
         self.sectors = max(0, -(-(len(data) - self.size) // self.size))  # ヘッダーの後のセクタの数(端数も1つ)
+        self._children = {}
         first_dir = struct.unpack_from("<I", data, 0x30)[0]
         self.mini_cutoff = struct.unpack_from("<I", data, 0x38)[0]
         first_minifat, num_minifat, first_difat = struct.unpack_from("<III", data, 0x3C)
@@ -19258,18 +19288,24 @@ class _CompoundFile:
         per = self.size // 4 - 1
         sector, seen = first_difat, set()
         while sector <= _CFB_MAXREG:
-            if sector in seen:
+            if sector in seen or len(seen) >= self.sectors:
                 raise MailReadError(_MSG_BROKEN)
             seen.add(sector)
             values = struct.unpack("<{}I".format(per + 1), self._sector(sector))
             fat_sectors.extend(values[:per])
             sector = values[per]
         self.fat = []
+        used = set()
+        needed = -(-self.sectors // (self.size // 4)) + 1  # ファイルのすべてのセクタを指すのに要る FAT のセクタの数
         for number in fat_sectors:
-            if number <= _CFB_MAXREG:
-                self.fat.extend(struct.unpack("<{}I".format(self.size // 4), self._sector(number)))
+            if number > _CFB_MAXREG or number in used:
+                continue
+            if len(used) >= needed:
+                break
+            used.add(number)
+            self.fat.extend(struct.unpack("<{}I".format(self.size // 4), self._sector(number)))
         # ディレクトリ
-        directory = self._chain(first_dir)
+        directory = self._chain(first_dir, _CFB_MAX_ENTRIES * 128)
         self.entries = []
         for offset in range(0, min(len(directory) // 128, _CFB_MAX_ENTRIES) * 128, 128):
             name_len = struct.unpack_from("<H", directory, offset + 0x40)[0]
@@ -19284,11 +19320,12 @@ class _CompoundFile:
         if not self.entries or self.entries[0][1] != _CFB_ROOT:
             raise MailReadError(_MSG_BROKEN)
         root = self.entries[0]
-        self.ministream = self._chain(root[5], root[6]) if root[6] else b""
+        self.ministream = self._chain(root[5], min(root[6], len(data))) if root[6] else b""
         self.minifat = []
         if num_minifat and first_minifat <= _CFB_MAXREG:
-            raw = self._chain(first_minifat)
-            self.minifat = list(struct.unpack("<{}I".format(len(raw) // 4), raw[:len(raw) // 4 * 4]))
+            raw = self._chain(first_minifat, (len(self.ministream) // 64 + 1) * 4)
+            count = len(raw) // 4
+            self.minifat = list(struct.unpack("<{}I".format(count), raw[:count * 4]))
 
     def _sector(self, number):
         if number >= self.sectors:
@@ -19322,21 +19359,29 @@ class _CompoundFile:
             sector = self.minifat[sector]
         return b"".join(parts)[:size]
 
-    def read(self, index):
-        """ストリーム index の中身(ストリームでなければ b"")。"""
+    def read(self, index, limit=None):
+        """ストリーム index の中身(limit があればその大きさまで。ストリームでなければ b"")。"""
         _name, kind, _left, _right, _child, start, size = self.entries[index]
         if kind != _CFB_STREAM or not size:
             return b""
         if size > len(self.data):
             raise MailReadError(_MSG_BROKEN)
+        want = size if limit is None else min(size, limit)
         if size < self.mini_cutoff:
-            return self._mini_chain(start, size)
-        return self._chain(start, size)
+            return self._mini_chain(start, want)
+        return self._chain(start, want)
 
-    def children(self, index):
-        """ストレージ index の直下の項目 {名前(大文字): 番号}(兄弟の木をたどる。循環しても止まる)。"""
-        result, stack, seen = {}, [self.entries[index][4]], set()
-        while stack:
+    def children(self, index, limit=_CFB_MAX_CHILDREN):
+        """ストレージ index の直下の項目 {名前(大文字): 番号}(兄弟の木をたどる。循環しても止まる。limit 個まで)。
+
+        同じ兄弟の木を指すストレージ(作り替えたファイル)で、同じ木を何度もたどらないよう、木の根ごとに覚えておく。
+        """
+        top = self.entries[index][4]
+        known = self._children.get((top, limit))
+        if known is not None:
+            return known
+        result, stack, seen = {}, [top], set()
+        while stack and len(seen) < limit:
             number = stack.pop()
             if number == _CFB_NOSTREAM or number >= len(self.entries) or number in seen:
                 continue
@@ -19344,39 +19389,43 @@ class _CompoundFile:
             name, _kind, left, right, _child, _start, _size = self.entries[number]
             result[name.upper()] = number
             stack.extend((left, right))
+        self._children[(top, limit)] = result
         return result
 
 # ---- .msg の MAPI のプロパティ ----
 _PT_LONG, _PT_BOOLEAN, _PT_SYSTIME = 0x0003, 0x000B, 0x0040
 _PT_STRING8, _PT_UNICODE, _PT_BINARY = 0x001E, 0x001F, 0x0102
-_MSG_MAX_ITEMS = 500   # 読む宛先・添付の数の上限
+_MSG_MAX_ITEMS = 500             # 読む宛先・添付のストレージの数の上限(それぞれ)
+_MSG_STORAGE_CHILDREN = 2000     # 宛先・添付の1つのストレージで読む項目の数の上限
+_MSG_PROP_LIMIT = 64 * 1024      # 名前・アドレスなどの文字列のプロパティで読む大きさの上限(バイト)
+_MSG_BODY_LIMIT = MAIL_TEXT_MAX * 2 + 2   # テキストの本文で読む大きさの上限(バイト。UTF-16)
 
 class _MsgProps:
     """.msg の1つのストレージ(メール本体・宛先・添付)のプロパティ。header_size は固定長のプロパティの前の部分の大きさ
     (メール本体 32・宛先と添付 8)。"""
 
-    def __init__(self, cf, index, header_size, codepage=None):
+    def __init__(self, cf, index, header_size, codepage=None, limit=_CFB_MAX_CHILDREN):
         self.cf = cf
-        self.items = cf.children(index)
+        self.items = cf.children(index, limit)
         self.codepage = codepage
         self.fixed = {}
         stream = self.items.get("__PROPERTIES_VERSION1.0")
         if stream is not None:
-            data = cf.read(stream)
+            data = cf.read(stream, _MSG_PROP_LIMIT)
             for offset in range(header_size, len(data) - 15, 16):
                 tag = struct.unpack_from("<I", data, offset)[0]
                 self.fixed[tag] = data[offset + 8:offset + 16]
 
-    def raw(self, prop_id, ptype):
+    def raw(self, prop_id, ptype, limit=_MSG_PROP_LIMIT):
         index = self.items.get("__SUBSTG1.0_{:04X}{:04X}".format(prop_id, ptype))
-        return None if index is None else self.cf.read(index)
+        return None if index is None else self.cf.read(index, limit)
 
-    def text(self, prop_id):
-        """文字列のプロパティ(Unicode・コードページの文字列のどちらでも)。無ければ ""。"""
-        data = self.raw(prop_id, _PT_UNICODE)
+    def text(self, prop_id, limit=_MSG_PROP_LIMIT):
+        """文字列のプロパティ(Unicode・コードページの文字列のどちらでも。limit バイトまで)。無ければ ""。"""
+        data = self.raw(prop_id, _PT_UNICODE, limit)
         if data is not None:
-            return data.decode("utf-16-le", "replace").split("\x00", 1)[0]
-        data = self.raw(prop_id, _PT_STRING8)
+            return data[:len(data) // 2 * 2].decode("utf-16-le", "replace").split("\x00", 1)[0]
+        data = self.raw(prop_id, _PT_STRING8, limit)
         if data is not None:
             return _decode_bytes(data.split(b"\x00", 1)[0], self.codepage)
         return ""
@@ -19440,20 +19489,22 @@ def _read_msg(data):
     mail.sent_at = root.time(0x0039) or root.time(0x0E06)  # PR_CLIENT_SUBMIT_TIME / PR_MESSAGE_DELIVERY_TIME
     if mail.sent_at is None:
         headers = root.text(0x007D)  # PR_TRANSPORT_MESSAGE_HEADERS
-        found = re.search(r"(?im)^Date:[ \t]*(.+)$", headers)
+        found = re.search(r"(?im)^Date:[ \t]*([^\r\n]{1,200})", headers)
         mail.sent_at = _mail_date(found.group(1)) if found else None
-    to, cc = [], []
-    attachments = []
+    to, cc, attachments = [], [], []
+    recipients = attaches = 0  # 読んだストレージの数(Bcc・隠しの添付も数える)
     for name, index in sorted(root.items.items()):
-        if name.startswith("__RECIP_VERSION1.0_#") and len(to) + len(cc) < _MSG_MAX_ITEMS:
-            props = _MsgProps(cf, index, 8, root.codepage)
+        if name.startswith("__RECIP_VERSION1.0_#") and recipients < _MSG_MAX_ITEMS:
+            recipients += 1
+            props = _MsgProps(cf, index, 8, root.codepage, _MSG_STORAGE_CHILDREN)
             address = next((a for a in (props.text(0x39FE), props.text(0x3003)) if "@" in a), "")
             label = _address_label(props.text(0x3001), address)
             kind = props.number(0x0C15)  # PR_RECIPIENT_TYPE(1=To・2=Cc・3=Bcc)
             if label and kind != 3:
                 (cc if kind == 2 else to).append(label)
-        elif name.startswith("__ATTACH_VERSION1.0_#") and len(attachments) < _MSG_MAX_ITEMS:
-            props = _MsgProps(cf, index, 8, root.codepage)
+        elif name.startswith("__ATTACH_VERSION1.0_#") and attaches < _MSG_MAX_ITEMS:
+            attaches += 1
+            props = _MsgProps(cf, index, 8, root.codepage, _MSG_STORAGE_CHILDREN)
             if props.flag(0x7FFE):  # PR_ATTACHMENT_HIDDEN(本文の中の画像など)
                 continue
             label = props.text(0x3707) or props.text(0x3704) or props.text(0x3001)  # 長い名前 / 名前 / 表示名
@@ -19472,19 +19523,21 @@ def _read_msg(data):
 
 def _msg_body(root):
     """本文: テキスト(PR_BODY) → HTML(PR_HTML) → RTF(PR_RTF_COMPRESSED)の順に、最初にあるもの。"""
-    text = root.text(0x1000)
+    text = root.text(0x1000, _MSG_BODY_LIMIT)
     if text.strip():
         return tidy_mail_body(text[:MAIL_TEXT_MAX])
-    raw = root.raw(0x1013, _PT_BINARY)
+    raw = root.raw(0x1013, _PT_BINARY, HTML_MAX_CHARS * 2)
     if raw is not None:
         head = raw[:2048].decode("ascii", "ignore")
-        found = re.search(r"""charset\s*=\s*["']?([A-Za-z0-9_\-]+)""", head, re.IGNORECASE)
-        html_text = _decode_bytes(raw, root.codepage, found.group(1) if found else None)
+        found = re.search(r"""charset[ \t]{0,5}=[ \t]{0,5}["']?([A-Za-z0-9_\-]{1,40})""", head, re.IGNORECASE)
+        # HTML の中の文字コードの指定を先に使う(無い・使えないときはメールのコードページ)
+        name = _codec_for(charset=found.group(1)) if found else None
+        html_text = raw.decode(name, "replace") if name else _decode_bytes(raw, root.codepage)
     else:
-        html_text = root.text(0x1013)
+        html_text = root.text(0x1013, HTML_MAX_CHARS * 2)
     if html_text.strip():
         return html_to_text(html_text)
-    rtf = root.raw(0x1009, _PT_BINARY)
+    rtf = root.raw(0x1009, _PT_BINARY, RTF_MAX_BYTES)
     if rtf:
         try:
             return rtf_to_text(decompress_rtf(rtf), root.codepage)
@@ -19492,61 +19545,87 @@ def _msg_body(root):
             return ""
     return ""
 
-def _read_eml(data):
+MAIL_HEADER_MAX = 2000       # .eml の見出しの値で読む文字数の上限
+_EML_MAX_PARTS = 500         # .eml で読む部分(本文・添付)の数の上限
+
+def _eml_header(message, name):
+    """.eml の見出しの値(符号化〔RFC 2047〕を戻し、空白をまとめる。MAIL_HEADER_MAX 文字まで)。無ければ ""。"""
     try:
-        message = message_from_bytes(data, policy=email_policy.default)
+        value = message.get(name)
+    except Exception:  # noqa: BLE001 (読めない見出しは無いものとする)
+        return ""
+    if value is None:
+        return ""
+    value = str(value)[:MAIL_HEADER_MAX]
+    try:
+        value = str(make_header(decode_header(value)))
+    except Exception:  # noqa: BLE001 (知らない文字コードなどはそのまま)
+        pass
+    return re.sub(r"\s+", " ", clean_text(value)).strip()
+
+def _read_eml(data):
+    # 見出しを1つずつ組み立てない形(compat32)で読む(宛先がとても多い見出しでも時間がかからないように)
+    try:
+        message = message_from_bytes(data, policy=email_policy.compat32)
     except Exception:  # noqa: BLE001 (壊れたファイル)
         raise MailReadError(_EML_BROKEN)
-
-    def header(name):
-        try:
-            value = message.get(name)
-            return clean_text(str(value)).replace("\n", " ").strip() if value is not None else ""
-        except Exception:  # noqa: BLE001 (読めない見出しは無いものとする)
-            return ""
-
-    if not any(header(name) for name in ("From", "Subject", "Date", "To", "Message-ID")):
+    if not any(_eml_header(message, name) for name in ("From", "Subject", "Date", "To", "Message-ID")):
         raise MailReadError(_EML_BROKEN)
     mail = MailContent(kind="eml")
-    mail.subject = header("Subject")
-    mail.sender = header("From")
-    mail.to = header("To")
-    mail.cc = header("Cc")
-    mail.sent_at = _mail_date(header("Date"))
-    importance = (header("Importance") or header("X-Priority") or header("Priority")).lower()
+    mail.subject = _eml_header(message, "Subject")
+    mail.sender = _eml_header(message, "From")
+    mail.to = _eml_header(message, "To")
+    mail.cc = _eml_header(message, "Cc")
+    mail.sent_at = _mail_date(_eml_header(message, "Date"))
+    importance = (_eml_header(message, "Importance") or _eml_header(message, "X-Priority")
+                  or _eml_header(message, "Priority")).lower()
     if importance.startswith(("high", "1", "2", "urgent")):
         mail.importance = "high"
     elif importance.startswith(("low", "4", "5", "non-urgent")):
         mail.importance = "low"
-    mail.body = _eml_body(message)
-    try:
-        for part in message.iter_attachments():
-            if len(mail.attachments) >= _MSG_MAX_ITEMS:
-                break
-            name = clean_text(part.get_filename() or "").strip()
-            mail.attachments.append(name or "（名前のない添付）")
-    except Exception:  # noqa: BLE001 (添付の一覧を読めなくても本文は使う)
-        pass
+    mail.body, mail.attachments = _eml_parts(message)
     return mail
 
-def _eml_body(message):
-    """本文(テキストがあればテキスト、無ければ HTML を文字にしたもの)。"""
-    try:
-        part = message.get_body(preferencelist=("plain", "html"))
-    except Exception:  # noqa: BLE001
-        part = None
+def _eml_parts(message):
+    """本文(テキストがあればテキスト、無ければ HTML を文字にしたもの)と添付のファイル名の一覧。"""
+    plain = html = None
+    attachments = []
+    for count, part in enumerate(message.walk()):
+        if count >= _EML_MAX_PARTS:
+            break
+        if part.is_multipart():
+            continue
+        try:
+            filename = part.get_filename()
+        except Exception:  # noqa: BLE001
+            filename = None
+        disposition = str(part.get("Content-Disposition") or "").lower()
+        if filename or disposition.startswith("attachment"):
+            name = str(filename or "")[:MAIL_HEADER_MAX]
+            try:
+                name = str(make_header(decode_header(name)))
+            except Exception:  # noqa: BLE001
+                pass
+            attachments.append(clean_text(name).strip() or "（名前のない添付）")
+            continue
+        content_type = part.get_content_type()
+        if content_type == "text/plain" and plain is None:
+            plain = part
+        elif content_type == "text/html" and html is None:
+            html = part
+    part = plain if plain is not None else html
     if part is None:
-        return ""
+        return "", attachments
     try:
-        content = part.get_content()
-    except Exception:  # noqa: BLE001 (知らない文字コードなど)
-        content = part.get_payload(decode=True) or b""
-    if isinstance(content, bytes):
-        content = _decode_bytes(content, charset=part.get_content_charset())
-    content = str(content)[:MAIL_TEXT_MAX * 2]
-    if part.get_content_type() == "text/html":
-        return html_to_text(content)
-    return tidy_mail_body(content[:MAIL_TEXT_MAX])
+        payload = part.get_payload(decode=True) or b""
+    except Exception:  # noqa: BLE001
+        payload = b""
+    if not isinstance(payload, bytes):
+        payload = str(payload).encode("utf-8", "replace")
+    content = _decode_bytes(payload[:HTML_MAX_CHARS * 2], charset=part.get_content_charset())
+    if part is html:
+        return html_to_text(content), attachments
+    return tidy_mail_body(content[:MAIL_TEXT_MAX]), attachments
 
 def read_mail_file(data, filename=""):
     """メールのファイル(.msg・.eml)を読む。読めなければ MailReadError(文は画面に出す)。"""
@@ -19556,13 +19635,19 @@ def read_mail_file(data, filename=""):
             return _read_msg(data)
         except MailReadError:
             raise
-        except (struct.error, IndexError, ValueError, KeyError, UnicodeError, OverflowError, RecursionError):
+        except (struct.error, IndexError, ValueError, KeyError, UnicodeError, OverflowError, RecursionError,
+                MemoryError):
             raise MailReadError(_MSG_BROKEN)
     if name.endswith(".msg"):
         raise MailReadError(_MSG_BROKEN)
     if name and not name.endswith(".eml"):
         raise MailReadError(_MAIL_NOT_SUPPORTED)
-    return _read_eml(data)
+    try:
+        return _read_eml(data)
+    except MailReadError:
+        raise
+    except (LookupError, ValueError, TypeError, IndexError, KeyError, UnicodeError, RecursionError, MemoryError):
+        raise MailReadError(_EML_BROKEN)
 
 # ==== 15-4. メールからの下書き(ルールとAI) ========================================================
 # 読んだメール(15-3)から、登録の画面に入れる下書き(タイトル・内容・開始日・期限・優先度・必要スキル)を作る。
@@ -19586,18 +19671,20 @@ _MAIL_TOO_LARGE = ("メールのファイルが大きすぎます（{}MB まで�
                    .format(MAIL_DRAFT_MAX_BYTES // 1000000))
 
 # 件名の先頭の返信・転送の印(「RE:」「Fw:」「RE[2]:」「返信:」「転送:」など。全角も)
-_SUBJECT_PREFIX = re.compile(r"^\s*(?:(?:re|fw|fwd|aw|wg|ｒｅ|ｆｗ|ｆｗｄ)\s*(?:\[\d+\]|\(\d+\))?\s*[:：]|返信\s*[:：]|"
-                             r"転送\s*[:：])\s*", re.IGNORECASE)
+_SUBJECT_PREFIX = re.compile(r"^ ?(?:(?:re|fw|fwd|aw|wg|ｒｅ|ｆｗ|ｆｗｄ) ?(?:\[\d{1,4}\]|\(\d{1,4}\))? ?[:：]|返信 ?[:：]|"
+                             r"転送 ?[:：]) ?", re.IGNORECASE)  # 空白は1つにまとめてから使う
 # 期限の書き方(NFKC で全角の数字・記号を半角にしてから探す)。年は省略可(無ければメールの日付から決める)
-_DATE_PART = (r"(?:(?P<y>20\d{2})\s*[/年.\-]\s*)?(?P<m>\d{1,2})\s*[/月.\-]\s*(?P<d>\d{1,2})\s*日?"
-              r"(?:\s*\([^)\n]{1,4}\))?")
-_DUE_AFTER = re.compile(_DATE_PART + r"\s*(?:[0-9:時分半]{0,6}\s*)?(?:まで|迄|〆|締切|締め切り|必着)")
-_DUE_BEFORE = re.compile(r"(?:期限|締切|締め切り|〆切|納期|期日|提出日|回答期限|提出期限)\s*(?:は|:|\s)*" + _DATE_PART)
+# (空白は1つにまとめてから使う。繰り返しを短くして、長い空白でも時間がかからないように)
+_DATE_PART = (r"(?:(?P<y>20\d{2}) ?[/年.\-] ?)?(?P<m>\d{1,2}) ?[/月.\-] ?(?P<d>\d{1,2}) ?日?"
+              r"(?: ?\([^)]{1,4}\))?")
+_DUE_AFTER = re.compile(_DATE_PART + r" ?(?:[0-9:時分半]{1,6} ?)?(?:まで|迄|〆|締切|締め切り|必着)")
+_DUE_BEFORE = re.compile(r"(?:期限|締切|締め切り|〆切|納期|期日|提出日|回答期限|提出期限)(?:は|:| ){0,3}" + _DATE_PART)
+MAIL_RULE_TEXT_MAX = 20000   # 期限・必要スキルを探す本文の文字数(先頭から)
 _URGENT = re.compile(r"至急|緊急|急ぎ|ASAP|urgent", re.IGNORECASE)
 
 def mail_task_title(subject):
     """件名からタイトル(先頭の RE:・FW: などを除く。TASK_TITLE_MAX 文字まで)。"""
-    title = clean_text(subject or "").replace("\n", " ").strip()
+    title = re.sub(r"\s+", " ", clean_text(subject or "")[:TASK_TITLE_MAX * 5]).strip()
     for _ in range(10):
         stripped = _SUBJECT_PREFIX.sub("", title, count=1).strip()
         if stripped == title:
@@ -19620,7 +19707,7 @@ def _infer_date(year, month, day, base):
 def mail_due_date(texts, base):
     """件名・本文(texts)の中の期限の書き方から期限を読む。戻り値: (日付 または None, 見つけた書き方)。"""
     for text in texts:
-        normalized = unicodedata.normalize("NFKC", text or "")
+        normalized = re.sub(r"\s+", " ", unicodedata.normalize("NFKC", (text or "")[:MAIL_RULE_TEXT_MAX]))
         found = []
         for pattern in (_DUE_BEFORE, _DUE_AFTER):
             for match in pattern.finditer(normalized):
@@ -19634,7 +19721,7 @@ def mail_due_date(texts, base):
 
 def mail_priority(mail):
     """優先度(重要度が高い・件名か本文の始めに「至急」など → 高、重要度が低い → 低、ほかは "")。"""
-    if mail.importance == "high" or _URGENT.search(mail.subject or "") or _URGENT.search((mail.body or "")[:300]):
+    if mail.importance == "high" or _URGENT.search((mail.subject or "")[:1000]) or _URGENT.search((mail.body or "")[:300]):
         return PRIORITY_HIGH
     if mail.importance == "low":
         return PRIORITY_LOW
@@ -19642,7 +19729,7 @@ def mail_priority(mail):
 
 def mail_skill_matches(texts, skills):
     """件名・本文(texts)に名前が出てくるスキル項目(英数字だけの名前は単語として。2文字以上の名前だけ)。"""
-    haystack = unicodedata.normalize("NFKC", "\n".join(t or "" for t in texts)).lower()
+    haystack = unicodedata.normalize("NFKC", "\n".join((t or "")[:MAIL_RULE_TEXT_MAX] for t in texts)).lower()
     found = []
     for skill in skills:
         name = unicodedata.normalize("NFKC", skill.name or "").strip().lower()
@@ -19797,7 +19884,9 @@ def build_mail_task_draft(mail, use_ai):
             notes.append("AIで整えられなかったため、メールの内容から下書きを作りました（{}）".format(_one_line(info, 200)))
         else:
             used_ai = True
-            notes = [n for n in notes if not n.startswith(("期限:", "必要スキル:"))]
+            # AI が返した項目のルールのメモだけを消す(AI が期限・必要スキルを返さなかったときは、ルールの値とメモのまま)
+            drop = tuple(word for key, word in (("due_date", "期限:"), ("skills", "必要スキル:")) if key in result)
+            notes = [n for n in notes if not (drop and n.startswith(drop))]
             title = result.get("title") or title
             summary = result.get("summary", "")
             start = result.get("start_date")
