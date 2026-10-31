@@ -114,14 +114,14 @@ Python のコードはすべてこの app.py にまとめている。ほかの�
       14-3. import-old-config: 旧版の instance/config.py の取り込み
   15. タスクの登録の支援(必要スキル・担当者の推奨・メールからの下書き)
       15-1. 必要スキル(タスクに必要なスキルと到達度)
-      15-2. 担当者の推奨(必要スキルの到達度と、期間中の年休)
+      15-2. 担当者の推奨(必要スキルの到達度と、期間中の年休・負荷)
       15-3. メールファイル(.msg・.eml)の読み取り
       15-4. メールからの下書き(ルールとAI)
       15-5. 画面(タスクの Blueprint に足すルート)
   16. 勤務(シフト)と出勤表
       16-1. 勤務表の記号と日ごとの勤務
       16-2. 出勤表(横軸=日付、縦軸=勤務帯・勤務と人)
-      16-3. 画面(勤務の設定・勤務表の入力〔年休の Blueprint に足すルート〕)
+      16-3. 画面(勤務の設定・勤務表の入力。システム管理〔admin だけ。18 章〕の Blueprint に足すルート)
   17. 複数の環境(グループ)
       17-1. 環境の一覧(instance/environments.json)と、環境ごとのフォルダ・URL
       17-2. 環境ごとのアプリと振り分け(EnvDispatcher)
@@ -3307,7 +3307,7 @@ class AppMark(db.Model):
 # 各機能は AI 無しの動きになり、画面には AI_NOT_CONFIGURED_MESSAGE を表示する。アプリが自分で外部の(社外の)AI の
 # 接続先を選ぶことは無い。APIキーは画面・ログ・エラーメッセージのどこにも表示しない。
 
-AI_NOT_CONFIGURED_MESSAGE = "AIの接続先（AI_API_URL）とモデル名（AI_MODEL）をシステム設定で設定してください"
+AI_NOT_CONFIGURED_MESSAGE = "AIの接続先（AI_API_URL）とモデル名（AI_MODEL）をシステム管理の「基本設定」（admin）で設定してください"
 
 def positive_int_value(raw):
     """設定値を1以上の整数として読む(数字だけの文字列・整数の値の float も可)。読めなければ None。"""
@@ -4320,13 +4320,16 @@ def _ensure_local_user(info):
 
     新しい DB で同時に初回ログインした(行の追加が重なった)ときは、後から追加しようとした側を取り消し、
     先に追加された行を使う(ログインIDの UNIQUE 制約。内部エラーにしない)。
+    info の shown_name は、認証の結果の氏名が無いときに新しい行に付ける氏名(共通のログインの画面に出す氏名。
+    1つの環境のときのログインから作った共通のログインで、ほかの環境に初めて入るとき。登録済みの氏名は変えない)。
     """
     for _attempt in range(2):
         user = User.query.filter_by(username=info["username"]).first()
         if user is None:
             user = User(username=info["username"])
             db.session.add(user)
-        user.display_name = _login_display_name(info) or user.display_name or info["username"]
+        user.display_name = (_login_display_name(info) or user.display_name
+                             or _login_display_name({"display_name": info.get("shown_name")}) or info["username"])
         role = info.get("role")
         user.role = role if role in (ROLE_MANAGER, ROLE_MEMBER) else (user.role or ROLE_MANAGER)
         user.is_active = True
@@ -4356,6 +4359,17 @@ def _match_registered_user(info):
 
 LOGIN_BACKEND_ERROR = ("認証サーバーに接続できなかったため、ログインできませんでした。しばらくしてからもう一度お試しください"
                        "（解決しない場合はマネージャーに連絡してください）。")
+
+def is_top_next(next_url):
+    """ログインの後に戻る先(next)が、アプリのトップ(「/」。URL を開いただけのとき)か。
+
+    固定ローカル管理者(admin)は、トップではなくシステム管理の画面(18 章)へ進めるために使う(開こうとしていた
+    ほかの画面〔ほかの環境のトップ /env/<キー>/ を含む〕は、ほかの人と同じくその画面へ)。
+    """
+    try:
+        return urlsplit(next_url or "").path == "/"
+    except ValueError:
+        return False
 
 def _safe_next(value):
     """ログイン後に戻る先(next)が、このアプリの中のパスならそのまま返す。それ以外は None。
@@ -4517,6 +4531,8 @@ def _after_portal_login(portal, next_url, rows=None):
     """共通のログインの後の移動先: next があればその画面の環境へ入る。無ければ、入れる環境が1つならその環境、
     複数なら環境の選択の画面。入れる環境が無くなっていれば(ログインの後に無効化された)ログインを終える。
     """
+    if next_url and portal["l"] and is_top_next(next_url):
+        next_url = None   # admin: トップの URL を開いただけのときは、システム管理の画面へ(下)
     if next_url:
         return redirect(env_enter_url(env_key_of_path(next_url), next_url))
     if portal["l"]:
@@ -4604,6 +4620,8 @@ def _redirect_after_login():
     """
     dropped = session.pop(DROPPED_REQUEST_KEY, None)
     next_page = _safe_next(request.args.get("next"))
+    if next_page and is_system_admin() and is_main_env() and is_top_next(next_page):
+        next_page = None   # admin: トップの URL を開いただけのときは、システム管理の画面へ(下)
     if next_page:
         page, post_only = _page_for_next(next_page)
         if post_only or (dropped and unquote(urlsplit(next_page).path) == dropped):
@@ -5252,7 +5270,8 @@ def new_task():
         db.session.flush()
         commit_submitted("task", url_for("tasks.detail", task_id=task.id))
         flash("タスクを登録しました。", "success")
-        capacity = task_capacity_alert(task.scale, task.start_date, task.due_date, assignees)
+        capacity = (task_capacity_alert(task.scale, task.start_date, task.due_date, assignees)
+                    if task.status != STATUS_DONE else None)
         if capacity:
             flash(capacity, "warning")   # 規模が期間の出勤日数を超える(15-2。保存はした)
         return redirect(url_for("tasks.detail", task_id=task.id))
@@ -16960,6 +16979,10 @@ def parse_config_form(form, initial, overrides):
     confirmed = set()  # 値を入力し直した・「空にする」を指定した秘密の値(接続先の確認 _check_secret_destinations に渡す)
     for field in FIELDS:
         key = field.key
+        if key in ENV_LOCAL_KEYS:
+            # 宛先(MAIL_TO・MAIL_CC)は環境ごとの「メールの宛先」タブ(11-3)。基本設定の画面には出さず、送られても
+            # 変えない(更新の前に開いたままの以前の画面から送られたとき。ドメインの確認も「メールの宛先」タブで行う)
+            continue
         reset = form.get("reset_" + key) == "1"
         state["reset_" + key] = reset
         has_override = key in overrides
@@ -17512,11 +17535,12 @@ def system_settings():
     return _render_system_settings(choice_or_default(tab, TAB_KEYS, TAB_RECIPIENTS))
 
 # 以前の基本設定の保存・接続テストの URL(POST)。システム管理(18 章)に移した(開いたままの以前の画面から送られた
-# とき用。admin だけが使える。エンドポイントの名前は以前と同じ)
+# とき用。admin だけが使える。エンドポイントの名前は以前と同じ。環境の追加・変更の URL は 17-5)
 ADMIN_MOVED_TABS = {TAB_CONFIG: "settings", TAB_ENVS: "envs"}
 
-def _moved_to_admin(path):
-    return redirect(admin_url(path), code=307)
+def _moved_to_admin(path, **values):
+    """システム管理の path へ 307 で送り直す(path の {名前} には URL の値を入れる)。"""
+    return redirect(admin_url(path.format(**{k: quote(str(v), safe="") for k, v in values.items()})), code=307)
 
 for _old, _endpoint, _path in (("config", "save_config", "settings"), ("test-mail", "test_mail", "settings/test-mail"),
                                ("test-ai", "test_ai", "settings/test-ai")):
@@ -19390,15 +19414,17 @@ def task_capacity_alert(scale, start, due, assignees):
         workdays = sum(workdays_by_user(assignees, start, due).values())
         who = ("担当者{}人の出勤日数の合計".format(len(assignees)) if len(assignees) > 1
                else "{}さんの出勤日数".format(assignees[0].display_name))
+        basis = "1日{}時間で計算".format(TASK_DAY_HOURS)
     else:
         workdays = sum(1 for i in range((due - start).days + 1) if is_business_day(start + timedelta(days=i)))
-        who = "営業日の数（担当者がいないため）"
+        who = "営業日の数"
+        basis = "担当者が未選択のため営業日・1日{}時間で計算".format(TASK_DAY_HOURS)
     capacity = workdays * TASK_DAY_HOURS
     if hours <= capacity:
         return None
-    return ("規模（{}＝約{}時間）が、開始日〜期限の{}（{}日＝{}時間。1日{}時間で計算）を超えています。"
+    return ("規模（{}＝約{}時間）が、開始日〜期限の{}（{}日＝{}時間。{}）を超えています。"
             "期限・規模・担当者を見直してください。".format(TASK_SCALE_LABELS.get(scale, scale), _fmt_num(hours), who,
-                                                     _fmt_num(workdays), _fmt_num(capacity), TASK_DAY_HOURS))
+                                                     _fmt_num(workdays), _fmt_num(capacity), basis))
 
 def _form_or_task_dates(form, task):
     """推奨に使う開始日・期限・規模(入力 form があればその値、無ければタスクの今の値)。"""
@@ -21547,7 +21573,7 @@ def enter():
     session.pop(LOCAL_AUTH_KEY, None)
     if portal["l"]:
         user = _ensure_local_user({"username": portal["u"], "display_name": portal["n"], "role": portal["r"],
-                                   "source": "local"})
+                                   "source": "local", "shown_name": portal["d"]})
     else:
         user = _match_registered_user({"username": portal["u"], "display_name": portal["n"]})
         if user is None:
@@ -21850,9 +21876,7 @@ def toggle_env(key):
 # 以前の環境の追加・変更の URL(システム設定の「環境」タブ。開いたままの以前の画面から送られたとき用。admin だけが使える)
 for _old, _endpoint, _path in (("envs", "create_env", "envs"), ("envs/<key>/rename", "rename_env", "envs/{key}/rename"),
                                ("envs/<key>/toggle", "toggle_env", "envs/{key}/toggle")):
-    system_bp.add_url_rule("/settings/" + _old, _endpoint,
-                           partial(lambda path, **values: redirect(admin_url(path.format(**values)), code=307), _path),
-                           methods=["POST"])
+    system_bp.add_url_rule("/settings/" + _old, _endpoint, partial(_moved_to_admin, _path), methods=["POST"])
 del _old, _endpoint, _path
 
 # #### 18. システム管理(固定ローカル管理者 admin だけの画面) #########################################

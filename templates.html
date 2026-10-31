@@ -166,9 +166,10 @@
     {% block content %}{% endblock %}
   </main>
 
-  <footer class="text-center text-muted small py-3">
+  {# 画面の下のアプリの名前(ログインの画面は出さない: auth/login.html で block footer を空にする) #}
+  {% block footer %}<footer class="text-center text-muted small py-3">
     {{ app_name }}
-  </footer>
+  </footer>{% endblock %}
 
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"
           integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz" crossorigin="anonymous"></script>
@@ -260,14 +261,14 @@
 {#=== auth/login.html ===#}
 {% extends "base.html" %}
 {% block title %}ログイン &middot; {{ app_name }}{% endblock %}
+{% block footer %}{% endblock %}
 
 {% block content %}
 <div class="row justify-content-center">
   <div class="col-md-5 col-lg-4">
     <div class="card shadow-sm mt-5">
       <div class="card-body p-4">
-        <h1 class="h4 text-center mb-1"><i class="bi bi-clipboard-check text-primary"></i> {{ app_name }}</h1>
-        <p class="text-center text-muted small mb-4">アカウントでログイン</p>
+        <h1 class="h4 text-center mb-4"><i class="bi bi-clipboard-check text-primary"></i> {{ app_name }}</h1>
 
         {# ログイン前に開こうとしたページ(next)を送信後も引き継ぐ。login_action は共通の入口の URL
            (複数の環境のとき、ほかの環境の画面から開いたログインの画面。app.py の 17 章) #}
@@ -2261,149 +2262,6 @@
     </form>
   </div>
 </div>
-{% endblock %}
-{#=== admin/shifts.html ===#}
-{# システム管理の「勤務パターン」: 勤務の設定(すべての環境で共通。admin だけ。app.py の 16-3) #}
-{% extends "admin/_layout.html" %}
-{% block title %}勤務の設定 &middot; システム管理 &middot; {{ app_name }}{% endblock %}
-
-{% block content %}
-<nav aria-label="breadcrumb">
-  <ol class="breadcrumb">
-    <li class="breadcrumb-item"><a href="{{ url_for('admin.home') }}">システム管理</a></li>
-    <li class="breadcrumb-item active">勤務の設定</li>
-  </ol>
-</nav>
-<div class="d-flex justify-content-between align-items-center mb-1 flex-wrap gap-2">
-  <h1 class="h3 mb-0"><i class="bi bi-gear"></i> 勤務の設定</h1>
-  <a href="{{ url_for('admin.shift_month', month=this_month) }}" class="btn btn-outline-primary"><i class="bi bi-grid-3x3"></i> 勤務表の入力</a>
-</div>
-<p class="text-muted small">交替勤務の班・日勤などの勤務と、勤務表の記号を設定します。勤務パターンは会社の中で共通のため、すべての環境の出勤表で使います（固定ローカル管理者 admin だけが変更できます）。メンバーの勤務は、各環境のマネージャーが「チームの管理」で選びます。人数はすべての環境の合計です。</p>
-
-<div class="card shadow-sm mb-4">
-  <div class="card-header bg-white fw-bold">勤務の一覧</div>
-  <div class="card-body">
-    {% for s in shifts %}
-    <form method="post" action="{{ url_for('admin.save_shift', shift_id=s.id) }}" class="row g-2 align-items-center mb-2">
-      {# 開いたときの内容の控え(ほかの操作の変更を古い画面の値で上書きしない) #}
-      <input type="hidden" name="version" value="{{ versions[s.id] }}">
-      <div class="col-md-3"><input type="text" name="name" class="form-control form-control-sm" value="{{ s.name }}" maxlength="{{ name_max }}" aria-label="勤務の名前" required></div>
-      <div class="col-md-3"><input type="text" name="group_name" class="form-control form-control-sm" value="{{ s.group_name }}" maxlength="{{ name_max }}" placeholder="勤務帯（任意）" aria-label="勤務帯"></div>
-      <div class="col-md-2"><input type="number" name="sort_order" class="form-control form-control-sm" value="{{ s.sort_order }}" title="並び順" aria-label="並び順"></div>
-      <div class="col-md-2">{% if s.is_active %}<span class="badge bg-success">有効</span>{% else %}<span class="badge bg-secondary">無効</span>{% endif %} <span class="text-muted small">{{ counts.get(s.id, 0) }}名</span></div>
-      <div class="col-md-2"><button class="btn btn-sm btn-outline-primary">保存</button></div>
-    </form>
-    <form method="post" action="{{ url_for('admin.toggle_shift', shift_id=s.id) }}" class="mb-3">
-      <input type="hidden" name="active" value="{{ '0' if s.is_active else '1' }}">
-      <button class="btn btn-sm btn-outline-{{ 'danger' if s.is_active else 'success' }}">{{ '無効化' if s.is_active else '有効化' }}</button>
-    </form>
-    {% else %}
-    <p class="text-muted small">勤務はまだありません。</p>
-    {% endfor %}
-
-    <hr>
-    <form method="post" action="{{ url_for('admin.new_shift') }}" class="row g-2 align-items-end">
-      {# 追加の二度押しで「既にあります」だけが表示されないようにする1回限りの印 #}
-      <input type="hidden" name="once" value="{{ submit_token() }}">
-      <div class="col-md-3">
-        <label class="form-label small mb-1" for="new-shift-name">新しい勤務の名前</label>
-        <input type="text" name="name" id="new-shift-name" class="form-control form-control-sm" maxlength="{{ name_max }}" placeholder="例: 1班 A" required>
-      </div>
-      <div class="col-md-3">
-        <label class="form-label small mb-1" for="new-shift-group">勤務帯（出勤表の行のまとまり。任意）</label>
-        <input type="text" name="group_name" id="new-shift-group" class="form-control form-control-sm" maxlength="{{ name_max }}" placeholder="例: 1班">
-      </div>
-      <div class="col-md-2">
-        <label class="form-label small mb-1" for="new-shift-sort">並び順</label>
-        <input type="number" name="sort_order" id="new-shift-sort" class="form-control form-control-sm" value="0">
-      </div>
-      <div class="col-md-2">
-        <button class="btn btn-sm btn-primary"><i class="bi bi-plus-lg"></i> 追加</button>
-      </div>
-    </form>
-  </div>
-</div>
-
-<div class="card shadow-sm mb-4">
-  <div class="card-header bg-white fw-bold">勤務表の記号</div>
-  <div class="card-body">
-    <p class="small text-muted">勤務表に書く記号（1文字）と、その名前・種類です。種類は、出勤表の色と担当者の推奨に使います（出勤・臨時出勤＝出勤の日、休日＝休み、年休＝休み〔担当者の推奨で、その日がある期間は対応できない〕）。勤務表で使っている記号は消せません（名前・種類は変えられます）。{% if not codes_saved %}<strong>まだ保存していません。</strong>例を入れてあるので、名前を勤務表の凡例に合わせて「記号を保存」を押してください。{% endif %}</p>
-    <form method="post" action="{{ url_for('admin.save_shift_codes') }}">
-      <input type="hidden" name="codes_version" value="{{ codes_version }}">
-      <input type="hidden" name="rows" value="{{ code_rows|length }}">
-      <div class="table-responsive">
-        <table class="table table-sm align-middle mb-2" style="max-width:640px;">
-          <thead class="table-light">
-            <tr><th scope="col" style="width:5em;">記号</th><th scope="col">名前</th><th scope="col" style="width:9em;">種類</th></tr>
-          </thead>
-          <tbody>
-            {% for r in code_rows %}
-            <tr>
-              <td><input type="text" name="code_{{ loop.index0 }}" value="{{ r.code }}" maxlength="1" class="form-control form-control-sm text-center" aria-label="記号"></td>
-              <td><input type="text" name="label_{{ loop.index0 }}" value="{{ r.label }}" maxlength="{{ label_max }}" class="form-control form-control-sm" aria-label="名前"></td>
-              <td>
-                <select name="kind_{{ loop.index0 }}" class="form-select form-select-sm" aria-label="種類">
-                  {% for k in kinds %}<option value="{{ k }}" {% if r.kind == k %}selected{% endif %}>{{ k }}</option>{% endfor %}
-                </select>
-              </td>
-            </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-      <div class="small text-muted mb-2">記号と名前を空にした行は消します（空の行が足りないときは、いったん保存すると増えます）。</div>
-      <button class="btn btn-primary btn-sm"><i class="bi bi-check-lg"></i> 記号を保存</button>
-    </form>
-  </div>
-</div>
-{% endblock %}
-{#=== admin/shift_month.html ===#}
-{# システム管理の「勤務パターン」: 勤務表の入力(すべての環境で共通。admin だけ。app.py の 16-3) #}
-{% extends "admin/_layout.html" %}
-{% block title %}勤務表の入力（{{ year }}年{{ month }}月） &middot; システム管理 &middot; {{ app_name }}{% endblock %}
-
-{% block content %}
-<nav aria-label="breadcrumb">
-  <ol class="breadcrumb">
-    <li class="breadcrumb-item"><a href="{{ url_for('admin.home') }}">システム管理</a></li>
-    <li class="breadcrumb-item"><a href="{{ url_for('admin.shifts') }}">勤務の設定</a></li>
-    <li class="breadcrumb-item active">勤務表の入力</li>
-  </ol>
-</nav>
-<div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
-  <h1 class="h3 mb-0"><i class="bi bi-grid-3x3"></i> 勤務表の入力（{{ year }}年 {{ month }}月）</h1>
-  <div class="btn-group">
-    {% if prev %}<a class="btn btn-outline-secondary btn-sm" href="{{ url_for('admin.shift_month', month=prev) }}">&laquo; 前月</a>{% endif %}
-    <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('admin.shift_month') }}">今月</a>
-    {% if next %}<a class="btn btn-outline-secondary btn-sm" href="{{ url_for('admin.shift_month', month=next) }}">次月 &raquo;</a>{% endif %}
-  </div>
-</div>
-<p class="small text-muted">勤務ごとに、1日から順に記号を入力します（{{ days|length }}日分）。Excel の勤務表の1行（日のセル）をコピーして、そのまま貼り付けられます。空白・「,」で区切っても、区切らずに続けて入力してもかまいません。記号の無い日は「-」です（記号の無い日は、土日・祝日を休み、それ以外を出勤として扱います）。</p>
-{% if not codes %}<div class="alert alert-warning small">勤務表の記号がまだありません。先に「<a href="{{ url_for('admin.shifts') }}">勤務の設定</a>」で記号を保存してください。</div>{% endif %}
-{% if not items %}<div class="alert alert-info small">有効な勤務がありません。「<a href="{{ url_for('admin.shifts') }}">勤務の設定</a>」で勤務を追加してください。</div>{% endif %}
-{% if codes %}
-<div class="small mb-1">記号: {% for c in codes %}<span class="badge bg-light text-dark border me-1">{{ c.code }} {{ c.label }}（{{ c.kind }}）</span>{% endfor %}</div>
-{% endif %}
-<div class="small text-muted mb-3">日付: {% for d in days %}<span class="{% if d.sun %}text-danger{% elif d.sat %}text-primary{% endif %}">{{ d.day }}{{ d.weekday }}</span>{% if not loop.last %} {% endif %}{% endfor %}</div>
-
-<form method="post" action="{{ url_for('admin.shift_month', month=key) }}">
-  <input type="hidden" name="month" value="{{ key }}">
-  {% for item in items %}
-  <div class="row g-2 align-items-center mb-2">
-    <label class="col-md-2 col-form-label col-form-label-sm" for="codes{{ item.shift.id }}">{{ item.shift.name }}{% if item.shift.group_name %} <span class="text-muted small">（{{ item.shift.group_name }}）</span>{% endif %}</label>
-    <div class="col-md-10">
-      {# 画面を開いたときの内容(ほかの操作で変わった行を、この画面の古い内容で上書きしない) #}
-      <input type="hidden" name="orig_{{ item.shift.id }}" value="{{ item.orig }}">
-      <textarea id="codes{{ item.shift.id }}" name="codes_{{ item.shift.id }}" rows="1" wrap="off" class="form-control form-control-sm font-monospace shift-codes"
-                placeholder="例: 2 2 ● ● ● 3 3 3 …（{{ days|length }}日分）" autocomplete="off" spellcheck="false">{{ item.value }}</textarea>
-    </div>
-  </div>
-  {% endfor %}
-  <div class="d-flex gap-2 mt-3">
-    {% if items %}<button class="btn btn-primary"><i class="bi bi-check-lg"></i> 保存</button>{% endif %}
-    <a href="{{ url_for('admin.shifts') }}" class="btn btn-outline-secondary">勤務の設定へ</a>
-  </div>
-</form>
 {% endblock %}
 {#=== skills/map.html ===#}
 {% extends "base.html" %}
@@ -5923,210 +5781,64 @@
 <script src="{{ url_for('static', filename='js/weekly-settings.js') }}"></script>
 <script src="{{ url_for('static', filename='js/system-settings.js') }}"></script>
 {% endblock %}
-{#=== system/_config_tab.html ===#}
-{# システム管理の「基本設定」のフォーム(admin だけ。admin/settings.html から読む)。項目の定義は app.py の FIELDS。
-   宛先(MAIL_TO・MAIL_CC)は環境ごとの設定(各環境の「メールの宛先」タブ)のため、ここには出さない。
-   値は2つの層(初期値 config.py ＋ 画面の設定 instance/settings.json)から決まり、画面で編集するのは画面の設定の層だけ #}
-{% macro layer_line(row) %}
-{% set f = row.field %}
-<div class="small text-muted cfg-layers">
-  <span class="me-2">初期値（config.py）: <span class="cfg-initial">{{ row.initial_text }}</span>{% if not row.has_override %} <span class="badge bg-primary">有効</span>{% endif %}</span>
-  <span class="me-2">画面の設定: {% if row.has_override %}<span class="cfg-override">{{ row.override_text }}</span> <span class="badge bg-primary">有効</span>{% else %}<span class="cfg-override">（なし）</span>{% endif %}</span>
-  <span>有効な値: <strong class="cfg-effective">{{ row.effective_text }}</strong></span>
-</div>
-{% endmacro %}
-{% macro reset_check(row) %}
-{% set f = row.field %}
-{% if row.has_override %}
-<div class="form-check mt-1">
-  <input class="form-check-input" type="checkbox" id="cfg-reset-{{ f.key }}" name="reset_{{ f.key }}" value="1"
-         {% if row.reset_checked %}checked{% endif %}>
-  <label class="form-check-label small" for="cfg-reset-{{ f.key }}">初期値に戻す（画面の設定を外し、config.py の値「{{ row.initial_text }}」を使う）</label>
-</div>
-{% endif %}
-{% endmacro %}
-{% macro field_input(row) %}
-{% set f = row.field %}
-{% set invalid = 'is-invalid' if row.error else '' %}
-{{ layer_line(row) }}
-{% if f.type == 'int' %}
-  <input type="number" class="form-control form-control-sm {{ invalid }}" id="cfg-{{ f.key }}" name="{{ f.key }}"
-         value="{{ row.value }}" min="{{ f.min }}" max="{{ f.max }}" step="1" style="max-width: 12rem;"
-         placeholder="{{ row.placeholder }}">
-  <div class="form-text mt-0">{{ f.min }}〜{{ f.max }}。空欄のまま保存すると変更しません。</div>
-  {{ reset_check(row) }}
-{% elif f.type == 'addresses' %}
-  <textarea class="form-control form-control-sm {{ invalid }}" id="cfg-{{ f.key }}" name="{{ f.key }}" rows="3"
-            autocomplete="off" spellcheck="false" placeholder="{% if row.placeholder %}{{ row.placeholder }}{% else %}name@example.com（1行に1件）{% endif %}">{{ row.value }}</textarea>
-  <div class="form-text mt-0">1行に1件。空欄のまま保存すると変更しません。</div>
-  {{ reset_check(row) }}
-{% elif f.type == 'domains' %}
-  <textarea class="form-control form-control-sm {{ invalid }}" id="cfg-{{ f.key }}" name="{{ f.key }}" rows="3"
-            autocomplete="off" spellcheck="false" placeholder="{% if row.placeholder %}{{ row.placeholder }}{% else %}example.com（1行に1件）{% endif %}">{{ row.value }}</textarea>
-  <div class="form-text mt-0">1行に1件（例: example.com。「@」の後ろの部分）。サブドメインも含みます。空欄のまま保存すると変更しません。</div>
-  <div class="form-check mt-1">
-    <input class="form-check-input" type="checkbox" id="cfg-clear-{{ f.key }}" name="clear_{{ f.key }}" value="1"
-           {% if row.clear_checked %}checked{% endif %}>
-    <label class="form-check-label small" for="cfg-clear-{{ f.key }}">制限しない（画面の設定を空にする）</label>
-  </div>
-  {% if row.violations %}
-  <div class="alert alert-warning small py-1 px-2 mt-1 mb-1">
-    <i class="bi bi-exclamation-triangle"></i> このドメイン以外のアドレスが登録されています（これらには送信しません）:
-    {% if row.violations.members %}メンバーのメールアドレス {{ row.violations.members|length }}人（{{ row.violations.members|join('、') }}）{% endif %}{% if row.violations.members and row.violations.reminder_addresses %}・{% endif %}{% if row.violations.reminder_addresses %}定型業務リマインドの追加の宛先 {{ row.violations.reminder_addresses }}件{% endif %}。
-    チーム管理・各業務の「編集」で直してください。
-  </div>
-  {% endif %}
-  {{ reset_check(row) }}
-{% elif f.type == 'secret_key' %}
-  <div class="mb-1">
-    {% if row.is_set %}<span class="badge bg-success">設定あり</span>{% else %}<span class="badge bg-secondary">未設定</span>
-    <span class="small text-muted">（次の起動のときに生成して画面の設定に保存します）</span>{% endif %}
-  </div>
-  <div class="form-check">
-    <input class="form-check-input" type="checkbox" id="cfg-generate-{{ f.key }}" name="generate_{{ f.key }}" value="1"
-           {% if row.generate_checked %}checked{% endif %}>
-    <label class="form-check-label small" for="cfg-generate-{{ f.key }}">新しいキーを生成する（保存時にランダムな値を作成し、画面の設定に保存）</label>
-  </div>
-  {{ reset_check(row) }}
-  <div class="small text-warning-emphasis mt-1"><i class="bi bi-exclamation-triangle"></i> 新しいキーはサーバーの再起動後に有効になります。再起動すると全員がログアウトされます。</div>
-{% elif f.type == 'secret' %}
-  <div class="mb-1">
-    {% if row.is_set %}<span class="badge bg-success">設定あり</span>{% else %}<span class="badge bg-secondary">未設定</span>{% endif %}
-    <span class="small text-muted">値は表示しません。空欄のまま保存すると変更しません。</span>
-  </div>
-  {% if f.unset_warning and not row.is_set %}
-  {# 有効な値が空のときだけの注意(状態に応じた表示。ADMIN_PASSWORD: admin のログインが ldap_client.py の判定に任されている) #}
-  <div class="alert alert-warning small py-1 px-2 mb-1 cfg-unset-warning"><i class="bi bi-exclamation-triangle"></i> {{ f.unset_warning }}</div>
-  {% endif %}
-  <input type="password" class="form-control form-control-sm {{ invalid }}" id="cfg-{{ f.key }}" name="{{ f.key }}"
-         autocomplete="new-password" placeholder="{% if f.confirm %}新しいパスワード{% else %}変更する場合だけ入力{% endif %}">
-  {% if f.confirm %}
-  <input type="password" class="form-control form-control-sm mt-1 {{ invalid }}" id="cfg-{{ f.key }}-confirm" name="{{ f.key }}_confirm"
-         autocomplete="new-password" placeholder="新しいパスワード（確認のためもう一度）" aria-label="{{ f.label }}（確認）">
-  {% endif %}
-  <div class="form-check mt-1">
-    <input class="form-check-input" type="checkbox" id="cfg-clear-{{ f.key }}" name="clear_{{ f.key }}" value="1"
-           {% if row.clear_checked %}checked{% endif %}>
-    <label class="form-check-label small" for="cfg-clear-{{ f.key }}">空にする（画面の設定を空にし、config.py の値も使わない）</label>
-  </div>
-  {{ reset_check(row) }}
-  {% if f.clear_warning %}
-  <div class="small text-warning-emphasis"><i class="bi bi-exclamation-triangle"></i> {{ f.clear_warning }}</div>
-  {% endif %}
-{% else %}
-  <input type="text" class="form-control form-control-sm {{ invalid }}" id="cfg-{{ f.key }}" name="{{ f.key }}"
-         value="{{ row.value }}" autocomplete="off" spellcheck="false" placeholder="{{ row.placeholder }}"
-         {% if f.type == 'url' %}inputmode="url"{% elif f.type == 'address' %}inputmode="email"{% endif %}>
-  <div class="form-text mt-0">空欄のまま保存すると変更しません。</div>
-  {{ reset_check(row) }}
-{% endif %}
-{% if row.error %}<div class="invalid-feedback d-block">{{ row.error }}</div>{% endif %}{% if row.notice %}<div class="small text-danger"><i class="bi bi-exclamation-triangle"></i> {{ row.notice }}</div>{% endif %}
-<div class="form-text">{{ f.help }}</div>
-{% endmacro %}
-
+{#=== system/_recipients_tab.html ===#}
+{# システム設定「メールの宛先」タブ(app.py の 11-3)。rc は env_mail_form_context の値。この環境の宛先
+   (instance/env_mail_settings.json。ほかの環境は instance/envs/<キー>/)を編集し、すべての環境で共通の設定は読み取り専用で表示する #}
 <p class="small text-muted">
-  環境ごとの設定（接続先・宛先・パスワードなど）です。値は <strong>初期値</strong>（<code>config.py</code>。app.py と同じフォルダ）と
-  <strong>画面の設定</strong>（<code>instance/settings.json</code>。この画面で保存した値）の2つの層から決まり、
-  画面の設定があればそれが優先されます。この画面で保存すると画面の設定の層だけが変わります（<code>config.py</code> は書き換えません）。
-  入力欄には画面の設定を表示しています（空欄は「画面の設定なし」。空欄のまま保存すると、その項目は変更しません）。
-  「初期値に戻す」で画面の設定を外すと、<code>config.py</code> の値が使われます。
-  <span class="badge bg-warning text-dark">再起動が必要</span> の項目以外は、保存するとすぐに反映されます。
-  {% if cfg.updated_at %}<br>画面の設定の最終更新: {{ cfg.updated_at }}（{{ cfg.updated_by }}）{% endif %}
+  週報・期限超過通知のメールの宛先です{% if env_nav %}（この環境: {{ rc.env_name }}）{% endif %}。定型業務リマインドは担当者のメールアドレスに送るため、この宛先は使いません。
+  すべての環境で共通の設定（AI・メールの送信サーバー・差出人・送信を許可するドメイン・リンクの基準URL）は、固定ローカル管理者（admin）がシステム管理の「基本設定」で変更します。
 </p>
-
-<form method="post" action="{{ url_for('admin.save_settings') }}" id="config-form" autocomplete="off" novalidate>
-  <input type="hidden" name="version" value="{{ cfg.version }}">
-  {# 保存のボタンの二度押しの2回目を「ほかの人の保存」と案内しないための1回限りの印 #}
-  <input type="hidden" name="once" value="{{ submit_token() }}">
-  {% for group in cfg.groups %}
+{% if rc.mail_problem %}
+<div class="alert alert-warning small py-2"><i class="bi bi-exclamation-triangle"></i> {{ rc.mail_problem }}</div>
+{% endif %}
+<form method="post" action="{{ url_for('system.save_recipients') }}" autocomplete="off" novalidate>
+  <input type="hidden" name="version" value="{{ rc.version }}">
   <div class="card shadow-sm mb-3">
-    <div class="card-header bg-white fw-bold">{{ group.label }}</div>
+    <div class="card-header bg-white fw-bold"><i class="bi bi-envelope"></i> この環境のメールの宛先</div>
     <div class="card-body pb-1">
-      {% for row in group.rows %}
-      {% set f = row.field %}
       <div class="row g-2 mb-3">
         <div class="col-md-4">
-          <label class="form-label small fw-bold mb-0" for="cfg-{{ f.key }}">{{ f.label }}</label>
-          <div class="small">
-            <code>{{ f.key }}</code>
-            {% if f.restart_required %}<span class="badge bg-warning text-dark">再起動が必要</span>{% endif %}
-            {% if row.pending %}<span class="badge bg-info text-dark" title="保存した値と実行中の値が異なります">再起動待ち</span>{% endif %}
-          </div>
-          <div class="small text-muted">{% if row.has_override %}画面の設定が有効{% else %}初期値（config.py）が有効{% endif %}</div>
+          <label class="form-label small fw-bold mb-0" for="env-mail-to">{{ rc.to_field.label }}</label>
+          <div class="small"><code>MAIL_TO</code></div>
         </div>
         <div class="col-md-8">
-          {{ field_input(row) }}
+          <textarea class="form-control form-control-sm" id="env-mail-to" name="MAIL_TO" rows="3" spellcheck="false"
+                    placeholder="name@example.com（1行に1件）">{{ rc.to_text }}</textarea>
+          <div class="form-text">週報と期限超過通知の宛先です（1行に1件。空にするとこの環境からは送りません）。</div>
         </div>
       </div>
-      {% endfor %}
-    </div>
-  </div>
-  {% endfor %}
-
-  {% if cfg.other %}
-  <div class="card shadow-sm mb-3">
-    <div class="card-header bg-white fw-bold">その他（読み取り専用）</div>
-    <div class="card-body small">
-      <p class="text-muted mb-2">
-        次の項目は <code>config.py</code> に書かれていますが、この画面の項目の定義（<code>app.py</code> の FIELDS）に無いため、画面からは変更できません。
-        変更する場合は <code>config.py</code> を直接編集し、サーバーを再起動してください。
-        {% if cfg.other|selectattr('retired')|list %}<span class="badge bg-secondary">未使用</span> の項目は以前の版の設定で、今は使われていません（残っていても動作には影響しません。不要なら <code>config.py</code> から消してください）。{% endif %}
-      </p>
-      <div class="table-responsive">
-        <table class="table table-sm align-middle mb-0">
-          <thead class="table-light"><tr><th>項目</th><th>記載場所</th><th>状態</th><th>値</th></tr></thead>
-          <tbody>
-            {% for row in cfg.other %}
-            <tr>
-              <td><code>{{ row.key }}</code>{% if row.retired %} <span class="badge bg-secondary">未使用</span>{% endif %}</td>
-              <td class="text-muted">{{ row.source }}{% if row.retired %}<div class="small">使われていません（{{ row.retired_note }}）</div>{% endif %}</td>
-              <td>{% if row.is_set %}設定あり{% else %}未設定{% endif %}</td>
-              <td class="text-break">{% if row.hidden %}<span class="text-muted">（表示しません）</span>{% elif row.value %}<code>{{ row.value }}</code>{% else %}<span class="text-muted">―</span>{% endif %}</td>
-            </tr>
-            {% endfor %}
-          </tbody>
-        </table>
+      <div class="row g-2 mb-3">
+        <div class="col-md-4">
+          <label class="form-label small fw-bold mb-0" for="env-mail-cc">{{ rc.cc_field.label }}</label>
+          <div class="small"><code>MAIL_CC</code></div>
+        </div>
+        <div class="col-md-8">
+          <textarea class="form-control form-control-sm" id="env-mail-cc" name="MAIL_CC" rows="3" spellcheck="false"
+                    placeholder="name@example.com（1行に1件）">{{ rc.cc_text }}</textarea>
+          <div class="form-text">週報と期限超過通知の同報（Cc）です（1行に1件）。{% if rc.domains_label %}送信を許可するドメイン（{{ rc.domains_label }}）のアドレスだけを保存できます。{% endif %}</div>
+        </div>
       </div>
     </div>
   </div>
-  {% endif %}
-
-  <div class="d-flex justify-content-end align-items-center gap-2 mb-4">
-    {% if not cfg.can_save %}<span class="small text-danger">画面の設定のファイル（<code>instance/settings.json</code>）を読み込めないため保存できません。</span>{% endif %}
-    <button class="btn btn-primary" {% if not cfg.can_save %}disabled{% endif %}><i class="bi bi-save"></i> 基本設定を保存</button>
+  <div class="d-flex justify-content-end mb-4">
+    <button class="btn btn-primary"><i class="bi bi-save"></i> 宛先を保存</button>
   </div>
 </form>
-
-{# 接続テスト(保存済みの設定を使う。入力中の値は使わない) #}
 <div class="card shadow-sm mb-4">
-  <div class="card-header bg-white fw-bold"><i class="bi bi-plug"></i> 接続テスト</div>
-  <div class="card-body">
-    <p class="small text-muted">保存済みの設定（有効な値）で接続を確かめます。入力中の値は使わないため、変更した場合は先に保存してください。</p>
-    <div class="row g-3">
-      <div class="col-md-6">
-        <form method="post" action="{{ url_for('admin.test_mail') }}">
-          <button class="btn btn-sm btn-outline-primary" {% if cfg.mail_test_problem %}disabled{% endif %}>
-            <i class="bi bi-envelope-check"></i> メール接続テスト
-          </button>
-        </form>
-        <div class="small text-muted mt-1">
-          差出人（<code>MAIL_FROM</code>）宛てに短いテキストのメールを1通送ります。
-        </div>
-        {% if cfg.mail_test_problem %}
-        <div class="small text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> {{ cfg.mail_test_problem }}</div>
-        {% endif %}
-      </div>
-      <div class="col-md-6">
-        <form method="post" action="{{ url_for('admin.test_ai') }}">
-          <button class="btn btn-sm btn-outline-primary" {% if not cfg.ai_enabled %}disabled{% endif %}>
-            <i class="bi bi-robot"></i> AI接続テスト
-          </button>
-        </form>
-        <div class="small text-muted mt-1">AIに短い問い合わせを1回送ります（{{ cfg.ai_status }}）。</div>
-        {% if not cfg.ai_enabled %}
-        <div class="small text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> AIが未設定のため送れません。</div>
-        {% endif %}
-      </div>
+  <div class="card-header bg-white fw-bold">すべての環境で共通の設定（読み取り専用）</div>
+  <div class="card-body small">
+    <div class="table-responsive">
+      <table class="table table-sm align-middle mb-0">
+        <thead class="table-light"><tr><th>項目</th><th>値</th></tr></thead>
+        <tbody>
+          {% for row in rc.shared %}
+          <tr>
+            <td>{{ row.field.label }}<div class="text-muted"><code>{{ row.field.key }}</code></div></td>
+            <td class="text-break">{{ row.text }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
     </div>
   </div>
 </div>
@@ -6633,67 +6345,6 @@
     <div class="small text-muted mt-2">HTMLを表示できないメールソフトではテキスト版が表示されます。件名の件数は、その宛先に送る回の数です。</div>
   </div>
 </div>
-{#=== system/_recipients_tab.html ===#}
-{# システム設定「メールの宛先」タブ(app.py の 11-3)。rc は env_mail_form_context の値。この環境の宛先
-   (instance/env_mail_settings.json。ほかの環境は instance/envs/<キー>/)を編集し、すべての環境で共通の設定は読み取り専用で表示する #}
-<p class="small text-muted">
-  週報・期限超過通知のメールの宛先です{% if env_nav %}（この環境: {{ rc.env_name }}）{% endif %}。定型業務リマインドは担当者のメールアドレスに送るため、この宛先は使いません。
-  すべての環境で共通の設定（AI・メールの送信サーバー・差出人・送信を許可するドメイン・リンクの基準URL）は、固定ローカル管理者（admin）がシステム管理の「基本設定」で変更します。
-</p>
-{% if rc.mail_problem %}
-<div class="alert alert-warning small py-2"><i class="bi bi-exclamation-triangle"></i> {{ rc.mail_problem }}</div>
-{% endif %}
-<form method="post" action="{{ url_for('system.save_recipients') }}" autocomplete="off" novalidate>
-  <input type="hidden" name="version" value="{{ rc.version }}">
-  <div class="card shadow-sm mb-3">
-    <div class="card-header bg-white fw-bold"><i class="bi bi-envelope"></i> この環境のメールの宛先</div>
-    <div class="card-body pb-1">
-      <div class="row g-2 mb-3">
-        <div class="col-md-4">
-          <label class="form-label small fw-bold mb-0" for="env-mail-to">{{ rc.to_field.label }}</label>
-          <div class="small"><code>MAIL_TO</code></div>
-        </div>
-        <div class="col-md-8">
-          <textarea class="form-control form-control-sm" id="env-mail-to" name="MAIL_TO" rows="3" spellcheck="false"
-                    placeholder="name@example.com（1行に1件）">{{ rc.to_text }}</textarea>
-          <div class="form-text">週報と期限超過通知の宛先です（1行に1件。空にするとこの環境からは送りません）。</div>
-        </div>
-      </div>
-      <div class="row g-2 mb-3">
-        <div class="col-md-4">
-          <label class="form-label small fw-bold mb-0" for="env-mail-cc">{{ rc.cc_field.label }}</label>
-          <div class="small"><code>MAIL_CC</code></div>
-        </div>
-        <div class="col-md-8">
-          <textarea class="form-control form-control-sm" id="env-mail-cc" name="MAIL_CC" rows="3" spellcheck="false"
-                    placeholder="name@example.com（1行に1件）">{{ rc.cc_text }}</textarea>
-          <div class="form-text">週報と期限超過通知の同報（Cc）です（1行に1件）。{% if rc.domains_label %}送信を許可するドメイン（{{ rc.domains_label }}）のアドレスだけを保存できます。{% endif %}</div>
-        </div>
-      </div>
-    </div>
-  </div>
-  <div class="d-flex justify-content-end mb-4">
-    <button class="btn btn-primary"><i class="bi bi-save"></i> 宛先を保存</button>
-  </div>
-</form>
-<div class="card shadow-sm mb-4">
-  <div class="card-header bg-white fw-bold">すべての環境で共通の設定（読み取り専用）</div>
-  <div class="card-body small">
-    <div class="table-responsive">
-      <table class="table table-sm align-middle mb-0">
-        <thead class="table-light"><tr><th>項目</th><th>値</th></tr></thead>
-        <tbody>
-          {% for row in rc.shared %}
-          <tr>
-            <td>{{ row.field.label }}<div class="text-muted"><code>{{ row.field.key }}</code></div></td>
-            <td class="text-break">{{ row.text }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-  </div>
-</div>
 {#=== admin/_layout.html ===#}
 {# システム管理の画面(固定ローカル管理者 admin だけ。app.py の 18 章)の共通の枠。ナビはシステム管理の項目だけ #}
 {% extends "base.html" %}
@@ -6900,6 +6551,356 @@
 
 {% block scripts %}
 <script src="{{ url_for('static', filename='js/system-settings.js') }}"></script>
+{% endblock %}
+{#=== system/_config_tab.html ===#}
+{# システム管理の「基本設定」のフォーム(admin だけ。admin/settings.html から読む)。項目の定義は app.py の FIELDS。
+   宛先(MAIL_TO・MAIL_CC)は環境ごとの設定(各環境の「メールの宛先」タブ)のため、ここには出さない。
+   値は2つの層(初期値 config.py ＋ 画面の設定 instance/settings.json)から決まり、画面で編集するのは画面の設定の層だけ #}
+{% macro layer_line(row) %}
+{% set f = row.field %}
+<div class="small text-muted cfg-layers">
+  <span class="me-2">初期値（config.py）: <span class="cfg-initial">{{ row.initial_text }}</span>{% if not row.has_override %} <span class="badge bg-primary">有効</span>{% endif %}</span>
+  <span class="me-2">画面の設定: {% if row.has_override %}<span class="cfg-override">{{ row.override_text }}</span> <span class="badge bg-primary">有効</span>{% else %}<span class="cfg-override">（なし）</span>{% endif %}</span>
+  <span>有効な値: <strong class="cfg-effective">{{ row.effective_text }}</strong></span>
+</div>
+{% endmacro %}
+{% macro reset_check(row) %}
+{% set f = row.field %}
+{% if row.has_override %}
+<div class="form-check mt-1">
+  <input class="form-check-input" type="checkbox" id="cfg-reset-{{ f.key }}" name="reset_{{ f.key }}" value="1"
+         {% if row.reset_checked %}checked{% endif %}>
+  <label class="form-check-label small" for="cfg-reset-{{ f.key }}">初期値に戻す（画面の設定を外し、config.py の値「{{ row.initial_text }}」を使う）</label>
+</div>
+{% endif %}
+{% endmacro %}
+{% macro field_input(row) %}
+{% set f = row.field %}
+{% set invalid = 'is-invalid' if row.error else '' %}
+{{ layer_line(row) }}
+{% if f.type == 'int' %}
+  <input type="number" class="form-control form-control-sm {{ invalid }}" id="cfg-{{ f.key }}" name="{{ f.key }}"
+         value="{{ row.value }}" min="{{ f.min }}" max="{{ f.max }}" step="1" style="max-width: 12rem;"
+         placeholder="{{ row.placeholder }}">
+  <div class="form-text mt-0">{{ f.min }}〜{{ f.max }}。空欄のまま保存すると変更しません。</div>
+  {{ reset_check(row) }}
+{% elif f.type == 'addresses' %}
+  <textarea class="form-control form-control-sm {{ invalid }}" id="cfg-{{ f.key }}" name="{{ f.key }}" rows="3"
+            autocomplete="off" spellcheck="false" placeholder="{% if row.placeholder %}{{ row.placeholder }}{% else %}name@example.com（1行に1件）{% endif %}">{{ row.value }}</textarea>
+  <div class="form-text mt-0">1行に1件。空欄のまま保存すると変更しません。</div>
+  {{ reset_check(row) }}
+{% elif f.type == 'domains' %}
+  <textarea class="form-control form-control-sm {{ invalid }}" id="cfg-{{ f.key }}" name="{{ f.key }}" rows="3"
+            autocomplete="off" spellcheck="false" placeholder="{% if row.placeholder %}{{ row.placeholder }}{% else %}example.com（1行に1件）{% endif %}">{{ row.value }}</textarea>
+  <div class="form-text mt-0">1行に1件（例: example.com。「@」の後ろの部分）。サブドメインも含みます。空欄のまま保存すると変更しません。</div>
+  <div class="form-check mt-1">
+    <input class="form-check-input" type="checkbox" id="cfg-clear-{{ f.key }}" name="clear_{{ f.key }}" value="1"
+           {% if row.clear_checked %}checked{% endif %}>
+    <label class="form-check-label small" for="cfg-clear-{{ f.key }}">制限しない（画面の設定を空にする）</label>
+  </div>
+  {% if row.violations %}
+  <div class="alert alert-warning small py-1 px-2 mt-1 mb-1">
+    <i class="bi bi-exclamation-triangle"></i> このドメイン以外のアドレスが登録されています（これらには送信しません）:
+    {% if row.violations.members %}メンバーのメールアドレス {{ row.violations.members|length }}人（{{ row.violations.members|join('、') }}）{% endif %}{% if row.violations.members and row.violations.reminder_addresses %}・{% endif %}{% if row.violations.reminder_addresses %}定型業務リマインドの追加の宛先 {{ row.violations.reminder_addresses }}件{% endif %}。
+    チーム管理・各業務の「編集」で直してください。
+  </div>
+  {% endif %}
+  {{ reset_check(row) }}
+{% elif f.type == 'secret_key' %}
+  <div class="mb-1">
+    {% if row.is_set %}<span class="badge bg-success">設定あり</span>{% else %}<span class="badge bg-secondary">未設定</span>
+    <span class="small text-muted">（次の起動のときに生成して画面の設定に保存します）</span>{% endif %}
+  </div>
+  <div class="form-check">
+    <input class="form-check-input" type="checkbox" id="cfg-generate-{{ f.key }}" name="generate_{{ f.key }}" value="1"
+           {% if row.generate_checked %}checked{% endif %}>
+    <label class="form-check-label small" for="cfg-generate-{{ f.key }}">新しいキーを生成する（保存時にランダムな値を作成し、画面の設定に保存）</label>
+  </div>
+  {{ reset_check(row) }}
+  <div class="small text-warning-emphasis mt-1"><i class="bi bi-exclamation-triangle"></i> 新しいキーはサーバーの再起動後に有効になります。再起動すると全員がログアウトされます。</div>
+{% elif f.type == 'secret' %}
+  <div class="mb-1">
+    {% if row.is_set %}<span class="badge bg-success">設定あり</span>{% else %}<span class="badge bg-secondary">未設定</span>{% endif %}
+    <span class="small text-muted">値は表示しません。空欄のまま保存すると変更しません。</span>
+  </div>
+  {% if f.unset_warning and not row.is_set %}
+  {# 有効な値が空のときだけの注意(状態に応じた表示。ADMIN_PASSWORD: admin のログインが ldap_client.py の判定に任されている) #}
+  <div class="alert alert-warning small py-1 px-2 mb-1 cfg-unset-warning"><i class="bi bi-exclamation-triangle"></i> {{ f.unset_warning }}</div>
+  {% endif %}
+  <input type="password" class="form-control form-control-sm {{ invalid }}" id="cfg-{{ f.key }}" name="{{ f.key }}"
+         autocomplete="new-password" placeholder="{% if f.confirm %}新しいパスワード{% else %}変更する場合だけ入力{% endif %}">
+  {% if f.confirm %}
+  <input type="password" class="form-control form-control-sm mt-1 {{ invalid }}" id="cfg-{{ f.key }}-confirm" name="{{ f.key }}_confirm"
+         autocomplete="new-password" placeholder="新しいパスワード（確認のためもう一度）" aria-label="{{ f.label }}（確認）">
+  {% endif %}
+  <div class="form-check mt-1">
+    <input class="form-check-input" type="checkbox" id="cfg-clear-{{ f.key }}" name="clear_{{ f.key }}" value="1"
+           {% if row.clear_checked %}checked{% endif %}>
+    <label class="form-check-label small" for="cfg-clear-{{ f.key }}">空にする（画面の設定を空にし、config.py の値も使わない）</label>
+  </div>
+  {{ reset_check(row) }}
+  {% if f.clear_warning %}
+  <div class="small text-warning-emphasis"><i class="bi bi-exclamation-triangle"></i> {{ f.clear_warning }}</div>
+  {% endif %}
+{% else %}
+  <input type="text" class="form-control form-control-sm {{ invalid }}" id="cfg-{{ f.key }}" name="{{ f.key }}"
+         value="{{ row.value }}" autocomplete="off" spellcheck="false" placeholder="{{ row.placeholder }}"
+         {% if f.type == 'url' %}inputmode="url"{% elif f.type == 'address' %}inputmode="email"{% endif %}>
+  <div class="form-text mt-0">空欄のまま保存すると変更しません。</div>
+  {{ reset_check(row) }}
+{% endif %}
+{% if row.error %}<div class="invalid-feedback d-block">{{ row.error }}</div>{% endif %}{% if row.notice %}<div class="small text-danger"><i class="bi bi-exclamation-triangle"></i> {{ row.notice }}</div>{% endif %}
+<div class="form-text">{{ f.help }}</div>
+{% endmacro %}
+
+<p class="small text-muted">
+  環境ごとの設定（接続先・宛先・パスワードなど）です。値は <strong>初期値</strong>（<code>config.py</code>。app.py と同じフォルダ）と
+  <strong>画面の設定</strong>（<code>instance/settings.json</code>。この画面で保存した値）の2つの層から決まり、
+  画面の設定があればそれが優先されます。この画面で保存すると画面の設定の層だけが変わります（<code>config.py</code> は書き換えません）。
+  入力欄には画面の設定を表示しています（空欄は「画面の設定なし」。空欄のまま保存すると、その項目は変更しません）。
+  「初期値に戻す」で画面の設定を外すと、<code>config.py</code> の値が使われます。
+  <span class="badge bg-warning text-dark">再起動が必要</span> の項目以外は、保存するとすぐに反映されます。
+  {% if cfg.updated_at %}<br>画面の設定の最終更新: {{ cfg.updated_at }}（{{ cfg.updated_by }}）{% endif %}
+</p>
+
+<form method="post" action="{{ url_for('admin.save_settings') }}" id="config-form" autocomplete="off" novalidate>
+  <input type="hidden" name="version" value="{{ cfg.version }}">
+  {# 保存のボタンの二度押しの2回目を「ほかの人の保存」と案内しないための1回限りの印 #}
+  <input type="hidden" name="once" value="{{ submit_token() }}">
+  {% for group in cfg.groups %}
+  <div class="card shadow-sm mb-3">
+    <div class="card-header bg-white fw-bold">{{ group.label }}</div>
+    <div class="card-body pb-1">
+      {% for row in group.rows %}
+      {% set f = row.field %}
+      <div class="row g-2 mb-3">
+        <div class="col-md-4">
+          <label class="form-label small fw-bold mb-0" for="cfg-{{ f.key }}">{{ f.label }}</label>
+          <div class="small">
+            <code>{{ f.key }}</code>
+            {% if f.restart_required %}<span class="badge bg-warning text-dark">再起動が必要</span>{% endif %}
+            {% if row.pending %}<span class="badge bg-info text-dark" title="保存した値と実行中の値が異なります">再起動待ち</span>{% endif %}
+          </div>
+          <div class="small text-muted">{% if row.has_override %}画面の設定が有効{% else %}初期値（config.py）が有効{% endif %}</div>
+        </div>
+        <div class="col-md-8">
+          {{ field_input(row) }}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endfor %}
+
+  {% if cfg.other %}
+  <div class="card shadow-sm mb-3">
+    <div class="card-header bg-white fw-bold">その他（読み取り専用）</div>
+    <div class="card-body small">
+      <p class="text-muted mb-2">
+        次の項目は <code>config.py</code> に書かれていますが、この画面の項目の定義（<code>app.py</code> の FIELDS）に無いため、画面からは変更できません。
+        変更する場合は <code>config.py</code> を直接編集し、サーバーを再起動してください。
+        {% if cfg.other|selectattr('retired')|list %}<span class="badge bg-secondary">未使用</span> の項目は以前の版の設定で、今は使われていません（残っていても動作には影響しません。不要なら <code>config.py</code> から消してください）。{% endif %}
+      </p>
+      <div class="table-responsive">
+        <table class="table table-sm align-middle mb-0">
+          <thead class="table-light"><tr><th>項目</th><th>記載場所</th><th>状態</th><th>値</th></tr></thead>
+          <tbody>
+            {% for row in cfg.other %}
+            <tr>
+              <td><code>{{ row.key }}</code>{% if row.retired %} <span class="badge bg-secondary">未使用</span>{% endif %}</td>
+              <td class="text-muted">{{ row.source }}{% if row.retired %}<div class="small">使われていません（{{ row.retired_note }}）</div>{% endif %}</td>
+              <td>{% if row.is_set %}設定あり{% else %}未設定{% endif %}</td>
+              <td class="text-break">{% if row.hidden %}<span class="text-muted">（表示しません）</span>{% elif row.value %}<code>{{ row.value }}</code>{% else %}<span class="text-muted">―</span>{% endif %}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="d-flex justify-content-end align-items-center gap-2 mb-4">
+    {% if not cfg.can_save %}<span class="small text-danger">画面の設定のファイル（<code>instance/settings.json</code>）を読み込めないため保存できません。</span>{% endif %}
+    <button class="btn btn-primary" {% if not cfg.can_save %}disabled{% endif %}><i class="bi bi-save"></i> 基本設定を保存</button>
+  </div>
+</form>
+
+{# 接続テスト(保存済みの設定を使う。入力中の値は使わない) #}
+<div class="card shadow-sm mb-4">
+  <div class="card-header bg-white fw-bold"><i class="bi bi-plug"></i> 接続テスト</div>
+  <div class="card-body">
+    <p class="small text-muted">保存済みの設定（有効な値）で接続を確かめます。入力中の値は使わないため、変更した場合は先に保存してください。</p>
+    <div class="row g-3">
+      <div class="col-md-6">
+        <form method="post" action="{{ url_for('admin.test_mail') }}">
+          <button class="btn btn-sm btn-outline-primary" {% if cfg.mail_test_problem %}disabled{% endif %}>
+            <i class="bi bi-envelope-check"></i> メール接続テスト
+          </button>
+        </form>
+        <div class="small text-muted mt-1">
+          差出人（<code>MAIL_FROM</code>）宛てに短いテキストのメールを1通送ります。
+        </div>
+        {% if cfg.mail_test_problem %}
+        <div class="small text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> {{ cfg.mail_test_problem }}</div>
+        {% endif %}
+      </div>
+      <div class="col-md-6">
+        <form method="post" action="{{ url_for('admin.test_ai') }}">
+          <button class="btn btn-sm btn-outline-primary" {% if not cfg.ai_enabled %}disabled{% endif %}>
+            <i class="bi bi-robot"></i> AI接続テスト
+          </button>
+        </form>
+        <div class="small text-muted mt-1">AIに短い問い合わせを1回送ります（{{ cfg.ai_status }}）。</div>
+        {% if not cfg.ai_enabled %}
+        <div class="small text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> AIが未設定のため送れません。</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{#=== admin/shifts.html ===#}
+{# システム管理の「勤務パターン」: 勤務の設定(すべての環境で共通。admin だけ。app.py の 16-3) #}
+{% extends "admin/_layout.html" %}
+{% block title %}勤務の設定 &middot; システム管理 &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('admin.home') }}">システム管理</a></li>
+    <li class="breadcrumb-item active">勤務の設定</li>
+  </ol>
+</nav>
+<div class="d-flex justify-content-between align-items-center mb-1 flex-wrap gap-2">
+  <h1 class="h3 mb-0"><i class="bi bi-gear"></i> 勤務の設定</h1>
+  <a href="{{ url_for('admin.shift_month', month=this_month) }}" class="btn btn-outline-primary"><i class="bi bi-grid-3x3"></i> 勤務表の入力</a>
+</div>
+<p class="text-muted small">交替勤務の班・日勤などの勤務と、勤務表の記号を設定します。勤務パターンは会社の中で共通のため、すべての環境の出勤表で使います（固定ローカル管理者 admin だけが変更できます）。メンバーの勤務は、各環境のマネージャーが「チームの管理」で選びます。人数はすべての環境の合計です。</p>
+
+<div class="card shadow-sm mb-4">
+  <div class="card-header bg-white fw-bold">勤務の一覧</div>
+  <div class="card-body">
+    {% for s in shifts %}
+    <form method="post" action="{{ url_for('admin.save_shift', shift_id=s.id) }}" class="row g-2 align-items-center mb-2">
+      {# 開いたときの内容の控え(ほかの操作の変更を古い画面の値で上書きしない) #}
+      <input type="hidden" name="version" value="{{ versions[s.id] }}">
+      <div class="col-md-3"><input type="text" name="name" class="form-control form-control-sm" value="{{ s.name }}" maxlength="{{ name_max }}" aria-label="勤務の名前" required></div>
+      <div class="col-md-3"><input type="text" name="group_name" class="form-control form-control-sm" value="{{ s.group_name }}" maxlength="{{ name_max }}" placeholder="勤務帯（任意）" aria-label="勤務帯"></div>
+      <div class="col-md-2"><input type="number" name="sort_order" class="form-control form-control-sm" value="{{ s.sort_order }}" title="並び順" aria-label="並び順"></div>
+      <div class="col-md-2">{% if s.is_active %}<span class="badge bg-success">有効</span>{% else %}<span class="badge bg-secondary">無効</span>{% endif %} <span class="text-muted small">{{ counts.get(s.id, 0) }}名</span></div>
+      <div class="col-md-2"><button class="btn btn-sm btn-outline-primary">保存</button></div>
+    </form>
+    <form method="post" action="{{ url_for('admin.toggle_shift', shift_id=s.id) }}" class="mb-3">
+      <input type="hidden" name="active" value="{{ '0' if s.is_active else '1' }}">
+      <button class="btn btn-sm btn-outline-{{ 'danger' if s.is_active else 'success' }}">{{ '無効化' if s.is_active else '有効化' }}</button>
+    </form>
+    {% else %}
+    <p class="text-muted small">勤務はまだありません。</p>
+    {% endfor %}
+
+    <hr>
+    <form method="post" action="{{ url_for('admin.new_shift') }}" class="row g-2 align-items-end">
+      {# 追加の二度押しで「既にあります」だけが表示されないようにする1回限りの印 #}
+      <input type="hidden" name="once" value="{{ submit_token() }}">
+      <div class="col-md-3">
+        <label class="form-label small mb-1" for="new-shift-name">新しい勤務の名前</label>
+        <input type="text" name="name" id="new-shift-name" class="form-control form-control-sm" maxlength="{{ name_max }}" placeholder="例: 1班 A" required>
+      </div>
+      <div class="col-md-3">
+        <label class="form-label small mb-1" for="new-shift-group">勤務帯（出勤表の行のまとまり。任意）</label>
+        <input type="text" name="group_name" id="new-shift-group" class="form-control form-control-sm" maxlength="{{ name_max }}" placeholder="例: 1班">
+      </div>
+      <div class="col-md-2">
+        <label class="form-label small mb-1" for="new-shift-sort">並び順</label>
+        <input type="number" name="sort_order" id="new-shift-sort" class="form-control form-control-sm" value="0">
+      </div>
+      <div class="col-md-2">
+        <button class="btn btn-sm btn-primary"><i class="bi bi-plus-lg"></i> 追加</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="card shadow-sm mb-4">
+  <div class="card-header bg-white fw-bold">勤務表の記号</div>
+  <div class="card-body">
+    <p class="small text-muted">勤務表に書く記号（1文字）と、その名前・種類です。種類は、出勤表の色と担当者の推奨に使います（出勤・臨時出勤＝出勤の日、休日＝休み、年休＝休み〔担当者の推奨で、その日がある期間は対応できない〕）。勤務表で使っている記号は消せません（名前・種類は変えられます）。{% if not codes_saved %}<strong>まだ保存していません。</strong>例を入れてあるので、名前を勤務表の凡例に合わせて「記号を保存」を押してください。{% endif %}</p>
+    <form method="post" action="{{ url_for('admin.save_shift_codes') }}">
+      <input type="hidden" name="codes_version" value="{{ codes_version }}">
+      <input type="hidden" name="rows" value="{{ code_rows|length }}">
+      <div class="table-responsive">
+        <table class="table table-sm align-middle mb-2" style="max-width:640px;">
+          <thead class="table-light">
+            <tr><th scope="col" style="width:5em;">記号</th><th scope="col">名前</th><th scope="col" style="width:9em;">種類</th></tr>
+          </thead>
+          <tbody>
+            {% for r in code_rows %}
+            <tr>
+              <td><input type="text" name="code_{{ loop.index0 }}" value="{{ r.code }}" maxlength="1" class="form-control form-control-sm text-center" aria-label="記号"></td>
+              <td><input type="text" name="label_{{ loop.index0 }}" value="{{ r.label }}" maxlength="{{ label_max }}" class="form-control form-control-sm" aria-label="名前"></td>
+              <td>
+                <select name="kind_{{ loop.index0 }}" class="form-select form-select-sm" aria-label="種類">
+                  {% for k in kinds %}<option value="{{ k }}" {% if r.kind == k %}selected{% endif %}>{{ k }}</option>{% endfor %}
+                </select>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="small text-muted mb-2">記号と名前を空にした行は消します（空の行が足りないときは、いったん保存すると増えます）。</div>
+      <button class="btn btn-primary btn-sm"><i class="bi bi-check-lg"></i> 記号を保存</button>
+    </form>
+  </div>
+</div>
+{% endblock %}
+{#=== admin/shift_month.html ===#}
+{# システム管理の「勤務パターン」: 勤務表の入力(すべての環境で共通。admin だけ。app.py の 16-3) #}
+{% extends "admin/_layout.html" %}
+{% block title %}勤務表の入力（{{ year }}年{{ month }}月） &middot; システム管理 &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('admin.home') }}">システム管理</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('admin.shifts') }}">勤務の設定</a></li>
+    <li class="breadcrumb-item active">勤務表の入力</li>
+  </ol>
+</nav>
+<div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+  <h1 class="h3 mb-0"><i class="bi bi-grid-3x3"></i> 勤務表の入力（{{ year }}年 {{ month }}月）</h1>
+  <div class="btn-group">
+    {% if prev %}<a class="btn btn-outline-secondary btn-sm" href="{{ url_for('admin.shift_month', month=prev) }}">&laquo; 前月</a>{% endif %}
+    <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('admin.shift_month') }}">今月</a>
+    {% if next %}<a class="btn btn-outline-secondary btn-sm" href="{{ url_for('admin.shift_month', month=next) }}">次月 &raquo;</a>{% endif %}
+  </div>
+</div>
+<p class="small text-muted">勤務ごとに、1日から順に記号を入力します（{{ days|length }}日分）。Excel の勤務表の1行（日のセル）をコピーして、そのまま貼り付けられます。空白・「,」で区切っても、区切らずに続けて入力してもかまいません。記号の無い日は「-」です（記号の無い日は、土日・祝日を休み、それ以外を出勤として扱います）。</p>
+{% if not codes %}<div class="alert alert-warning small">勤務表の記号がまだありません。先に「<a href="{{ url_for('admin.shifts') }}">勤務の設定</a>」で記号を保存してください。</div>{% endif %}
+{% if not items %}<div class="alert alert-info small">有効な勤務がありません。「<a href="{{ url_for('admin.shifts') }}">勤務の設定</a>」で勤務を追加してください。</div>{% endif %}
+{% if codes %}
+<div class="small mb-1">記号: {% for c in codes %}<span class="badge bg-light text-dark border me-1">{{ c.code }} {{ c.label }}（{{ c.kind }}）</span>{% endfor %}</div>
+{% endif %}
+<div class="small text-muted mb-3">日付: {% for d in days %}<span class="{% if d.sun %}text-danger{% elif d.sat %}text-primary{% endif %}">{{ d.day }}{{ d.weekday }}</span>{% if not loop.last %} {% endif %}{% endfor %}</div>
+
+<form method="post" action="{{ url_for('admin.shift_month', month=key) }}">
+  <input type="hidden" name="month" value="{{ key }}">
+  {% for item in items %}
+  <div class="row g-2 align-items-center mb-2">
+    <label class="col-md-2 col-form-label col-form-label-sm" for="codes{{ item.shift.id }}">{{ item.shift.name }}{% if item.shift.group_name %} <span class="text-muted small">（{{ item.shift.group_name }}）</span>{% endif %}</label>
+    <div class="col-md-10">
+      {# 画面を開いたときの内容(ほかの操作で変わった行を、この画面の古い内容で上書きしない) #}
+      <input type="hidden" name="orig_{{ item.shift.id }}" value="{{ item.orig }}">
+      <textarea id="codes{{ item.shift.id }}" name="codes_{{ item.shift.id }}" rows="1" wrap="off" class="form-control form-control-sm font-monospace shift-codes"
+                placeholder="例: 2 2 ● ● ● 3 3 3 …（{{ days|length }}日分）" autocomplete="off" spellcheck="false">{{ item.value }}</textarea>
+    </div>
+  </div>
+  {% endfor %}
+  <div class="d-flex gap-2 mt-3">
+    {% if items %}<button class="btn btn-primary"><i class="bi bi-check-lg"></i> 保存</button>{% endif %}
+    <a href="{{ url_for('admin.shifts') }}" class="btn btn-outline-secondary">勤務の設定へ</a>
+  </div>
+</form>
 {% endblock %}
 {#=== static/css/style.css ===#}
 /* 業務管理アプリ 追加スタイル */
@@ -7600,6 +7601,8 @@ a:hover {
       if (!box || box.disabled) return;
       box.checked = !box.checked;
       syncAssignButtons(panel);
+      // 担当者が変わったので、規模と出勤日数の案内も確かめ直す(プログラムで変えたチェックでは change は起きない)
+      if (refreshCapacity) refreshCapacity();
     });
     syncAssignButtons(panel);
     return schedule;
