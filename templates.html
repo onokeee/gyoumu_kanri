@@ -3527,13 +3527,13 @@
 {% endblock %}
 {#=== manager/dashboard.html ===#}
 {% extends "base.html" %}
+{% from '_macros.html' import ai_analysis_sent_items %}
 {% block title %}マネージャーダッシュボード &middot; {{ app_name }}{% endblock %}
 
 {% block content %}
 <div class="d-flex justify-content-between align-items-start mb-1 flex-wrap gap-2">
   <h1 class="h3 mb-0"><i class="bi bi-graph-up-arrow"></i> マネージャーダッシュボード</h1>
   <div class="d-flex flex-wrap gap-2">
-  <a href="{{ url_for('manager.analysis') }}" class="btn btn-outline-primary"><i class="bi bi-clipboard-data"></i> AI分析（サマリーと推奨アクション）</a>
   <div class="dropdown">
     <button class="btn btn-outline-success dropdown-toggle" type="button" data-bs-toggle="dropdown">
       <i class="bi bi-file-earmark-excel"></i> Excelデータ出力
@@ -3548,6 +3548,55 @@
       <li><a class="dropdown-item" href="{{ url_for('export.teams_xlsx') }}">チーム・メンバー</a></li>
     </ul>
   </div>
+  </div>
+</div>
+
+{# ===== エグゼクティブサマリー(AI分析のまとめを1つの文章に。app.py の 9-10。表示だけ) ===== #}
+{% set s = analysis %}
+<div class="card shadow-sm mb-3 border-primary" id="ai-panel" data-status-url="{{ url_for('manager.analysis_status') }}"
+     data-running="{{ 1 if s.run and s.run.running else 0 }}">
+  <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <span class="fw-bold"><i class="bi bi-clipboard-data"></i> エグゼクティブサマリー（AI分析）</span>
+    <div class="d-flex align-items-center flex-wrap gap-2">
+      <span class="small text-muted">
+        {%- if s.applied %}<i class="bi bi-stars"></i> AIで分析: {{ s.ai.result.generated_at }} 時点
+        {%- else %}アプリの集計とルールによるまとめ（AIで分析していません）{% endif -%}
+      </span>
+      <form method="post" action="{{ url_for('manager.analysis_run') }}" class="m-0">
+        <input type="hidden" name="period" value="{{ s.default_days }}">
+        <input type="hidden" name="back" value="dashboard">
+        <button class="btn btn-sm btn-primary" {% if not s.ai_configured or (s.run and s.run.running) %}disabled{% endif %}
+                title="{{ '直近' ~ s.default_days ~ '日で、AIが本文を読んで分析します' if s.ai_configured else 'AIが未設定です（システム管理の「基本設定」。admin）' }}">
+          <i class="bi bi-stars"></i> AIで分析
+        </button>
+      </form>
+    </div>
+  </div>
+  <div class="card-body small">
+    {% if s.run and s.run.running %}
+    <div class="alert alert-info py-2 mb-2" id="ai-running">
+      <span class="spinner-border spinner-border-sm" role="status"></span>
+      AIで分析しています（{{ s.run.period }}・開始 {{ s.run.started_at }}）:
+      <span id="ai-progress">{{ s.run.done }}/{{ s.run.total }} {{ s.run.step }}</span><br>
+      終わると画面が自動で更新されます（更新されないときは、しばらくしてから再読み込みしてください）。
+    </div>
+    {% endif %}
+    {% if s.run and s.run.last_error %}
+    <div class="alert alert-danger py-2 mb-2"><i class="bi bi-exclamation-triangle"></i> 前回の実行（{{ s.run.finished_at }}）: {{ s.run.last_error }}</div>
+    {% endif %}
+    {% if s.error %}
+    <div class="alert alert-warning py-2 mb-2"><i class="bi bi-exclamation-triangle"></i> {{ s.error }}</div>
+    {% elif s.ai and s.ai.error %}
+    <div class="alert alert-warning py-2 mb-2"><i class="bi bi-exclamation-triangle"></i> {{ s.ai.error }}</div>
+    {% endif %}
+    {% if s.text %}
+    <div class="exec-summary pre-wrap border rounded bg-light px-3 py-2" id="exec-summary">{{ s.text }}</div>
+    {% endif %}
+    <div class="text-muted mt-2">
+      {% if s.ai_configured %}「AIで分析」を押すと、直近{{ s.default_days }}日について、{{ ai_analysis_sent_items() }}がシステム管理の「基本設定」で設定したAIの接続先に送られ（{{ s.ai_status }}）、終わるとAIのまとめと推奨アクションがここに表示されます。
+      {%- else %}AIが未設定のため、アプリの集計とルールの推奨アクションだけを表示しています（{{ s.ai_status }}）。{% endif %}
+      項目ごとの表・書き直し案は <a href="{{ url_for('manager.analysis') }}">AI分析の画面</a>で見られます。
+    </div>
   </div>
 </div>
 <p class="text-muted small mb-4">チームの全体俯瞰（対象メンバー {{ member_count }} 名）</p>
@@ -4032,6 +4081,9 @@
   </div>
   {% endfor %}
 </div>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/ai-analysis.js') }}"></script>
 {% endblock %}
 {#=== manager/_gantt.html ===#}
 {# 全タスクのガントチャート(ダッシュボード内蔵・全画面ページで共用) #}
@@ -6911,6 +6963,11 @@ body {
 
 /* 改行・空白は保持しつつ、スペースの無い長い連続文字も必ず折り返す。
    min-width:0 は flex/grid の子が内容幅より縮めるようにするため(枠の飛び出し防止)。 */
+.exec-summary {
+  max-height: 32rem;
+  overflow-y: auto;
+  line-height: 1.7;
+}
 .pre-wrap {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -8329,7 +8386,7 @@ a:hover {
   }
 })();
 {#=== static/js/ai-analysis.js ===#}
-/* AI分析の画面(manager/analysis.html)用。
+/* AI分析の画面(manager/analysis.html)と、マネージャーダッシュボードのエグゼクティブサマリー(manager/dashboard.html)用。
  *
  * ・「案をコピー」: data-copy-target で指定した要素の文字(書き直し案)をクリップボードにコピーする
  *   (自動では反映しない。タスクの画面に貼り付けて使う)。

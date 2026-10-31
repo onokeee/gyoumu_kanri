@@ -89,6 +89,7 @@ Python のコードはすべてこの app.py にまとめている。ほかの�
       9-7. AI分析: 実行(バックグラウンド)と保存
       9-8. AI分析: 結果の反映(画面・チームのまとめの材料)
       9-9. AI分析: 画面
+      9-10. AI分析: マネージャーダッシュボードのまとめ(エグゼクティブサマリー)
   10. 定型業務のリマインド(メール)
       10-1. リマインド: 予定の作り方(繰り返しのルール・休日の扱い)
       10-2. リマインド: 予定(実施予定日)の作成と未完了の一覧
@@ -7461,6 +7462,7 @@ def manager_dashboard():
         "manager/dashboard.html",
         today=today,
         member_count=member_count,
+        analysis=dashboard_analysis_summary_safe(),   # 一番上のエグゼクティブサマリー(AI分析のまとめ。9-10)
         workload_rows=workload_rows,
         workload_totals=workload_totals,
         load_full=_LOAD_FULL,
@@ -11044,7 +11046,8 @@ def skill_ai_panel_context(thread_id=None):
     }
 
 # #### 9. AI分析(サマリーと推奨アクション) #########################################################
-# マネージャーダッシュボードの「AI分析（サマリーと推奨アクション）」(/manager/analysis)。
+# マネージャーダッシュボードの「AI分析（サマリーと推奨アクション）」(/manager/analysis)。ダッシュボードの一番上には、
+# その内容を1つの文章にまとめたエグゼクティブサマリーを表示する(9-10)。
 # マネージャーのみ(メンバーは画面・データのどれにもアクセスできない。403)。
 # チームの状況を4つの観点でまとめ、マネージャーが今やることを推奨アクションとして示す:
 #   ① タスクの進捗   進み(期間内の完了・着手)/遅れ(期限超過・期限が近いのに未着手・
@@ -14996,9 +14999,12 @@ def analysis_dashboard():
 @manager_bp.route("/analysis/run", methods=["POST"], endpoint="analysis_run")
 @manager_required
 def analysis_run():
-    """「AIで分析」: 画面で選んでいる期間で、別スレッドの実行を始める。"""
+    """「AIで分析」: 画面で選んでいる期間で、別スレッドの実行を始める(back=dashboard ならダッシュボードに戻る)。"""
     args = {key: request.form.get(key, "").strip() for key in _ANALYSIS_PERIOD_ARGS}
-    back = url_for("manager.analysis", **{k: v for k, v in args.items() if v})
+    if request.form.get("back") == ANALYSIS_BACK_DASHBOARD:
+        back = url_for("manager.dashboard")   # ダッシュボードのまとめ(9-10)から実行したとき
+    else:
+        back = url_for("manager.analysis", **{k: v for k, v in args.items() if v})
     if not ai_is_configured():
         flash("AIが未設定のため、AIで分析できません。{}。".format(ai_missing_label()), "danger")
     elif start_ai_analysis(current_app._get_current_object(), args):
@@ -15012,6 +15018,136 @@ def analysis_run():
 def analysis_status():
     """実行中の表示用の状態(JSON)。"""
     return jsonify(ai_analysis_status())
+
+# ==== 9-10. AI分析: マネージャーダッシュボードのまとめ(エグゼクティブサマリー) =======================
+# マネージャーダッシュボードの一番上に、AI分析(①〜④のまとめ・推奨アクション)を1つの文章にまとめて表示する
+# (画面を切り替えずに見る。表示だけ。項目ごとの表・書き直し案は AI分析の画面〔9-9〕)。
+#   期間 : 保存した AI の結果があればその期間(AI のまとめをそのまま出すため)、無ければ既定の直近30日
+#   文章 : 対象(期間・人数・現時点) → 全体の状況(アプリの集計) → AIのまとめ(AI の結果があるとき)
+#          → いま対応すること(AI の推奨アクション。AI の結果が無ければルールの推奨アクション)
+# 「AIで分析」はダッシュボードからも実行できる(既定の直近30日。終わるとダッシュボードを読み直して表示する)。
+
+ANALYSIS_BACK_DASHBOARD = "dashboard"   # 「AIで分析」のフォームの back(終わった後にダッシュボードに戻る)
+SUMMARY_REASON_MAX = 200                # 推奨アクションの理由の文字数(まとめの中。長ければ「…」)
+
+def _summary_period(stored, today):
+    """まとめの期間: 保存した AI の結果の期間(読めて正しければ)、無ければ既定の直近N日。"""
+    p = stored.get("period") if isinstance(stored, dict) and isinstance(stored.get("period"), dict) else None
+    if p:
+        period = analysis_period({"period": ANALYSIS_PERIOD_RANGE, "from": p.get("start"), "to": p.get("end")}, today)
+        if period["error"] is None and period["kind"] == ANALYSIS_PERIOD_RANGE:
+            return period
+    return analysis_period({}, today)
+
+def _summary_amounts(team):
+    """成果(年換算)の合計の文(金額・時間。見込み・実績のどちらも無い種類は書かない)。"""
+    parts = []
+    if team["money_act"] or team["money_est"]:
+        parts.append("金額 実績 ¥{:,.0f}（見込み ¥{:,.0f}）".format(team["money_act"], team["money_est"]))
+    if team["hour_act"] or team["hour_est"]:
+        parts.append("時間 実績 {:,.1f}h（見込み {:,.1f}h）".format(team["hour_act"], team["hour_est"]))
+    return "・".join(parts)
+
+def executive_summary_text(data, period_label, applied):
+    """AI分析の結果(collect_analysis の戻り値。applied なら AI の結果を反映済み〔9-8〕)を1つの文章にする。"""
+    progress = data["progress"]["team"]
+    skills = data["skills"]
+    outputs = data["outputs"]["team"]
+    lines = ["対象: {}・メンバー {}名・現時点 {}".format(period_label, len(data["members"]),
+                                                    data["now"].strftime("%Y/%m/%d %H:%M")),
+             "", "【全体の状況】"]
+    lines.append("・タスク: 期間内の完了 {done}件・着手 {started}件。現時点で期限超過 {overdue}件・期限が近いのに未着手 "
+                 "{due_soon}件・進行中なのに記載がない {stale}件・保留 {hold}件。".format(**progress))
+    if progress["mc_total"]:
+        lines.append("・マネージャーのコメント: {mc_total}件のうち、担当者の返信がないもの {mc_no_reply}件。".format(**progress))
+    updates = skills["updates"]["team"]
+    manual = updates["manual_ups"] + updates["manual_downs"]
+    line = "・スキル: 期間内の到達度の更新 {}件（タスクの完了からの自動更新 {}件・マネージャーの変更 {}件）。".format(
+        updates["auto_ups"] + manual, updates["auto_ups"], manual)
+    line += "保有者が1名以下のスキル {}件・対応できる人が1名以下の業務 {}件。".format(
+        len(skills["thin_skills"]), len(skills["single_operations"]))
+    concentration = skills["concentration"]
+    if concentration.get("flag") and concentration.get("top"):
+        line += "単独でできる（Lv{}以上）スキルの {}% を {} さんが持っています（偏り）。".format(
+            skills["proficient"], concentration["top_share"], concentration["top"]["name"])
+    lines.append(line)
+    line = "・成果: 期間内に完了したタスク {}件".format(outputs["completed"])
+    amounts = _summary_amounts(outputs)
+    if amounts:
+        line += "。成果（年換算）: " + amounts
+    if outputs["rewrite"]:
+        line += "。書き直しを勧める成果 {}件".format(outputs["rewrite"])
+    lines.append(line + "。")
+    heavy = [r for r in data["abilities"]["rows"] if (r.get("load_h") or 0) >= _LOAD_FULL]
+    if heavy:
+        lines.append("・負荷: フルタイム（{}h/月）以上の人 {}名（{}）。".format(
+            _LOAD_FULL, len(heavy), "、".join("{} {}h/月".format(r["name"], _fmt_num(r["load_h"])) for r in heavy)))
+    else:
+        lines.append("・負荷: フルタイム（{}h/月）以上の人はいません。".format(_LOAD_FULL))
+
+    summary = data.get("ai_summary") if applied else None
+    if summary:
+        lines += ["", "【AIのまとめ】"]
+        for key, label in SUMMARY_KEYS:
+            items = [str(item).strip() for item in summary.get(key) or [] if str(item).strip()]
+            if items:
+                lines.append(label)
+                lines += ["・" + item for item in items]
+
+    ai_actions = data.get("ai_actions") if applied else None
+    actions = ai_actions or data["actions"]
+    lines += ["", "【いま対応すること（優先度の高い順・{}）】".format(
+        "AIが選んだもの" if ai_actions else "集計のルールで選んだもの")]
+    if not actions:
+        lines.append("いま対応が必要な項目はありません。")
+    for action in actions:
+        target = action.get("target") if isinstance(action.get("target"), dict) else {}
+        line = "{}. 〔{}〕{}".format(action.get("rank"), action.get("category_label") or "", action.get("title") or "")
+        label = str(target.get("label") or "")
+        if label or target.get("stale"):
+            line += "（{}）".format("・".join(x for x in (label, str(target.get("stale") or "")) if x))
+        lines.append(line)
+        if action.get("reason"):
+            lines.append("　理由: " + one_line(str(action["reason"]), SUMMARY_REASON_MAX))
+    return "\n".join(lines)
+
+def dashboard_analysis_summary():
+    """マネージャーダッシュボードの「エグゼクティブサマリー」の表示用の値(文章・AI の結果の状況・実行中の状態)。"""
+    now = _now()
+    stored, _error = load_ai_analysis_result()
+    period = _summary_period(stored, now.date())
+    data = collect_analysis(period, now, load_ai_analysis_settings())
+    ai = _analysis_ai_view(data, period)
+    applied = ai["applied"] and ai["result"] is not None
+    if applied:
+        label = ai["result"]["period_label"]
+    elif period["kind"] == ANALYSIS_PERIOD_RANGE:
+        label = period["label"]
+    else:
+        label = "{}（{}〜{}）".format(period["label"], period["start"].strftime("%Y/%m/%d"),
+                                    period["end"].strftime("%Y/%m/%d"))
+    return {
+        "text": executive_summary_text(data, label, applied),
+        "applied": applied,
+        "ai": ai,
+        "run": ai_analysis_status(),
+        "ai_configured": ai_is_configured(),
+        "ai_status": ai_status_label(),
+        "default_days": ANALYSIS_DEFAULT_DAYS,
+        "error": None,
+    }
+
+def dashboard_analysis_summary_safe():
+    """dashboard_analysis_summary の値。作れなかったとき(想定外のエラー)もダッシュボードは表示する(ログに残す)。"""
+    try:
+        return dashboard_analysis_summary()
+    except Exception:
+        db.session.rollback()
+        current_app.logger.exception("マネージャーダッシュボードのエグゼクティブサマリーを作れませんでした")
+        return {"text": "", "applied": False, "ai": None, "run": None, "ai_configured": ai_is_configured(),
+                "ai_status": ai_status_label(), "default_days": ANALYSIS_DEFAULT_DAYS,
+                "error": "AI分析のまとめを作れませんでした（内容はサーバーのログに記録しました）。"
+                         "項目ごとの表は AI分析の画面で確認できます。"}
 
 # #### 10. 定型業務のリマインド(メール) ############################################################
 # 定型・定期業務(3-4・5-4)の実施日に担当者へメールで知らせ、その回の完了の入力があるまで1日2回
