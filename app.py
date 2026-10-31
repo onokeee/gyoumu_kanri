@@ -121,7 +121,7 @@ Python のコードはすべてこの app.py にまとめている。ほかの�
       15-5. 画面(タスクの Blueprint に足すルート)
   16. 勤務(シフト)と出勤表
       16-1. 勤務表の記号と日ごとの勤務
-      16-2. 出勤表(横軸=日付、縦軸=勤務帯・勤務と人)
+      16-2. 出勤表(横軸=日付、縦軸=勤務と人)
       16-3. 画面(勤務の設定・勤務表の入力。システム管理〔admin だけ。18 章〕の Blueprint に足すルート)
       16-4. 勤務表の Excel の取り込み(年間分などまとめて)・ひな形
   17. 複数の環境(グループ)
@@ -2518,7 +2518,7 @@ SHIFT_KIND_CSS = {SHIFT_KIND_WORK: "work", SHIFT_KIND_EXTRA: "extra", SHIFT_KIND
 class WorkShift(db.Model):
     """勤務(交替勤務の班・日勤などの勤務の型。例:「1班 A」)。メンバーは1人1つの勤務を持つ(UserShift)。
 
-    group_name は出勤表で行をまとめる「勤務帯」(例:「1班」。空なら勤務の名前だけで並べる)。
+    group_name は以前の版の「勤務帯」(出勤表で行をまとめる名前)。今は使わない(DB の列はそのまま。新しい勤務は空)。
     すべての環境で共通(メインの環境の DB。SHARED_BIND)。
     """
     __bind_key__ = SHARED_BIND
@@ -5956,7 +5956,7 @@ def delete_routine(routine_id):
     return flash_redirect("定型・定期業務を削除しました。", "info", url_for("routine.list_routines"))
 
 # ==== 5-5. 年休 ===================================================================================
-# 画面の最初(/leaves/)は出勤表(横軸=日付、縦軸=勤務帯・勤務と人。16-2)。勤務の設定・勤務表の入力は 16-3。
+# 画面の最初(/leaves/)は出勤表(横軸=日付、縦軸=勤務と人。16-2)。勤務の設定・勤務表の入力は 16-3。
 
 leaves_bp = Blueprint("leaves", __name__, url_prefix="/leaves")
 
@@ -16685,8 +16685,7 @@ FIELDS = (
     # ---- ログイン・セキュリティ ----
     Field(
         "SECRET_KEY", GROUP_LOGIN, "セッションの秘密鍵",
-        "ログイン状態（セッション）の暗号化に使う鍵です。値は表示しません。"
-        "自由には入力できず、「新しいキーを生成」で作り直します。"
+        "ログイン状態（セッション）の暗号化に使う鍵です。基本設定の画面には出しません（CONFIG_SCREEN_HIDDEN_KEYS）。"
         "config.py にも画面の設定にも無い場合は、起動時に1回だけ生成して画面の設定（instance/settings.json）に保存します"
         "（再起動しても同じ鍵を使います）。",
         type=TYPE_SECRET_KEY, restart_required=True, secret=True,
@@ -16787,6 +16786,10 @@ FIELDS = (
 
 FIELD_MAP = {field.key: field for field in FIELDS}
 SECRET_KEYS = tuple(field.key for field in FIELDS if field.secret)
+# 基本設定の画面に出さない・画面からは変えない項目。SECRET_KEY(セッションの秘密鍵)は、起動のときに自動で作って
+# 画面の設定(instance/settings.json)に保存し、その鍵を使い続ける(_ensure_secret_key。13-2)。作り直すときは、
+# サーバーを止めて settings.json の SECRET_KEY を消してから起動する(全員がログアウトされる)
+CONFIG_SCREEN_HIDDEN_KEYS = ("SECRET_KEY",)
 # 画面の項目の定義と、環境ごとの設定の項目(ENV_KEYS。1-1)は同じ(読み込みの重ね合わせと画面の編集が1対1になるように)
 assert tuple(FIELD_MAP) == ENV_KEYS, "FIELDS と ENV_KEYS の項目が違います"
 
@@ -16811,13 +16814,13 @@ RETIRED_KEYS = {
 #      - 入力欄が空のまま(秘密の値の欄も): その項目の画面の設定は変えない(今の層のまま)
 #      - 「初期値に戻す」: その項目を settings.json から削除する(config.py の値が有効になる)。入力欄に表示している
 #        今の画面の設定のままの値は入力とみなさない(別の値の入力と同時は誤り)
-#      - 秘密の値の「空にする」: 画面の設定を空にする(有効な値も空)。SECRET_KEY は「新しいキーを生成」だけ
+#      - 秘密の値の「空にする」: 画面の設定を空にする(有効な値も空)
 #      - 接続先(AI_API_URL)を変えるとき、保存済みの APIキーをそのまま使わせない(入力し直す〔同じ値でも〕か「空にする」)。
 #        「初期値に戻す」で config.py の APIキーを使うときは、接続先も config.py の接続先でなければならない
 #        (_check_secret_destinations)
 #   3. 変わった項目だけを instance/settings.json に書く(1-3 の write_settings。一時ファイルに書いて置き換える)
-#   4. 再起動が不要な項目は、実行中のアプリの設定(current_app.config)にもすぐ反映する。
-#      SECRET_KEY はファイルにだけ書き、再起動後に反映される
+#   4. 再起動が不要な項目は、実行中のアプリの設定(current_app.config)にもすぐ反映する
+#      (SECRET_KEY は画面に出さず、画面からは変えない。CONFIG_SCREEN_HIDDEN_KEYS)
 # 秘密の値(SECRET_KEY / ADMIN_PASSWORD / AI_API_KEY)は、画面・ログ・
 # メッセージのどこにも出さない(画面には「設定あり／未設定」だけを表示する)。
 
@@ -16889,7 +16892,7 @@ CHANGE_RESET = "reset"   # 画面の設定から外す(初期値に戻す)
 
 # changed         : 画面の設定(settings.json)を変えた項目
 # reset           : そのうち「初期値に戻す」で外した項目
-# restart_changed : 変えた項目のうち、再起動後に反映されるもの(SECRET_KEY)
+# restart_changed : 変えた項目のうち、再起動後に反映されるもの(restart_required の項目)
 # applied         : 実行中のアプリに反映した(値が変わった)項目
 SaveResult = namedtuple("SaveResult", "status errors state changed reset restart_changed applied message")
 
@@ -17173,19 +17176,13 @@ def parse_config_form(form, initial, overrides):
             # 宛先(MAIL_TO・MAIL_CC)は環境ごとの「メールの宛先」タブ(11-3)。基本設定の画面には出さず、送られても
             # 変えない(更新の前に開いたままの以前の画面から送られたとき。ドメインの確認も「メールの宛先」タブで行う)
             continue
+        if key in CONFIG_SCREEN_HIDDEN_KEYS:
+            # 画面に出さない項目(SECRET_KEY)。送られても変えない(更新の前に開いたままの以前の画面の
+            # 「新しいキーを生成」「初期値に戻す」も受け付けない)
+            continue
         reset = form.get("reset_" + key) == "1"
         state["reset_" + key] = reset
         has_override = key in overrides
-        if field.type == TYPE_SECRET_KEY:
-            generate = form.get("generate_" + key) == "1"
-            state["generate_" + key] = generate
-            if generate and reset:
-                errors[key] = "「新しいキーを生成」と「初期値に戻す」は同時に指定できません。"
-            elif generate:
-                changes[key] = (CHANGE_SET, secrets.token_hex(32))
-            elif reset and has_override:
-                changes[key] = (CHANGE_RESET, None)
-            continue
         if field.type == TYPE_SECRET:
             change, error, flags = _parse_secret(field, form)
             state["clear_" + key] = flags["clear"]
@@ -17372,14 +17369,12 @@ def save_config_form(app, form, username):
 def _config_already_saved(app, form, store):
     """画面を開いた後にファイルが変わっていた(version が違う)保存が、既に保存された内容の2回目か。
 
-    ・同じ画面(1回限りの印 once)からの同じ内容が、少し前に保存されている(二度押し。新しいキーの生成も含む)
-    ・または、入力のとおりに保存しても画面の設定が1つも変わらない(新しいキーの生成を除く。上書きで失われるものが無い)
+    ・同じ画面(1回限りの印 once)からの同じ内容が、少し前に保存されている(二度押し)
+    ・または、入力のとおりに保存しても画面の設定が1つも変わらない(上書きで失われるものが無い)
     どちらでもなければ False(ほかの人の保存と重なった)。
     """
     if has_request_context() and already_submitted(CONFIG_ONCE_KIND) is not None:
         return True
-    if any(form.get("generate_" + f.key) == "1" for f in FIELDS if f.type == TYPE_SECRET_KEY):
-        return False
     changes, errors, _state = parse_config_form(form, initial_values(app), store["values"])
     return not errors and not changes
 
@@ -17477,14 +17472,17 @@ def config_form_context(app, state=None, errors=None):
     initial = initial_values(app)
     overrides = store["values"] if store is not None else {}
     current = effective_values(initial, overrides)
-    pending = pending_fields(app, current) if store is not None else []
+    pending = ([f for f in pending_fields(app, current) if f.key not in CONFIG_SCREEN_HIDDEN_KEYS]
+               if store is not None else [])
     pending_keys = {f.key for f in pending}
 
     groups = []
     for group_key, group_label in GROUPS:
         rows = []
-        # 宛先(MAIL_TO・MAIL_CC)は環境ごとの設定(各環境の「メールの宛先」タブ)のため、基本設定には出さない
-        for field in (f for f in FIELDS if f.group == group_key and f.key not in ENV_LOCAL_KEYS):
+        # 宛先(MAIL_TO・MAIL_CC)は環境ごとの設定(各環境の「メールの宛先」タブ)のため、基本設定には出さない。
+        # SECRET_KEY も出さない(CONFIG_SCREEN_HIDDEN_KEYS)
+        for field in (f for f in FIELDS if f.group == group_key and f.key not in ENV_LOCAL_KEYS
+                      and f.key not in CONFIG_SCREEN_HIDDEN_KEYS):
             key = field.key
             has_override = key in overrides
             row = {
@@ -17499,7 +17497,6 @@ def config_form_context(app, state=None, errors=None):
                 "error": errors.get(key),
                 # キー名に clear などを使わない(Jinja の row.clear が dict.clear メソッドになるため)
                 "clear_checked": bool(state and state.get("clear_" + key)),
-                "generate_checked": bool(state and state.get("generate_" + key)),
                 "reset_checked": bool(state and state.get("reset_" + key)),
                 "value": "",
                 "placeholder": "",
@@ -17531,7 +17528,6 @@ def config_form_context(app, state=None, errors=None):
         "groups": groups,
         "other": _other_rows(app, initial),
         "pending": pending,
-        "pending_secret_key": "SECRET_KEY" in pending_keys,
         "error_count": len(errors),
         "mail_test_problem": check_mail_settings(test=True),
         "mail_from": mail_settings()["mail_from"],
@@ -20671,11 +20667,11 @@ def draft_from_mail():
 # #### 16. 勤務(シフト)と出勤表 ######################################################################
 # 交替勤務などの勤務の型(WorkShift)、メンバーの勤務(UserShift)、勤務表(勤務ごと・月ごとの日の記号。WorkShiftMonth)、
 # 記号の名前と種類(WorkShiftCode)は新しいテーブル(3-3。既存のテーブル・ldap_client.py は変更しない)。
-#   出勤表(年休の Blueprint の最初の画面 /leaves/): 横軸に日付、縦軸に勤務帯・勤務と人。勤務の行に勤務表の記号、
+#   出勤表(年休の Blueprint の最初の画面 /leaves/): 横軸に日付、縦軸に勤務と人。勤務の行に勤務表の記号、
 #                人の行に年休(全休・半休)と、休みの日(勤務表の休日・年休、記号の無い日は営業日カレンダー)の色。
 #   勤務・記号・勤務表(勤務パターン)はすべての環境で共通(メインの環境の DB。3-3)。変えられるのは固定ローカル管理者
 #   (admin)だけ(システム管理の「勤務パターン」。18 章):
-#   勤務の設定(/admin/shifts): 勤務の追加・名前と勤務帯の変更・有効/無効、記号の名前と種類。
+#   勤務の設定(/admin/shifts): 勤務の追加・名前と並び順の変更・有効/無効、記号の名前と種類。
 #   勤務表の入力(/admin/shifts/month): 月ごとに、勤務ごとの日の記号を入力(Excel の1行の貼り付けも可)。
 #   メンバーの勤務: 各環境のチーム管理の「メンバーの管理」(5-8)でマネージャーが選ぶ(メンバーの追加のときも選べる)。
 # 勤務表の記号が無い日(未入力の月・記号なしの日・勤務の無い人)は、営業日カレンダー(2-4)で決める(営業日=出勤)。
@@ -20695,7 +20691,7 @@ DEFAULT_SHIFT_CODES = (
 SHIFT_CODE_ROWS_EXTRA = 4         # 記号の設定の画面に足す空の行の数(記号を増やすため)
 SHIFT_CODES_MAX = 40              # 記号の数の上限
 SHIFT_CODE_LABEL_MAX = 40         # 記号の名前の文字数の上限
-SHIFT_NAME_MAX = 64               # 勤務の名前・勤務帯の文字数の上限
+SHIFT_NAME_MAX = 64               # 勤務の名前の文字数の上限
 SHIFT_BLANK_MARKS = ("-", "－", "_", "＿")  # 勤務表の入力の「記号なし」の印
 SHIFT_SEPARATORS = (",", "、", "，", ";")    # 勤務表の入力の区切り(空白・タブも)
 SHIFT_DAYS_MAX = 800              # 出勤日数を数える期間の日数の上限(これより長い期間は数えない)
@@ -20853,7 +20849,7 @@ def shift_codes_text(codes):
     """日ごとの記号の一覧を、入力欄の文字(空白区切り。記号なしは「-」。最後の記号なしは省く)にする。"""
     return " ".join(code or "-" for code in codes).rstrip(" -")
 
-# ==== 16-2. 出勤表(横軸=日付、縦軸=勤務帯・勤務と人) =============================================
+# ==== 16-2. 出勤表(横軸=日付、縦軸=勤務と人) =====================================================
 
 ROSTER_LEAVE_MARKS = {LEAVE_FULL: "年", LEAVE_AM: "前", LEAVE_PM: "後", LEAVE_AM_HOURS: "前", LEAVE_PM_HOURS: "後"}
 # 印の見た目(CSS のクラス)。時間休は枠だけの印(半休と同じ「前」「後」と見分ける)
@@ -20873,7 +20869,7 @@ def _roster_days(year, month):
     return days
 
 def build_roster(year, month, dept_id=None, viewer=None):
-    """出勤表の材料。groups は勤務帯ごとの勤務(shifts。勤務の行の記号と、その勤務の人の行)、no_shift は勤務の登録の無い人の行。
+    """出勤表の材料。shifts は勤務ごとの行(勤務の行の記号と、その勤務の人の行。並び順・名前の順)、no_shift は勤務の登録の無い人の行。
 
     人の行は有効なユーザー(チームで絞り込むときはそのチームの人)と、その月に年休がある無効化した人。
     勤務の行は人のいる勤務(チームで絞り込まないときは、人のいない有効な勤務も)。
@@ -20921,22 +20917,16 @@ def build_roster(year, month, dept_id=None, viewer=None):
             no_shift.append(person(user, None))
         else:
             by_shift.setdefault(shift.id, []).append(person(user, shift))
-    groups = {}
-    for shift in shifts.values():
+    rows = []
+    for shift in sorted(shifts.values(), key=lambda s: (s.sort_order, s.name)):
         cells = []
         for day in days:
             code = day_codes.get((shift.id, day["date"]), "")
             info = codes.get(code) if code else None
             cells.append({"code": code, "kind": day_kind(code, codes, day["date"]) if info is not None else "",
                           "label": info.label if info is not None else ("記号の一覧に無い記号" if code else "")})
-        groups.setdefault(shift.group_name or "", []).append(
-            {"shift": shift, "cells": cells, "people": by_shift.get(shift.id, [])})
-    ordered = []
-    for name, items in groups.items():
-        items.sort(key=lambda item: (item["shift"].sort_order, item["shift"].name))
-        ordered.append({"name": name, "shifts": items, "rows": sum(1 + len(item["people"]) for item in items),
-                        "order": min(item["shift"].sort_order for item in items)})
-    ordered.sort(key=lambda g: (g["order"], g["name"]))
+        people = by_shift.get(shift.id, [])
+        rows.append({"shift": shift, "cells": cells, "people": people, "rows": 1 + len(people)})
 
     # 日ごとの年休の人数(半休も1人。時間休は数えない)と、同じチームで同じ日に休む人数が多いか(以前のカレンダーと
     # 同じ基準)
@@ -20950,7 +20940,7 @@ def build_roster(year, month, dept_id=None, viewer=None):
         else:
             warn = any(len(off_ids & member_ids) > LEAVE_DAILY_LIMIT for member_ids in dept_member_ids.values())
         totals.append({"count": len(off_ids) if off_ids else "", "warn": warn})
-    return {"days": days, "groups": ordered, "no_shift": no_shift, "totals": totals,
+    return {"days": days, "shifts": rows, "no_shift": no_shift, "totals": totals,
             "codes": list(codes.values()), "has_shifts": bool(shifts)}
 
 # ==== 16-3. 画面(勤務の設定・勤務表の入力。システム管理〔admin だけ。18 章〕の Blueprint に足すルート) =======
@@ -20958,13 +20948,13 @@ def build_roster(year, month, dept_id=None, viewer=None):
 # 「勤務パターン」。/admin/shifts・/admin/shifts/month)。メンバーの勤務の選択はその環境のマネージャー(チーム管理)。
 # 以前の URL(/leaves/shifts…)は、システム管理の画面へ転送する。
 
-SHIFT_VERSION = VersionFields((("name", "名前"), ("group_name", "勤務帯"), ("sort_order", "並び順")))
+SHIFT_VERSION = VersionFields((("name", "名前"), ("sort_order", "並び順")))
 _SHIFT_EMPTY = "勤務の名前を入力してください。"
 _SHIFT_DUP = "同じ名前の勤務が既にあります。"
 
 def _ordered_shifts(active_only=False):
     query = WorkShift.query.filter_by(is_active=True) if active_only else WorkShift.query
-    return sorted(query.all(), key=lambda s: (s.sort_order, s.group_name or "", s.name))
+    return sorted(query.all(), key=lambda s: (s.sort_order, s.name))
 
 def _codes_version(rows):
     """記号の一覧の控え(画面を開いた後のほかの保存を確かめる)。"""
@@ -21012,13 +21002,12 @@ def _render_shift_settings(code_rows=None):
 
 @admin_bp.route("/shifts", endpoint="shifts")
 def shift_settings():
-    """勤務の設定(勤務の一覧・追加・名前と勤務帯の変更・有効/無効、勤務表の記号)。admin だけ。"""
+    """勤務の設定(勤務の一覧・追加・名前と並び順の変更・有効/無効、勤務表の記号)。admin だけ。"""
     return _render_shift_settings()
 
 def _shift_form_values(shift=None):
-    """勤務の名前・勤務帯・並び順の入力(名前と勤務帯は SHIFT_NAME_MAX 文字まで)。"""
+    """勤務の名前・並び順の入力(名前は SHIFT_NAME_MAX 文字まで。以前の画面から送られた勤務帯〔group_name〕は使わない)。"""
     return {"name": request.form.get("name", "").strip()[:SHIFT_NAME_MAX],
-            "group_name": request.form.get("group_name", "").strip()[:SHIFT_NAME_MAX],
             "sort_order": form_sort_order(request.form, shift.sort_order if shift is not None else 0)}
 
 @admin_bp.route("/shifts/new", methods=["POST"], endpoint="new_shift")
@@ -21028,12 +21017,11 @@ def new_shift():
     if len(request.form.get("name", "").strip()) > SHIFT_NAME_MAX:
         return flash_redirect("勤務の名前は{}文字までにしてください。".format(SHIFT_NAME_MAX), "danger", url_for("admin.shifts"))
     return _add_named_row(WorkShift, "shift", "勤務", _SHIFT_EMPTY, _SHIFT_DUP, url_for("admin.shifts"),
-                          lambda name: WorkShift(name=name, group_name=values["group_name"],
-                                                 sort_order=values["sort_order"]))
+                          lambda name: WorkShift(name=name, sort_order=values["sort_order"]))
 
 @admin_bp.route("/shifts/<int:shift_id>/save", methods=["POST"], endpoint="save_shift")
 def save_shift(shift_id):
-    """勤務の名前・勤務帯・並び順を保存する(_rename_named_row〔2-2〕)。"""
+    """勤務の名前・並び順を保存する(_rename_named_row〔2-2〕)。"""
     lock_for_write()
     shift = get_or_404(WorkShift, shift_id)
     return _rename_named_row(shift, SHIFT_VERSION, _shift_form_values(shift), "勤務", _SHIFT_EMPTY, _SHIFT_DUP,
@@ -21284,7 +21272,7 @@ def save_member_shift(user_id):
 # システム管理の「勤務表の入力」(admin だけ)。Excel(.xlsx・.xlsm)の表から、何か月分でもまとめて勤務表を登録する。
 #   表の形: 見出しの行に日付(日付のセル・「2026/11/5」「11/5」の文字、またはその月の日〔1〜31。年月はシートの名前
 #           〔「2026年11月」など〕か見出しより上のセルの「2026年11月」、どちらも無ければ画面の月〕。日が月の終わりから1に
-#           戻ると次の月)。その下の行の左の列に勤務の名前(勤務の設定の名前。勤務帯と名前を別の列に分けてもよい)、
+#           戻ると次の月)。その下の行の左の列に勤務の名前(勤務の設定の名前。2つの列に分けても〔「1班」「A」〕よい)、
 #           日の列に記号。空のセル・「-」は記号なし。シートはいくつでも読む(日付の見出しの無いシートは読まない)。
 #   ひな形: 開始の月から N か月分(1シート1か月。見出しは日付のセル)を、今の勤務表の記号を入れて作る(直して取り込める)。
 #   取り込み: 記号の一覧に無い記号・同じ日の記号の食い違いがあれば何も保存しない。勤務の名前と一致しない行は読まずに
@@ -21756,7 +21744,10 @@ def _default_env(key):
             "created_at": "", "created_by": ""}
 
 def _normalize_env_registry(data):
-    """読み込んだ環境の一覧を整える(正しくない行は除く。メインの環境は必ず最初に置き、停止しない)。"""
+    """読み込んだ環境の一覧を整える(正しくない行は除く。メインの環境は必ず最初に置き、停止しない)。
+
+    deleted は削除した環境の記録(キー・名前・削除した日時と人・残したフォルダの名前)。そのキーは今後使わない。
+    """
     envs, seen = [], set()
     items = data.get("envs") if isinstance(data, dict) else None
     for item in items if isinstance(items, list) else ():
@@ -21779,10 +21770,22 @@ def _normalize_env_registry(data):
     version = data.get("version") if isinstance(data, dict) else None
     if not isinstance(version, int) or isinstance(version, bool) or version < 0:
         version = 0
-    return {"envs": main + [e for e in envs if e["key"] != MAIN_ENV_KEY], "version": version}
+    deleted, gone = [], set()
+    items = data.get("deleted") if isinstance(data, dict) else None
+    for item in items if isinstance(items, list) else ():
+        key = item.get("key") if isinstance(item, dict) else None
+        if not isinstance(key, str) or key in gone or key == MAIN_ENV_KEY or not ENV_KEY_PATTERN.fullmatch(key):
+            continue
+        gone.add(key)
+        record = {"key": key, "name": clean_env_name(item.get("name"))[:ENV_NAME_MAX] or key}
+        for field in ("deleted_at", "deleted_by", "folder"):
+            record[field] = item[field][:128] if isinstance(item.get(field), str) else ""
+        deleted.append(record)
+    return {"envs": main + [e for e in envs if e["key"] != MAIN_ENV_KEY], "deleted": deleted, "version": version}
 
 def read_env_registry(shared, strict=False):
-    """環境の一覧(instance/environments.json)。戻り値: {"envs": [{key, name, active, created_at, created_by}], "version"}。
+    """環境の一覧(instance/environments.json)。戻り値: {"envs": [{key, name, active, created_at, created_by}],
+    "deleted": [{key, name, deleted_at, deleted_by, folder}](削除した環境), "version"}。
 
     ファイルが無ければメインの環境だけ。ファイルの版(更新日時と大きさ)が変わったときだけ読み直す。
     読めないとき: strict なら SettingsFileError(画面からの変更は止める)。そうでなければ、前に読めた内容
@@ -21804,8 +21807,11 @@ def read_env_registry(shared, strict=False):
         raise cached[2]
     return copy.deepcopy(cached[1])
 
-def write_env_registry(shared, envs, username, expected_version):
-    """環境の一覧を envs(整えたもの)にする。読んだ後にほかの保存があれば SettingsConflictError。書けなければ OSError。"""
+def write_env_registry(shared, envs, username, expected_version, deleted=None):
+    """環境の一覧を envs(整えたもの)にする(deleted は削除した環境の記録。None なら今のまま)。
+
+    読んだ後にほかの保存があれば SettingsConflictError。書けなければ OSError。
+    """
     path = os.path.join(shared, ENV_REGISTRY_FILENAME)
     with _env_registry_lock:
         current = read_env_registry(shared, strict=True)
@@ -21813,6 +21819,9 @@ def write_env_registry(shared, envs, username, expected_version):
             raise SettingsConflictError("画面を開いた後に環境の一覧が変わっています。")
         data = {"version": current["version"] + 1, "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
                 "updated_by": _clean_label(username), "envs": envs}
+        kept = current["deleted"] if deleted is None else deleted
+        if kept:
+            data["deleted"] = kept
         write_json(path, data)
         _env_registry_cache.pop(path, None)
     if has_request_context():
@@ -22305,21 +22314,66 @@ def env_nav_context():
 
 ENV_ONCE_KIND = "env_create"
 
-def _env_member_counts(entry):
-    """環境の有効なメンバーの数(数えられなければ None)。
+# 環境の最終更新に使う、利用者の操作で書かれる日時の列(自動で作る行〔定型業務の回の作成・一度だけの処理の印〕と、
+# admin が環境を開いたときに用意されるユーザーの行は使わない。使われていない環境の棚卸しのため)
+ENV_ACTIVITY_COLUMNS = (
+    ("tasks", "updated_at"), ("tasks", "created_at"), ("task_comments", "created_at"),
+    ("task_status_changes", "changed_at"), ("routine_works", "updated_at"), ("routine_occurrences", "completed_at"),
+    ("routine_reminders", "updated_at"), ("leave_requests", "updated_at"), ("leave_requests", "created_at"),
+    ("skill_ratings", "rated_at"), ("skill_level_changes", "created_at"), ("skills", "updated_at"),
+    ("operations", "created_at"), ("departments", "updated_at"), ("users", "created_at"), ("user_emails", "updated_at"),
+    ("user_shifts", "updated_at"), ("skill_chat_messages", "created_at"), ("skill_plans", "updated_at"),
+)
+
+def _env_db_stats(entry):
+    """環境の有効なメンバーの数と、業務のデータを最後に更新した日時(どちらも分からなければ None)。
 
     DB を読み取り専用で開いて数える(環境のアプリは作らない。停止した環境の DB を変えない・無いフォルダを作らない)。
+    メンバーの数・最終更新とも、固定ローカル管理者(admin。その環境のメンバーではない)の行は数えない。
     """
     path = os.path.join(env_instance_path(shared_instance_path(), entry["key"]), "app.db")
     if not os.path.isfile(path):
-        return None
+        return None, None
     try:
         uri = "file:{}?mode=ro".format(urllib.request.pathname2url(os.path.abspath(path)))
         with closing(sqlite3.connect(uri, uri=True, timeout=2)) as conn:
-            return conn.execute("SELECT COUNT(*) FROM users WHERE is_active = 1").fetchone()[0]
+            members = conn.execute("SELECT COUNT(*) FROM users WHERE is_active = 1 AND username != ?",
+                                   (ADMIN_USERNAME,)).fetchone()[0]
+            columns = {}
+            for (table,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'"):
+                columns[table] = {row[1] for row in conn.execute('PRAGMA table_info("{}")'.format(table.replace('"', '""')))}
+            latest = None
+            now = datetime.now().isoformat(" ")   # 先の日時(時計のずれ・手で入れたデータ)は最終更新にしない
+            for table, column in ENV_ACTIVITY_COLUMNS:
+                if column not in columns.get(table, ()):
+                    continue
+                sql = 'SELECT MAX("{0}") FROM "{1}" WHERE "{0}" <= ?'.format(column, table)
+                params = (now,)
+                if table == "users":
+                    sql += " AND username != ?"
+                    params = (now, ADMIN_USERNAME)
+                value = conn.execute(sql, params).fetchone()[0]
+                when = _db_datetime(value)
+                if when is not None and (latest is None or when > latest):
+                    latest = when
+            return members, latest
     except (sqlite3.Error, OSError):
-        current_app.logger.warning("環境 %s のメンバーを数えられませんでした", entry["key"], exc_info=True)
+        current_app.logger.warning("環境 %s のメンバー・最終更新を数えられませんでした", entry["key"], exc_info=True)
+        return None, None
+
+def _db_datetime(value):
+    """DB の日時の文字列(「YYYY-MM-DD HH:MM:SS.ffffff」)を datetime に(読めなければ None)。"""
+    if not isinstance(value, str) or not value:
         return None
+    try:
+        return datetime.fromisoformat(value[:26])
+    except ValueError:
+        try:
+            return datetime.strptime(value[:10], "%Y-%m-%d")
+        except ValueError:
+            return None
+
+ENV_IDLE_DAYS = 90   # 環境の一覧で、最終更新が古い(使われていないかもしれない)と印を付ける日数
 
 def _env_open_url(entry):
     """システム管理から環境を開く URL(停止した環境は None)。admin はその環境のマネージャーと同じように入る。"""
@@ -22337,13 +22391,17 @@ def envs_tab_context(inputs=None):
     except SettingsFileError as exc:
         registry, error = read_env_registry(shared), str(exc)
     rows = []
+    today = date.today()
     for entry in registry["envs"]:
+        members, latest = _env_db_stats(entry)
         rows.append(dict(entry, url=env_home_url(entry["key"]), open_url=_env_open_url(entry),
-                         members=_env_member_counts(entry),
+                         members=members, last_updated=latest,
+                         idle_days=(today - latest.date()).days if latest is not None else None,
                          folder="instance/" if entry["key"] == MAIN_ENV_KEY else "instance/{}/{}/".format(
                              ENVS_DIRNAME, entry["key"])))
-    return {"envs": rows, "version": str(registry["version"]), "error": error, "multi": multi_env_enabled(),
-            "name_max": ENV_NAME_MAX, "inputs": inputs or {}}
+    deleted = [dict(d, url=env_home_url(d["key"])) for d in reversed(registry["deleted"])]   # 新しいものが先
+    return {"envs": rows, "deleted": deleted, "version": str(registry["version"]), "error": error,
+            "multi": multi_env_enabled(), "name_max": ENV_NAME_MAX, "inputs": inputs or {}, "idle_days": ENV_IDLE_DAYS}
 
 def _env_name_error(name, registry, key=None):
     """環境の名前の誤り(無ければ None)。key は名前を変える環境(その環境の今の名前とは重複にしない)。"""
@@ -22356,8 +22414,11 @@ def _env_name_error(name, registry, key=None):
     return None
 
 def _next_env_key(registry, shared):
-    """新しい環境のキー(e2 から順に。一覧にある・フォルダのあるキーは使わない)。"""
-    numbers = [int(e["key"][1:]) for e in registry["envs"] if e["key"] != MAIN_ENV_KEY]
+    """新しい環境のキー(e2 から順に。一覧にある・削除した・フォルダのあるキーは使わない)。
+
+    削除した環境のキーを使わないのは、以前に送ったメールのリンク・ブックマーク(/env/<キー>/…)が別の環境を開かないため。
+    """
+    numbers = [int(e["key"][1:]) for e in registry["envs"] + registry["deleted"] if e["key"] != MAIN_ENV_KEY]
     number = max(numbers + [1]) + 1
     while os.path.exists(env_instance_path(shared, "e{}".format(number))):
         number += 1
@@ -22394,20 +22455,32 @@ def create_environment(name, created_by, expected_version):
             _unlock_settings_file(lock_file)
     return entry
 
+def _close_env_app(dispatcher, key, app=None):
+    """環境のアプリを忘れ、DB の接続を閉じる(app を指定したときは、振り分けにあるのがそのアプリのときだけ忘れる)。
+
+    Windows では開いている DB のフォルダの名前を変えられないため、フォルダの名前を変える前に呼ぶ。
+    """
+    with dispatcher.lock:
+        current = dispatcher.apps.get(key)
+        if current is not None and key != MAIN_ENV_KEY and (app is None or current is app):
+            dispatcher.apps.pop(key, None)
+    target = app if app is not None else current
+    if target is not None and key != MAIN_ENV_KEY:
+        try:
+            with target.app_context():
+                for engine in set(db.engines.values()):
+                    engine.dispose()
+        except Exception:
+            current_app.logger.warning("環境 %s の DB の接続を閉じられませんでした", key, exc_info=True)
+
 def _discard_env_build(dispatcher, key, app, shared):
     """追加に失敗した環境の後始末: 作ったアプリを忘れ、DB の接続を閉じて、フォルダの名前を「<キー>.failed-日時」に
     変える(一覧に載っていない DB をその名前のまま残さない。変えられなければそのまま。ログに残す)。
     """
     with dispatcher.lock:
-        if dispatcher.apps.get(key) is app:
-            dispatcher.apps.pop(key, None)
-    if app is not None:
-        try:
-            with app.app_context():
-                for engine in set(db.engines.values()):
-                    engine.dispose()
-        except Exception:
-            current_app.logger.warning("追加に失敗した環境 %s の DB の接続を閉じられませんでした", key, exc_info=True)
+        built = dispatcher.apps.get(key) is app
+    if app is not None or built:
+        _close_env_app(dispatcher, key, app)
     folder = env_instance_path(shared, key)
     if os.path.isdir(folder):
         target = "{}.failed-{}".format(folder, datetime.now().strftime("%Y%m%d%H%M%S"))
@@ -22440,6 +22513,57 @@ def change_environment(key, expected_version, username, name=None, active=None):
         finally:
             _unlock_settings_file(lock_file)
     return entry
+
+ENV_DELETED_SUFFIX = ".deleted-"   # 削除した環境の DB のフォルダの名前に付ける(「<キー>.deleted-日時」)
+
+def delete_environment(key, expected_version, username, confirm_name):
+    """停止した環境を削除する(一覧から除き、削除した環境の記録に残す。そのキー・URL は今後使わない)。
+
+    DB のフォルダ(instance/envs/<キー>)は消さずに、名前を「<キー>.deleted-日時」に変えて残す(バックアップ。不要に
+    なったら手で消す)。戻り値: 削除した環境の記録。一覧が画面を開いた後に変わっていれば SettingsConflictError、
+    無い環境は KeyError、メインの環境・使用中の環境・確かめの名前の違いは ValueError、一覧が読めなければ
+    SettingsFileError、フォルダの名前を変えられない・一覧を書けなければ OSError(どちらも一覧は今のまま)。
+    """
+    dispatcher = env_dispatcher()
+    shared = shared_instance_path()
+    with _env_change_lock:
+        lock_file = _lock_settings_file(shared)
+        try:
+            registry = read_env_registry(shared, strict=True)
+            if registry["version"] != expected_version:
+                raise SettingsConflictError("画面を開いた後に環境の一覧が変わっています。")
+            entry = next((e for e in registry["envs"] if e["key"] == key), None)
+            if entry is None:
+                raise KeyError(key)
+            if key == MAIN_ENV_KEY:
+                raise ValueError("メインの環境は削除できません。")
+            if entry["active"]:
+                raise ValueError("使用中の環境は削除できません。先に環境の一覧で「停止」してください。")
+            if confirm_name != entry["name"]:
+                raise ValueError("確かめのために入力した名前が、環境の名前（{}）と違います。削除していません。".format(
+                    entry["name"]))
+            _close_env_app(dispatcher, key)
+            folder = env_instance_path(shared, key)
+            moved = ""
+            if os.path.isdir(folder):
+                moved = "{}{}{}".format(folder, ENV_DELETED_SUFFIX, datetime.now().strftime("%Y%m%d%H%M%S"))
+                os.rename(folder, moved)
+            record = {"key": key, "name": entry["name"], "deleted_at": datetime.now().strftime("%Y/%m/%d %H:%M"),
+                      "deleted_by": str(username)[:64], "folder": os.path.basename(moved)}
+            try:
+                write_env_registry(shared, [e for e in registry["envs"] if e["key"] != key], username,
+                                   registry["version"], deleted=registry["deleted"] + [record])
+            except Exception:
+                if moved:
+                    try:
+                        os.rename(moved, folder)
+                    except OSError:
+                        current_app.logger.exception("削除できなかった環境 %s のフォルダの名前を戻せませんでした（%s）",
+                                                     key, os.path.basename(moved))
+                raise
+        finally:
+            _unlock_settings_file(lock_file)
+    return record
 
 def _form_version(form):
     value = str(form.get("version", ""))
@@ -22540,6 +22664,50 @@ def toggle_env(key):
     return flash_redirect("環境「{}」を停止しました（画面は開けず、定期メールも送りません。データは残っています）。".format(
         entry["name"]), "success", _envs_tab_url())
 
+@admin_bp.route("/envs/<key>/delete", methods=["GET", "POST"], endpoint="delete_env")
+def delete_env(key):
+    """環境を削除する(admin だけ。停止した環境だけ。メインの環境は削除できない)。
+
+    GET は確かめの画面(環境の名前を入力する)、POST で削除する(delete_environment)。二度押しの2回目・削除済みの
+    環境は「削除しました」と案内する。
+    """
+    if key == MAIN_ENV_KEY:
+        abort(400)
+    ev = envs_tab_context()
+    entry = next((e for e in ev["envs"] if e["key"] == key), None)
+    if entry is None:
+        done = next((d for d in ev["deleted"] if d["key"] == key), None)
+        if done is None:
+            abort(404)
+        return flash_redirect("環境「{}」は削除しました（{}）。".format(done["name"], done["deleted_at"] or "削除済み"),
+                              "info", _envs_tab_url())
+    if request.method == "GET":
+        return render_template("admin/env_delete.html", ev=ev, e=entry)
+    try:
+        record = delete_environment(key, _form_version(request.form), current_user.username,
+                                    clean_env_name(request.form.get("confirm_name", "")))
+    except SettingsConflictError:
+        return flash_redirect(_ENVS_CHANGED.format("削除していません"), "warning", _envs_tab_url())
+    except KeyError:
+        return redirect(url_for("admin.delete_env", key=key))   # ほかの操作で削除された(上の案内を出す)
+    except ValueError as exc:
+        flash(str(exc), "danger")
+        return render_template("admin/env_delete.html", ev=ev, e=entry), 400
+    except (OSError, SettingsStoreError) as exc:
+        current_app.logger.exception("環境を削除できませんでした")
+        return flash_redirect("環境「{}」を削除できませんでした（{}）。データのフォルダをほかのサーバー・プログラムが開いていると"
+                              "名前を変えられません。閉じてから（サーバーを再起動してから）もう一度お試しください"
+                              "（環境は停止のまま残しています）。".format(entry["name"], exc.__class__.__name__),
+                              "danger", _envs_tab_url())
+    current_app.logger.info("環境を削除しました: %s %s（%s。フォルダ: %s）", key, record["name"], current_user.username,
+                            record["folder"] or "なし")
+    if record["folder"]:
+        kept = "データのフォルダは instance/{}/{} に名前を変えて残しています（不要になったら手で削除してください）。".format(
+            ENVS_DIRNAME, record["folder"])
+    else:
+        kept = "データのフォルダはありませんでした。"
+    return flash_redirect("環境「{}」を削除しました。{}".format(record["name"], kept), "success", _envs_tab_url())
+
 # 以前の環境の追加・変更の URL(システム設定の「環境」タブ。開いたままの以前の画面から送られたとき用。admin だけが使える)
 for _old, _endpoint, _path in (("envs", "create_env", "envs"), ("envs/<key>/rename", "rename_env", "envs/{key}/rename"),
                                ("envs/<key>/toggle", "toggle_env", "envs/{key}/toggle")):
@@ -22548,8 +22716,8 @@ del _old, _endpoint, _path
 
 # #### 18. システム管理(固定ローカル管理者 admin だけの画面) #########################################
 # 固定ローカル管理者(admin。ADMIN_USERNAME)は、特定の環境のユーザーではなく、このアプリ全体の管理者。ログインすると、
-# このシステム管理の画面(/admin/)を開く(ログインの前に開こうとした画面があればその画面)。
-#   環境       : すべての環境(グループ)の一覧・開く・追加(名前だけ)・名前の変更・停止/再開(17 章)
+# このシステム管理の画面(/admin/。入口で「環境」の画面へ進む)を開く(ログインの前に開こうとした画面があればその画面)。
+#   環境       : すべての環境(グループ)の一覧・開く・追加(名前だけ)・名前の変更・停止/再開・削除(停止した環境。17 章)
 #   基本設定   : すべての環境で共通の設定(AI・メールの送信サーバー・差出人・送信を許可するドメイン・リンク・LDAP・
 #                admin のパスワード・SECRET_KEY。11 章の項目。宛先 MAIL_TO・MAIL_CC は環境ごとのため、ここには出さない)
 #   勤務パターン: 勤務・勤務表の記号・勤務表の入力(すべての環境で共通。16 章)
@@ -22604,8 +22772,8 @@ def admin_only():
 
 @admin_bp.route("/", endpoint="home")
 def admin_home():
-    """システム管理のトップ(すべての環境の一覧と開く・共通の設定への入口)。"""
-    return render_template("admin/home.html", ev=envs_tab_context())
+    """システム管理の入口(ログインの後・ナビの「システム管理」): 「環境」の画面へ(環境の一覧と「開く」)。"""
+    return redirect(url_for("admin.envs"))
 
 # ---- 環境 ----
 def _render_admin_envs(status=200, inputs=None):
@@ -22664,10 +22832,7 @@ def admin_save_settings():
         message += "{} はすぐに反映しました。".format("、".join(live))
     flash(message, "success")
     if result.restart_changed:
-        notice = "{} はサーバーの再起動後に反映されます。".format("、".join(result.restart_changed))
-        if "SECRET_KEY" in result.restart_changed:
-            notice += "再起動すると全員がログアウトされます。"
-        flash(notice, "warning")
+        flash("{} はサーバーの再起動後に反映されます。".format("、".join(result.restart_changed)), "warning")
     return redirect(_admin_settings_url())
 
 @admin_bp.route("/settings/test-mail", methods=["POST"], endpoint="test_mail")

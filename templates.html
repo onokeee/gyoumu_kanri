@@ -31,7 +31,7 @@
     システム設定　　　  system/settings.html  system/_recipients_tab.html（メールの宛先）  system/_weekly_tab.html
                         system/_overdue_tab.html  system/_skill_ai_tab.html
                         system/_analysis_tab.html  system/_reminder_tab.html
-    システム管理(admin) admin/_layout.html  admin/home.html  admin/envs.html  admin/settings.html
+    システム管理(admin) admin/_layout.html  admin/envs.html  admin/env_delete.html  admin/settings.html
                         system/_config_tab.html（基本設定のフォーム）  admin/shifts.html  admin/shift_month.html
     静的ファイル　　　  static/css/style.css  static/js/sort-table.js  static/js/auto-filter.js
                         static/js/routine-form.js  static/js/task-form.js
@@ -2100,12 +2100,11 @@
           {% endfor %}
         </tr>
       </thead>
-      {% for g in roster.groups %}
+      {% for item in roster.shifts %}
       <tbody>
-        {% for item in g.shifts %}
         <tr class="roster-shift-row">
-          {% if loop.first %}<th scope="rowgroup" rowspan="{{ g.rows }}" class="roster-group roster-sticky">{{ g.name or '―' }}</th>{% endif %}
-          <th scope="row" class="roster-name roster-sticky2">{{ item.shift.label }}</th>
+          <th scope="rowgroup" rowspan="{{ item.rows }}" class="roster-group roster-sticky">{{ item.shift.label }}</th>
+          <th scope="row" class="roster-name roster-sticky2">勤務表</th>
           {% for c in item.cells %}
           <td class="roster-code roster-kind-{{ kind_css.get(c.kind, 'none') }}"{% if c.label %} title="{{ c.label }}"{% endif %}>{{ c.code }}</td>
           {% endfor %}
@@ -2113,10 +2112,9 @@
         {% for p in item.people %}
         <tr>{{ person_cells(p) }}</tr>
         {% endfor %}
-        {% endfor %}
       </tbody>
       {% endfor %}
-      {% if roster.no_shift or not roster.groups %}
+      {% if roster.no_shift or not roster.shifts %}
       <tbody>
         {% for p in roster.no_shift %}
         <tr>
@@ -2124,7 +2122,7 @@
           {{ person_cells(p) }}
         </tr>
         {% endfor %}
-        {% if not roster.groups and not roster.no_shift %}
+        {% if not roster.shifts and not roster.no_shift %}
         <tr><td colspan="{{ roster.days|length + 2 }}" class="text-muted small text-start">表示する人がいません。</td></tr>
         {% endif %}
       </tbody>
@@ -2151,7 +2149,7 @@
   <span>（無効化したチームは、同じ日に休む人数を判定しません）</span>{% endfor %}
 </div>
 {% if not roster.has_shifts and current_user.is_manager %}
-<p class="small text-muted mt-2 mb-0"><i class="bi bi-info-circle"></i> 勤務がまだありません。固定ローカル管理者（admin）がシステム管理の「勤務パターン」で勤務（例: 1班 A・日勤）と勤務表の記号を設定し、チームの管理でメンバーの勤務を選ぶと、勤務帯・勤務ごとに並びます。</p>
+<p class="small text-muted mt-2 mb-0"><i class="bi bi-info-circle"></i> 勤務がまだありません。固定ローカル管理者（admin）がシステム管理の「勤務パターン」で勤務（例: 1班 A・日勤）と勤務表の記号を設定し、チームの管理でメンバーの勤務を選ぶと、勤務ごとに並びます。</p>
 {% endif %}
 {% endblock %}
 {#=== leaves/detail.html ===#}
@@ -6401,7 +6399,7 @@
 {% block navbar %}
 <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
   <div class="container-fluid">
-    <a class="navbar-brand fw-bold" href="{{ url_for('admin.home') }}">
+    <a class="navbar-brand fw-bold" href="{{ url_for('admin.envs') }}">
       <i class="bi bi-shield-lock"></i> {{ app_name }} <span class="badge bg-warning text-dark align-middle env-badge">システム管理</span>
     </a>
     <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarAdmin"
@@ -6410,8 +6408,7 @@
     </button>
     <div class="collapse navbar-collapse" id="navbarAdmin">
       <ul class="navbar-nav me-auto">
-        <li class="nav-item"><a class="nav-link {% if request.endpoint == 'admin.home' %}active{% endif %}" href="{{ url_for('admin.home') }}"><i class="bi bi-house"></i> トップ</a></li>
-        <li class="nav-item"><a class="nav-link {% if request.endpoint in ('admin.envs', 'admin.create_env') %}active{% endif %}" href="{{ url_for('admin.envs') }}"><i class="bi bi-collection"></i> 環境</a></li>
+        <li class="nav-item"><a class="nav-link {% if request.endpoint in ('admin.envs', 'admin.create_env', 'admin.delete_env') %}active{% endif %}" href="{{ url_for('admin.envs') }}"><i class="bi bi-collection"></i> 環境</a></li>
         <li class="nav-item"><a class="nav-link {% if request.endpoint in ('admin.settings', 'admin.save_settings') %}active{% endif %}" href="{{ url_for('admin.settings') }}"><i class="bi bi-sliders"></i> 基本設定</a></li>
         <li class="nav-item"><a class="nav-link {% if request.endpoint in ('admin.shifts', 'admin.shift_month', 'admin.new_shift', 'admin.save_shift_codes') %}active{% endif %}" href="{{ url_for('admin.shifts') }}"><i class="bi bi-calendar3"></i> 勤務パターン</a></li>
       </ul>
@@ -6423,60 +6420,6 @@
   </div>
 </nav>
 {% endblock %}
-{#=== admin/home.html ===#}
-{# システム管理のトップ(すべての環境の一覧と開く・共通の設定への入口)。ev は app.py の envs_tab_context の値 #}
-{% extends "admin/_layout.html" %}
-{% block title %}システム管理 &middot; {{ app_name }}{% endblock %}
-
-{% block content %}
-<h1 class="h3 mb-1"><i class="bi bi-shield-lock"></i> システム管理</h1>
-<p class="text-muted small">
-  固定ローカル管理者（admin）だけの画面です。すべての環境（グループ）を開いて、その環境のマネージャーと同じように編集できます。
-  すべての環境で共通の設定（基本設定・勤務パターン）と、環境の追加・停止はここで行います。各環境のマネージャーは、その環境の中だけを編集します。
-</p>
-{% if ev.error %}
-<div class="alert alert-danger small"><i class="bi bi-x-octagon"></i> <strong>環境の一覧のファイル（<code>instance/environments.json</code>）を読み込めません。</strong> {{ ev.error }}</div>
-{% endif %}
-<div class="card shadow-sm mb-4">
-  <div class="card-header bg-white fw-bold d-flex justify-content-between align-items-center flex-wrap gap-2">
-    <span><i class="bi bi-collection"></i> 環境（グループ）</span>
-    <a class="btn btn-sm btn-outline-primary" href="{{ url_for('admin.envs') }}"><i class="bi bi-gear"></i> 環境の追加・名前の変更・停止</a>
-  </div>
-  <div class="list-group list-group-flush">
-    {% for e in ev.envs %}
-    <div class="list-group-item d-flex justify-content-between align-items-center flex-wrap gap-2">
-      <div class="text-break">
-        <span class="fw-bold">{{ e.name }}</span>
-        {% if e.key == 'main' %}<span class="badge bg-primary">メイン</span>{% elif not e.active %}<span class="badge bg-secondary">停止中</span>{% endif %}
-        <div class="small text-muted"><code>{{ e.url }}</code>・メンバー {% if e.members is none %}―{% else %}{{ e.members }}人{% endif %}</div>
-      </div>
-      {% if e.open_url %}<a class="btn btn-sm btn-primary" href="{{ e.open_url }}"><i class="bi bi-box-arrow-in-right"></i> 開く</a>{% else %}<span class="small text-muted">停止中（開けません）</span>{% endif %}
-    </div>
-    {% endfor %}
-  </div>
-</div>
-<div class="row g-3 mb-4">
-  <div class="col-md-6">
-    <div class="card shadow-sm h-100">
-      <div class="card-body">
-        <h2 class="h6 fw-bold"><i class="bi bi-sliders"></i> 基本設定</h2>
-        <p class="small text-muted mb-2">AI の接続先・メールの送信サーバー・差出人・送信を許可するドメイン・リンクの基準URL・admin のパスワードなど、すべての環境で共通の設定です（メールの宛先は各環境で設定します）。</p>
-        <a class="btn btn-sm btn-outline-primary" href="{{ url_for('admin.settings') }}">基本設定を開く</a>
-      </div>
-    </div>
-  </div>
-  <div class="col-md-6">
-    <div class="card shadow-sm h-100">
-      <div class="card-body">
-        <h2 class="h6 fw-bold"><i class="bi bi-calendar3"></i> 勤務パターン</h2>
-        <p class="small text-muted mb-2">勤務（交替勤務の班・日勤など）・勤務表の記号・月ごとの勤務表です。会社の中で共通のため、すべての環境の出勤表で使います（メンバーの勤務は各環境のチーム管理で選びます）。</p>
-        <a class="btn btn-sm btn-outline-primary" href="{{ url_for('admin.shifts') }}">勤務の設定</a>
-        <a class="btn btn-sm btn-outline-primary" href="{{ url_for('admin.shift_month') }}">勤務表の入力</a>
-      </div>
-    </div>
-  </div>
-</div>
-{% endblock %}
 {#=== admin/envs.html ===#}
 {# システム管理の「環境」(環境の一覧・開く・追加〔名前だけ〕・名前の変更・停止/再開。admin だけ)。ev は envs_tab_context の値 #}
 {% extends "admin/_layout.html" %}
@@ -6485,7 +6428,7 @@
 {% block content %}
 <nav aria-label="breadcrumb">
   <ol class="breadcrumb">
-    <li class="breadcrumb-item"><a href="{{ url_for('admin.home') }}">システム管理</a></li>
+    <li class="breadcrumb-item">システム管理</li>
     <li class="breadcrumb-item active">環境</li>
   </ol>
 </nav>
@@ -6494,6 +6437,11 @@
   グループ（マネージャーごとのチーム）ごとに、このサーバーを別の環境として使えます。環境ごとにタスク・メンバー・スキル・出勤表・定期メールの設定とメールの宛先が分かれ、
   ログインの画面は1つです（ログインの後に、自分が登録されている環境に入ります）。基本設定と勤務パターンはすべての環境で共通です。
   環境を追加したら「開く」からその環境に入り、チーム管理でメンバー（マネージャーを含む）を登録してください。
+  使わなくなった環境は「停止」してから「削除」できます（データのフォルダはバックアップとして残します）。
+</p>
+<p class="small text-muted">
+  「最終更新」は、その環境で業務のデータ（タスク・進捗の記載・定型業務の完了・年休・スキル・チーム・メンバーなど）を最後に更新した日です
+  （使われていない環境の棚卸しに使えます。見出しを押すと並び替えられます。{{ ev.idle_days }}日以上更新の無い環境は赤で表示します）。
 </p>
 {% if ev.error %}
 <div class="alert alert-danger small"><i class="bi bi-x-octagon"></i> <strong>環境の一覧のファイル（<code>instance/environments.json</code>）を読み込めません。</strong> {{ ev.error }} ファイルを直すまで、環境の追加・変更はできません。</div>
@@ -6505,12 +6453,12 @@
   <div class="card-header bg-white fw-bold"><i class="bi bi-list-ul"></i> 環境の一覧</div>
   <div class="card-body">
     <div class="table-responsive">
-      <table class="table table-sm align-middle mb-0">
-        <thead class="table-light"><tr><th>名前</th><th>URL</th><th>状態</th><th class="text-end">メンバー</th><th class="ps-3">追加</th><th>操作</th></tr></thead>
+      <table class="table table-sm align-middle mb-0 sortable">
+        <thead class="table-light"><tr><th>名前</th><th>URL</th><th>状態</th><th class="text-end" data-type="num">メンバー</th><th class="ps-3">最終更新</th><th class="ps-3">追加</th><th data-nosort>操作</th></tr></thead>
         <tbody>
           {% for e in ev.envs %}
           <tr>
-            <td style="min-width: 14rem;">
+            <td style="min-width: 14rem;" data-sort="{{ e.name }}">
               <form method="post" action="{{ url_for('admin.rename_env', key=e.key) }}" class="d-flex gap-1">
                 <input type="hidden" name="version" value="{{ ev.version }}">
                 <input type="text" class="form-control form-control-sm" name="name" value="{{ e.name }}" maxlength="{{ ev.name_max }}"
@@ -6519,9 +6467,13 @@
               </form>
             </td>
             <td class="small text-break"><code>{{ e.url }}</code><div class="text-muted">{{ e.folder }}</div></td>
-            <td class="text-nowrap">{% if e.key == 'main' %}<span class="badge bg-primary">メイン</span>{% elif e.active %}<span class="badge bg-success">使用中</span>{% else %}<span class="badge bg-secondary">停止中</span>{% endif %}</td>
-            <td class="text-end">{% if e.members is none %}―{% else %}{{ e.members }}人{% endif %}</td>
-            <td class="small text-muted text-nowrap ps-3">{{ e.created_at or '―' }}{% if e.created_by %}<div>{{ e.created_by }}</div>{% endif %}</td>
+            <td class="text-nowrap">{% if e.active %}<span class="badge bg-success">使用中</span>{% else %}<span class="badge bg-secondary">停止中</span>{% endif %}</td>
+            <td class="text-end" data-sort="{{ e.members if e.members is not none else '' }}">{% if e.members is none %}―{% else %}{{ e.members }}人{% endif %}</td>
+            <td class="small text-nowrap ps-3" data-sort="{{ e.last_updated.strftime('%Y-%m-%d %H:%M') if e.last_updated else '' }}">
+              {%- if e.last_updated %}<span class="{{ 'text-danger fw-bold' if e.idle_days >= ev.idle_days else '' }}">{{ e.last_updated.strftime('%Y/%m/%d') }}</span>
+              <div class="{{ 'text-danger' if e.idle_days >= ev.idle_days else 'text-muted' }}">{% if e.idle_days <= 0 %}今日{% else %}{{ e.idle_days }}日前{% endif %}</div>
+              {%- else %}<span class="text-muted">―</span>{% endif %}</td>
+            <td class="small text-muted text-nowrap ps-3" data-sort="{{ e.created_at or '' }}">{{ e.created_at or '―' }}{% if e.created_by %}<div>{{ e.created_by }}</div>{% endif %}</td>
             <td class="text-nowrap">
               {% if e.open_url %}<a class="btn btn-sm btn-primary" href="{{ e.open_url }}"><i class="bi bi-box-arrow-in-right"></i> 開く</a>{% endif %}
               {% if e.key != 'main' %}
@@ -6532,6 +6484,7 @@
                 <input type="hidden" name="active" value="{{ '0' if e.active else '1' }}">
                 <button class="btn btn-sm {{ 'btn-outline-secondary' if e.active else 'btn-outline-success' }}">{{ '停止' if e.active else '再開' }}</button>
               </form>
+              {% if not e.active %}<a class="btn btn-sm btn-outline-danger" href="{{ url_for('admin.delete_env', key=e.key) }}"><i class="bi bi-trash"></i> 削除</a>{% endif %}
               {% endif %}
             </td>
           </tr>
@@ -6556,9 +6509,81 @@
         <button class="btn btn-primary" {% if ev.error %}disabled{% endif %}><i class="bi bi-plus-lg"></i> 環境を追加</button>
       </div>
     </form>
-    <div class="form-text">新しい環境の DB（<code>instance/envs/&lt;キー&gt;/app.db</code>）を作ります。URL は <code>/env/&lt;キー&gt;/</code> です。環境は削除できません（使わなくなったら停止します）。</div>
+    <div class="form-text">新しい環境の DB（<code>instance/envs/&lt;キー&gt;/app.db</code>）を作ります。URL は <code>/env/&lt;キー&gt;/</code> です。</div>
   </div>
 </div>
+{% if ev.deleted %}
+<div class="card shadow-sm mb-4">
+  <div class="card-header bg-white fw-bold"><i class="bi bi-trash"></i> 削除した環境</div>
+  <div class="card-body">
+    <p class="small text-muted mb-2">データのフォルダは消さずに、名前を変えて <code>instance/envs/</code> に残しています（不要になったら手で削除してください）。削除した環境の URL は、ほかの環境には使いません。</p>
+    <div class="table-responsive">
+      <table class="table table-sm align-middle mb-0">
+        <thead class="table-light"><tr><th>名前</th><th>URL（使えません）</th><th>削除</th><th>残したフォルダ</th></tr></thead>
+        <tbody>
+          {% for d in ev.deleted %}
+          <tr>
+            <td>{{ d.name }}</td>
+            <td class="small text-break"><code>{{ d.url }}</code></td>
+            <td class="small text-muted text-nowrap">{{ d.deleted_at or '―' }}{% if d.deleted_by %}<div>{{ d.deleted_by }}</div>{% endif %}</td>
+            <td class="small text-break">{% if d.folder %}<code>instance/envs/{{ d.folder }}/</code>{% else %}―{% endif %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endif %}
+{% endblock %}
+{#=== admin/env_delete.html ===#}
+{# システム管理の「環境」の削除の確かめ(admin だけ。停止した環境だけ削除できる)。ev は envs_tab_context の値、e はその環境の行 #}
+{% extends "admin/_layout.html" %}
+{% block title %}環境の削除 &middot; システム管理 &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item">システム管理</li>
+    <li class="breadcrumb-item"><a href="{{ url_for('admin.envs') }}">環境</a></li>
+    <li class="breadcrumb-item active">削除</li>
+  </ol>
+</nav>
+<h1 class="h3 mb-3"><i class="bi bi-trash"></i> 環境の削除</h1>
+<div class="card shadow-sm mb-3">
+  <div class="card-body">
+    <dl class="row mb-0 small">
+      <dt class="col-sm-3">名前</dt><dd class="col-sm-9 fw-bold">{{ e.name }}</dd>
+      <dt class="col-sm-3">URL</dt><dd class="col-sm-9"><code>{{ e.url }}</code></dd>
+      <dt class="col-sm-3">状態</dt><dd class="col-sm-9">{% if e.active %}<span class="badge bg-success">使用中</span>{% else %}<span class="badge bg-secondary">停止中</span>{% endif %}</dd>
+      <dt class="col-sm-3">メンバー</dt><dd class="col-sm-9">{% if e.members is none %}―{% else %}{{ e.members }}人{% endif %}</dd>
+      <dt class="col-sm-3">最終更新</dt><dd class="col-sm-9">{% if e.last_updated %}{{ e.last_updated.strftime('%Y/%m/%d') }}（{% if e.idle_days <= 0 %}今日{% else %}{{ e.idle_days }}日前{% endif %}）{% else %}―{% endif %}</dd>
+      <dt class="col-sm-3">追加</dt><dd class="col-sm-9">{{ e.created_at or '―' }}{% if e.created_by %}（{{ e.created_by }}）{% endif %}</dd>
+      <dt class="col-sm-3">データのフォルダ</dt><dd class="col-sm-9"><code>{{ e.folder }}</code></dd>
+    </dl>
+  </div>
+</div>
+{% if e.active %}
+<div class="alert alert-warning small"><i class="bi bi-exclamation-triangle"></i> 使用中の環境は削除できません。環境の一覧で「停止」してから削除してください。</div>
+<a class="btn btn-sm btn-outline-secondary" href="{{ url_for('admin.envs') }}">環境の一覧へ戻る</a>
+{% else %}
+<div class="alert alert-danger small">
+  <i class="bi bi-exclamation-octagon"></i> 削除すると、この環境は環境の一覧・環境の選択から無くなり、URL（<code>{{ e.url }}</code>）は使えなくなります
+  （画面から元に戻すことはできません。同じ URL はほかの環境にも使いません）。
+  データのフォルダは消さずに、名前を「<code>{{ e.key }}.deleted-日時</code>」に変えて <code>instance/envs/</code> に残します（バックアップ。不要になったら手で削除してください）。
+</div>
+<form method="post" action="{{ url_for('admin.delete_env', key=e.key) }}" class="row g-2 align-items-end" autocomplete="off">
+  <input type="hidden" name="version" value="{{ ev.version }}">
+  <div class="col-md-6">
+    <label class="form-label small fw-bold mb-0" for="env-delete-name">確かめのため、環境の名前「{{ e.name }}」を入力してください</label>
+    <input type="text" class="form-control form-control-sm" id="env-delete-name" name="confirm_name" maxlength="{{ ev.name_max }}" required>
+  </div>
+  <div class="col-md-6 d-flex gap-2">
+    <button class="btn btn-sm btn-danger"><i class="bi bi-trash"></i> 削除する</button>
+    <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('admin.envs') }}">やめる</a>
+  </div>
+</form>
+{% endif %}
 {% endblock %}
 {#=== admin/settings.html ===#}
 {# システム管理の「基本設定」(すべての環境で共通の設定。admin だけ)。cfg は app.py の config_form_context の値 #}
@@ -6568,7 +6593,7 @@
 {% block content %}
 <nav aria-label="breadcrumb">
   <ol class="breadcrumb">
-    <li class="breadcrumb-item"><a href="{{ url_for('admin.home') }}">システム管理</a></li>
+    <li class="breadcrumb-item">システム管理</li>
     <li class="breadcrumb-item active">基本設定</li>
   </ol>
 </nav>
@@ -6590,9 +6615,6 @@
   <i class="bi bi-arrow-repeat"></i> <strong>再起動が必要な変更があります。</strong>
   次の項目は、保存した値（有効な値）と実行中の値が異なります。サーバーを再起動すると反映されます:
   {% for f in cfg.pending %}<code>{{ f.key }}</code>（{{ f.label }}）{% if not loop.last %}、{% endif %}{% endfor %}
-  {% if cfg.pending_secret_key %}
-  <div class="mt-1"><i class="bi bi-exclamation-triangle"></i> <code>SECRET_KEY</code> が変わるため、再起動すると全員がログアウトされます。</div>
-  {% endif %}
 </div>
 {% endif %}
 
@@ -6656,18 +6678,6 @@
   </div>
   {% endif %}
   {{ reset_check(row) }}
-{% elif f.type == 'secret_key' %}
-  <div class="mb-1">
-    {% if row.is_set %}<span class="badge bg-success">設定あり</span>{% else %}<span class="badge bg-secondary">未設定</span>
-    <span class="small text-muted">（次の起動のときに生成して画面の設定に保存します）</span>{% endif %}
-  </div>
-  <div class="form-check">
-    <input class="form-check-input" type="checkbox" id="cfg-generate-{{ f.key }}" name="generate_{{ f.key }}" value="1"
-           {% if row.generate_checked %}checked{% endif %}>
-    <label class="form-check-label small" for="cfg-generate-{{ f.key }}">新しいキーを生成する（保存時にランダムな値を作成し、画面の設定に保存）</label>
-  </div>
-  {{ reset_check(row) }}
-  <div class="small text-warning-emphasis mt-1"><i class="bi bi-exclamation-triangle"></i> 新しいキーはサーバーの再起動後に有効になります。再起動すると全員がログアウトされます。</div>
 {% elif f.type == 'secret' %}
   <div class="mb-1">
     {% if row.is_set %}<span class="badge bg-success">設定あり</span>{% else %}<span class="badge bg-secondary">未設定</span>{% endif %}
@@ -6817,7 +6827,7 @@
 {% block content %}
 <nav aria-label="breadcrumb">
   <ol class="breadcrumb">
-    <li class="breadcrumb-item"><a href="{{ url_for('admin.home') }}">システム管理</a></li>
+    <li class="breadcrumb-item">システム管理</li>
     <li class="breadcrumb-item active">勤務の設定</li>
   </ol>
 </nav>
@@ -6830,20 +6840,26 @@
 <div class="card shadow-sm mb-4">
   <div class="card-header bg-white fw-bold">勤務の一覧</div>
   <div class="card-body">
+    {% if shifts %}
+    <div class="d-none d-md-flex gap-2 small text-muted mb-1">
+      <span class="shift-col-name">勤務の名前</span><span class="shift-col-order">並び順</span><span>状態・人数</span>
+    </div>
+    {% endif %}
     {% for s in shifts %}
-    <form method="post" action="{{ url_for('admin.save_shift', shift_id=s.id) }}" class="row g-2 align-items-center mb-2">
-      {# 開いたときの内容の控え(ほかの操作の変更を古い画面の値で上書きしない) #}
-      <input type="hidden" name="version" value="{{ versions[s.id] }}">
-      <div class="col-md-3"><input type="text" name="name" class="form-control form-control-sm" value="{{ s.name }}" maxlength="{{ name_max }}" aria-label="勤務の名前" required></div>
-      <div class="col-md-3"><input type="text" name="group_name" class="form-control form-control-sm" value="{{ s.group_name }}" maxlength="{{ name_max }}" placeholder="勤務帯（任意）" aria-label="勤務帯"></div>
-      <div class="col-md-2"><input type="number" name="sort_order" class="form-control form-control-sm" value="{{ s.sort_order }}" title="並び順" aria-label="並び順"></div>
-      <div class="col-md-2">{% if s.is_active %}<span class="badge bg-success">有効</span>{% else %}<span class="badge bg-secondary">無効</span>{% endif %} <span class="text-muted small">{{ counts.get(s.id, 0) }}名</span></div>
-      <div class="col-md-2"><button class="btn btn-sm btn-outline-primary">保存</button></div>
-    </form>
-    <form method="post" action="{{ url_for('admin.toggle_shift', shift_id=s.id) }}" class="mb-3">
-      <input type="hidden" name="active" value="{{ '0' if s.is_active else '1' }}">
-      <button class="btn btn-sm btn-outline-{{ 'danger' if s.is_active else 'success' }}">{{ '無効化' if s.is_active else '有効化' }}</button>
-    </form>
+    <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+      <form method="post" action="{{ url_for('admin.save_shift', shift_id=s.id) }}" class="d-flex flex-wrap align-items-center gap-2">
+        {# 開いたときの内容の控え(ほかの操作の変更を古い画面の値で上書きしない) #}
+        <input type="hidden" name="version" value="{{ versions[s.id] }}">
+        <input type="text" name="name" class="form-control form-control-sm shift-col-name" value="{{ s.name }}" maxlength="{{ name_max }}" aria-label="勤務の名前" required>
+        <input type="number" name="sort_order" class="form-control form-control-sm shift-col-order" value="{{ s.sort_order }}" title="並び順" aria-label="並び順">
+        <span class="shift-col-state text-nowrap">{% if s.is_active %}<span class="badge bg-success">有効</span>{% else %}<span class="badge bg-secondary">無効</span>{% endif %} <span class="text-muted small">{{ counts.get(s.id, 0) }}名</span></span>
+        <button class="btn btn-sm btn-outline-primary">保存</button>
+      </form>
+      <form method="post" action="{{ url_for('admin.toggle_shift', shift_id=s.id) }}">
+        <input type="hidden" name="active" value="{{ '0' if s.is_active else '1' }}">
+        <button class="btn btn-sm btn-outline-{{ 'danger' if s.is_active else 'success' }}">{{ '無効化' if s.is_active else '有効化' }}</button>
+      </form>
+    </div>
     {% else %}
     <p class="text-muted small">勤務はまだありません。</p>
     {% endfor %}
@@ -6852,13 +6868,9 @@
     <form method="post" action="{{ url_for('admin.new_shift') }}" class="row g-2 align-items-end">
       {# 追加の二度押しで「既にあります」だけが表示されないようにする1回限りの印 #}
       <input type="hidden" name="once" value="{{ submit_token() }}">
-      <div class="col-md-3">
+      <div class="col-md-4">
         <label class="form-label small mb-1" for="new-shift-name">新しい勤務の名前</label>
-        <input type="text" name="name" id="new-shift-name" class="form-control form-control-sm" maxlength="{{ name_max }}" placeholder="例: 1班 A" required>
-      </div>
-      <div class="col-md-3">
-        <label class="form-label small mb-1" for="new-shift-group">勤務帯（出勤表の行のまとまり。任意）</label>
-        <input type="text" name="group_name" id="new-shift-group" class="form-control form-control-sm" maxlength="{{ name_max }}" placeholder="例: 1班">
+        <input type="text" name="name" id="new-shift-name" class="form-control form-control-sm" maxlength="{{ name_max }}" placeholder="例: 1班・日勤" required>
       </div>
       <div class="col-md-2">
         <label class="form-label small mb-1" for="new-shift-sort">並び順</label>
@@ -6912,7 +6924,7 @@
 {% block content %}
 <nav aria-label="breadcrumb">
   <ol class="breadcrumb">
-    <li class="breadcrumb-item"><a href="{{ url_for('admin.home') }}">システム管理</a></li>
+    <li class="breadcrumb-item">システム管理</li>
     <li class="breadcrumb-item"><a href="{{ url_for('admin.shifts') }}">勤務の設定</a></li>
     <li class="breadcrumb-item active">勤務表の入力</li>
   </ol>
@@ -6978,7 +6990,7 @@
   <input type="hidden" name="month" value="{{ key }}">
   {% for item in items %}
   <div class="row g-2 align-items-center mb-2">
-    <label class="col-md-2 col-form-label col-form-label-sm" for="codes{{ item.shift.id }}">{{ item.shift.name }}{% if item.shift.group_name %} <span class="text-muted small">（{{ item.shift.group_name }}）</span>{% endif %}</label>
+    <label class="col-md-2 col-form-label col-form-label-sm" for="codes{{ item.shift.id }}">{{ item.shift.name }}</label>
     <div class="col-md-10">
       {# 画面を開いたときの内容(ほかの操作で変わった行を、この画面の古い内容で上書きしない) #}
       <input type="hidden" name="orig_{{ item.shift.id }}" value="{{ item.orig }}">
@@ -7244,7 +7256,18 @@ a:hover {
 .recommend-panel-stale {
   opacity: 0.5;
 }
-/* 出勤表(leaves/calendar.html。横軸=日付・縦軸=勤務帯と人。app.py の 16 章) */
+/* 勤務の設定(admin/shifts.html)の勤務の一覧の列の幅(見出しと入力欄をそろえる) */
+.shift-col-name {
+  width: 16rem;
+  max-width: 100%;
+}
+.shift-col-order {
+  width: 6rem;
+}
+.shift-col-state {
+  min-width: 6.5rem;
+}
+/* 出勤表(leaves/calendar.html。横軸=日付・縦軸=勤務と人。app.py の 16 章) */
 .roster {
   font-size: 0.78rem;
   white-space: nowrap;
@@ -8339,7 +8362,7 @@ a:hover {
  *
  * ・開いているタブを URL(?tab=...)に残す(再読み込み・ブックマークでも同じタブを開く)。
  *   #weekly のような URL の末尾(フラグメント)でもタブを指定できる。
- * ・基本設定(システム管理の画面)で admin のパスワードを空にする・初期値に戻す、新しい SECRET_KEY を生成するときは、保存前に確認する。
+ * ・基本設定(システム管理の画面)で admin のパスワードを空にする・初期値に戻すときは、保存前に確認する。
  * ・基本設定の「初期値に戻す」にチェックすると、その項目の入力欄(今の画面の設定を表示している)を空にして入力できなくする
  *   (チェックを外すと元の表示に戻す。表示したままの値なら、JavaScript が無くてもサーバー側は「初期値に戻す」として受け付ける)。
  *
@@ -8378,15 +8401,11 @@ a:hover {
       var messages = [];
       var clearAdmin = form.elements["clear_ADMIN_PASSWORD"];
       var resetAdmin = form.elements["reset_ADMIN_PASSWORD"];
-      var generateKey = form.elements["generate_SECRET_KEY"];
       if (clearAdmin && clearAdmin.checked) {
         messages.push("admin のパスワードを空にします（admin のログイン可否は ldap_client.py の判定に任されます）。");
       }
       if (resetAdmin && resetAdmin.checked) {
         messages.push("admin のパスワードの画面の設定を外し、config.py の値にします（config.py で空なら、admin のログイン可否は ldap_client.py の判定に任されます）。");
-      }
-      if (generateKey && generateKey.checked) {
-        messages.push("新しい SECRET_KEY を生成します（サーバーの再起動後に有効になり、そのとき全員がログアウトされます）。");
       }
       if (messages.length && !window.confirm(messages.join("\n") + "\nよろしいですか？")) {
         event.preventDefault();
@@ -8399,7 +8418,7 @@ a:hover {
     if (!form) return;
     form.querySelectorAll("input[type=checkbox][name^='reset_']").forEach(function (box) {
       var input = document.getElementById("cfg-" + box.name.slice("reset_".length));
-      // 値を表示する入力欄(文字・数・URL・アドレスの一覧)だけ。パスワードの欄は空のまま、SECRET_KEY に入力欄は無い
+      // 値を表示する入力欄(文字・数・URL・アドレスの一覧)だけ。パスワードの欄は空のまま
       if (!input || input.type === "checkbox" || input.type === "password") return;
       var kept = null;
       var apply = function () {
