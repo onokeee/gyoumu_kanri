@@ -188,6 +188,7 @@ from flask import (
     current_app,
     flash as _flask_flash,
     g,
+    has_app_context,
     has_request_context,
     jsonify,
     make_response,
@@ -640,6 +641,12 @@ DROPPED_REQUEST_KEY = "dropped_request_path"
 # 固定ローカル管理者(admin など)でログインしたときの、パスワードの印(_local_credential_mark)を残すセッションのキー
 # (パスワードを変えたら、既にログインしていたブラウザも使えなくする。load_user で照合する)
 LOCAL_AUTH_KEY = "local_auth"
+# ログインしたときの認証(固定ローカル / LDAP)を残すセッションのキー(環境を追加したときに、このログインから共通の
+# ログインを作るときに使う。ログインIDが固定ローカル管理者と同じ名前の LDAP のアカウントを、固定ローカル管理者として
+# 扱わないように。17 章)
+LOGIN_SOURCE_KEY = "login_source"
+LOGIN_SOURCE_LOCAL = "local"
+LOGIN_SOURCE_LDAP = "ldap"
 
 @login_manager.unauthorized_handler
 def _unauthorized():
@@ -1799,7 +1806,7 @@ class MailJob:
 
     def is_sending(self):
         """この環境で送信(テスト・本番)の処理中か。"""
-        return self.lock_for(current_app._get_current_object()).locked()
+        return self.lock_for(current_app_or_none()).locked()
 
     def error_message(self, app, exc):
         """例外を画面・前回の結果用の短い文言にする(想定外のものはログにトレースを残す)。"""
@@ -4058,11 +4065,15 @@ def _update_login_sessions(change, path=None):
         write_json(path, data)
         _login_sessions_cache.pop(path, None)
 
-def _issue_token(path, user_key):
-    """ログインの印を作って記録ファイル path の user_key の行に記録し、印を返す(期限を過ぎた印はここで消す)。"""
+def _issue_token(path, user_key, at=None):
+    """ログインの印を作って記録ファイル path の user_key の行に記録し、印を返す(期限を過ぎた印はここで消す)。
+
+    at はログインした日時(UNIX 秒。無ければ今。前のログインから作る印の有効期限を延ばさないため。17 章)。
+    """
     token = secrets.token_urlsafe(24)
     now = _epoch_now()
     oldest = now - LOGIN_LIFETIME_HOURS * 3600
+    logged_in_at = at if _is_int(at) and oldest < at <= now else now
 
     def change(data):
         for key in list(data):
@@ -4070,7 +4081,7 @@ def _issue_token(path, user_key):
             if not data[key]:
                 del data[key]
         tokens = data.setdefault(user_key, {})
-        tokens[token] = now
+        tokens[token] = logged_in_at
         for old, _at in sorted(tokens.items(), key=lambda item: item[1])[:max(len(tokens) - LOGIN_SESSIONS_PER_USER, 0)]:
             del tokens[old]
 
@@ -4422,6 +4433,8 @@ def login():
         logout_user()
         session.pop(DROPPED_REQUEST_KEY, None)
         session.pop(LOCAL_AUTH_KEY, None)
+        session.pop(LOGIN_SOURCE_KEY, None)
+        end_portal_session()  # 複数の環境だったときの共通のログインが残っていれば消す(17 章)
         flash(f"{previous} さんのログインを終了しました（別のIDが入力されたため）。", "info")
 
     if request.method == "POST":
@@ -4448,14 +4461,21 @@ def login():
             flash(LOGIN_RECORD_ERROR, "danger")
             return render_template("auth/login.html", username=username)
         clear_login_failures(username)
+        # 複数の環境だったとき(ほかの環境を停止して1つに戻した)の、前の人の共通のログイン・ほかの環境のログインが
+        # このブラウザに残っていれば終える(また複数の環境になったときに、前の人として続けないように。17 章)
+        end_portal_session()
         login_user(user)
         session[SESSION_TOKEN_KEY] = token
         if is_local_account(user.username):
             session[LOCAL_AUTH_KEY] = _local_credential_mark(user.username)
         else:
             session.pop(LOCAL_AUTH_KEY, None)
+        # どの認証で入ったか(環境を追加したときに、このログインから共通のログインを作るときに使う。17 章)
+        session[LOGIN_SOURCE_KEY] = LOGIN_SOURCE_LOCAL if info.get("source") == "local" else LOGIN_SOURCE_LDAP
         flash(f"ようこそ、{user.display_name} さん。", "success")
-        return _redirect_after_login()
+        response = _redirect_after_login()
+        end_env_logins(response)
+        return response
 
     return render_template("auth/login.html")
 
@@ -4496,10 +4516,11 @@ def _portal_login():
     logged_in = current_user.is_authenticated  # 先に確かめる(メインの環境の以前のログインから共通のログインを作る)
     portal, _state = portal_state()
     if not is_main_env():
+        if request.method == "POST":
+            # ID・パスワードは共通の入口で確かめる(共通のログインが有効でも、別の ID が送られたらそこで切り替える)
+            return redirect(_portal_login_action(next_url), code=307)
         if portal is not None:
             return redirect(url_for("auth.enter", next=next_url) if next_url else url_for("auth.enter"))
-        if request.method == "POST":
-            return redirect(_portal_login_action(next_url), code=307)
         return render_template("auth/login.html", login_action=_portal_login_action(next_url))
     if request.method == "POST":
         username = request.form.get("username", "").strip()
@@ -4507,7 +4528,7 @@ def _portal_login():
         if portal is not None and (not username or username == portal["u"]):
             return _after_portal_login(portal, next_url)   # 別のタブで既にログインした
         if portal is not None or logged_in:
-            previous = current_user.display_name if logged_in else (portal["n"] or portal["u"])
+            previous = current_user.display_name if logged_in else (portal["d"] or portal["u"])
             _end_main_logins()
             flash(f"{previous} さんのログインを終了しました（別のIDが入力されたため）。", "info")
         info, response = _check_login_form(username, password)
@@ -4643,15 +4664,17 @@ def logout():
     logout_user()
     session.pop(DROPPED_REQUEST_KEY, None)  # ログインが切れた状態で送った操作の印も消す
     session.pop(LOCAL_AUTH_KEY, None)  # 固定ローカル管理者のパスワードの印も消す
+    session.pop(LOGIN_SOURCE_KEY, None)
+    # 共通のログインと、このブラウザのほかの環境のログイン(クッキー)も終える(17 章。1つの環境のときは何もしない)
+    end_portal_session()
     if not is_main_env():
-        # ほかの環境(17 章): 共通のログインを終えて、共通の入口のログアウトへ(メインの環境のクッキーと、
-        # このブラウザのほかの環境のログインもそこで終える)
-        end_portal_session()
-        return redirect(portal_url("/logout"))
-    response = flash_redirect("ログアウトしました。", "info", url_for("auth.login"))
-    if multi_env_enabled() or session.get(PORTAL_SESSION_KEY) is not None:
-        end_portal_session()
-        end_env_logins(response)
+        # ほかの環境: メインの環境のログインの印もここで消してから(メインの環境のクッキーは書き換えられないため)、
+        # 共通の入口のログアウトへ(クッキーを消して「ログアウトしました」を出す。開かれなくてもログインは終わっている)
+        end_main_env_login()
+        response = redirect(portal_url("/logout"))
+    else:
+        response = flash_redirect("ログアウトしました。", "info", url_for("auth.login"))
+    end_env_logins(response)
     return response
 
 # ==== 5-2. トップページ(ダッシュボード) ===========================================================
@@ -10259,7 +10282,7 @@ SKILL_AI_FILE_LOCK = threading.Lock()
 
 def skill_map_ai_lock(app=None):
     """スキルマップのAI分析の実行中の印(環境ごと。メインの環境は SKILL_MAP_AI_LOCK。17 章)。"""
-    return env_scoped(app or current_app._get_current_object(), "skill_map_ai", threading.Lock, SKILL_MAP_AI_LOCK)
+    return env_scoped(app or current_app_or_none(), "skill_map_ai", threading.Lock, SKILL_MAP_AI_LOCK)
 
 def skill_map_analysis_state():
     """画面に出す分析の状態(running: 実行中、interrupted: 実行中のまま中断した)。"""
@@ -14299,11 +14322,11 @@ def save_ai_analysis_result(result):
 
 def ai_analysis_running():
     """この環境で AI分析を実行中か。"""
-    return _analysis_lock_for(current_app._get_current_object()).locked()
+    return _analysis_lock_for(current_app_or_none()).locked()
 
 def ai_analysis_status():
     """実行中の表示に使う状態(画面と GET /manager/analysis/status)。"""
-    state = _analysis_state_for(current_app._get_current_object())
+    state = _analysis_state_for(current_app_or_none())
     running = ai_analysis_running()
     return {
         "running": running,
@@ -14317,7 +14340,7 @@ def ai_analysis_status():
     }
 
 def _set_progress(done, total, step):
-    _analysis_state_for(current_app._get_current_object()).update(done=done, total=total, step=step)
+    _analysis_state_for(current_app_or_none()).update(done=done, total=total, step=step)
 
 def run_ai_analysis_job(app, args):
     """AIで分析して結果を保存する(呼び出したスレッドで最後まで実行)。
@@ -20831,7 +20854,7 @@ ENV_URL_PREFIX = "/env"           # ほかの環境の URL の先頭(/env/<キ�
 ENVS_DIRNAME = "envs"             # ほかの環境の instance フォルダの置き場(instance/envs/<キー>)
 ENV_REGISTRY_FILENAME = "environments.json"
 ENV_REGISTRY_LABEL = "環境の一覧のファイル"
-ENV_KEY_PATTERN = re.compile(r"e[1-9][0-9]{0,5}")
+ENV_KEY_PATTERN = re.compile(r"e(?!0)\d{1,6}", re.ASCII)  # 「e」と 1〜6 桁の数字(0 で始まらない)
 ENV_NAME_MAX = 40
 MAIN_ENV_DEFAULT_NAME = "メインの環境"
 ENV_CONFIG_KEY = "ENV_KEY"                        # app.config: この環境のキー(ほかの環境だけ)
@@ -20865,6 +20888,10 @@ def shared_instance_path(app=None):
 def env_key(app=None):
     """この環境(アプリ)のキー(メインの環境は MAIN_ENV_KEY)。"""
     return (app or current_app).config.get(ENV_CONFIG_KEY) or MAIN_ENV_KEY
+
+def current_app_or_none():
+    """今のアプリ(アプリの外なら None。env_scoped はメインの環境として扱う)。"""
+    return current_app._get_current_object() if has_app_context() else None
 
 def is_main_env(app=None):
     return env_key(app) == MAIN_ENV_KEY
@@ -20978,9 +21005,10 @@ def env_scoped(app, name, factory, main_value):
     """環境ごとの処理中の印(ロック)・状態。
 
     メインの環境は main_value(以前と同じモジュールの値)。ほかの環境は初めて使うときに factory() で作る
-    (同じプロセスのほかの環境の処理と待ち合わせない・状態を混ぜない)。
+    (同じプロセスのほかの環境の処理と待ち合わせない・状態を混ぜない)。app が None(アプリの外。コマンド・
+    動作確認のスクリプトなど)はメインの環境として扱う。
     """
-    if is_main_env(app):
+    if app is None or is_main_env(app):
         return main_value
     values = app.extensions.setdefault(ENV_SCOPED_KEY, {})
     value = values.get(name)
@@ -21121,6 +21149,11 @@ def build_env_app(main_app, key):
     # 動作確認(TESTING。判定・相談の応答をその場で作るなど)はメインの環境に合わせる
     app.config["TESTING"] = bool(main_app.config.get("TESTING"))
     prepare_instance(app)
+    # 再起動が必要な設定(SECRET_KEY)は、メインの環境の実行中の値にそろえる(画面で新しい鍵を作った後・再起動の前に
+    # 作った環境だけが新しい鍵になり、メインの環境のクッキーを読めなくならないように)
+    for field in FIELDS:
+        if field.restart_required:
+            app.config[field.key] = main_app.config.get(field.key)
     return app
 
 def scheduled_apps(app):
@@ -21130,7 +21163,8 @@ def scheduled_apps(app):
 
 # ==== 17-3. 共通のログイン(instance/portal_sessions.json) =======================================
 # 複数の環境のとき、ログインの画面で本人を確かめたことを、メインの環境のクッキーの PORTAL_SESSION_KEY に残す:
-#   {"u": ログインID, "t": 印, "n": 認証の結果の氏名, "l": 固定ローカル管理者か, "r": その役割, "m": パスワードの印}
+#   {"u": ログインID, "t": 印, "n": 認証の結果の氏名(各環境に入るときにその環境の氏名を合わせる。空なら合わせない),
+#    "d": 画面に出す氏名, "l": 固定ローカル管理者か, "r": その役割, "m": パスワードの印}
 # 印は instance/portal_sessions.json({ログインID: {印: ログインした日時}}。login_sessions.json と同じ形・同じ
 # 有効期限)にあるときだけ有効。固定ローカル管理者は、ログインしたときのパスワードの印(_local_credential_mark)が
 # 今のパスワードと合うときだけ有効(パスワードを変えると、すべての環境でログインし直しになる)。
@@ -21171,7 +21205,8 @@ def _portal_fields(raw):
     if not isinstance(username, str) or not username or not isinstance(token, str) or not token:
         return None
     role = raw.get("r")
-    return {"u": username, "t": token, "n": raw.get("n") if isinstance(raw.get("n"), str) else "",
+    name = raw.get("n") if isinstance(raw.get("n"), str) else ""
+    return {"u": username, "t": token, "n": name, "d": raw.get("d") if isinstance(raw.get("d"), str) else name,
             "l": raw.get("l") is True, "r": role if role in (ROLE_MANAGER, ROLE_MEMBER) else None,
             "m": raw.get("m") if isinstance(raw.get("m"), str) else ""}
 
@@ -21202,15 +21237,37 @@ def portal_state():
     g._portal_state = result
     return result
 
-def start_portal_session(username, display_name, local, role=None):
-    """共通のログインを始める(印を記録して、メインの環境のセッションに残す)。記録できなければ OSError。"""
-    token = _issue_token(_portal_sessions_path(), username)
+def start_portal_session(username, display_name, local, role=None, shown_name=None, at=None):
+    """共通のログインを始める(印を記録して、メインの環境のセッションに残す)。記録できなければ OSError。
+
+    display_name は認証の結果の氏名(各環境の氏名を合わせる。空なら合わせない)、shown_name は画面に出す氏名
+    (無ければ display_name)、at はログインした日時(前のログインから作るとき。有効期限を延ばさない)。
+    """
+    token = _issue_token(_portal_sessions_path(), username, at=at)
     session[PORTAL_SESSION_KEY] = {
-        "u": username, "t": token, "n": display_name or "", "l": bool(local),
+        "u": username, "t": token, "n": display_name or "", "d": shown_name or display_name or "", "l": bool(local),
         "r": role if local and role in (ROLE_MANAGER, ROLE_MEMBER) else None,
         "m": _local_credential_mark(username) if local else "",
     }
     g.pop("_portal_state", None)
+
+def start_portal_from_main_login(user):
+    """1つの環境のときのメインの環境のログイン(user)から、共通のログインを作る(環境を追加したとき・その後の最初の要求)。
+
+    ログインした日時は元のログインのまま(有効期限を延ばさない)。固定ローカル管理者として扱うのは、固定ローカルの
+    認証で入ったと記録したログイン(LOGIN_SOURCE_KEY)だけ(記録の無い以前のログインは LDAP の人として扱う)。
+    認証の結果の氏名は無い(各環境の氏名は書き換えない)。記録できなければ OSError。
+    """
+    at = (_read_login_sessions(_login_sessions_path()).get(user.get_id()) or {}).get(session.get(SESSION_TOKEN_KEY))
+    local = session.get(LOGIN_SOURCE_KEY) == LOGIN_SOURCE_LOCAL and is_local_account(user.username)
+    start_portal_session(user.username, "", local, user.role, shown_name=user.display_name, at=at)
+
+def end_main_env_login():
+    """ほかの環境のログアウトのとき: メインの環境のこのブラウザのログインの印を消す(クッキーは共通の入口のログアウトで消す)。"""
+    data = _main_cookie_session()
+    user_key, token = data.get("_user_id"), data.get(SESSION_TOKEN_KEY)
+    if isinstance(user_key, str) and isinstance(token, str):
+        _revoke_login_sessions(user_key, token, path=os.path.join(shared_instance_path(), LOGIN_SESSIONS_FILENAME))
 
 def end_portal_session():
     """このブラウザの共通のログインの印を消す(メインの環境ではセッションからも消す)。"""
@@ -21234,7 +21291,7 @@ def portal_allows(user):
     if portal is None:
         if state == PORTAL_ABSENT and is_main_env():
             try:
-                start_portal_session(user.username, user.display_name, is_local_account(user.username), user.role)
+                start_portal_from_main_login(user)
             except OSError:
                 current_app.logger.exception("共通のログインの記録（instance/%s）を保存できませんでした",
                                              PORTAL_SESSIONS_FILENAME)
@@ -21573,11 +21630,13 @@ def create_env():
                                   _envs_tab_url())
         remember_submitted(ENV_ONCE_KIND, "")
     current_app.logger.info("環境を追加しました: %s %s（%s）", entry["key"], entry["name"], current_user.username)
-    # 2つ目の環境で共通のログインが始まる: 追加した人のログインはそのまま続ける(load_user の portal_allows でも作る)
-    if multi_env_enabled() and portal_state()[0] is None:
+    # 2つ目の環境で共通のログインが始まる: 追加した人のログインはそのまま続ける(load_user の portal_allows でも作る。
+    # 別の人の共通のログインが残っていれば作り直す)
+    portal = portal_state()[0] if multi_env_enabled() else None
+    if multi_env_enabled() and (portal is None or portal["u"] != current_user.username):
         try:
-            start_portal_session(current_user.username, current_user.display_name,
-                                 is_local_account(current_user.username), current_user.role)
+            end_portal_session()
+            start_portal_from_main_login(current_user)
         except OSError:
             current_app.logger.exception("共通のログインの記録を保存できませんでした")
     return flash_redirect("環境「{}」を追加しました（URL: {}）。最初のマネージャー: {}（{}）。".format(
