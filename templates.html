@@ -6445,7 +6445,7 @@
   <div class="card-body">
     <div class="table-responsive">
       <table class="table table-sm align-middle mb-0 sortable">
-        <thead class="table-light"><tr><th>名前</th><th>URL</th><th>状態</th><th class="text-end" data-type="num">メンバー</th><th class="ps-3">最終更新</th><th class="ps-3">追加</th><th data-nosort>操作</th></tr></thead>
+        <thead class="table-light"><tr><th>名前</th><th>URL</th><th>状態</th><th class="text-end" data-type="num">メンバー</th><th class="ps-3">最終更新</th><th data-nosort>操作</th></tr></thead>
         <tbody>
           {% for e in ev.envs %}
           <tr>
@@ -6464,7 +6464,6 @@
               {%- if e.last_updated %}<span class="{{ 'text-danger fw-bold' if e.idle_days >= ev.idle_days else '' }}">{{ e.last_updated.strftime('%Y/%m/%d') }}</span>
               <div class="{{ 'text-danger' if e.idle_days >= ev.idle_days else 'text-muted' }}">{% if e.idle_days <= 0 %}今日{% else %}{{ e.idle_days }}日前{% endif %}</div>
               {%- else %}<span class="text-muted">―</span>{% endif %}</td>
-            <td class="small text-muted text-nowrap ps-3" data-sort="{{ e.created_at or '' }}">{{ e.created_at or '―' }}{% if e.created_by %}<div>{{ e.created_by }}</div>{% endif %}</td>
             <td class="text-nowrap">
               {% if e.open_url %}<a class="btn btn-sm btn-primary" href="{{ e.open_url }}"><i class="bi bi-box-arrow-in-right"></i> 開く</a>{% endif %}
               {% if e.key != 'main' %}
@@ -6549,7 +6548,6 @@
       <dt class="col-sm-3">状態</dt><dd class="col-sm-9">{% if e.active %}<span class="badge bg-success">使用中</span>{% else %}<span class="badge bg-secondary">停止中</span>{% endif %}</dd>
       <dt class="col-sm-3">メンバー</dt><dd class="col-sm-9">{% if e.members is none %}―{% else %}{{ e.members }}人{% endif %}</dd>
       <dt class="col-sm-3">最終更新</dt><dd class="col-sm-9">{% if e.last_updated %}{{ e.last_updated.strftime('%Y/%m/%d') }}（{% if e.idle_days <= 0 %}今日{% else %}{{ e.idle_days }}日前{% endif %}）{% else %}―{% endif %}</dd>
-      <dt class="col-sm-3">追加</dt><dd class="col-sm-9">{{ e.created_at or '―' }}{% if e.created_by %}（{{ e.created_by }}）{% endif %}</dd>
       <dt class="col-sm-3">データのフォルダ</dt><dd class="col-sm-9"><code>{{ e.folder }}</code></dd>
     </dl>
   </div>
