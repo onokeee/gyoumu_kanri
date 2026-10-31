@@ -123,6 +123,7 @@ Python のコードはすべてこの app.py にまとめている。ほかの�
       16-1. 勤務表の記号と日ごとの勤務
       16-2. 出勤表(横軸=日付、縦軸=勤務帯・勤務と人)
       16-3. 画面(勤務の設定・勤務表の入力。システム管理〔admin だけ。18 章〕の Blueprint に足すルート)
+      16-4. 勤務表の Excel の取り込み(年間分などまとめて)・ひな形
   17. 複数の環境(グループ)
       17-1. 環境の一覧(instance/environments.json)と、環境ごとのフォルダ・URL
       17-2. 環境ごとのアプリと振り分け(EnvDispatcher)
@@ -214,7 +215,7 @@ from flask_login import (
 from flask_sqlalchemy import SQLAlchemy
 from itsdangerous import BadSignature
 from jinja2 import BaseLoader, TemplateNotFound
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
 from sqlalchemy import case, func, inspect, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -18503,6 +18504,9 @@ def limit_streamed_body():
     (Content-Length の付いた送信と同じく、フォームの上限 MAX_FORM_MEMORY_SIZE も効くように)。
     """
     environ = request.environ
+    if request.endpoint == "admin.import_shifts":
+        # 勤務表の Excel の取り込み(16-4)は、年間分などの大きなファイルも受け付ける(フォームを読む前に上限を変える)
+        request.max_content_length = SHIFT_IMPORT_MAX_BYTES
     if "wsgi.input_terminated" not in environ or \
             str(environ.get("HTTP_TRANSFER_ENCODING", "")).strip().lower() != "chunked":
         return None
@@ -18510,6 +18514,8 @@ def limit_streamed_body():
     mail_draft = request.endpoint == "tasks.draft_from_mail"
     if mail_draft:
         limit = MAIL_DRAFT_MAX_BYTES  # メールから下書き(15-5)は添付ファイルを含むメールを受け付ける
+    elif request.endpoint == "admin.import_shifts":
+        limit = SHIFT_IMPORT_MAX_BYTES
     if not limit:
         return None
     stream = environ["wsgi.input"]
@@ -21273,6 +21279,389 @@ def save_member_shift(user_id):
     db.session.commit()
     return flash_redirect("「{}」の勤務を「{}」にしました。".format(
         user.display_name, shift.name if shift is not None else "勤務なし"), "success", url)
+
+# ==== 16-4. 勤務表の Excel の取り込み(年間分などまとめて)・ひな形 ================================
+# システム管理の「勤務表の入力」(admin だけ)。Excel(.xlsx・.xlsm)の表から、何か月分でもまとめて勤務表を登録する。
+#   表の形: 見出しの行に日付(日付のセル・「2026/11/5」「11/5」の文字、またはその月の日〔1〜31。年月はシートの名前
+#           〔「2026年11月」など〕か見出しより上のセルの「2026年11月」、どちらも無ければ画面の月〕。日が月の終わりから1に
+#           戻ると次の月)。その下の行の左の列に勤務の名前(勤務の設定の名前。勤務帯と名前を別の列に分けてもよい)、
+#           日の列に記号。空のセル・「-」は記号なし。シートはいくつでも読む(日付の見出しの無いシートは読まない)。
+#   ひな形: 開始の月から N か月分(1シート1か月。見出しは日付のセル)を、今の勤務表の記号を入れて作る(直して取り込める)。
+#   取り込み: 記号の一覧に無い記号・同じ日の記号の食い違いがあれば何も保存しない。勤務の名前と一致しない行は読まずに
+#           案内する。ファイルにある日だけを書き換える(月の途中までの表なら、ほかの日は今のまま)。
+
+SHIFT_IMPORT_MAX_BYTES = 10 * 1000 * 1000   # 取り込むファイルの大きさの上限(MAX_CONTENT_LENGTH より大きい)
+SHIFT_IMPORT_MAX_SHEETS = 40
+SHIFT_IMPORT_MAX_ROWS = 300
+SHIFT_IMPORT_MAX_COLS = 400                 # 1年分(366日)を1行に並べた表も読めるように
+SHIFT_IMPORT_MAX_MONTHS = 36
+SHIFT_IMPORT_HEADER_ROWS = 30               # 見出しの行を探す範囲(上からこの行数まで)
+SHIFT_IMPORT_MIN_DAYS = 7                   # 見出しの行とみなす日付のセルの数
+SHIFT_IMPORT_MESSAGES = 20                  # 画面に出す誤り・案内の件数の上限
+SHIFT_TEMPLATE_MAX_MONTHS = 12
+SHIFT_WEEKDAY_CHARS = "月火水木金土日"
+_SHIFT_YM = re.compile(r"(\d{4})\s*[年/\-.]\s*(\d{1,2})(?!\d)")
+_SHIFT_FULL_DATE = re.compile(r"^(\d{4})\s*[/\-.年]\s*(\d{1,2})\s*[/\-.月]\s*(\d{1,2})\s*日?(?:\s*[(（][日月火水木金土][)）])?$")
+_SHIFT_MONTH_DAY = re.compile(r"^(\d{1,2})\s*[/月]\s*(\d{1,2})\s*日?(?:\s*[(（][日月火水木金土][)）])?$")
+_SHIFT_DAY = re.compile(r"^(\d{1,2})\s*日?(?:\s*[(（][日月火水木金土][)）])?$")
+SHIFT_IMPORT_EXTENSIONS = (".xlsx", ".xlsm")
+XLSX_MIMETYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+class ShiftImportError(Exception):
+    """勤務表の Excel を読み取れない(ファイルの形式が違う・壊れている)。文は画面にそのまま出す。"""
+
+def _shift_label(text):
+    """勤務の名前の比べる形(全角→半角・空白を除く)。"""
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(text or "")))
+
+def _shift_cell_text(value):
+    """セルの値を記号・名前の文字に(整数の数は小数点なし。全角の英数字は半角に)。"""
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, datetime):
+        value = value.date()
+    return unicodedata.normalize("NFKC", str(value)).strip()
+
+def _sheet_year_month(text):
+    """「2026年11月」「2026-11」などから (年, 月)。読めなければ None。"""
+    match = _SHIFT_YM.search(unicodedata.normalize("NFKC", str(text or "")))
+    if match:
+        year, month = int(match.group(1)), int(match.group(2))
+        if LEAVE_YEAR_MIN <= year <= LEAVE_YEAR_MAX and 1 <= month <= 12:
+            return year, month
+    return None
+
+def _header_value(value):
+    """見出しのセルの読み方: ("date", 日付) / ("md", (月, 日)) / ("day", 日) / None。"""
+    if isinstance(value, datetime):
+        value = value.date()
+    if isinstance(value, date):
+        return ("date", value) if LEAVE_YEAR_MIN <= value.year <= LEAVE_YEAR_MAX else None
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return ("day", int(value)) if float(value).is_integer() and 1 <= int(value) <= 31 else None
+    text = _shift_cell_text(value)
+    match = _SHIFT_FULL_DATE.match(text)
+    if match:
+        try:
+            day = date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        except ValueError:
+            return None
+        return ("date", day) if LEAVE_YEAR_MIN <= day.year <= LEAVE_YEAR_MAX else None
+    match = _SHIFT_MONTH_DAY.match(text)
+    if match and 1 <= int(match.group(1)) <= 12 and 1 <= int(match.group(2)) <= 31:
+        return ("md", (int(match.group(1)), int(match.group(2))))
+    match = _SHIFT_DAY.match(text)
+    if match and 1 <= int(match.group(1)) <= 31:
+        return ("day", int(match.group(1)))
+    return None
+
+def _header_dates(row, context):
+    """見出しの行の候補から {列の番号: 日付}。日付が続かない(戻る・飛ぶ)・年月が要るのに無いときは None。
+
+    context は日だけの見出しの年月(シートの名前などから。無ければ None)。戻り値の2つ目は、年月が無いために
+    読めなかったか(日が7つ以上続いているが年月が分からない)。
+    """
+    found = [(index, _header_value(value)) for index, value in enumerate(row)]
+    found = [(index, item) for index, item in found if item is not None]
+    if len(found) < SHIFT_IMPORT_MIN_DAYS:
+        return None, False
+    columns, previous, ym = {}, None, context
+    for index, (kind, value) in found:
+        if kind == "date":
+            current = value
+        elif kind == "md":
+            month_, day_ = value
+            year_ = (previous.year if previous is not None else (ym[0] if ym else None))
+            if year_ is None:
+                return None, True
+            if previous is not None and month_ < previous.month:
+                year_ += 1
+            try:
+                current = date(year_, month_, day_)
+            except ValueError:
+                return None, False
+        else:
+            if previous is None:
+                if ym is None:
+                    # 1から日が続いているなら、年月の分からない見出し
+                    days = [v for _i, (k, v) in found if k == "day"]
+                    return None, days[:SHIFT_IMPORT_MIN_DAYS] == list(range(days[0], days[0] + SHIFT_IMPORT_MIN_DAYS))
+                try:
+                    current = date(ym[0], ym[1], value)
+                except ValueError:
+                    return None, False
+            elif value == previous.day + 1:
+                try:
+                    current = date(previous.year, previous.month, value)
+                except ValueError:
+                    return None, False
+            elif value == 1 and previous.day == month_days(previous.year, previous.month):
+                current = previous + _ONE_DAY   # 月の終わりから1に戻った: 次の月
+            else:
+                return None, False
+        if previous is not None and current <= previous:
+            return None, False
+        columns[index] = current
+        previous = current
+    return columns, False
+
+def read_shift_workbook(data, codes, shifts, fallback=None):
+    """Excel のファイル(バイト列)から勤務表を読む。
+
+    codes は記号の一覧(shift_codes)、shifts は有効な勤務、fallback は日だけの見出しで年月の分からないシートの年月
+    (画面の月。年月の分からないシートが1つのときだけ使う)。戻り値: {
+      "months": {(年, 月): {勤務ID: {日: 記号("" は記号なし)}}}, "errors": [...](あれば何も保存しない),
+      "notes": [...](読まなかった行・シートの案内), "sheets": [読んだシートの名前]}。
+    読めないファイルは ShiftImportError。
+    """
+    try:
+        book = load_workbook(BytesIO(data), read_only=True, data_only=True)
+    except Exception as exc:  # zip でない・Excel の中身が壊れているなど(openpyxl は様々な例外を出す)
+        raise ShiftImportError("Excel のファイル（.xlsx・.xlsm）として読み取れませんでした（{}）。".format(
+            exc.__class__.__name__)) from None
+    by_label = {_shift_label(s.name): s for s in shifts}
+    result = {"months": {}, "errors": [], "notes": [], "sheets": []}
+    seen = {}   # (勤務ID, 日付) → (記号, シート・行の表示)
+    try:
+        sheets = book.worksheets[:SHIFT_IMPORT_MAX_SHEETS]
+        if len(book.worksheets) > SHIFT_IMPORT_MAX_SHEETS:
+            result["notes"].append("シートが多いため、最初の{}枚だけを読みました。".format(SHIFT_IMPORT_MAX_SHEETS))
+        loaded = []
+        for sheet in sheets:
+            rows = [list(row) for row in sheet.iter_rows(max_row=SHIFT_IMPORT_MAX_ROWS, max_col=SHIFT_IMPORT_MAX_COLS,
+                                                       values_only=True)]
+            loaded.append((sheet.title, rows))
+    except Exception as exc:
+        raise ShiftImportError("Excel のファイルの中身を読み取れませんでした（{}）。".format(exc.__class__.__name__)) from None
+    finally:
+        book.close()
+    # 年月の分からない日だけの見出しのシートが1つなら、画面の月を使う(2つ以上なら、どの月か分からないので誤り)
+    pending = []
+    plans = []
+    for title, rows in loaded:
+        context = _sheet_year_month(title)
+        header = None
+        for index, row in enumerate(rows[:SHIFT_IMPORT_HEADER_ROWS]):
+            if context is None:
+                for value in row:
+                    if isinstance(value, str) and _sheet_year_month(value):
+                        context = _sheet_year_month(value)
+                        break
+            columns, needs_month = _header_dates(row, context)
+            if columns:
+                header = (index, columns)
+                break
+            if needs_month:
+                header = (index, None)
+                pending.append(title)
+                break
+        plans.append((title, rows, context, header))
+    for title, rows, context, header in plans:
+        if header is None:
+            result["notes"].append("シート「{}」は、日付の見出しの行が無いため読んでいません。".format(_one_line(title, 40)))
+            continue
+        index, columns = header
+        if columns is None:
+            if fallback is None or len(pending) > 1:
+                result["errors"].append(
+                    "シート「{}」は見出しが日（1〜31）だけで、年月が分かりません。シートの名前を「2026年11月」のように"
+                    "するか、見出しを日付のセルにしてください。".format(_one_line(title, 40)))
+                continue
+            columns, _needs = _header_dates(rows[index], fallback)
+            if not columns:
+                result["errors"].append("シート「{}」の見出しの日付を読み取れません。".format(_one_line(title, 40)))
+                continue
+            result["notes"].append("シート「{}」は年月が分からないため、{}年{}月として読みました。".format(
+                _one_line(title, 40), fallback[0], fallback[1]))
+        first = min(columns)
+        result["sheets"].append(title)
+        for row_number, row in enumerate(rows[index + 1:], start=index + 2):
+            labels = [_shift_cell_text(v) for v in row[:first] if _shift_cell_text(v)]
+            cells = {col: _shift_cell_text(row[col]) if col < len(row) else "" for col in columns}
+            filled = [text for text in cells.values() if text]
+            if not filled:
+                continue
+            if all(text in SHIFT_WEEKDAY_CHARS or text in ("祝", "祝日") for text in filled) \
+                    or "".join(labels) in ("曜日", "曜", "日付", "日"):
+                continue   # 曜日の行など
+            shift = by_label.get(_shift_label("".join(labels)))
+            if shift is None:
+                shift = next((by_label[_shift_label(t)] for t in reversed(labels) if _shift_label(t) in by_label), None)
+            where = "シート「{}」の{}行目".format(_one_line(title, 40), row_number)
+            if shift is None:
+                result["notes"].append("{}（{}）は、勤務の名前と一致しないため読んでいません。".format(
+                    where, _one_line(" ".join(labels), 30) or "名前なし"))
+                continue
+            for col, text in cells.items():
+                day = columns[col]
+                code = "" if text in SHIFT_BLANK_MARKS else text
+                if code and code not in codes:
+                    result["errors"].append("{}（{}）の{}: 記号「{}」は記号の一覧にありません。".format(
+                        where, shift.name, day.strftime("%Y/%m/%d"), _one_line(code, 10)))
+                    continue
+                before = seen.get((shift.id, day))
+                if before is not None and before[0] != code:
+                    result["errors"].append("勤務「{}」の{}が2か所にあり、記号が違います（{}・{}）。".format(
+                        shift.name, day.strftime("%Y/%m/%d"), before[1], where))
+                    continue
+                seen[(shift.id, day)] = (code, where)
+                result["months"].setdefault((day.year, day.month), {}).setdefault(shift.id, {})[day.day] = code
+    if len(result["months"]) > SHIFT_IMPORT_MAX_MONTHS:
+        result["errors"].append("1回に取り込めるのは{}か月分までです（{}か月分あります）。ファイルを分けてください。".format(
+            SHIFT_IMPORT_MAX_MONTHS, len(result["months"])))
+    return result
+
+def save_imported_shifts(months):
+    """読んだ勤務表を保存する(ファイルにある日だけを書き換える。commit は呼び出し側)。戻り値: 変えた(勤務・月)の数。"""
+    changed = 0
+    for (year, month), by_shift in sorted(months.items()):
+        key, days = month_key(year, month), month_days(year, month)
+        current = {row.shift_id: row for row in WorkShiftMonth.query.filter_by(month=key).all()}
+        for shift_id, day_codes in by_shift.items():
+            row = current.get(shift_id)
+            now = (row.code_list() + [""] * days)[:days] if row is not None else [""] * days
+            new = list(now)
+            for day, code in day_codes.items():
+                new[day - 1] = code
+            if new == now:
+                continue
+            changed += 1
+            if not any(new):
+                if row is not None:
+                    db.session.delete(row)
+            elif row is None:
+                db.session.add(WorkShiftMonth(shift_id=shift_id, month=key, codes=json.dumps(new, ensure_ascii=False)))
+            else:
+                row.codes = json.dumps(new, ensure_ascii=False)
+    return changed
+
+def _month_range_label(months):
+    keys = sorted(months)
+    first, last = keys[0], keys[-1]
+    if first == last:
+        return "{}年{}月".format(*first)
+    return "{}年{}月〜{}年{}月".format(first[0], first[1], last[0], last[1])
+
+@admin_bp.route("/shifts/import", methods=["POST"], endpoint="import_shifts")
+def import_shifts():
+    """勤務表を Excel から取り込む(年間分などまとめて。誤りがあれば何も保存しない)。"""
+    picked = _read_month(request.form.get("month"))
+    back = url_for("admin.shift_month", month=month_key(*picked)) if picked else url_for("admin.shift_month")
+    upload = request.files.get("file")
+    if upload is None or not upload.filename:
+        return flash_redirect("取り込む Excel のファイルを選んでください。", "warning", back)
+    if not upload.filename.lower().endswith(SHIFT_IMPORT_EXTENSIONS):
+        return flash_redirect("Excel のファイル（.xlsx・.xlsm）を選んでください（古い形式の .xls は、Excel で「.xlsx」として"
+                              "保存し直してください）。", "danger", back)
+    data = upload.read(SHIFT_IMPORT_MAX_BYTES + 1)
+    if len(data) > SHIFT_IMPORT_MAX_BYTES:
+        abort(413)
+    lock_for_write()   # 読んでから保存するまでの間に、ほかの勤務表の入力・記号の変更が入らないように
+    codes = shift_codes()
+    if not codes:
+        return flash_redirect("勤務表の記号がまだありません。先に「勤務の設定」で記号を保存してください。", "warning", back)
+    try:
+        result = read_shift_workbook(data, codes, _ordered_shifts(active_only=True), picked)
+    except ShiftImportError as exc:
+        return flash_redirect(str(exc), "danger", back)
+    notes = result["notes"]
+    if result["errors"]:
+        db.session.rollback()
+        for message in result["errors"][:SHIFT_IMPORT_MESSAGES]:
+            flash(message, "danger")
+        if len(result["errors"]) > SHIFT_IMPORT_MESSAGES:
+            flash("ほかにも{}件の誤りがあります。".format(len(result["errors"]) - SHIFT_IMPORT_MESSAGES), "danger")
+        flash("誤りがあるため、勤務表は何も保存していません。Excel を直してから、もう一度取り込んでください。", "danger")
+    elif not result["months"]:
+        db.session.rollback()
+        flash("取り込める勤務表がありませんでした（日付の見出しの行と、勤務の名前の行がある表を読みます）。", "warning")
+    else:
+        changed = save_imported_shifts(result["months"])
+        if changed and not commit_or_conflict():
+            return redirect(back)
+        label = _month_range_label(result["months"])
+        shift_count = len({sid for by_shift in result["months"].values() for sid in by_shift})
+        current_app.logger.info("勤務表を Excel から取り込みました: %s（%dか月・勤務 %d件・変えた行 %d）（%s）", label,
+                                len(result["months"]), shift_count, changed, current_user.username)
+        flash("Excel から {}（{}か月分）・勤務 {}件の勤務表を取り込みました（{}）。".format(
+            label, len(result["months"]), shift_count,
+            "変わった勤務と月 {}件".format(changed) if changed else "今の勤務表と同じため、変わったところはありません"), "success")
+        first = sorted(result["months"])[0]
+        back = url_for("admin.shift_month", month=month_key(*first))
+    for message in notes[:SHIFT_IMPORT_MESSAGES]:
+        flash(message, "warning")
+    if len(notes) > SHIFT_IMPORT_MESSAGES:
+        flash("ほかにも{}件の案内があります。".format(len(notes) - SHIFT_IMPORT_MESSAGES), "warning")
+    return redirect(back)
+
+def build_shift_template(year, month, months):
+    """勤務表の取り込みのひな形(開始の月から months か月分。1シート1か月。今の勤務表の記号入り)。"""
+    book = Workbook()
+    book.remove(book.active)
+    shifts = _ordered_shifts(active_only=True)
+    codes = list(shift_codes().values())
+    bold = Font(bold=True)
+    red = Font(color="C00000")
+    blue = Font(color="1F4E9E")
+    for offset in range(months):
+        y, m = divmod(year * 12 + (month - 1) + offset, 12)
+        m += 1
+        if y > LEAVE_YEAR_MAX:
+            break
+        key, days = month_key(y, m), month_days(y, m)
+        saved = {row.shift_id: (row.code_list() + [""] * days)[:days]
+                 for row in WorkShiftMonth.query.filter_by(month=key).all()}
+        sheet = book.create_sheet(title="{}年{}月".format(y, m))
+        sheet.cell(row=1, column=1, value="勤務").font = bold
+        sheet.cell(row=2, column=1, value="曜日").font = bold
+        for d in range(1, days + 1):
+            day = date(y, m, d)
+            head = sheet.cell(row=1, column=d + 1, value=day)
+            head.number_format = "d"
+            head.font = bold
+            weekday = sheet.cell(row=2, column=d + 1, value=SHIFT_WEEKDAY_CHARS[day.weekday()])
+            if day.weekday() == 6 or holiday_name(day):
+                weekday.font = red
+            elif day.weekday() == 5:
+                weekday.font = blue
+            sheet.column_dimensions[head.column_letter].width = 4
+        for r, shift in enumerate(shifts, start=3):
+            sheet.cell(row=r, column=1, value=_fmt(shift.name))
+            for d, code in enumerate(saved.get(shift.id, [""] * days), start=2):
+                if code:
+                    cell = sheet.cell(row=r, column=d, value=int(code) if code.isdigit() else code)
+                    if cell.data_type == "f":
+                        cell.data_type = "s"
+        sheet.column_dimensions["A"].width = 18
+        sheet.freeze_panes = "B3"
+    legend = book.create_sheet(title="記号")
+    legend.append(["記号", "名前", "種類"])
+    for cell in legend[1]:
+        cell.font = bold
+    for item in codes:
+        legend.append([_fmt(item.code), _fmt(item.label), _fmt(item.kind)])
+        for cell in legend[legend.max_row]:
+            if cell.data_type == "f":
+                cell.data_type = "s"
+    legend.column_dimensions["B"].width = 24
+    return book
+
+@admin_bp.route("/shifts/template", endpoint="shift_template")
+def shift_template():
+    """勤務表の取り込みのひな形(.xlsx)をダウンロードする(?from=YYYY-MM&months=1〜12)。"""
+    today = date.today()
+    year, month = _read_month(request.args.get("from")) or (today.year, today.month)
+    months = to_int(request.args.get("months"))
+    months = months if months is not None and 1 <= months <= SHIFT_TEMPLATE_MAX_MONTHS else SHIFT_TEMPLATE_MAX_MONTHS
+    book = build_shift_template(year, month, months)
+    bio = BytesIO()
+    book.save(bio)
+    return Response(bio.getvalue(), mimetype=XLSX_MIMETYPE, headers={
+        "Content-Disposition": 'attachment; filename="shift_{}_{}months.xlsx"'.format(month_key(year, month), months)})
 
 # #### 17. 複数の環境(グループ) ###################################################################
 # 1つのサーバー(このフォルダ)を、複数のグループ(マネージャーごとのチーム)で使い分ける。入口(ログイン)は1つで、

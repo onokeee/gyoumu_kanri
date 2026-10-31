@@ -6905,7 +6905,7 @@
 </div>
 {% endblock %}
 {#=== admin/shift_month.html ===#}
-{# システム管理の「勤務パターン」: 勤務表の入力(すべての環境で共通。admin だけ。app.py の 16-3) #}
+{# システム管理の「勤務パターン」: 勤務表の入力(すべての環境で共通。admin だけ。app.py の 16-3。Excel の取り込みは 16-4) #}
 {% extends "admin/_layout.html" %}
 {% block title %}勤務表の入力（{{ year }}年{{ month }}月） &middot; システム管理 &middot; {{ app_name }}{% endblock %}
 
@@ -6925,6 +6925,47 @@
     {% if next %}<a class="btn btn-outline-secondary btn-sm" href="{{ url_for('admin.shift_month', month=next) }}">次月 &raquo;</a>{% endif %}
   </div>
 </div>
+
+<div class="card shadow-sm mb-3 border-success">
+  <div class="card-header bg-white fw-bold"><i class="bi bi-file-earmark-excel text-success"></i> Excel で取り込む（年間分などまとめて）</div>
+  <div class="card-body small">
+    <p class="mb-2">
+      Excel の表から、何か月分でもまとめて勤務表を登録します。表は、<strong>見出しの行に日付</strong>（日付のセル・「11/5」など。
+      日〔1〜31〕だけのときは、シートの名前を「2026年11月」のようにします）、<strong>左の列に勤務の名前</strong>（勤務の設定の名前と同じ）、
+      <strong>日の列に記号</strong>を入れます。空のセル・「-」は記号なしです。シートはいくつあってもかまいません（1シート1か月でも、1枚に1年分でも）。
+      まずは今の勤務表が入ったひな形をダウンロードして、記号を入れて取り込むのが確実です。
+    </p>
+    <form method="get" action="{{ url_for('admin.shift_template') }}" class="row g-2 align-items-end mb-3">
+      <div class="col-auto">
+        <label class="form-label small mb-0" for="tpl-from">開始の月</label>
+        <input type="month" id="tpl-from" name="from" value="{{ key }}" class="form-control form-control-sm">
+      </div>
+      <div class="col-auto">
+        <label class="form-label small mb-0" for="tpl-months">月数</label>
+        <select id="tpl-months" name="months" class="form-select form-select-sm">
+          {% for n in range(1, 13) %}<option value="{{ n }}" {% if n == 12 %}selected{% endif %}>{{ n }}か月</option>{% endfor %}
+        </select>
+      </div>
+      <div class="col-auto">
+        <button class="btn btn-sm btn-outline-success"><i class="bi bi-download"></i> ひな形をダウンロード（今の勤務表入り）</button>
+      </div>
+    </form>
+    <form method="post" action="{{ url_for('admin.import_shifts') }}" enctype="multipart/form-data" class="row g-2 align-items-end"
+          onsubmit="return confirm('Excel の勤務表を取り込みます。ファイルにある日の記号は、今の勤務表を上書きします。よろしいですか？');">
+      <input type="hidden" name="month" value="{{ key }}">
+      <div class="col-auto">
+        <label class="form-label small mb-0" for="shift-file">Excel のファイル（.xlsx・.xlsm）</label>
+        <input type="file" id="shift-file" name="file" accept=".xlsx,.xlsm,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" class="form-control form-control-sm" required>
+      </div>
+      <div class="col-auto">
+        <button class="btn btn-sm btn-success" {% if not codes or not items %}disabled{% endif %}><i class="bi bi-upload"></i> 取り込む</button>
+      </div>
+    </form>
+    <div class="form-text">記号の一覧に無い記号があるときは、何も保存しません（誤りの場所を表示します）。勤務の名前と一致しない行は読まずに案内します。
+      ファイルにある日だけを書き換えます（月の途中までの表なら、ほかの日は今のままです）。</div>
+  </div>
+</div>
+<h2 class="h6 fw-bold mt-4">この月を画面で入力・修正する</h2>
 <p class="small text-muted">勤務ごとに、1日から順に記号を入力します（{{ days|length }}日分）。Excel の勤務表の1行（日のセル）をコピーして、そのまま貼り付けられます。空白・「,」で区切っても、区切らずに続けて入力してもかまいません。記号の無い日は「-」です（記号の無い日は、土日・祝日を休み、それ以外を出勤として扱います）。</p>
 {% if not codes %}<div class="alert alert-warning small">勤務表の記号がまだありません。先に「<a href="{{ url_for('admin.shifts') }}">勤務の設定</a>」で記号を保存してください。</div>{% endif %}
 {% if not items %}<div class="alert alert-info small">有効な勤務がありません。「<a href="{{ url_for('admin.shifts') }}">勤務の設定</a>」で勤務を追加してください。</div>{% endif %}
