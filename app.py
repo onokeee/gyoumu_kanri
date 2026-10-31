@@ -2425,9 +2425,6 @@ class TaskSkill(db.Model):
 # ==== 3-3. 年休 ===================================================================================
 # チーム内での情報共有・見える化が目的。承認フローは持たない(登録=即共有)。
 
-# 同じチームで同日に休む人数がこれを超えると、登録時に調整を促すメッセージを表示
-LEAVE_DAILY_LIMIT = 2
-
 LEAVE_FULL = "全休"
 LEAVE_AM = "午前半休"
 LEAVE_PM = "午後半休"
@@ -2436,7 +2433,7 @@ LEAVE_PM_HOURS = "午後時間休"
 LEAVE_TYPE_CHOICES = [LEAVE_FULL, LEAVE_AM, LEAVE_PM, LEAVE_AM_HOURS, LEAVE_PM_HOURS]
 LEAVE_HALF_TYPES = (LEAVE_AM, LEAVE_PM)
 # 時間休(午前・午後の数時間の年休。時間は記録しない): 換算日数に数えず、出勤日数では出勤の日として数える。担当者の
-# 推奨の「休み」・同じ日に休む人数(出勤表・登録の案内)にも数えない(出勤表・一覧・推奨の表には表示する)
+# 推奨の「休み」にも数えない(出勤表・一覧・推奨の表には表示する)
 LEAVE_HOURLY_TYPES = (LEAVE_AM_HOURS, LEAVE_PM_HOURS)
 LEAVE_TYPE_COLORS = {
     LEAVE_FULL: "primary",
@@ -5997,7 +5994,7 @@ def _render_leave_form(leave, form=None, version=None):
         version = LEAVE_VERSION.shown(form, leave)
     return render_template(
         "leaves/form.html", leave=leave,
-        type_choices=LEAVE_TYPE_CHOICES, daily_limit=LEAVE_DAILY_LIMIT, form=form,
+        type_choices=LEAVE_TYPE_CHOICES, form=form,
         year_min=LEAVE_YEAR_MIN, year_max=LEAVE_YEAR_MAX, version=version,
     )
 
@@ -6009,7 +6006,7 @@ def _read_leave_form():
 def _leave_date_error(leave_date, current=None):
     """取得日の誤り(未入力・範囲外・営業日でない日)のメッセージ。問題なければ None。
 
-    土日・祝日(営業日カレンダー 2-4)は登録できない(換算日数・同日の人数に数えないように)。ただし本人の勤務表(16 章)に
+    土日・祝日(営業日カレンダー 2-4)は登録できない(換算日数に数えないように)。ただし本人の勤務表(16 章)に
     その日の記号があれば勤務表で決める(出勤・臨時出勤の日は土日・祝日でも登録でき、休日・年休の日は登録できない)。
     current は編集する年休の今の取得日(以前の版で土日・祝日に登録した年休も、取得日を変えなければ
     種別の変更などはできるように)。
@@ -6038,31 +6035,8 @@ def _duplicate_on(user_id, leave_date, exclude_id=None):
         q = q.filter(LeaveRequest.id != exclude_id)
     return q.first()
 
-def _is_overbooked(user, leave_date, exclude_id=None):
-    """本人の所属チーム(有効なもの)のいずれかで、同日に休む人数が上限を超えるか。"""
-    # 無効化されたチームは判定対象外(カレンダーの警告と基準を揃える)
-    depts = [d for d in user.departments if d.is_active]
-    if not depts:
-        return False
-    q = LeaveRequest.query.filter(LeaveRequest.leave_date == leave_date)
-    if exclude_id:
-        q = q.filter(LeaveRequest.id != exclude_id)
-    others = [lv for lv in q.all() if lv.leave_type not in LEAVE_HOURLY_TYPES]   # 時間休は数えない
-    for dept in depts:
-        member_ids = {u.id for u in dept.users}
-        off_ids = {lv.user_id for lv in others if lv.user_id in member_ids}
-        off_ids.add(user.id)  # 本人ぶん
-        if len(off_ids) > LEAVE_DAILY_LIMIT:
-            return True
-    return False
-
-def _registration_messages(user, leave_date, exclude_id=None, leave_type=None):
-    """登録/更新後に出すメッセージ(同日上限・今週連絡)をflashする(時間休は同日上限を確かめない)。"""
-    if leave_type not in LEAVE_HOURLY_TYPES and _is_overbooked(user, leave_date, exclude_id=exclude_id):
-        flash(
-            "チーム内（マネージャー・メンバー）で業務影響ないよう事前にすり合わせて登録するようお願いします。",
-            "warning",
-        )
+def _registration_messages(leave_date):
+    """登録/更新後に出すメッセージ(今週の取得の連絡のお願い)をflashする。"""
     # 今週(月〜日)の取得なら、チャット/メール/口頭での連絡を促す
     today = date.today()
     monday = today - timedelta(days=today.weekday())
@@ -6108,7 +6082,6 @@ def calendar_view():
         dept_id=dept_id,
         prev=(prev_year, prev_month) if prev_year >= LEAVE_YEAR_MIN else None,
         next=(next_year, next_month) if next_year <= LEAVE_YEAR_MAX else None,
-        daily_limit=LEAVE_DAILY_LIMIT,
         leave_marks=ROSTER_LEAVE_MARKS,
         kind_css=SHIFT_KIND_CSS,
         month_key=month_key(year, month),
@@ -6179,9 +6152,9 @@ def new_leave():
             calendar_url = url_for("leaves.calendar_view", year=leave_date.year, month=leave_date.month)
             if dup and already_submitted("leave"):
                 # 登録のボタンの二度押しの2回目: 表示されるのはこちらの画面なので、1回目の案内
-                # (同日の人数・今週の連絡のお願い)をもう一度出す
+                # (今週の連絡のお願い)をもう一度出す
                 flash(_SUBMITTED_TWICE.format("年休"), "info")
-                _registration_messages(current_user, leave_date, exclude_id=dup.id, leave_type=dup.leave_type)
+                _registration_messages(leave_date)
                 return redirect(calendar_url)
             if dup:
                 return flash_redirect("その取得日の年休は既に登録されています。", "warning", url_for("leaves.detail", leave_id=dup.id))
@@ -6192,7 +6165,7 @@ def new_leave():
             db.session.add(leave)
             commit_submitted("leave", calendar_url)
         flash("年休を登録しました。", "success")
-        _registration_messages(current_user, leave_date, exclude_id=leave.id, leave_type=leave_type)
+        _registration_messages(leave_date)
         return redirect(url_for("leaves.calendar_view", year=leave_date.year, month=leave_date.month))
 
     # 出勤表の自分の行の日(?date=YYYY-MM-DD)から開いたときは、その日を取得日に入れておく
@@ -6247,7 +6220,7 @@ def edit_leave(leave_id):
             leave.leave_type = leave_type
             db.session.commit()
         flash("年休を更新しました。", "success")
-        _registration_messages(current_user, leave_date, exclude_id=leave_id, leave_type=leave_type)
+        _registration_messages(leave_date)
         return redirect(url_for("leaves.detail", leave_id=leave_id))
 
     return _render_leave_form(leave)
@@ -18905,7 +18878,7 @@ def seed_command():
             # 田中の2件目は1件目より後の日(連休で同じ日にならないように)
             later = business_day_from(max(today + timedelta(days=6), same_day + timedelta(days=1)))
             leaves = [
-                # 同日にチームBが3名 → カレンダーで同日上限超の警告色を確認できる
+                # 同じ日に3名が休む(出勤表で確認できる)
                 LeaveRequest(user_id=user_map["yamada"].id, leave_date=same_day, leave_type=LEAVE_FULL),
                 LeaveRequest(user_id=user_map["tanaka"].id, leave_date=same_day, leave_type=LEAVE_FULL),
                 LeaveRequest(user_id=user_map["leader"].id, leave_date=same_day, leave_type=LEAVE_FULL),
@@ -20925,20 +20898,7 @@ def build_roster(year, month, dept_id=None, viewer=None):
                           "label": info.label if info is not None else ("記号の一覧に無い記号" if code else "")})
         people = by_shift.get(shift.id, [])
         rows.append({"shift": shift, "cells": cells, "people": people, "rows": 1 + len(people)})
-
-    # 日ごとの年休の人数(半休も1人。時間休は数えない)と、同じチームで同じ日に休む人数が多いか(以前のカレンダーと
-    # 同じ基準)
-    dept_member_ids = {d.id: {u.id for u in d.users} for d in ordered_rows(Department)}
-    totals = []
-    for day in days:
-        day_leaves = [lv for lv in leaves if lv.leave_date == day["date"] and lv.leave_type not in LEAVE_HOURLY_TYPES]
-        off_ids = {lv.user_id for lv in day_leaves}
-        if dept_id:
-            warn = dept is not None and dept.is_active and len(off_ids) > LEAVE_DAILY_LIMIT
-        else:
-            warn = any(len(off_ids & member_ids) > LEAVE_DAILY_LIMIT for member_ids in dept_member_ids.values())
-        totals.append({"count": len(off_ids) if off_ids else "", "warn": warn})
-    return {"days": days, "shifts": rows, "no_shift": no_shift, "totals": totals,
+    return {"days": days, "shifts": rows, "no_shift": no_shift,
             "codes": list(codes.values()),
             "has_shifts": bool(shifts) or db.session.query(WorkShift.id).filter(WorkShift.is_active.is_(True)).first() is not None}
 

@@ -2127,14 +2127,6 @@
         {% endif %}
       </tbody>
       {% endif %}
-      <tfoot>
-        <tr>
-          <th scope="row" colspan="2" class="roster-sticky roster-corner">年休（人）</th>
-          {% for t in roster.totals %}
-          <td class="roster-total {% if t.warn %}table-danger{% endif %}">{% if t.warn %}<i class="bi bi-people-fill text-danger" title="同日に休む人数が多いチームがあります"></i>{% endif %}{{ t.count }}</td>
-          {% endfor %}
-        </tr>
-      </tfoot>
     </table>
   </div>
 </div>
@@ -2142,11 +2134,9 @@
   {% for c in roster.codes %}<span><span class="roster-legend roster-kind-{{ kind_css.get(c.kind, 'none') }}">{{ c.code }}</span> {{ c.label }}</span>{% endfor %}
   <span><span class="roster-leave roster-leave-full">{{ leave_marks['全休'] }}</span> 年休（全休）</span>
   <span><span class="roster-leave roster-leave-half">{{ leave_marks['午前半休'] }}</span> 午前半休 <span class="roster-leave roster-leave-half">{{ leave_marks['午後半休'] }}</span> 午後半休</span>
-  <span><span class="roster-leave roster-leave-hour">{{ leave_marks['午前時間休'] }}</span> 午前時間休 <span class="roster-leave roster-leave-hour">{{ leave_marks['午後時間休'] }}</span> 午後時間休（年休の人数には数えません）</span>
+  <span><span class="roster-leave roster-leave-hour">{{ leave_marks['午前時間休'] }}</span> 午前時間休 <span class="roster-leave roster-leave-hour">{{ leave_marks['午後時間休'] }}</span> 午後時間休</span>
   <span><span class="roster-legend roster-off-swatch"></span> 休み（勤務表の休日・年休の日。勤務表の記号が無い日は土日・祝日）</span>
   <span>自分の行の「＋」から、その日の年休を登録できます</span>
-  <span class="text-danger"><i class="bi bi-people-fill"></i> 同じチームで同日{{ daily_limit }}名超</span>{% for d in departments if d.id == dept_id and not d.is_active %}
-  <span>（無効化したチームは、同じ日に休む人数を判定しません）</span>{% endfor %}
 </div>
 {% if current_user.is_manager and not roster.has_shifts %}
 <p class="small text-muted mt-2 mb-0"><i class="bi bi-info-circle"></i> 勤務がまだありません。固定ローカル管理者（admin）がシステム管理の「勤務パターン」で勤務（例: 1班 A・日勤）と勤務表の記号を設定し、チームの管理でメンバーの勤務を選ぶと、勤務ごとに並びます。</p>
@@ -2227,7 +2217,7 @@
     <form method="post" class="card card-body shadow-sm">{% if editing %}
       <input type="hidden" name="row" value="{{ leave.row_key }}">
       <input type="hidden" name="version" value="{{ version }}">{# 画面を開いたときの内容の控え(ほかの操作で変わった項目を、この画面の古い内容で上書きしない) #}{% else %}
-      {# 登録の二度押しで、1回目の案内(同日の人数・今週の連絡)が表示されなくならないようにする1回限りの印 #}
+      {# 登録の二度押しで、1回目の案内(今週の連絡)が表示されなくならないようにする1回限りの印 #}
       <input type="hidden" name="once" value="{{ submit_token() }}">{% endif %}
       <div class="mb-3">
         <label class="form-label">取得日 <span class="text-danger">*</span></label>
@@ -2244,13 +2234,12 @@
             {% if (form.get('leave_type') if form else (leave.leave_type if leave else '全休')) == t %}selected{% endif %}>{{ t }}</option>
           {% endfor %}
         </select>
-        <div class="form-text">時間休（午前・午後の数時間の年休）は、換算日数と、同じチームで同じ日に休む人数には数えません。</div>
+        <div class="form-text">時間休（午前・午後の数時間の年休）は、換算日数には数えません。</div>
       </div>
 
       <div class="alert alert-secondary small py-2 mb-3">
         <i class="bi bi-info-circle"></i>
-        承認は不要です(登録するとチームに共有されます)。同じチームで同日に {{ daily_limit }} 名を超えて休む場合は、
-        登録後に調整のお願いが表示されます。
+        承認は不要です(登録するとチームに共有されます)。
       </div>
 
       <div class="d-flex gap-2">
