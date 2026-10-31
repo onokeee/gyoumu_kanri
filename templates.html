@@ -166,8 +166,7 @@
     {% block content %}{% endblock %}
   </main>
 
-  {# 画面の下のアプリの名前(ログインの画面は出さない: auth/login.html で block footer を空にする) #}
-  {% block footer %}<footer class="text-center text-muted small py-3">
+  {% block footer %}{# 画面の下のアプリの名前(ログインの画面は出さない: auth/login.html で block footer を空にする) #}<footer class="text-center text-muted small py-3">
     {{ app_name }}
   </footer>{% endblock %}
 
