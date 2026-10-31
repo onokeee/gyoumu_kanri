@@ -12,7 +12,7 @@
 
   目次(区切りの名前。この順に並ぶ):
     共通　　　　　　　  base.html  _macros.html  errors/too_large.html  errors/http_error.html
-    ログイン　　　　　  auth/login.html
+    ログイン　　　　　  auth/login.html  auth/envs.html（環境の選択）
     メールアドレス　　  account/email.html
     個人ダッシュボード  main/dashboard.html
     タスク　　　　　　  tasks/list.html  tasks/detail.html  tasks/form.html  tasks/_recommend.html
@@ -32,6 +32,7 @@
     システム設定　　　  system/settings.html  system/_config_tab.html  system/_weekly_tab.html
                         system/_overdue_tab.html  system/_skill_ai_tab.html
                         system/_analysis_tab.html  system/_reminder_tab.html
+                        system/_env_config_tab.html（ほかの環境の基本設定）  system/_envs_tab.html（環境）
     静的ファイル　　　  static/css/style.css  static/js/sort-table.js  static/js/auto-filter.js
                         static/js/routine-form.js  static/js/task-form.js
                         static/js/skill-item-form.js  static/js/skill-ai.js
@@ -58,7 +59,7 @@
   <nav class="navbar {{ 'navbar-expand-xl' if current_user.is_manager else 'navbar-expand-lg' }} navbar-dark bg-primary">
     <div class="container-fluid">
       <a class="navbar-brand fw-bold" href="{{ url_for('main.dashboard') }}">
-        <i class="bi bi-clipboard-check"></i> {{ app_name }}
+        <i class="bi bi-clipboard-check"></i> {{ app_name }}{% if env_nav %} <span class="badge bg-light text-primary align-middle env-badge">{{ env_nav.name }}</span>{% endif %}
       </a>
       <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarMain">
         <span class="navbar-toggler-icon"></span>
@@ -136,7 +137,9 @@
               <li><hr class="dropdown-divider"></li>
               {% endif %}
               {# 自分のメールアドレス(定型業務のリマインドの宛先) #}
-              <li><a class="dropdown-item {% if request.blueprint == 'account' %}active{% endif %}" href="{{ url_for('account.email') }}"><i class="bi bi-envelope"></i> メールアドレス</a></li>
+              <li><a class="dropdown-item {% if request.blueprint == 'account' %}active{% endif %}" href="{{ url_for('account.email') }}"><i class="bi bi-envelope"></i> メールアドレス</a></li>{% if env_nav %}
+              {# 複数の環境(グループ)のとき: 使う環境の選び直し(環境の選択の画面) #}
+              <li><a class="dropdown-item" href="{{ env_nav.switch_url }}"><i class="bi bi-arrow-left-right"></i> 環境の切り替え</a></li>{% endif %}
               <li><a class="dropdown-item" href="{{ url_for('auth.logout') }}"><i class="bi bi-box-arrow-right"></i> ログアウト</a></li>
             </ul>
           </li>
@@ -262,8 +265,9 @@
         <h1 class="h4 text-center mb-1"><i class="bi bi-clipboard-check text-primary"></i> {{ app_name }}</h1>
         <p class="text-center text-muted small mb-4">アカウントでログイン</p>
 
-        {# ログイン前に開こうとしたページ(next)を送信後も引き継ぐ #}
-        <form method="post" action="{{ url_for('auth.login', next=request.args.get('next')) }}">
+        {# ログイン前に開こうとしたページ(next)を送信後も引き継ぐ。login_action は共通の入口の URL
+           (複数の環境のとき、ほかの環境の画面から開いたログインの画面。app.py の 17 章) #}
+        <form method="post" action="{{ login_action or url_for('auth.login', next=request.args.get('next')) }}">
           <div class="mb-3">
             <label class="form-label">ID</label>
             <input type="text" name="username" class="form-control" autofocus required
@@ -277,6 +281,38 @@
             <i class="bi bi-box-arrow-in-right"></i> ログイン
           </button>
         </form>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{#=== auth/envs.html ===#}
+{# 環境の選択の画面(複数の環境のとき。ログインの後・ナビの「環境の切り替え」。app.py の envs)。
+   envs は入れる環境(停止していないもの。メインが最初。各行 name・role_label・url)、portal は共通のログイン #}
+{% extends "base.html" %}
+{% block title %}環境の選択 &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+  <div class="col-md-7 col-lg-5">
+    <div class="card shadow-sm mt-4">
+      <div class="card-body p-4">
+        <h1 class="h5 mb-1"><i class="bi bi-collection text-primary"></i> 使う環境を選んでください</h1>
+        <p class="small text-muted mb-3">{{ portal.n or portal.u }} さん（ログインID: {{ portal.u }}）。環境ごとにタスク・メンバー・設定が分かれています。</p>
+        {% if envs %}
+        <div class="list-group mb-3">
+          {% for e in envs %}
+          <a class="list-group-item list-group-item-action d-flex justify-content-between align-items-center gap-2" href="{{ e.url }}">
+            <span class="text-break"><i class="bi bi-box-arrow-in-right"></i> {{ e.name }}</span>
+            <span class="badge bg-light text-dark border">{{ e.role_label }}</span>
+          </a>
+          {% endfor %}
+        </div>
+        {% else %}
+        <div class="alert alert-warning small">入れる環境がありません（どの環境にもメンバーとして登録されていないか、無効化されています）。マネージャーに登録を依頼してください。</div>
+        {% endif %}
+        <p class="small text-muted mb-3">同じブラウザの別のタブで、別の環境を同時に開くこともできます。</p>
+        <a href="{{ url_for('auth.logout') }}" class="btn btn-sm btn-outline-secondary"><i class="bi bi-box-arrow-right"></i> ログアウト</a>
       </div>
     </div>
   </div>
@@ -5863,7 +5899,7 @@
 
 <div class="tab-content pt-3">
   <div class="tab-pane fade {% if tab == 'config' %}show active{% endif %}" id="pane-config" role="tabpanel" aria-labelledby="tab-config">
-    {% include "system/_config_tab.html" %}
+    {% if env_main %}{% include "system/_config_tab.html" %}{% else %}{{ file_error_alert(rc) }}{% include "system/_env_config_tab.html" %}{% endif %}
   </div>
   <div class="tab-pane fade {% if tab == 'weekly' %}show active{% endif %}" id="pane-weekly" role="tabpanel" aria-labelledby="tab-weekly">
     {{ file_error_alert(wk) }}{% include "system/_weekly_tab.html" %}
@@ -5879,7 +5915,10 @@
   </div>
   <div class="tab-pane fade {% if tab == 'reminder' %}show active{% endif %}" id="pane-reminder" role="tabpanel" aria-labelledby="tab-reminder">
     {{ file_error_alert(rm) }}{% include "system/_reminder_tab.html" %}
-  </div>
+  </div>{% if ev %}
+  <div class="tab-pane fade {% if tab == 'envs' %}show active{% endif %}" id="pane-envs" role="tabpanel" aria-labelledby="tab-envs">
+    {% include "system/_envs_tab.html" %}
+  </div>{% endif %}
 </div>
 {% endblock %}
 
@@ -5987,6 +6026,12 @@
 <div class="form-text">{{ f.help }}</div>
 {% endmacro %}
 
+{% if env_nav %}
+<div class="alert alert-info small py-2">
+  <i class="bi bi-collection"></i> 複数の環境（グループ）で使っています。ここの設定は<strong>すべての環境で共通</strong>です
+  （宛先の <code>MAIL_TO</code>・<code>MAIL_CC</code> だけは、この環境〈{{ env_nav.name }}〉の週報・期限超過通知の宛先です。ほかの環境の宛先は、その環境のシステム設定で設定します）。
+</div>
+{% endif -%}
 <p class="small text-muted">
   環境ごとの設定（接続先・宛先・パスワードなど）です。値は <strong>初期値</strong>（<code>config.py</code>。app.py と同じフォルダ）と
   <strong>画面の設定</strong>（<code>instance/settings.json</code>。この画面で保存した値）の2つの層から決まり、
@@ -6594,6 +6639,151 @@
               sandbox="allow-popups allow-popups-to-escape-sandbox" srcdoc="{{ rm_status.test_mail.document }}"></iframe>
     </details>
     <div class="small text-muted mt-2">HTMLを表示できないメールソフトではテキスト版が表示されます。件名の件数は、その宛先に送る回の数です。</div>
+  </div>
+</div>
+{#=== system/_env_config_tab.html ===#}
+{# ほかの環境(グループ)のシステム設定「基本設定」タブ(app.py の 17 章)。rc は env_mail_form_context の値。
+   この環境の宛先(instance/envs/<キー>/env_mail_settings.json)だけを編集し、すべての環境で共通の設定は読み取り専用で表示する #}
+<p class="small text-muted">
+  この環境（{{ rc.env_name }}）の週報・期限超過通知の宛先と、すべての環境で共通の設定です。
+  共通の設定（AI・メールの送信サーバー・差出人・送信を許可するドメイン・リンクの基準URL）は、メインの環境のマネージャーがメインの環境のシステム設定で変更します。
+</p>
+{% if rc.mail_problem %}
+<div class="alert alert-warning small py-2"><i class="bi bi-exclamation-triangle"></i> {{ rc.mail_problem }}</div>
+{% endif %}
+<form method="post" action="{{ url_for('system.save_recipients') }}" autocomplete="off" novalidate>
+  <input type="hidden" name="version" value="{{ rc.version }}">
+  <div class="card shadow-sm mb-3">
+    <div class="card-header bg-white fw-bold"><i class="bi bi-envelope"></i> この環境のメールの宛先</div>
+    <div class="card-body pb-1">
+      <div class="row g-2 mb-3">
+        <div class="col-md-4">
+          <label class="form-label small fw-bold mb-0" for="env-mail-to">{{ rc.to_field.label }}</label>
+          <div class="small"><code>MAIL_TO</code></div>
+        </div>
+        <div class="col-md-8">
+          <textarea class="form-control form-control-sm" id="env-mail-to" name="MAIL_TO" rows="3" spellcheck="false"
+                    placeholder="name@example.com（1行に1件）">{{ rc.to_text }}</textarea>
+          <div class="form-text">週報と期限超過通知の宛先です（1行に1件。空にするとこの環境からは送りません）。</div>
+        </div>
+      </div>
+      <div class="row g-2 mb-3">
+        <div class="col-md-4">
+          <label class="form-label small fw-bold mb-0" for="env-mail-cc">{{ rc.cc_field.label }}</label>
+          <div class="small"><code>MAIL_CC</code></div>
+        </div>
+        <div class="col-md-8">
+          <textarea class="form-control form-control-sm" id="env-mail-cc" name="MAIL_CC" rows="3" spellcheck="false"
+                    placeholder="name@example.com（1行に1件）">{{ rc.cc_text }}</textarea>
+          <div class="form-text">週報と期限超過通知の同報（Cc）です（1行に1件）。{% if rc.domains_label %}送信を許可するドメイン（{{ rc.domains_label }}）のアドレスだけを保存できます。{% endif %}</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="d-flex justify-content-end mb-4">
+    <button class="btn btn-primary"><i class="bi bi-save"></i> 宛先を保存</button>
+  </div>
+</form>
+<div class="card shadow-sm mb-4">
+  <div class="card-header bg-white fw-bold">すべての環境で共通の設定（読み取り専用）</div>
+  <div class="card-body small">
+    <div class="table-responsive">
+      <table class="table table-sm align-middle mb-0">
+        <thead class="table-light"><tr><th>項目</th><th>値</th></tr></thead>
+        <tbody>
+          {% for row in rc.shared %}
+          <tr>
+            <td>{{ row.field.label }}<div class="text-muted"><code>{{ row.field.key }}</code></div></td>
+            <td class="text-break">{{ row.text }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{#=== system/_envs_tab.html ===#}
+{# システム設定「環境」タブ(メインの環境だけ。app.py の 17 章)。ev は envs_tab_context の値。
+   環境(グループ)ごとに DB・設定が別。ログインは共通で、ログインの後に使う環境を選ぶ #}
+<p class="small text-muted">
+  ほかのグループ（マネージャーごとのチーム）も、このサーバーを別の環境として使えます。環境ごとにタスク・メンバー・スキル・出勤表・定期メールの設定が分かれ、
+  ログインの画面は1つです（ログインの後に、自分が登録されている環境を選びます。admin はすべての環境に入れます）。
+  基本設定（AI・メールの送信サーバーなど）はすべての環境で共通で、宛先（<code>MAIL_TO</code>・<code>MAIL_CC</code>）だけが環境ごとです。
+  環境を追加するときに、その環境の最初のマネージャーを登録します（メンバーは、そのマネージャーがその環境のチーム管理で登録します）。
+</p>
+{% if ev.error %}
+<div class="alert alert-danger small"><i class="bi bi-x-octagon"></i> <strong>環境の一覧のファイル（<code>instance/environments.json</code>）を読み込めません。</strong> {{ ev.error }} ファイルを直すまで、環境の追加・変更はできません。</div>
+{% endif %}
+{% if not ev.multi %}
+<div class="alert alert-light border small py-2">今は1つの環境だけで使っています（今までと同じ動き）。環境を追加すると、ログインの後に環境を選ぶ画面になります（ログイン中の人はそのまま使えます）。</div>
+{% endif %}
+<div class="card shadow-sm mb-3">
+  <div class="card-header bg-white fw-bold"><i class="bi bi-collection"></i> 環境の一覧</div>
+  <div class="card-body">
+    <div class="table-responsive">
+      <table class="table table-sm align-middle mb-0">
+        <thead class="table-light"><tr><th>名前</th><th>URL</th><th>状態</th><th class="text-end">メンバー</th><th>追加</th><th>操作</th></tr></thead>
+        <tbody>
+          {% for e in ev.envs %}
+          <tr>
+            <td style="min-width: 14rem;">
+              <form method="post" action="{{ url_for('system.rename_env', key=e.key) }}" class="d-flex gap-1">
+                <input type="hidden" name="version" value="{{ ev.version }}">
+                <input type="text" class="form-control form-control-sm" name="name" value="{{ e.name }}" maxlength="{{ ev.name_max }}"
+                       required aria-label="環境の名前（{{ e.name }}）">
+                <button class="btn btn-sm btn-outline-primary text-nowrap">名前を変更</button>
+              </form>
+            </td>
+            <td class="small text-break"><code>{{ e.url }}</code><div class="text-muted">{{ e.folder }}</div></td>
+            <td class="text-nowrap">{% if e.key == 'main' %}<span class="badge bg-primary">メイン</span>{% elif e.active %}<span class="badge bg-success">使用中</span>{% else %}<span class="badge bg-secondary">停止中</span>{% endif %}</td>
+            <td class="text-end">{% if e.members is none %}―{% else %}{{ e.members }}人{% endif %}</td>
+            <td class="small text-muted text-nowrap">{{ e.created_at or '―' }}{% if e.created_by %}<div>{{ e.created_by }}</div>{% endif %}</td>
+            <td class="text-nowrap">
+              {% if e.key != 'main' %}
+              <form method="post" action="{{ url_for('system.toggle_env', key=e.key) }}" class="d-inline"
+                    data-confirm="{% if e.active %}環境「{{ e.name }}」を停止します。この環境の画面は開けなくなり、定期メールも送りません（データは残り、再開できます）。よろしいですか？{% else %}環境「{{ e.name }}」を再開します。よろしいですか？{% endif %}"
+                    onsubmit="return confirm(this.dataset.confirm);">
+                <input type="hidden" name="version" value="{{ ev.version }}">
+                <input type="hidden" name="active" value="{{ '0' if e.active else '1' }}">
+                <button class="btn btn-sm {{ 'btn-outline-secondary' if e.active else 'btn-outline-success' }}">{{ '停止' if e.active else '再開' }}</button>
+              </form>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+<div class="card shadow-sm mb-4">
+  <div class="card-header bg-white fw-bold"><i class="bi bi-plus-circle"></i> 環境を追加</div>
+  <div class="card-body">
+    <form method="post" action="{{ url_for('system.create_env') }}" autocomplete="off">
+      <input type="hidden" name="version" value="{{ ev.version }}">
+      <input type="hidden" name="once" value="{{ submit_token() }}">
+      <div class="row g-2">
+        <div class="col-md-4">
+          <label class="form-label small fw-bold mb-0" for="env-new-name">環境の名前</label>
+          <input type="text" class="form-control form-control-sm" id="env-new-name" name="name" maxlength="{{ ev.name_max }}" required
+                 value="{{ ev.inputs.name or '' }}" placeholder="例: 〇〇グループ">
+        </div>
+        <div class="col-md-4">
+          <label class="form-label small fw-bold mb-0" for="env-new-username">最初のマネージャーのログインID</label>
+          <input type="text" class="form-control form-control-sm" id="env-new-username" name="username" maxlength="64" required
+                 value="{{ ev.inputs.username or '' }}" spellcheck="false">
+        </div>
+        <div class="col-md-4">
+          <label class="form-label small fw-bold mb-0" for="env-new-display">その人の氏名</label>
+          <input type="text" class="form-control form-control-sm" id="env-new-display" name="display_name" maxlength="128" required
+                 value="{{ ev.inputs.display_name or '' }}">
+        </div>
+      </div>
+      <div class="form-text">新しい環境の DB（<code>instance/envs/&lt;キー&gt;/app.db</code>）を作り、このマネージャーを登録します。URL は <code>/env/&lt;キー&gt;/</code> です。環境は削除できません（使わなくなったら停止します）。</div>
+      <div class="d-flex justify-content-end mt-2">
+        <button class="btn btn-primary" {% if ev.error %}disabled{% endif %}><i class="bi bi-plus-lg"></i> 環境を追加</button>
+      </div>
+    </form>
   </div>
 </div>
 {#=== static/css/style.css ===#}

@@ -122,6 +122,12 @@ Python のコードはすべてこの app.py にまとめている。ほかの�
       16-1. 勤務表の記号と日ごとの勤務
       16-2. 出勤表(横軸=日付、縦軸=勤務帯・勤務と人)
       16-3. 画面(勤務の設定・勤務表の入力〔年休の Blueprint に足すルート〕)
+  17. 複数の環境(グループ)
+      17-1. 環境の一覧(instance/environments.json)と、環境ごとのフォルダ・URL
+      17-2. 環境ごとのアプリと振り分け(EnvDispatcher)
+      17-3. 共通のログイン(instance/portal_sessions.json)
+      17-4. 画面(ログインの後の環境の選択・環境に入る)
+      17-5. 環境の追加・名前の変更・停止(システム設定の「環境」タブ。メインの環境のマネージャー)
 """
 import calendar
 import codecs
@@ -203,6 +209,7 @@ from flask_login import (
     logout_user,
 )
 from flask_sqlalchemy import SQLAlchemy
+from itsdangerous import BadSignature
 from jinja2 import BaseLoader, TemplateNotFound
 from openpyxl import Workbook
 from openpyxl.styles import Font
@@ -213,6 +220,7 @@ from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.exc import StaleDataError
 from werkzeug.exceptions import BadRequestKeyError, HTTPException, MethodNotAllowed, RequestEntityTooLarge
 from werkzeug.routing import IntegerConverter, RequestRedirect
+from werkzeug.utils import redirect as werkzeug_redirect
 from werkzeug.wsgi import get_input_stream
 
 # #### 1. 設定(config.py の初期値・instance/settings.json の画面の設定) ############################
@@ -567,10 +575,14 @@ def initial_values(app):
     return app.extensions.get(INITIAL_VALUES_KEY) or {}
 
 def apply_values(app, values, keys=ENV_KEYS):
-    """values の項目(keys)を実行中のアプリの設定(app.config)に入れる。値が変わった項目を返す。"""
+    """values の項目(keys)を実行中のアプリの設定(app.config)に入れる。値が変わった項目を返す。
+
+    ほかの環境(17 章)には、環境ごとの宛先(ENV_LOCAL_KEYS)を入れない(その環境の宛先の設定を使う)。
+    """
+    local = () if is_main_env(app) else ENV_LOCAL_KEYS
     changed = []
     for key in keys:
-        if key not in values:
+        if key not in values or key in local:
             continue
         if not same_value(app.config.get(key), values[key]):
             changed.append(key)
@@ -596,13 +608,18 @@ def load_config_layers(app):
     app.extensions[INITIAL_VALUES_KEY] = initial
     app.config.update(initial)  # FIELDS に無い項目(固定設定の上書きなど)も from_pyfile と同じように入れる
     try:
-        store = read_settings(app.instance_path)
+        # 基本設定はすべての環境で共通(ほかの環境もメインの環境の instance/settings.json を読む。17 章)
+        store = read_settings(shared_instance_path(app))
     except SettingsStoreError as exc:
         raise ConfigLoadError(
             "画面で設定した値のファイル instance/{} を読み込めません（{}）。ファイルを直すか、名前を変えて"
             "（画面の設定を捨てて）から、もう一度実行してください。".format(SETTINGS_FILENAME, exc)) from None
     app.extensions[SETTINGS_LIVE_VERSION_KEY] = store["file_version"]
     apply_values(app, effective_values(initial, store["values"]))
+    if not is_main_env(app):
+        # ほかの環境の宛先は、その環境の「基本設定」タブの設定だけ(config.py・基本設定の宛先には送らない)
+        for key in ENV_LOCAL_KEYS:
+            app.config[key] = copy.copy(getattr(Config, key))
     return store
 
 # #### 2. 共通の部品 ###############################################################################
@@ -636,7 +653,16 @@ def _unauthorized():
     """
     if prefers_json():
         return jsonify(ok=False, login_required=True, message=LOGIN_EXPIRED_JSON), 401
+    # 送り先のパスは、この環境の URL の先頭(ほかの環境の /env/<キー>。17 章)を含めて扱う
+    path = request.script_root + request.path
     changed_for = g.get("local_password_changed")
+    if not changed_for and multi_env_enabled() and portal_state()[0] is not None:
+        # 複数の環境で、共通のログインは有効(この環境のログインが無い・切れた): 案内を出さずにこの環境に入り直す(17 章)
+        next_url = request.url
+        if request.method not in ("GET", "HEAD", "OPTIONS"):
+            session[DROPPED_REQUEST_KEY] = path
+            next_url, _post_only = _page_for_next(path)
+        return redirect(url_for("auth.enter", next=_next_path(next_url)) if next_url else url_for("auth.enter"))
     if changed_for:
         # 固定ローカル管理者(admin など)のパスワードが、このブラウザでログインした後に変わった(自分の基本設定の
         # 保存・ほかのマネージャーの変更)。保存のボタンの二度押しの2回目もここに来る(1回目で変わった)ため、
@@ -646,13 +672,13 @@ def _unauthorized():
         next_url = request.url
         if request.method not in ("GET", "HEAD", "OPTIONS"):
             message += LOCAL_PASSWORD_CHANGED_POST
-            next_url, _post_only = _page_for_next(request.path)
+            next_url, _post_only = _page_for_next(path)
         session.pop(DROPPED_REQUEST_KEY, None)
         flash(message, "warning")
         return redirect(login_url(login_manager.login_view, next_url=next_url) if next_url
                         else url_for(login_manager.login_view))
     if request.method not in ("GET", "HEAD", "OPTIONS"):
-        session[DROPPED_REQUEST_KEY] = request.path
+        session[DROPPED_REQUEST_KEY] = path
     if g.get("login_expired"):
         # ログインしてから LOGIN_LIFETIME_HOURS 時間が過ぎた(load_user)
         flash(LOGIN_LIFETIME_EXPIRED.format(LOGIN_LIFETIME_HOURS), "warning")
@@ -846,8 +872,15 @@ def get_or_404(model, ident):
     return obj
 
 def display_app_name(app=None):
-    """メール・Word に書くアプリの名前(設定 APP_NAME。空なら「業務管理システム」)。"""
-    return (app or current_app).config.get("APP_NAME") or "業務管理システム"
+    """メール・Word に書くアプリの名前(設定 APP_NAME。空なら「業務管理システム」)。
+
+    複数の環境(17 章)のときは、環境の名前を付ける(どのグループのメール・週報かが分かるように)。
+    """
+    app = app or current_app
+    name = app.config.get("APP_NAME") or "業務管理システム"
+    if multi_env_enabled(app):
+        return "{}（{}）".format(name, env_name(app))
+    return name
 
 def get_active_users():
     """有効なユーザーを表示名順で取得する(担当者・受信者の選択肢用)。"""
@@ -972,7 +1005,8 @@ def _submitted_key(kind):
         return None
     fields = sorted((k, v) for k, v in request.form.items(multi=True) if k != "once")
     digest = hashlib.sha256(json.dumps(fields, ensure_ascii=False).encode("utf-8")).hexdigest()
-    return (current_user.id, kind, token, digest)
+    # ユーザーID は環境(17 章)ごとの DB の番号のため、環境のキーも含める
+    return (env_key(), current_user.id, kind, token, digest)
 
 def already_submitted(kind):
     """同じ印・同じ内容の登録が既に行われていれば、その行の URL(無ければ None)。lock_for_write の後で呼ぶ。"""
@@ -1743,7 +1777,8 @@ def start_in_thread(app, lock, name, work, error_message, prepare=None, cleanup=
 class MailJob:
     """メール機能(週報・期限超過通知・定型業務リマインド)の送信のとりまとめ。
 
-    送信(テスト・本番)は同時に1つだけ(lock。二重送信の防止)。成否にかかわらず store の「前回の結果」を上書きする。
+    送信(テスト・本番)は環境(17 章)ごとに同時に1つだけ(lock。二重送信の防止。メインの環境は lock、ほかの環境は
+    環境ごとのロック〔lock_for〕)。成否にかかわらず store の「前回の結果」を上書きする。
     label       : 機能の名前(ログ・メッセージ用)
     thread_name : 画面から別スレッドで送るときのスレッドの名前
     expected    : 利用者に伝える想定内のエラーの例外クラス(ログにトレースは残さない)
@@ -1758,9 +1793,13 @@ class MailJob:
         self.expected = expected
         self.rollback = rollback
 
+    def lock_for(self, app):
+        """その環境の送信中の印(メインの環境は self.lock)。"""
+        return env_scoped(app, "mail:" + self.label, threading.Lock, self.lock)
+
     def is_sending(self):
-        """送信(テスト・本番)の処理中か。"""
-        return self.lock.locked()
+        """この環境で送信(テスト・本番)の処理中か。"""
+        return self.lock_for(current_app._get_current_object()).locked()
 
     def error_message(self, app, exc):
         """例外を画面・前回の結果用の短い文言にする(想定外のものはログにトレースを残す)。"""
@@ -1790,23 +1829,24 @@ class MailJob:
                 app.logger.exception("%sの前回の結果を保存できませんでした", self.label)
             return {"ok": ok, "message": message}
 
-    def run(self, work):
-        """work() を実行する(処理中なら終わるまで待つ)。"""
-        with self.lock:
+    def run(self, app, work):
+        """環境 app の work() を実行する(その環境で処理中なら終わるまで待つ)。"""
+        with self.lock_for(app):
             return work()
 
-    def try_run(self, work):
-        """work() を実行する。処理中なら待たずに None を返す(画面のテスト送信用)。"""
-        if not self.lock.acquire(blocking=False):
+    def try_run(self, app, work):
+        """環境 app の work() を実行する。処理中なら待たずに None を返す(画面のテスト送信用)。"""
+        lock = self.lock_for(app)
+        if not lock.acquire(blocking=False):
             return None
         try:
             return work()
         finally:
-            self.lock.release()
+            lock.release()
 
     def start_background(self, app, work):
         """work() を別スレッドで始める(画面からの送信用)。既に処理中なら何もせず False を返す。"""
-        return start_in_thread(app, self.lock, self.thread_name, work,
+        return start_in_thread(app, self.lock_for(app), self.thread_name, work,
                                "{}の送信処理でエラーが発生しました".format(self.label))
 
 # ==== 2-7. メール機能(週報・期限超過通知・リマインド)の共通の部品 =================================
@@ -1849,8 +1889,12 @@ def legacy_settings_route(bp, tab):
                     methods=["POST"])
 
 def app_path(endpoint, values):
-    """画面のパス(例: /tasks/12?t=…)。リクエストの外(自動送信のスレッド)でも作れるよう URL マップから作る。"""
-    return current_app.url_map.bind("localhost").build(endpoint, values)
+    """画面のパス(例: /tasks/12?t=…)。リクエストの外(自動送信のスレッド)でも作れるよう URL マップから作る。
+
+    ほかの環境(17 章)の画面は、その環境の URL の先頭を付ける(例: /env/e2/tasks/12)。
+    """
+    prefix = env_url_prefix(env_key())
+    return current_app.url_map.bind("localhost", script_name=prefix or None).build(endpoint, values)
 
 def mail_footer():
     """メールの末尾の文(期限超過通知・定型業務リマインドで共通)。"""
@@ -2001,6 +2045,9 @@ def load_user(user_id):
         if state != LOGIN_SESSION_OK:
             if state == LOGIN_SESSION_EXPIRED:
                 g.login_expired = True
+            return None
+        # 複数の環境(17 章)のときは、共通のログインも有効で同じログインIDのときだけ
+        if not portal_allows(user):
             return None
     return user
 
@@ -3612,13 +3659,19 @@ def mail_settings():
     """現在のメール設定(画面の読み取り専用表示にも使う)。port_error はポート番号の誤り(無ければ None)。"""
     config = current_app.config
     port, port_error = smtp_port_value(config.get("MAIL_SMTP_PORT"))
+    if is_main_env():
+        to, cc = config.get("MAIL_TO"), config.get("MAIL_CC")
+    else:
+        # ほかの環境(17 章)の宛先は、その環境の「基本設定」タブの設定(基本設定の MAIL_TO・MAIL_CC は使わない)
+        local = ENV_MAIL_SETTINGS.load()
+        to, cc = local["MAIL_TO"], local["MAIL_CC"]
     return {
         "server": str(config.get("MAIL_SMTP_SERVER") or "").strip(),
         "port": port,
         "port_error": port_error,
         "mail_from": str(config.get("MAIL_FROM") or "").strip(),
-        "to": mail_addresses(config.get("MAIL_TO")),
-        "cc": mail_addresses(config.get("MAIL_CC")),
+        "to": mail_addresses(to),
+        "cc": mail_addresses(cc),
     }
 
 def mail_recipients(test=False, to=None, cc=None):
@@ -3990,17 +4043,19 @@ def _read_login_sessions(path):
     _login_sessions_cache[path] = (stamp, clean)
     return clean
 
-def _update_login_sessions(change):
-    """login_sessions.json を読み、change(内容の辞書を書き換える関数)を適用して書き込む。書けなければ OSError。"""
-    path = _login_sessions_path()
+def _update_login_sessions(change, path=None):
+    """login_sessions.json(path を渡すとそのファイル。共通のログインの記録〔17 章〕など)を読み、change(内容の辞書を
+    書き換える関数)を適用して書き込む。書けなければ OSError。
+    """
+    path = path or _login_sessions_path()
     with _login_sessions_lock:
         data = copy.deepcopy(_read_login_sessions(path))
         change(data)
         write_json(path, data)
         _login_sessions_cache.pop(path, None)
 
-def issue_login_session(user):
-    """ログインの印を作って記録し、印を返す(ログインのとき。セッションの SESSION_TOKEN_KEY に入れる)。"""
+def _issue_token(path, user_key):
+    """ログインの印を作って記録ファイル path の user_key の行に記録し、印を返す(期限を過ぎた印はここで消す)。"""
     token = secrets.token_urlsafe(24)
     now = _epoch_now()
     oldest = now - LOGIN_LIFETIME_HOURS * 3600
@@ -4010,13 +4065,17 @@ def issue_login_session(user):
             data[key] = {t: at for t, at in data[key].items() if at > oldest}
             if not data[key]:
                 del data[key]
-        tokens = data.setdefault(user.get_id(), {})
+        tokens = data.setdefault(user_key, {})
         tokens[token] = now
         for old, _at in sorted(tokens.items(), key=lambda item: item[1])[:max(len(tokens) - LOGIN_SESSIONS_PER_USER, 0)]:
             del tokens[old]
 
-    _update_login_sessions(change)
+    _update_login_sessions(change, path)
     return token
+
+def issue_login_session(user):
+    """ログインの印を作って記録し、印を返す(ログインのとき。セッションの SESSION_TOKEN_KEY に入れる)。"""
+    return _issue_token(_login_sessions_path(), user.get_id())
 
 def login_session_state(user):
     """このセッションの印が有効か: LOGIN_SESSION_OK / LOGIN_SESSION_EXPIRED(有効期限切れ) / LOGIN_SESSION_INVALID。"""
@@ -4030,8 +4089,10 @@ def login_session_state(user):
         return LOGIN_SESSION_EXPIRED
     return LOGIN_SESSION_OK
 
-def _revoke_login_sessions(user_key, token=None):
-    """ログインの印を消す(token が None ならその人のすべて)。書けなくても止めない(ログに残す)。"""
+def _revoke_login_sessions(user_key, token=None, path=None):
+    """ログインの印を消す(token が None ならその人のすべて。path はほかの記録ファイル〔17 章〕)。
+    書けなくても止めない(ログに残す)。
+    """
     def change(data):
         if token is None:
             data.pop(user_key, None)
@@ -4042,9 +4103,10 @@ def _revoke_login_sessions(user_key, token=None):
             data.pop(user_key, None)
 
     try:
-        _update_login_sessions(change)
+        _update_login_sessions(change, path)
     except OSError:
-        current_app.logger.exception("ログインの記録（instance/login_sessions.json）を更新できませんでした")
+        current_app.logger.exception("ログインの記録（instance/%s）を更新できませんでした",
+                                     os.path.basename(path or _login_sessions_path()))
 
 def end_login_session():
     """このブラウザのログインの印を消す(ログアウト・別のIDでのログインの前に呼ぶ)。"""
@@ -4278,8 +4340,70 @@ def _safe_next(value):
         return None
     return value
 
+LOGIN_NOT_REGISTERED = ("このIDはアプリに登録されていません(または無効化されています)。"
+                        "マネージャーにアカウント登録を依頼してください。")
+
+def _check_login_form(username, password):
+    """ログインの画面の ID・パスワードを確かめる(失敗の制限・本人確認・結果の形)。
+
+    戻り値: (認証の結果 info, None)。確かめられない・違うときは (None, ログインの画面〔案内付き〕の応答)。
+    """
+    refused, locked = begin_login_attempt(username)
+    if refused == "locked":
+        flash(LOGIN_LOCKED_MESSAGE.format(max(1, int(math.ceil(locked / 60)))), "danger")
+        return None, render_template("auth/login.html", username=username)
+    if refused:
+        # 確認中の試行と失敗の数が上限に届いている(同時に多く送られた)。パスワードは確かめない
+        # (ログには残さない。確認中の試行が失敗して制限を始めたときに残す)
+        flash(LOGIN_BUSY_MESSAGE, "danger")
+        return None, render_template("auth/login.html", username=username)
+
+    # ① 本人確認: 固定ローカル管理者は基本設定の ADMIN_PASSWORD で、
+    #    それ以外は ldap_client.py の authenticate()(LDAP＋固定ローカル)で確認する
+    #    (本番の ldap_client.py は LDAP認証API に問い合わせる。止まっている・つながらないときの例外は
+    #    内部エラーの画面にせず、ログイン画面で案内する。パスワードはログに出さない)
+    #    確認中の試行(begin_login_attempt)は、結果にかかわらず end_login_attempt で外す
+    #    (認証サーバーの例外・結果の形の誤りは、失敗として数えない)
+    failed = False
+    try:
+        try:
+            checked, info = _check_config_admin(username, password)
+            if not checked:
+                import ldap_client  # 本番環境ごとに差し替えるファイル(使うときに読み込む)
+
+                info = ldap_client.authenticate(username, password)
+        except Exception:
+            current_app.logger.exception("ログインの認証で例外が発生しました（ログインID: %s）", username)
+            flash(LOGIN_BACKEND_ERROR, "danger")
+            return None, render_template("auth/login.html", username=username)
+        failed = info is None
+    finally:
+        locked_now = end_login_attempt(username, failed)
+    if info is not None and (not isinstance(info, dict) or not isinstance(info.get("username"), str)
+                             or not info["username"].strip()):
+        # ldap_client.py の authenticate() の戻り値の形が違う(辞書でない・ログインIDが無い)。内部エラーの
+        # 画面にせず、認証サーバーにつながらないときと同じ案内にする(内容はログに残す。パスワードは出さない)
+        current_app.logger.error("ログインの認証の結果の形が正しくありません（ログインID: %s、種類: %s）",
+                                 username, type(info).__name__)
+        flash(LOGIN_BACKEND_ERROR, "danger")
+        return None, render_template("auth/login.html", username=username)
+    if info is None:
+        if username == ADMIN_USERNAME:
+            current_app.logger.warning("admin のログインに失敗しました（送信元: %s）", request.remote_addr)
+        if locked_now:
+            current_app.logger.warning("ログインに続けて失敗したため、%d秒の間ログインを制限します（ログインID: %s、送信元: %s）",
+                                       LOGIN_LOCK_SECONDS, username, request.remote_addr)
+            flash(LOGIN_LOCKED_MESSAGE.format(max(1, LOGIN_LOCK_SECONDS // 60)), "danger")
+        else:
+            flash("IDまたはパスワードが正しくありません。", "danger")
+        return None, render_template("auth/login.html", username=username)
+    return info, None
+
 @auth_bp.route("/login", methods=["GET", "POST"])
 def login():
+    # 複数の環境(17 章)のときは、共通の入口のログイン(本人を確かめた後に環境を選ぶ)
+    if multi_env_enabled():
+        return _portal_login()
     # すでにログイン済み(別のタブでログインし直した後に、残っていたログイン画面を開いた・送信したなど)なら、
     # ログインしたときと同じく next の画面(このアプリの中だけ)へ。無ければトップへ。
     # ただし、ログイン中の人と別のIDが送られたとき(共用のPCで、前の人のログインが残ったままの画面から
@@ -4299,55 +4423,9 @@ def login():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
-        refused, locked = begin_login_attempt(username)
-        if refused == "locked":
-            flash(LOGIN_LOCKED_MESSAGE.format(max(1, int(math.ceil(locked / 60)))), "danger")
-            return render_template("auth/login.html", username=username)
-        if refused:
-            # 確認中の試行と失敗の数が上限に届いている(同時に多く送られた)。パスワードは確かめない
-            # (ログには残さない。確認中の試行が失敗して制限を始めたときに残す)
-            flash(LOGIN_BUSY_MESSAGE, "danger")
-            return render_template("auth/login.html", username=username)
-
-        # ① 本人確認: 固定ローカル管理者は基本設定の ADMIN_PASSWORD で、
-        #    それ以外は ldap_client.py の authenticate()(LDAP＋固定ローカル)で確認する
-        #    (本番の ldap_client.py は LDAP認証API に問い合わせる。止まっている・つながらないときの例外は
-        #    内部エラーの画面にせず、ログイン画面で案内する。パスワードはログに出さない)
-        #    確認中の試行(begin_login_attempt)は、結果にかかわらず end_login_attempt で外す
-        #    (認証サーバーの例外・結果の形の誤りは、失敗として数えない)
-        failed = False
-        try:
-            try:
-                checked, info = _check_config_admin(username, password)
-                if not checked:
-                    import ldap_client  # 本番環境ごとに差し替えるファイル(使うときに読み込む)
-
-                    info = ldap_client.authenticate(username, password)
-            except Exception:
-                current_app.logger.exception("ログインの認証で例外が発生しました（ログインID: %s）", username)
-                flash(LOGIN_BACKEND_ERROR, "danger")
-                return render_template("auth/login.html", username=username)
-            failed = info is None
-        finally:
-            locked_now = end_login_attempt(username, failed)
-        if info is not None and (not isinstance(info, dict) or not isinstance(info.get("username"), str)
-                                 or not info["username"].strip()):
-            # ldap_client.py の authenticate() の戻り値の形が違う(辞書でない・ログインIDが無い)。内部エラーの
-            # 画面にせず、認証サーバーにつながらないときと同じ案内にする(内容はログに残す。パスワードは出さない)
-            current_app.logger.error("ログインの認証の結果の形が正しくありません（ログインID: %s、種類: %s）",
-                                     username, type(info).__name__)
-            flash(LOGIN_BACKEND_ERROR, "danger")
-            return render_template("auth/login.html", username=username)
-        if info is None:
-            if username == ADMIN_USERNAME:
-                current_app.logger.warning("admin のログインに失敗しました（送信元: %s）", request.remote_addr)
-            if locked_now:
-                current_app.logger.warning("ログインに続けて失敗したため、%d秒の間ログインを制限します（ログインID: %s、送信元: %s）",
-                                           LOGIN_LOCK_SECONDS, username, request.remote_addr)
-                flash(LOGIN_LOCKED_MESSAGE.format(max(1, LOGIN_LOCK_SECONDS // 60)), "danger")
-            else:
-                flash("IDまたはパスワードが正しくありません。", "danger")
-            return render_template("auth/login.html", username=username)
+        info, response = _check_login_form(username, password)
+        if response is not None:
+            return response
 
         if info.get("source") == "local":
             # 固定ローカル管理者は常に許可(アプリ登録チェック免除)
@@ -4356,10 +4434,7 @@ def login():
             # ② LDAPで実在確認できても、アプリ未登録/無効のIDはログインさせない
             user = _match_registered_user(info)
             if user is None:
-                flash(
-                    "このIDはアプリに登録されていません(または無効化されています)。"
-                    "マネージャーにアカウント登録を依頼してください。", "danger"
-                )
+                flash(LOGIN_NOT_REGISTERED, "danger")
                 return render_template("auth/login.html", username=username)
 
         try:
@@ -4379,6 +4454,95 @@ def login():
         return _redirect_after_login()
 
     return render_template("auth/login.html")
+
+def _portal_login_action(next_url):
+    """共通の入口のログイン(メインの環境の /login)の URL(next はログインの後に開く画面)。"""
+    return portal_url("/login") + ("?" + urlencode({"next": next_url}) if next_url else "")
+
+def _end_main_logins():
+    """メインの環境のこのブラウザのログインと共通のログインを終える(共用の PC で別の人がログインするとき)。"""
+    end_login_session()
+    logout_user()
+    session.pop(DROPPED_REQUEST_KEY, None)
+    session.pop(LOCAL_AUTH_KEY, None)
+    end_portal_session()
+
+def _after_portal_login(portal, next_url, rows=None):
+    """共通のログインの後の移動先: next があればその画面の環境へ入る。無ければ、入れる環境が1つならその環境、
+    複数なら環境の選択の画面。入れる環境が無くなっていれば(ログインの後に無効化された)ログインを終える。
+    """
+    if next_url:
+        return redirect(env_enter_url(env_key_of_path(next_url), next_url))
+    rows = accessible_envs(portal["u"], portal["l"]) if rows is None else rows
+    if len(rows) == 1:
+        return redirect(rows[0]["url"])
+    if not rows:
+        _end_main_logins()
+        return flash_redirect(LOGIN_NOT_REGISTERED, "danger", url_for("auth.login"))
+    return redirect(url_for("auth.envs"))
+
+def _portal_login():
+    """複数の環境のときのログイン(17 章)。
+
+    メインの環境の /login が共通の入口: 本人を確かめ(5-1 と同じ失敗の制限・認証)、入れる環境(有効なメンバーとして
+    登録されている環境。固定ローカル管理者はすべて)があれば共通のログインを始めて、その環境・環境の選択へ進む。
+    ほかの環境の /login は、共通のログインが有効ならこの環境に入り、無ければログインの画面を出す(送信先は共通の入口)。
+    """
+    next_url = _safe_next(request.args.get("next"))
+    logged_in = current_user.is_authenticated  # 先に確かめる(メインの環境の以前のログインから共通のログインを作る)
+    portal, _state = portal_state()
+    if not is_main_env():
+        if portal is not None:
+            return redirect(url_for("auth.enter", next=next_url) if next_url else url_for("auth.enter"))
+        if request.method == "POST":
+            return redirect(_portal_login_action(next_url), code=307)
+        return render_template("auth/login.html", login_action=_portal_login_action(next_url))
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        if portal is not None and (not username or username == portal["u"]):
+            return _after_portal_login(portal, next_url)   # 別のタブで既にログインした
+        if portal is not None or logged_in:
+            previous = current_user.display_name if logged_in else (portal["n"] or portal["u"])
+            _end_main_logins()
+            flash(f"{previous} さんのログインを終了しました（別のIDが入力されたため）。", "info")
+        info, response = _check_login_form(username, password)
+        if response is not None:
+            return response
+        local = info.get("source") == "local"
+        rows = accessible_envs(info["username"], local)
+        if not rows:
+            flash(LOGIN_NOT_REGISTERED, "danger")
+            return render_template("auth/login.html", username=username)
+        try:
+            start_portal_session(info["username"], _login_display_name(info) or "", local, info.get("role"))
+        except OSError:
+            current_app.logger.exception("共通のログインの記録（instance/%s）を保存できませんでした", PORTAL_SESSIONS_FILENAME)
+            flash(LOGIN_RECORD_ERROR, "danger")
+            return render_template("auth/login.html", username=username)
+        clear_login_failures(username)
+        return _after_portal_login(portal_state()[0], next_url, rows)
+    if portal is not None:
+        return _after_portal_login(portal, next_url)
+    return render_template("auth/login.html")
+
+def _next_path(url):
+    """戻る先の URL を、このサーバーの中のパス(と「?」以降)にする(スキーム・ホストを除く)。"""
+    parts = urlsplit(url)
+    return parts.path + ("?" + parts.query if parts.query else "")
+
+def _app_relative(path):
+    """このアプリの URL の先頭(script_root。ほかの環境は /env/<キー>)から始まるパスの、先頭を除いたもの。
+    このアプリの外のパスなら None。
+    """
+    root = request.script_root
+    if not root:
+        return path
+    if path == root:
+        return "/"
+    if path.startswith(root + "/"):
+        return path[len(root):]
+    return None
 
 def _redirect_after_login():
     """ログインの後(またはログイン済みでログイン画面を開いたとき)の移動先。
@@ -4410,7 +4574,9 @@ _DOWNLOAD_ENDPOINT_PREFIXES = ("export.",)
 def _is_download(path):
     """path(このアプリの中のパス)が、GET で開くとファイルのダウンロードになる URL か。"""
     adapter = current_app.url_map.bind("localhost")
-    candidate = urlsplit(path).path
+    candidate = _app_relative(urlsplit(path).path)
+    if candidate is None:
+        return False
     for _ in range(2):  # 末尾の「/」の違い(アプリが移動先へ転送する)は、移動先で確かめる
         try:
             endpoint, _args = adapter.match(candidate, method="GET")
@@ -4430,15 +4596,19 @@ def _page_for_next(path):
     入る。そのまま GET で移動すると 405 になるため、上の階層で GET で開ける画面に戻す
     (例: /tasks/1/status → /tasks/1、/system/settings/config → /system/settings)。
     ログアウトには戻らない(ログインした直後にまたログアウトしないように)。
+    path はこのアプリの URL の先頭(ほかの環境は /env/<キー>。17 章)から始まるパス。このアプリの外のパスは None。
     """
     adapter = current_app.url_map.bind("localhost")
     parts = urlsplit(path)
-    candidate, post_only = parts.path, False
+    local = _app_relative(parts.path)
+    if local is None:
+        return None, False
+    candidate, post_only = local, False
     for _ in range(32):  # 階層をたどる回数の上限(末尾の「/」の補正を含む)
         try:
             endpoint, _args = adapter.match(candidate, method="GET")
         except RequestRedirect as exc:
-            if candidate == parts.path:
+            if candidate == local:
                 return path, False  # 末尾の「/」の違いなど(開くとアプリが移動先へ転送する。今までどおり)
             # 上の階層の末尾の「/」の違い: 移動先のパスで確かめ直す
             candidate = urlsplit(exc.new_url).path
@@ -4450,9 +4620,9 @@ def _page_for_next(path):
         if endpoint == "auth.logout":
             return None, post_only
         if endpoint is not None:
-            if candidate == parts.path:
+            if candidate == local:
                 return path, post_only
-            return candidate, post_only
+            return request.script_root + candidate, post_only
         if candidate in ("", "/"):
             break
         candidate = candidate.rstrip("/").rsplit("/", 1)[0] or "/"
@@ -4469,7 +4639,16 @@ def logout():
     logout_user()
     session.pop(DROPPED_REQUEST_KEY, None)  # ログインが切れた状態で送った操作の印も消す
     session.pop(LOCAL_AUTH_KEY, None)  # 固定ローカル管理者のパスワードの印も消す
-    return flash_redirect("ログアウトしました。", "info", url_for("auth.login"))
+    if not is_main_env():
+        # ほかの環境(17 章): 共通のログインを終えて、共通の入口のログアウトへ(メインの環境のクッキーと、
+        # このブラウザのほかの環境のログインもそこで終える)
+        end_portal_session()
+        return redirect(portal_url("/logout"))
+    response = flash_redirect("ログアウトしました。", "info", url_for("auth.login"))
+    if multi_env_enabled() or session.get(PORTAL_SESSION_KEY) is not None:
+        end_portal_session()
+        end_env_logins(response)
+    return response
 
 # ==== 5-2. トップページ(ダッシュボード) ===========================================================
 # メンバーの個人ダッシュボード。マネージャーのトップはマネージャーダッシュボード(5-7)のため、
@@ -8891,7 +9070,7 @@ def run_weekly(app, start, end, trigger, deliver, send_date=None):
             except Exception as exc:
                 return {"ok": False, "message": WEEKLY_JOB.error_message(app, exc), "filename": None, "data": None}
             return dict(result, ok=True, message=_weekly_summary(written, users))
-    return WEEKLY_JOB.run(lambda: _deliver_weekly(app, start, end, trigger, deliver, send_date))
+    return WEEKLY_JOB.run(app, lambda: _deliver_weekly(app, start, end, trigger, deliver, send_date))
 
 def start_weekly_background(app, start, end, trigger, deliver, send_date=None):
     """テスト送信・本番送信を別スレッドで始める(画面の「今すぐ作成」用)。"""
@@ -9365,7 +9544,7 @@ def run_overdue(app, trigger, test=False, today=None):
     戻り値: {"ok", "message"}。例外は外に出さず、失敗は ok=False とメッセージで返す。
     送信は同時に1つだけ(処理中なら終わるまで待つ)。
     """
-    return OVERDUE_JOB.run(lambda: _deliver_overdue(app, trigger, test, today))
+    return OVERDUE_JOB.run(app, lambda: _deliver_overdue(app, trigger, test, today))
 
 def start_overdue_background(app, trigger, test=False):
     """送信を別スレッドで始める(画面の「今すぐ送信」用)。
@@ -10074,10 +10253,14 @@ def _save_skill_map_ai(**values):
 
 SKILL_AI_FILE_LOCK = threading.Lock()
 
+def skill_map_ai_lock(app=None):
+    """スキルマップのAI分析の実行中の印(環境ごと。メインの環境は SKILL_MAP_AI_LOCK。17 章)。"""
+    return env_scoped(app or current_app._get_current_object(), "skill_map_ai", threading.Lock, SKILL_MAP_AI_LOCK)
+
 def skill_map_analysis_state():
     """画面に出す分析の状態(running: 実行中、interrupted: 実行中のまま中断した)。"""
     data = load_skill_map_ai()
-    running = SKILL_MAP_AI_LOCK.locked()
+    running = skill_map_ai_lock().locked()
     data["running"] = running
     data["interrupted"] = data.get("status") == JUDGE_RUNNING and not running
     return data
@@ -10183,11 +10366,11 @@ def start_skill_map_analysis(app, username):
             run_skill_map_analysis(username)
 
     if app.config.get("TESTING"):
-        with SKILL_MAP_AI_LOCK:
+        with skill_map_ai_lock(app):
             prepare()
             run_skill_map_analysis(username)
         return True, "AIで分析しました。"
-    if not start_in_thread(app, SKILL_MAP_AI_LOCK, "skill-map-ai", work, "スキルマップのAI分析に失敗しました",
+    if not start_in_thread(app, skill_map_ai_lock(app), "skill-map-ai", work, "スキルマップのAI分析に失敗しました",
                            prepare=prepare):
         return False, "分析を実行中です。終わるまでお待ちください。"
     return True, "AIで分析しています（数十秒〜数分かかります）。終わると自動で表示されます。"
@@ -13349,10 +13532,18 @@ AI_ANALYSIS_RESULT_LABEL = "AI分析の結果ファイル"
 AI_ANALYSIS_RESULT_VERSION = 1
 ANALYSIS_MAX_FAILURES = 3
 
+# 実行中の印と進み具合(メインの環境。ほかの環境は環境ごと〔_analysis_lock_for・_analysis_state_for。17 章〕)
 _analysis_lock = threading.Lock()
 _analysis_result_lock = threading.Lock()
-_analysis_state = {"step": "", "done": 0, "total": 0, "started_at": None, "period": "",
-                   "last_error": None, "finished_at": None}
+_ANALYSIS_STATE_INITIAL = {"step": "", "done": 0, "total": 0, "started_at": None, "period": "",
+                           "last_error": None, "finished_at": None}
+_analysis_state = dict(_ANALYSIS_STATE_INITIAL)
+
+def _analysis_lock_for(app):
+    return env_scoped(app, "ai_analysis_lock", threading.Lock, _analysis_lock)
+
+def _analysis_state_for(app):
+    return env_scoped(app, "ai_analysis_state", lambda: dict(_ANALYSIS_STATE_INITIAL), _analysis_state)
 
 class AnalysisRun:
     """1回の AI分析(collect_analysis の結果 data を材料に AI を呼び、保存する結果を作る)。"""
@@ -14103,12 +14294,12 @@ def save_ai_analysis_result(result):
         write_json(_ai_analysis_result_path(), result)
 
 def ai_analysis_running():
-    """AI分析を実行中か。"""
-    return _analysis_lock.locked()
+    """この環境で AI分析を実行中か。"""
+    return _analysis_lock_for(current_app._get_current_object()).locked()
 
 def ai_analysis_status():
     """実行中の表示に使う状態(画面と GET /manager/analysis/status)。"""
-    state = _analysis_state
+    state = _analysis_state_for(current_app._get_current_object())
     running = ai_analysis_running()
     return {
         "running": running,
@@ -14122,7 +14313,7 @@ def ai_analysis_status():
     }
 
 def _set_progress(done, total, step):
-    _analysis_state.update(done=done, total=total, step=step)
+    _analysis_state_for(current_app._get_current_object()).update(done=done, total=total, step=step)
 
 def run_ai_analysis_job(app, args):
     """AIで分析して結果を保存する(呼び出したスレッドで最後まで実行)。
@@ -14133,7 +14324,7 @@ def run_ai_analysis_job(app, args):
         try:
             now = _now()
             period = analysis_period(args, now.date())
-            _analysis_state["period"] = period["label"]
+            _analysis_state_for(app)["period"] = period["label"]
             data = collect_analysis(period, now, load_ai_analysis_settings())
             result = run_ai_analysis(data, progress=_set_progress)
             result["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -14151,7 +14342,7 @@ def run_ai_analysis_job(app, args):
             app.logger.exception("AI分析に失敗しました")
             ok, message = False, _mask_api_key("AI分析の実行中にエラーが発生しました: {}".format(exc),
                                                _ai_settings()["api_key"])
-        _analysis_state.update(last_error=None if ok else one_line(message, 500), finished_at=datetime.now())
+        _analysis_state_for(app).update(last_error=None if ok else one_line(message, 500), finished_at=datetime.now())
         return ok, message
 
 def start_ai_analysis(app, args):
@@ -14164,10 +14355,10 @@ def start_ai_analysis(app, args):
         label = ""
 
     def reset_state():
-        _analysis_state.update(step="準備しています", done=0, total=0, started_at=datetime.now(),
-                               period=label, last_error=None)
+        _analysis_state_for(app).update(step="準備しています", done=0, total=0, started_at=datetime.now(),
+                                        period=label, last_error=None)
 
-    return start_in_thread(app, _analysis_lock, "ai-analysis", lambda: run_ai_analysis_job(app, args),
+    return start_in_thread(app, _analysis_lock_for(app), "ai-analysis", lambda: run_ai_analysis_job(app, args),
                            "AI分析でエラーが発生しました", prepare=reset_state)
 
 # ==== 9-8. AI分析: 結果の反映(画面・チームのまとめの材料) =========================================
@@ -15834,11 +16025,11 @@ def run_routine_reminders(app, trigger, now=None, test=False):
 
     戻り値: {"ok", "message"}。例外は外に出さず、失敗は ok=False とメッセージで返す。
     """
-    return REMINDER_JOB.run(lambda: _deliver_reminders(app, trigger, now, test))
+    return REMINDER_JOB.run(app, lambda: _deliver_reminders(app, trigger, now, test))
 
 def try_run_routine_reminders(app, trigger, now=None, test=False):
     """run_routine_reminders と同じ。ただし送信の処理中なら待たずに None を返す(画面のテスト送信用)。"""
-    return REMINDER_JOB.try_run(lambda: _deliver_reminders(app, trigger, now, test))
+    return REMINDER_JOB.try_run(app, lambda: _deliver_reminders(app, trigger, now, test))
 
 def reminder_status_context():
     """システム設定の「定型業務リマインド」タブの状況の表示(次回の送信・前回の結果・注意・プレビュー。2-7 の
@@ -16802,12 +16993,13 @@ def refresh_live_config(app):
     要求のたび(before_request)と、自動送信の前(_execute)に呼ぶ。ファイルの版(更新日時とサイズ)が反映済みと
     同じなら何もしない。読めないファイルはそのままにして(反映せず)ログに残す。ログには項目名だけを書く。
     """
-    version = file_version(settings_path(app.instance_path))
+    shared = shared_instance_path(app)  # 基本設定はすべての環境で共通(17 章)
+    version = file_version(settings_path(shared))
     if version == app.extensions.get(SETTINGS_LIVE_VERSION_KEY):
         return []
     with settings_store_lock:
         try:
-            store = read_settings(app.instance_path)
+            store = read_settings(shared)
         except SettingsStoreError as exc:
             app.extensions[SETTINGS_LIVE_VERSION_KEY] = version  # 直るまで毎回は読まない(直ると版が変わる)
             app.logger.warning("ほかのサーバーで保存された基本設定を読み込めませんでした: %s", exc)
@@ -16832,9 +17024,10 @@ def save_config_form(app, form, username):
         return SaveResult(status, errors or {}, state, list(changed), list(reset), list(restart_changed),
                           list(applied), message)
 
+    shared = shared_instance_path(app)
     with settings_store_lock:
         try:
-            store = read_settings(app.instance_path)
+            store = read_settings(shared)
         except SettingsStoreError as exc:
             return result(CONFIG_SAVE_UNREADABLE, message=str(exc))
         if form.get("version", "") != str(store["version"]):
@@ -16856,7 +17049,7 @@ def save_config_form(app, form, username):
 
         new_values = apply_changes(store["values"], changes)
         try:
-            write_settings(app.instance_path, new_values, username, expected_version=store["version"])
+            write_settings(shared, new_values, username, expected_version=store["version"])
         except SettingsConflictError:
             return result(CONFIG_SAVE_CONFLICT, message=MSG_CONFLICT)
         except (OSError, SettingsStoreError) as exc:
@@ -16864,7 +17057,7 @@ def save_config_form(app, form, username):
             return result(CONFIG_SAVE_ERROR, state=state,
                           message="instance/{} を保存できませんでした（{}）。".format(
                               SETTINGS_FILENAME, exc.__class__.__name__))
-        app.extensions[SETTINGS_LIVE_VERSION_KEY] = file_version(settings_path(app.instance_path))
+        app.extensions[SETTINGS_LIVE_VERSION_KEY] = file_version(settings_path(shared))
 
         if has_request_context():
             # 保存のボタンの二度押しの2回目を「ほかの人の保存」と案内しないように、印と内容を覚える
@@ -16981,7 +17174,7 @@ def config_form_context(app, state=None, errors=None):
         # 保存(一時ファイルからの置き換え)と同時に読むと、Windows では置き換えが PermissionError になるため、
         # 読み込みも保存と同じロックの中で行う
         with settings_store_lock:
-            store = read_settings(app.instance_path)
+            store = read_settings(shared_instance_path(app))
         file_error = None
     except SettingsStoreError as exc:
         store, file_error = None, str(exc)
@@ -17066,6 +17259,9 @@ TAB_OVERDUE = "overdue"
 TAB_SKILL_AI = "skill_ai"
 TAB_ANALYSIS = "analysis"
 TAB_REMINDER = "reminder"
+# 複数の環境(17 章): 環境の一覧(メインの環境だけ)と、ほかの環境の宛先(その環境の基本設定タブで保存する)
+TAB_ENVS = "envs"
+TAB_RECIPIENTS = "recipients"
 
 # (キー, 表示名, アイコン)
 TABS = (
@@ -17077,6 +17273,70 @@ TABS = (
     (TAB_REMINDER, "定型業務リマインド", "bi-bell"),
 )
 TAB_KEYS = tuple(key for key, _label, _icon in TABS)
+TAB_ENVS_LABEL = ("環境", "bi-collection")
+
+def system_tabs():
+    """この環境のシステム設定のタブ。メインの環境は「環境」タブも。ほかの環境(17 章)の「基本設定」タブは、
+    この環境の宛先と、すべての環境で共通の設定(読み取り専用)。
+    """
+    if is_main_env():
+        return TABS + ((TAB_ENVS,) + TAB_ENVS_LABEL,)
+    return ((TAB_CONFIG, "基本設定", "bi-sliders"),) + TABS[1:]
+
+# ---- ほかの環境のメールの宛先(17 章。instance/envs/<キー>/env_mail_settings.json) ----
+# 週報・期限超過通知の宛先(To)・同報(Cc)。メインの環境の宛先は今までどおり基本設定の MAIL_TO・MAIL_CC。
+# ほかの環境では基本設定の MAIL_TO・MAIL_CC(と config.py の値)は使わない(別のグループの宛先に送らないように)。
+ENV_MAIL_DEFAULTS = {"MAIL_TO": [], "MAIL_CC": []}
+# すべての環境で共通の設定の表示(ほかの環境の基本設定タブ)に出さない項目
+ENV_HIDDEN_SHARED_KEYS = ("SECRET_KEY", "ADMIN_PASSWORD", "LDAP_API_URL")
+
+def _address_items(value):
+    """保存した宛先の一覧(文字列の一覧だけ。正しくなければ None で既定値のまま)。"""
+    if not isinstance(value, list):
+        return None
+    return [item for item in value if isinstance(item, str) and item.strip()][:ADDRESS_MAX_COUNT]
+
+ENV_MAIL_SETTINGS = JsonSettings(
+    "env_mail_settings.json", "この環境のメールの宛先の設定ファイル", ENV_MAIL_DEFAULTS,
+    (("MAIL_TO", _address_items), ("MAIL_CC", _address_items)))
+
+def parse_env_mail_form(form):
+    """ほかの環境の基本設定タブの宛先(MAIL_TO・MAIL_CC)の入力を確かめる。戻り値: (values, errors)。
+
+    基本設定と同じ形式の確認(1行に1件)と、送信を許可するドメインの確認(そのドメイン以外は保存できない)。
+    """
+    values, errors = {}, []
+    domains = allowed_mail_domains()
+    for key in ENV_LOCAL_KEYS:
+        field = FIELD_MAP[key]
+        raw = str(form.get(key, ""))
+        addresses, error = _parse_addresses(field, raw)
+        if error:
+            errors.append("{}: {}".format(field.label, error))
+            values[key] = [item.strip() for item in _ADDRESS_SPLIT.split(raw) if item.strip()][:ADDRESS_MAX_COUNT]
+            continue
+        blocked = blocked_by_domain(addresses, domains)
+        if blocked:
+            errors.append("{}: 送信を許可するドメイン（{}）以外のアドレスは保存できません: {}".format(
+                field.label, domains_label(domains), "、".join(item[:80] for item in blocked[:3])))
+        values[key] = addresses
+    return values, errors
+
+def env_mail_form_context(settings):
+    """ほかの環境の基本設定タブの表示用の値(この環境の宛先と、すべての環境で共通の設定〔読み取り専用〕)。"""
+    domains = allowed_mail_domains()
+    return {
+        "settings": settings,
+        "to_text": "\n".join(settings["MAIL_TO"]),
+        "cc_text": "\n".join(settings["MAIL_CC"]),
+        "to_field": FIELD_MAP["MAIL_TO"],
+        "cc_field": FIELD_MAP["MAIL_CC"],
+        "domains_label": domains_label(domains) if domains else "",
+        "shared": [{"field": f, "text": _summary(f, current_app.config.get(f.key))}
+                   for f in FIELDS if f.key not in ENV_LOCAL_KEYS and f.key not in ENV_HIDDEN_SHARED_KEYS],
+        "mail_problem": check_mail_settings(),
+        "env_name": env_name(),
+    }
 
 # 機能ごとの設定(画面のJSONファイル)の扱い方
 #   label         : ログに出す機能の名前
@@ -17104,6 +17364,10 @@ FEATURES = {
     TAB_REMINDER: SettingsFeature(
         "定型業務リマインド", "定型業務リマインドの設定を保存しました。", REMINDER_SETTINGS, parse_reminder_settings_form,
         settings_with_input, reminder_settings_form_context, "定型業務リマインドは自動送信されず、テスト送信もできません"),
+    # ほかの環境の宛先(17 章。その環境の「基本設定」タブに表示する。メインの環境では使わない)
+    TAB_RECIPIENTS: SettingsFeature(
+        "この環境のメールの宛先", "この環境のメールの宛先を保存しました。", ENV_MAIL_SETTINGS, parse_env_mail_form,
+        settings_with_input, env_mail_form_context, "週報・期限超過通知はこの環境の宛先に送れません"),
 }
 
 # AI接続テストで送る問い合わせ(短く、応答も短くなるもの)
@@ -17113,22 +17377,27 @@ AI_TEST_MESSAGES = [
 AI_REPLY_MAX = 80
 
 def _tab_url(tab):
-    return url_for("system.settings", tab=tab)
+    # ほかの環境の宛先(TAB_RECIPIENTS)は基本設定タブにある
+    return url_for("system.settings", tab=TAB_CONFIG if tab == TAB_RECIPIENTS else tab)
 
 def _render_system_settings(tab, status=200, config_state=None, config_errors=None, inputs=None,
-                            versions=None):
+                            versions=None, env_inputs=None):
     """設定画面を表示する。
 
     config_state / config_errors : 基本設定の入力エラーで再表示するときの入力と誤り
     inputs                       : 機能の設定の入力エラーで再表示するときの {タブ: 設定}
     versions                     : 機能の設定のフォームの控え(hidden の version)を指定するときの {タブ: 控え}
                                    (入力エラーの再表示は送られた控えのまま。無ければ保存済みの設定から作る)
+    env_inputs                   : 環境の追加(「環境」タブ。17 章)の入力エラーで再表示するときの入力
     """
     app = current_app._get_current_object()
+    main = is_main_env(app)
     inputs = inputs or {}
     versions = versions or {}
     contexts = {}
     for key, feature in FEATURES.items():
+        if key == TAB_RECIPIENTS and main:
+            continue  # メインの環境の宛先は基本設定(MAIL_TO・MAIL_CC)
         saved = feature.store.load()
         settings = inputs[key] if key in inputs else saved
         contexts[key] = feature.context(settings)
@@ -17141,9 +17410,13 @@ def _render_system_settings(tab, status=200, config_state=None, config_errors=No
         contexts[key]["file_error_note"] = feature.file_note
     return render_template(
         "system/settings.html",
-        tab=tab,
-        tabs=TABS,
-        cfg=config_form_context(app, state=config_state, errors=config_errors),
+        tab=TAB_CONFIG if tab == TAB_RECIPIENTS else tab,
+        tabs=system_tabs(),
+        env_main=main,
+        # 基本設定はメインの環境だけで編集する(ほかの環境は宛先と共通の設定の表示。17 章)
+        cfg=config_form_context(app, state=config_state, errors=config_errors) if main else {},
+        rc=contexts.get(TAB_RECIPIENTS),
+        ev=envs_tab_context(env_inputs) if main else None,
         wk=contexts[TAB_WEEKLY],
         od=contexts[TAB_OVERDUE],
         sa=contexts[TAB_SKILL_AI],
@@ -17158,11 +17431,18 @@ def system_index():
 
 @system_bp.route("/settings", endpoint="settings")
 def system_settings():
-    return _render_system_settings(choice_or_default(request.args.get("tab"), TAB_KEYS, TAB_CONFIG))
+    keys = tuple(key for key, _label, _icon in system_tabs())
+    return _render_system_settings(choice_or_default(request.args.get("tab"), keys, TAB_CONFIG))
+
+def _require_shared_settings_env():
+    """すべての環境で共通の基本設定の保存・接続テストは、メインの環境だけ(ほかの環境は 404。17 章)。"""
+    if not is_main_env():
+        abort(404)
 
 # ---- 基本設定(画面の設定の層 instance/settings.json を編集する) ----
 @system_bp.route("/settings/config", methods=["POST"])
 def save_config():
+    _require_shared_settings_env()
     app = current_app._get_current_object()
     result = save_config_form(app, request.form, current_user.username)
 
@@ -17205,6 +17485,7 @@ def save_config():
 @system_bp.route("/settings/test-mail", methods=["POST"])
 def test_mail():
     """保存済みの設定で、差出人(MAIL_FROM)宛てに短いメールを送る。"""
+    _require_shared_settings_env()
     app = current_app._get_current_object()
     subject = "【接続テスト】{}".format(display_app_name(app))
     text = (
@@ -17226,6 +17507,7 @@ def test_mail():
 @system_bp.route("/settings/test-ai", methods=["POST"])
 def test_ai():
     """保存済みの設定で、AIに短い問い合わせを1回送る。"""
+    _require_shared_settings_env()
     app = current_app._get_current_object()
     reply, error = ai_chat(AI_TEST_MESSAGES)
     if error:
@@ -17251,6 +17533,8 @@ def _save_feature(tab):
     (フォームの hidden の version。JsonSettings.save_checked)。重なったときは保存せず、変わった項目を
     今の設定にし、ほかの項目は入力中の値のまま再表示する(その画面からもう一度保存できる)。
     """
+    if tab == TAB_RECIPIENTS and is_main_env():
+        abort(404)  # メインの環境の宛先は基本設定(MAIL_TO・MAIL_CC)
     feature = FEATURES[tab]
     store = feature.store
     sent_version = request.form.get("version")
@@ -17449,13 +17733,23 @@ def _tick(app, fired, now, start_thread=True):
     return started
 
 def _loop(app, interval):
+    """約 interval 秒ごとに、環境(17 章。メインと、停止していないほかの環境)ごとにジョブを確かめる。
+
+    実行済みの記録(fired)も環境ごと。1つの環境の確認で例外が起きても、ほかの環境の確認は続ける。
+    """
     fired = {}
     wait = threading.Event()
     while True:
         try:
-            _tick(app, fired, datetime.now())
+            apps = scheduled_apps(app)
         except Exception:
-            app.logger.exception("定期メールのスケジューラでエラーが発生しました")
+            app.logger.exception("定期メールのスケジューラで環境の一覧を読めませんでした")
+            apps = [app]
+        for target in apps:
+            try:
+                _tick(target, fired.setdefault(env_key(target), {}), datetime.now())
+            except Exception:
+                target.logger.exception("定期メールのスケジューラでエラーが発生しました")
         wait.wait(interval)
 
 def start_scheduler(app, interval=CHECK_INTERVAL):
@@ -17557,6 +17851,7 @@ def _standby_scheduler(app, interval):
 def scheduler_is_stopped(app):
     """自動送信のスケジューラが、このフォルダのどのプロセスでも動いていないか(画面の注意の表示用)。
 
+    スケジューラは1つですべての環境(17 章)を確かめるため、ロックはメインの環境の instance/scheduler.lock。
     このプロセスがロックを持っていれば、スケジューラのスレッドが動いているかで決める。
     持っていなければ、instance/scheduler.lock のロックを取れるか(取れたらすぐ外す)で確かめる:
     取れない = ほかのプロセスが持っている(動いている)。ファイルが無い・取れた = どこでも動いていない。
@@ -17564,7 +17859,7 @@ def scheduler_is_stopped(app):
     """
     if _scheduler_lock_file is not None:
         return not (_scheduler_thread is not None and _scheduler_thread.is_alive())
-    path = os.path.join(app.instance_path, SCHEDULER_LOCK_FILENAME)
+    path = os.path.join(shared_instance_path(app), SCHEDULER_LOCK_FILENAME)
     if not os.path.isfile(path):
         return True
     try:
@@ -17813,10 +18108,11 @@ def _ensure_secret_key(app):
     running = app.config.get("SECRET_KEY")
     if isinstance(running, str) and running:
         return False
+    shared = shared_instance_path(app)  # 鍵はすべての環境で共通(ほかの環境のクッキーも同じ鍵で作る。17 章)
     with settings_store_lock:
-        lock_file = _lock_settings_file(app.instance_path)
+        lock_file = _lock_settings_file(shared)
         try:
-            key, generated = _generate_secret_key(app.instance_path)
+            key, generated = _generate_secret_key(shared)
         except (OSError, SettingsStoreError) as exc:
             raise ConfigLoadError(
                 "SECRET_KEY が未設定のため鍵を生成しましたが、instance/{} に保存できませんでした（{}）。"
@@ -17825,7 +18121,7 @@ def _ensure_secret_key(app):
                 "もう一度実行してください。".format(SETTINGS_FILENAME, exc.__class__.__name__)) from None
         finally:
             _unlock_settings_file(lock_file)
-        app.extensions[SETTINGS_LIVE_VERSION_KEY] = file_version(settings_path(app.instance_path))
+        app.extensions[SETTINGS_LIVE_VERSION_KEY] = file_version(settings_path(shared))
     app.config["SECRET_KEY"] = key
     if generated:
         app.logger.info("SECRET_KEY が未設定のため生成し、instance/%s に保存しました（値は表示しません）。",
@@ -17869,9 +18165,13 @@ def prepare_instance(app, create_tables=True):
         return
     os.makedirs(app.instance_path, exist_ok=True)
     store = load_config_layers(app)
-    _hint_old_config(app, store)
-    _hint_admin_password(app)
+    if is_main_env(app):
+        _hint_old_config(app, store)
+        _hint_admin_password(app)
     _ensure_secret_key(app)
+    if not is_main_env(app):
+        # ほかの環境(17 章)のクッキーは環境ごと(同じブラウザで別の環境を同時に開ける。メインの環境のクッキーは読むだけ)
+        app.config["SESSION_COOKIE_NAME"] = ENV_COOKIE_PREFIX + env_key(app)
 
     app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///{}".format(instance_db_path(app))
     db.init_app(app)
@@ -18079,16 +18379,17 @@ def frame_options(response):
     response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
     return response
 
-def create_app():
-    """アプリを作る。「flask --app app <コマンド>」はこの関数でアプリを作る。
+def _new_app(env=None, shared_instance=None):
+    """アプリを組み立てる(設定・DB はまだ読まない。prepare_instance で読む)。
 
-    - flask run         : instance を用意し、定期メールの自動送信スケジューラも起動する
-    - flask seed / migrate など、このアプリのコマンド:
-                          コマンドを探すために読み込まれる段階では instance に触れない
-                          (各コマンドが prepare_instance() を呼ぶ。migrate --db は既定のDBに触れない)
-    - それ以外(テスト・flask routes など): instance を用意する(スケジューラは起動しない)
+    env はほかの環境(17 章)のキー(メインの環境は None)。ほかの環境のアプリは instance/envs/<キー> を
+    instance フォルダにし、基本設定は共通の instance フォルダ(shared_instance)から読む。
     """
-    app = Flask(__name__, instance_relative_config=True, static_folder=None, template_folder=None)
+    if env is None:
+        app = Flask(__name__, instance_relative_config=True, static_folder=None, template_folder=None)
+    else:
+        app = Flask(__name__, instance_path=env_instance_path(shared_instance, env), instance_relative_config=True,
+                    static_folder=None, template_folder=None)
     # 運用の記録(設定の変更・自動送信・ほかのプロセスで動いているスケジューラなど。app.logger.info)は、
     # --debug でない通常の起動でも表示する(Flask のロガーは既定で WARNING 以上しか表示しないため)
     if app.logger.getEffectiveLevel() > logging.INFO:
@@ -18098,6 +18399,9 @@ def create_app():
     app.jinja_loader = SectionTemplateLoader(template_sections)
     app.add_url_rule("/static/<path:filename>", endpoint="static", view_func=send_static_section)
     app.config.from_object(Config)
+    if env is not None:
+        app.config[ENV_CONFIG_KEY] = env
+        app.config[SHARED_INSTANCE_CONFIG] = shared_instance
 
     login_manager.init_app(app)
     # URL の <int:...> は SQLite の整数の範囲まで(範囲外の ID は 404。Blueprint の登録より前に差し替える)
@@ -18107,7 +18411,9 @@ def create_app():
 
     @app.context_processor
     def inject_globals():
-        return {"app_name": app.config.get("APP_NAME", "業務管理"), "submit_token": submit_token}
+        # env_nav: 複数の環境(17 章)のときにナビに出す環境の名前・切り替えの URL(1つの環境のあいだは None)
+        return {"app_name": app.config.get("APP_NAME", "業務管理"), "submit_token": submit_token,
+                "env_nav": env_nav_context()}
 
     # 送信された入力が大きすぎる(フォームが MAX_FORM_MEMORY_SIZE を超えた)ときは、英語の既定の画面ではなく
     # 上限と対処を日本語で案内する(日本語は URL エンコードで1文字9バイトになるため、1つの欄が約5万字で超える)
@@ -18164,7 +18470,19 @@ def create_app():
     app.before_request(check_same_origin)
     app.after_request(frame_options)
     app.after_request(no_store_when_logged_in)
+    return app
 
+def create_app():
+    """アプリを作る。「flask --app app <コマンド>」はこの関数でアプリを作る。
+
+    - flask run         : instance を用意し、定期メールの自動送信スケジューラも起動する
+    - flask seed / migrate など、このアプリのコマンド:
+                          コマンドを探すために読み込まれる段階では instance に触れない
+                          (各コマンドが prepare_instance() を呼ぶ。migrate --db は既定のDBに触れない)
+    - それ以外(テスト・flask routes など): instance を用意する(スケジューラは起動しない)
+    作るのはメインの環境のアプリ。ほかの環境(17 章)のアプリは、初めて使うときに振り分け(EnvDispatcher)が作る。
+    """
+    app = _new_app()
     app.cli.add_command(seed_command)
     app.cli.add_command(migrate_command)
     app.cli.add_command(import_old_config_command)
@@ -18175,6 +18493,7 @@ def create_app():
         # flask がこのアプリのコマンド(seed / migrate)を探すために読み込んでいる
         return app
     prepare_instance(app)
+    install_env_dispatcher(app)  # /env/<キー>/… はほかの環境のアプリへ(17 章)
     if command is not None and command.command.name == "run":
         start_scheduler_once(app)
     return app
@@ -20474,3 +20793,814 @@ def save_member_shift(user_id):
     db.session.commit()
     return flash_redirect("「{}」の勤務を「{}」にしました。".format(
         user.display_name, shift.name if shift is not None else "勤務なし"), "success", url)
+
+# #### 17. 複数の環境(グループ) ###################################################################
+# 1つのサーバー(このフォルダ)を、複数のグループ(マネージャーごとのチーム)で使い分ける。入口(ログイン)は1つで、
+# ログインの後に使う環境を選ぶ。環境ごとに DB・機能の設定(instance/ の JSON)・ログインの記録・メールの宛先が別。
+#   メインの環境 : 今までの instance/(app.db・settings.json ほか)。URL も今までどおり(/tasks など)
+#   ほかの環境   : instance/envs/<キー>/(キーは e2, e3, …)。URL は /env/<キー>/ の下(/env/e2/tasks など)。
+#                  クッキーも環境ごと(session_<キー>)で、同じブラウザの別のタブで別の環境を同時に開ける
+# すべての環境で共通: 基本設定(instance/settings.json。AI・メールの送信サーバー・差出人・送信を許可するドメイン・
+#   リンクの基準URL・LDAP・admin のパスワード・SECRET_KEY)。変えられるのはメインの環境の「基本設定」タブだけ。
+#   メールの宛先(MAIL_TO・MAIL_CC)だけは環境ごと(ほかの環境は、その環境の「基本設定」タブで設定する。
+#   instance/envs/<キー>/env_mail_settings.json。メインの環境の宛先は今までどおり基本設定)。
+# 環境の一覧: instance/environments.json。メインの環境のマネージャーが、システム設定の「環境」タブで追加・名前の変更・
+#   停止/再開を行う(追加するときに、その環境の最初のマネージャーのログインIDと氏名を登録する。そのマネージャーが
+#   その環境のチーム管理でメンバーを登録する)。環境は消さない(停止すると開けなくなり、自動送信もしない。DB は残る)。
+# 使える環境が1つ(メインだけ・ほかはすべて停止)のあいだは、今までと同じ動き(ログイン・URL・クッキー)。
+# 使える環境が2つ以上のとき:
+#   ログイン(/login。メインの環境の画面)で本人を確かめ、印(instance/portal_sessions.json。ログインの記録〔5-1〕と
+#   同じ形)をメインの環境のクッキーに残す(以下「共通のログイン」)。入れる環境(有効なメンバーとして登録されている
+#   環境)が1つならその環境へ、複数なら環境の選択の画面(/envs)へ進む。固定ローカル管理者(admin など)は、すべての
+#   環境に入れる(初めて入るときにその環境のユーザーを用意する)。
+#   環境に入る(/enter。ほかの環境は /env/<キー>/enter)と、その環境のログイン(5-1 と同じ。その環境の
+#   login_sessions.json)を作る。各環境の画面は、その環境のログインと共通のログインの両方が有効で、同じログインIDの
+#   ときだけ開ける(共通のログインを終えると、すべての環境の画面が開けなくなる)。
+#   ログアウトは共通のログインと、このブラウザのすべての環境のログインを終える。
+# 1つのプロセスの中で、環境ごとに Flask のアプリを作る(EnvDispatcher が URL で振り分ける)。メールの送信中・AI分析の
+# 実行中などの印は環境ごと(env_scoped)。定期メールの自動送信は、スケジューラ(12 章)が環境ごとに確かめる。
+
+# ==== 17-1. 環境の一覧(instance/environments.json)と、環境ごとのフォルダ・URL ===================
+
+MAIN_ENV_KEY = "main"
+ENV_URL_PREFIX = "/env"           # ほかの環境の URL の先頭(/env/<キー>/...)
+ENVS_DIRNAME = "envs"             # ほかの環境の instance フォルダの置き場(instance/envs/<キー>)
+ENV_REGISTRY_FILENAME = "environments.json"
+ENV_REGISTRY_LABEL = "環境の一覧のファイル"
+ENV_KEY_PATTERN = re.compile(r"e[1-9][0-9]{0,5}")
+ENV_NAME_MAX = 40
+MAIN_ENV_DEFAULT_NAME = "メインの環境"
+ENV_CONFIG_KEY = "ENV_KEY"                        # app.config: この環境のキー(ほかの環境だけ)
+SHARED_INSTANCE_CONFIG = "SHARED_INSTANCE_PATH"   # app.config: 共通の instance フォルダ(ほかの環境だけ)
+PORTAL_COOKIE_CONFIG = "PORTAL_COOKIE_NAME"       # app.config: メインの環境のクッキーの名前(ほかの環境だけ)
+ENV_COOKIE_PREFIX = "session_"
+ENV_ROOT_ENVIRON = "app.env_root"   # environ: 環境の URL の先頭を足す前の SCRIPT_NAME(共通の入口の URL の先頭)
+ENV_DISPATCHER_KEY = "env_dispatcher"   # app.extensions(メインの環境): 振り分け
+ENV_MAIN_APP_KEY = "env_main_app"       # app.extensions(ほかの環境): メインの環境のアプリ
+ENV_SCOPED_KEY = "env_scoped"           # app.extensions(ほかの環境): 環境ごとの処理中の印・状態
+ENV_USERNAME_MAX = 64
+ENV_DISPLAY_NAME_MAX = 128
+# 基本設定の項目のうち環境ごとのもの(ほかの環境は、その環境の宛先の設定 ENV_MAIL_SETTINGS〔11-3〕を使う)
+ENV_LOCAL_KEYS = ("MAIL_TO", "MAIL_CC")
+
+_env_registry_lock = threading.RLock()
+_env_registry_cache = {}   # {ファイルのパス: (ファイルの版, 整えた内容, 読めなかったときの例外)}
+_env_scoped_lock = threading.Lock()
+
+def shared_instance_path(app=None):
+    """すべての環境で共通の instance フォルダ(基本設定・環境の一覧・共通のログインの記録の置き場)。
+
+    メインの環境では自分の instance フォルダ。
+    """
+    app = app or current_app
+    return app.config.get(SHARED_INSTANCE_CONFIG) or app.instance_path
+
+def env_key(app=None):
+    """この環境(アプリ)のキー(メインの環境は MAIN_ENV_KEY)。"""
+    return (app or current_app).config.get(ENV_CONFIG_KEY) or MAIN_ENV_KEY
+
+def is_main_env(app=None):
+    return env_key(app) == MAIN_ENV_KEY
+
+def env_instance_path(shared, key):
+    """環境の instance フォルダ(メインは共通のフォルダそのもの、ほかは instance/envs/<キー>)。"""
+    return shared if key == MAIN_ENV_KEY else os.path.join(shared, ENVS_DIRNAME, key)
+
+def env_url_prefix(key):
+    """環境の URL の先頭(メインは ""、ほかは /env/<キー>)。"""
+    return "" if key == MAIN_ENV_KEY else "{}/{}".format(ENV_URL_PREFIX, key)
+
+def clean_env_name(value):
+    """環境の名前(制御文字を除き、空白を1つにまとめる)。"""
+    return " ".join(CONTROL_CHARS.sub("", str(value or "")).split())
+
+def _default_env(key):
+    return {"key": key, "name": MAIN_ENV_DEFAULT_NAME if key == MAIN_ENV_KEY else key, "active": True,
+            "created_at": "", "created_by": ""}
+
+def _normalize_env_registry(data):
+    """読み込んだ環境の一覧を整える(正しくない行は除く。メインの環境は必ず最初に置き、停止しない)。"""
+    envs, seen = [], set()
+    items = data.get("envs") if isinstance(data, dict) else None
+    for item in items if isinstance(items, list) else ():
+        if not isinstance(item, dict):
+            continue
+        key = item.get("key")
+        if not isinstance(key, str) or key in seen or not (key == MAIN_ENV_KEY or ENV_KEY_PATTERN.fullmatch(key)):
+            continue
+        seen.add(key)
+        entry = _default_env(key)
+        name = clean_env_name(item.get("name"))[:ENV_NAME_MAX]
+        if name:
+            entry["name"] = name
+        entry["active"] = key == MAIN_ENV_KEY or item.get("active") is not False
+        for field in ("created_at", "created_by"):
+            if isinstance(item.get(field), str):
+                entry[field] = item[field][:64]
+        envs.append(entry)
+    main = [e for e in envs if e["key"] == MAIN_ENV_KEY] or [_default_env(MAIN_ENV_KEY)]
+    version = data.get("version") if isinstance(data, dict) else None
+    if not isinstance(version, int) or isinstance(version, bool) or version < 0:
+        version = 0
+    return {"envs": main + [e for e in envs if e["key"] != MAIN_ENV_KEY], "version": version}
+
+def read_env_registry(shared, strict=False):
+    """環境の一覧(instance/environments.json)。戻り値: {"envs": [{key, name, active, created_at, created_by}], "version"}。
+
+    ファイルが無ければメインの環境だけ。ファイルの版(更新日時と大きさ)が変わったときだけ読み直す。
+    読めないとき: strict なら SettingsFileError(画面からの変更は止める)。そうでなければ、前に読めた内容
+    (無ければメインの環境だけ)を使い、ログに残す(読めるようになると版が変わり、読み直す)。
+    """
+    path = os.path.join(shared, ENV_REGISTRY_FILENAME)
+    version = file_version(path)
+    with _env_registry_lock:
+        cached = _env_registry_cache.get(path)
+        if cached is None or cached[0] != version:
+            try:
+                cached = (version, _normalize_env_registry(read_json(path, ENV_REGISTRY_LABEL)), None)
+            except SettingsFileError as exc:
+                logging.getLogger(__name__).warning("%s（前に読めた内容を使います）", exc)
+                previous = cached[1] if cached is not None else _normalize_env_registry(None)
+                cached = (version, previous, exc)
+            _env_registry_cache[path] = cached
+    if strict and cached[2] is not None:
+        raise cached[2]
+    return copy.deepcopy(cached[1])
+
+def write_env_registry(shared, envs, username, expected_version):
+    """環境の一覧を envs(整えたもの)にする。読んだ後にほかの保存があれば SettingsConflictError。書けなければ OSError。"""
+    path = os.path.join(shared, ENV_REGISTRY_FILENAME)
+    with _env_registry_lock:
+        current = read_env_registry(shared, strict=True)
+        if current["version"] != expected_version:
+            raise SettingsConflictError("画面を開いた後に環境の一覧が変わっています。")
+        data = {"version": current["version"] + 1, "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "updated_by": _clean_label(username), "envs": envs}
+        write_json(path, data)
+        _env_registry_cache.pop(path, None)
+    if has_request_context():
+        g.pop("_multi_env", None)
+    return _normalize_env_registry(data)
+
+def env_registry(app=None):
+    return read_env_registry(shared_instance_path(app))
+
+def active_envs(app=None):
+    """停止していない環境(メインが最初)。"""
+    return [e for e in env_registry(app)["envs"] if e["active"]]
+
+def multi_env_enabled(app=None):
+    """使える環境が2つ以上か(1つのあいだは今までと同じ動き)。要求の中では1回だけ確かめる。"""
+    if app is None and has_request_context():
+        cached = g.get("_multi_env")
+        if cached is None:
+            cached = g._multi_env = len(active_envs()) >= 2
+        return cached
+    return len(active_envs(app)) >= 2
+
+def env_entry(key, app=None):
+    """環境の一覧のその環境の行(無ければ None)。"""
+    return next((e for e in env_registry(app)["envs"] if e["key"] == key), None)
+
+def env_name(app=None):
+    """この環境の名前(画面・メールに出す)。"""
+    entry = env_entry(env_key(app), app)
+    return entry["name"] if entry else env_key(app)
+
+def env_scoped(app, name, factory, main_value):
+    """環境ごとの処理中の印(ロック)・状態。
+
+    メインの環境は main_value(以前と同じモジュールの値)。ほかの環境は初めて使うときに factory() で作る
+    (同じプロセスのほかの環境の処理と待ち合わせない・状態を混ぜない)。
+    """
+    if is_main_env(app):
+        return main_value
+    values = app.extensions.setdefault(ENV_SCOPED_KEY, {})
+    value = values.get(name)
+    if value is None:
+        with _env_scoped_lock:
+            value = values.setdefault(name, factory())
+    return value
+
+# ---- URL(共通の入口と、環境ごとの URL の先頭) ----
+def portal_root():
+    """共通の入口(メインの環境)の URL の先頭(サーバーの前のプロキシなどがパスを付けていればそのパス)。"""
+    if not has_request_context():
+        return ""
+    return request.environ.get(ENV_ROOT_ENVIRON, request.script_root)
+
+def portal_url(path):
+    """共通の入口(メインの環境)の画面の URL(path は「/login」など)。"""
+    return portal_root() + path
+
+def env_home_url(key):
+    return portal_root() + env_url_prefix(key) + "/"
+
+def env_enter_url(key, next_url=None):
+    """環境に入る URL(next_url はその後に開く、その環境の画面のパス)。"""
+    url = portal_root() + env_url_prefix(key) + "/enter"
+    return url + "?" + urlencode({"next": next_url}) if next_url else url
+
+def env_key_of_path(path):
+    """このサーバーの中のパス(共通の入口の URL の先頭から始まる)が、どの環境の画面か。
+
+    使える(停止していない)ほかの環境の /env/<キー>/ の下ならそのキー、ほかはメインの環境。
+    """
+    root = portal_root()
+    rest = path[len(root):] if root and path.startswith(root) else path
+    prefix = ENV_URL_PREFIX + "/"
+    if rest.startswith(prefix):
+        key = rest[len(prefix):].split("/", 1)[0]
+        entry = env_entry(key)
+        if entry is not None and entry["active"]:
+            return key
+    return MAIN_ENV_KEY
+
+# ==== 17-2. 環境ごとのアプリと振り分け(EnvDispatcher) ============================================
+# メインの環境のアプリ(create_app で作るもの)の wsgi_app の前に置く。/env/<キー>/... は、その環境のアプリへ
+# (SCRIPT_NAME に /env/<キー> を足して渡すため、画面の URL・リダイレクトは /env/<キー>/... になる)。
+# ほかの URL はメインの環境のアプリへ。登録されていない・停止した環境のキーもメインの環境に渡す(404 の画面)。
+# 環境のアプリは初めて使うときに作る(create_app と同じ組み立て。DB の足りないテーブルも作る)。
+
+_PLAIN_ENV_ERROR = ("<!doctype html><html lang=\"ja\"><meta charset=\"utf-8\"><title>環境を開けません</title>"
+                    "<h1>環境を開けません</h1><p>この環境のデータを読み込めませんでした（内容はサーバーのログに記録されています）。"
+                    "しばらくしてからもう一度お試しください。解決しない場合はマネージャーに連絡してください。</p></html>")
+
+class EnvDispatcher:
+    """URL で環境のアプリに振り分ける WSGI アプリ(メインの環境のアプリの wsgi_app を置き換える)。"""
+
+    def __init__(self, main_app, main_wsgi):
+        self.main_app = main_app
+        self.main_wsgi = main_wsgi
+        self.apps = {MAIN_ENV_KEY: main_app}
+        self.lock = threading.Lock()
+
+    def build(self, key):
+        """環境のアプリ(無ければ作る。一覧に登録されているかは確かめない)。"""
+        app = self.apps.get(key)
+        if app is None:
+            with self.lock:
+                app = self.apps.get(key)
+                if app is None:
+                    app = build_env_app(self.main_app, key)
+                    self.apps[key] = app
+        return app
+
+    def app_for(self, key):
+        """使える(登録されていて停止していない)環境のアプリ。使えなければ None。"""
+        if key == MAIN_ENV_KEY:
+            return self.main_app
+        entry = next((e for e in read_env_registry(self.main_app.instance_path)["envs"] if e["key"] == key), None)
+        if entry is None or not entry["active"]:
+            return None
+        return self.build(key)
+
+    def env_apps(self):
+        """使える環境のアプリ(メインが最初)。用意できない環境は飛ばす(ログに残す)。"""
+        apps = []
+        for entry in read_env_registry(self.main_app.instance_path)["envs"]:
+            if not entry["active"]:
+                continue
+            try:
+                apps.append(self.app_for(entry["key"]))
+            except Exception:
+                self.main_app.logger.exception("環境 %s のアプリを用意できませんでした", entry["key"])
+        return [app for app in apps if app is not None]
+
+    def __call__(self, environ, start_response):
+        path = environ.get("PATH_INFO") or ""
+        prefix = ENV_URL_PREFIX + "/"
+        root = environ.get("SCRIPT_NAME", "")
+        if path.startswith(prefix):
+            key, sep, rest = path[len(prefix):].partition("/")
+            app = None
+            if ENV_KEY_PATTERN.fullmatch(key):
+                try:
+                    app = self.app_for(key)
+                except Exception:
+                    self.main_app.logger.exception("環境 %s のアプリを用意できませんでした", key)
+                    return Response(_PLAIN_ENV_ERROR, status=503, mimetype="text/html")(environ, start_response)
+            if app is not None:
+                if not sep:
+                    # /env/e2 → /env/e2/(画面の相対のリンクがその環境の中を指すように)
+                    query = environ.get("QUERY_STRING")
+                    location = root + prefix + key + "/" + ("?" + query if query else "")
+                    return werkzeug_redirect(location, code=308)(environ, start_response)
+                environ[ENV_ROOT_ENVIRON] = root
+                environ["SCRIPT_NAME"] = root + prefix + key
+                environ["PATH_INFO"] = "/" + rest
+                return app.wsgi_app(environ, start_response)
+        environ.setdefault(ENV_ROOT_ENVIRON, root)
+        return self.main_wsgi(environ, start_response)
+
+def install_env_dispatcher(app):
+    """メインの環境のアプリに振り分けを付ける(create_app。テストのクライアントも app.wsgi_app を通る)。"""
+    dispatcher = EnvDispatcher(app, app.wsgi_app)
+    app.wsgi_app = dispatcher
+    app.extensions[ENV_DISPATCHER_KEY] = dispatcher
+    return dispatcher
+
+def env_dispatcher(app=None):
+    """振り分け(メインの環境のアプリに付けたもの)。コマンド(seed など)から作ったアプリでは None。"""
+    app = app or current_app
+    main = app.extensions.get(ENV_MAIN_APP_KEY, app)
+    return main.extensions.get(ENV_DISPATCHER_KEY)
+
+def build_env_app(main_app, key):
+    """ほかの環境のアプリを作る(create_app と同じ組み立て。instance/envs/<キー> の DB・設定を使う)。"""
+    app = _new_app(key, main_app.instance_path)
+    app.extensions[ENV_MAIN_APP_KEY] = main_app
+    app.config[PORTAL_COOKIE_CONFIG] = main_app.config.get("SESSION_COOKIE_NAME") or "session"
+    # 動作確認(TESTING。判定・相談の応答をその場で作るなど)はメインの環境に合わせる
+    app.config["TESTING"] = bool(main_app.config.get("TESTING"))
+    prepare_instance(app)
+    return app
+
+def scheduled_apps(app):
+    """定期メールの自動送信を確かめる環境のアプリ(メインと、停止していないほかの環境。12 章のスケジューラ)。"""
+    dispatcher = env_dispatcher(app)
+    return dispatcher.env_apps() if dispatcher is not None else [app]
+
+# ==== 17-3. 共通のログイン(instance/portal_sessions.json) =======================================
+# 複数の環境のとき、ログインの画面で本人を確かめたことを、メインの環境のクッキーの PORTAL_SESSION_KEY に残す:
+#   {"u": ログインID, "t": 印, "n": 認証の結果の氏名, "l": 固定ローカル管理者か, "r": その役割, "m": パスワードの印}
+# 印は instance/portal_sessions.json({ログインID: {印: ログインした日時}}。login_sessions.json と同じ形・同じ
+# 有効期限)にあるときだけ有効。固定ローカル管理者は、ログインしたときのパスワードの印(_local_credential_mark)が
+# 今のパスワードと合うときだけ有効(パスワードを変えると、すべての環境でログインし直しになる)。
+# ほかの環境のアプリは、メインの環境のクッキーを同じ鍵(SECRET_KEY)で読む(書き換えはしない)。
+
+PORTAL_SESSION_KEY = "portal"
+PORTAL_SESSIONS_FILENAME = "portal_sessions.json"
+PORTAL_OK = "ok"
+PORTAL_ABSENT = "absent"     # 共通のログインの印がセッションに無い
+PORTAL_EXPIRED = "expired"   # 有効期限が切れた
+PORTAL_INVALID = "invalid"   # ログアウトした・形が違う・パスワードが変わった
+
+def _portal_sessions_path():
+    return os.path.join(shared_instance_path(), PORTAL_SESSIONS_FILENAME)
+
+def _main_cookie_session():
+    """メインの環境のクッキー(ほかの環境のアプリから読む)の中身。読めなければ {}。"""
+    cookie = request.cookies.get(current_app.config.get(PORTAL_COOKIE_CONFIG) or "session")
+    serializer = current_app.session_interface.get_signing_serializer(current_app)
+    if not cookie or serializer is None:
+        return {}
+    try:
+        data = serializer.loads(cookie, max_age=int(current_app.permanent_session_lifetime.total_seconds()))
+    except BadSignature:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+def _portal_raw():
+    if is_main_env():
+        return session.get(PORTAL_SESSION_KEY)
+    return _main_cookie_session().get(PORTAL_SESSION_KEY)
+
+def _portal_fields(raw):
+    """セッションの共通のログインの値を整える(形が違えば None)。"""
+    if not isinstance(raw, dict):
+        return None
+    username, token = raw.get("u"), raw.get("t")
+    if not isinstance(username, str) or not username or not isinstance(token, str) or not token:
+        return None
+    role = raw.get("r")
+    return {"u": username, "t": token, "n": raw.get("n") if isinstance(raw.get("n"), str) else "",
+            "l": raw.get("l") is True, "r": role if role in (ROLE_MANAGER, ROLE_MEMBER) else None,
+            "m": raw.get("m") if isinstance(raw.get("m"), str) else ""}
+
+def portal_state():
+    """このブラウザの共通のログイン。戻り値: (値 または None, 状態 PORTAL_*)。要求の中では1回だけ確かめる。"""
+    cached = g.get("_portal_state")
+    if cached is not None:
+        return cached
+    raw = _portal_raw()
+    portal = _portal_fields(raw)
+    if raw is None:
+        result = (None, PORTAL_ABSENT)
+    elif portal is None:
+        result = (None, PORTAL_INVALID)
+    else:
+        at = (_read_login_sessions(_portal_sessions_path()).get(portal["u"]) or {}).get(portal["t"])
+        if at is None:
+            result = (None, PORTAL_INVALID)
+        elif _epoch_now() - at > LOGIN_LIFETIME_HOURS * 3600:
+            result = (None, PORTAL_EXPIRED)
+        elif portal["l"] and not hmac.compare_digest(
+                portal["m"].encode("utf-8"), _local_credential_mark(portal["u"]).encode("utf-8")):
+            # 固定ローカル管理者のパスワードが、ログインした後に変わった(_unauthorized で案内する)
+            g.local_password_changed = portal["u"]
+            result = (None, PORTAL_INVALID)
+        else:
+            result = (portal, PORTAL_OK)
+    g._portal_state = result
+    return result
+
+def start_portal_session(username, display_name, local, role=None):
+    """共通のログインを始める(印を記録して、メインの環境のセッションに残す)。記録できなければ OSError。"""
+    token = _issue_token(_portal_sessions_path(), username)
+    session[PORTAL_SESSION_KEY] = {
+        "u": username, "t": token, "n": display_name or "", "l": bool(local),
+        "r": role if local and role in (ROLE_MANAGER, ROLE_MEMBER) else None,
+        "m": _local_credential_mark(username) if local else "",
+    }
+    g.pop("_portal_state", None)
+
+def end_portal_session():
+    """このブラウザの共通のログインの印を消す(メインの環境ではセッションからも消す)。"""
+    portal = _portal_fields(_portal_raw())
+    if portal is not None:
+        _revoke_login_sessions(portal["u"], portal["t"], path=_portal_sessions_path())
+    if is_main_env():
+        session.pop(PORTAL_SESSION_KEY, None)
+    g.pop("_portal_state", None)
+
+def portal_allows(user):
+    """この環境のログイン(user)を続けてよいか(load_user。1つの環境のあいだは常に True)。
+
+    複数の環境のときは、共通のログインが有効で、同じログインIDのときだけ。メインの環境で、共通のログインの印が
+    無いセッション(1つの環境のときにログインしたもの)は、共通のログインを作って続ける(環境を追加したときに、
+    ログイン中の人をログアウトさせない)。
+    """
+    if not multi_env_enabled():
+        return True
+    portal, state = portal_state()
+    if portal is None:
+        if state == PORTAL_ABSENT and is_main_env():
+            try:
+                start_portal_session(user.username, user.display_name, is_local_account(user.username), user.role)
+            except OSError:
+                current_app.logger.exception("共通のログインの記録（instance/%s）を保存できませんでした",
+                                             PORTAL_SESSIONS_FILENAME)
+                return False
+            return True
+        if state == PORTAL_EXPIRED:
+            g.login_expired = True
+        return False
+    return portal["u"] == user.username
+
+def env_user_role(app, username, local):
+    """環境 app に username で入れるときの、その環境での役割(入れなければ None)。
+
+    固定ローカル管理者はいつでも入れる(まだユーザーが無ければマネージャー)。ほかは有効なメンバーのときだけ。
+    """
+    with app.app_context():
+        user = User.query.filter_by(username=username).first()
+        if local:
+            return user.role if user is not None else ROLE_MANAGER
+        if user is None or not user.is_active:
+            return None
+        return user.role
+
+def accessible_envs(username, local):
+    """username で入れる環境(停止していないもの。メインが最初)。各行: 環境の一覧の行 + role・role_label・url。"""
+    dispatcher = env_dispatcher()
+    rows = []
+    for entry in active_envs():
+        try:
+            app = dispatcher.app_for(entry["key"]) if dispatcher is not None else (
+                current_app._get_current_object() if entry["key"] == env_key() else None)
+            role = env_user_role(app, username, local) if app is not None else None
+        except Exception:
+            current_app.logger.exception("環境 %s のユーザーを確かめられませんでした", entry["key"])
+            continue
+        if role is not None:
+            rows.append(dict(entry, role=role, role_label=ROLE_LABELS.get(role, role), url=env_enter_url(entry["key"])))
+    return rows
+
+def end_env_logins(response):
+    """ログアウトのとき: このブラウザのほかの環境のログイン(クッキー session_<キー>)の印を消し、クッキーも消す。"""
+    serializer = current_app.session_interface.get_signing_serializer(current_app)
+    shared = shared_instance_path()
+    max_age = int(current_app.permanent_session_lifetime.total_seconds())
+    for name, value in list(request.cookies.items()):
+        key = name[len(ENV_COOKIE_PREFIX):] if name.startswith(ENV_COOKIE_PREFIX) else ""
+        if not ENV_KEY_PATTERN.fullmatch(key) or env_entry(key) is None:
+            continue
+        try:
+            data = serializer.loads(value, max_age=max_age) if serializer is not None else None
+        except BadSignature:
+            data = None
+        if isinstance(data, dict):
+            user_key, token = data.get("_user_id"), data.get(SESSION_TOKEN_KEY)
+            if isinstance(user_key, str) and isinstance(token, str):
+                _revoke_login_sessions(user_key, token, path=os.path.join(
+                    env_instance_path(shared, key), LOGIN_SESSIONS_FILENAME))
+        response.delete_cookie(name, path=current_app.session_interface.get_cookie_path(current_app),
+                               domain=current_app.session_interface.get_cookie_domain(current_app))
+
+# ==== 17-4. 画面(ログインの後の環境の選択・環境に入る) ===========================================
+# GET /envs  : 環境の選択の画面(共通の入口。入れる環境の一覧)。ナビの「環境の切り替え」からも開く
+# GET /enter : 共通のログインで、この環境のログインを作る(ほかの環境は /env/<キー>/enter)。next はその後に開く画面
+# ログインの画面(/login)・ログアウト(/logout)は 5-1(複数の環境のときは _portal_login・logout が共通の入口として動く)。
+
+def flash_login_needed(state):
+    """共通のログインが無い・切れたときの案内(ログインの画面に出す)。"""
+    changed_for = g.get("local_password_changed")
+    if changed_for:
+        flash(LOCAL_PASSWORD_CHANGED.format(changed_for), "warning")
+    elif state == PORTAL_EXPIRED or g.get("login_expired"):
+        flash(LOGIN_LIFETIME_EXPIRED.format(LOGIN_LIFETIME_HOURS), "warning")
+    else:
+        flash(login_manager.login_message, login_manager.login_message_category)
+
+def _env_refused_page(heading, message, status=403):
+    """環境に入れないときの画面(環境の選び直しのボタン付き)。"""
+    response = make_response(render_template(
+        "errors/http_error.html", code=status, heading=heading, message=message,
+        confirm_url=portal_url("/envs"), confirm_label="環境を選び直す"), status)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+@auth_bp.route("/enter")
+def enter():
+    """共通のログインで、この環境のログインを作る(環境の選択の画面・ログインの後・この環境のログインが切れたとき)。"""
+    if not multi_env_enabled():
+        return redirect(_safe_next(request.args.get("next")) or url_for("main.dashboard"))
+    portal, state = portal_state()
+    if portal is None:
+        flash_login_needed(state)
+        return redirect(url_for("auth.login", next=_safe_next(request.args.get("next")) or url_for("main.dashboard")))
+    if current_user.is_authenticated and current_user.username == portal["u"]:
+        return _redirect_after_login()
+    # この環境に前のログイン(共有の PC で前の人のもの・切れたもの)が残っていれば、その印を消してから入る
+    end_login_session()
+    logout_user()
+    session.pop(LOCAL_AUTH_KEY, None)
+    if portal["l"]:
+        user = _ensure_local_user({"username": portal["u"], "display_name": portal["n"], "role": portal["r"],
+                                   "source": "local"})
+    else:
+        user = _match_registered_user({"username": portal["u"], "display_name": portal["n"]})
+        if user is None:
+            session.pop(DROPPED_REQUEST_KEY, None)
+            return _env_refused_page(
+                "この環境には登録されていません",
+                "このIDは、この環境（{}）のメンバーとして登録されていないか、無効化されています。使う環境を選び直すか、"
+                "この環境のマネージャーに登録を依頼してください。".format(env_name()))
+    try:
+        token = issue_login_session(user)
+    except OSError:
+        current_app.logger.exception("ログインの記録（instance/login_sessions.json）を保存できませんでした")
+        return _env_refused_page("この環境に入れませんでした", LOGIN_RECORD_ERROR, status=503)
+    login_user(user)
+    session[SESSION_TOKEN_KEY] = token
+    if is_local_account(user.username):
+        session[LOCAL_AUTH_KEY] = _local_credential_mark(user.username)
+    flash("ようこそ、{} さん（{}）。".format(user.display_name, env_name()), "success")
+    return _redirect_after_login()
+
+@auth_bp.route("/envs")
+def envs():
+    """環境の選択の画面(複数の環境のとき。ログインの後・ナビの「環境の切り替え」)。"""
+    if not is_main_env():
+        return redirect(portal_url("/envs"))
+    if not multi_env_enabled():
+        return redirect(url_for("main.dashboard"))
+    portal, state = portal_state()
+    if portal is None:
+        flash_login_needed(state)
+        return redirect(url_for("auth.login", next=url_for("auth.envs")))
+    response = make_response(render_template("auth/envs.html", envs=accessible_envs(portal["u"], portal["l"]),
+                                             portal=portal))
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+def env_nav_context():
+    """ナビに出す環境の名前と切り替えの URL(複数の環境のときだけ。テンプレートの env_nav)。"""
+    if not has_request_context() or not multi_env_enabled():
+        return None
+    return {"name": env_name(), "switch_url": portal_url("/envs"), "is_main": is_main_env()}
+
+# ==== 17-5. 環境の追加・名前の変更・停止(システム設定の「環境」タブ。メインの環境のマネージャー) ==========
+# 追加: 名前と、その環境の最初のマネージャー(ログインID・氏名)を登録する。キーは e2 から順に(使ったキー・フォルダの
+# あるキーは使わない)。instance/envs/<キー>/ に DB を作り、マネージャーのユーザーを追加してから一覧に載せる。
+# 一覧の変更は、画面を開いたときの一覧の版(hidden の version)と今の版が違えば行わない(ほかの変更と重ならないように)。
+# 停止した環境は、開けず(URL は 404)、環境の選択の画面にも出ず、定期メールも送らない(DB・設定は残る。再開できる)。
+
+ENV_ONCE_KIND = "env_create"
+
+def _env_member_counts(entry):
+    """環境の有効なメンバーの数(数えられなければ None)。"""
+    dispatcher = env_dispatcher()
+    if dispatcher is None:
+        return None
+    try:
+        app = dispatcher.build(entry["key"])
+        with app.app_context():
+            return User.query.filter_by(is_active=True).count()
+    except Exception:
+        current_app.logger.exception("環境 %s のメンバーを数えられませんでした", entry["key"])
+        return None
+
+def envs_tab_context(inputs=None):
+    """「環境」タブの表示用の値。inputs は追加の入力エラーで再表示するときの入力。"""
+    shared = shared_instance_path()
+    try:
+        registry, error = read_env_registry(shared, strict=True), None
+    except SettingsFileError as exc:
+        registry, error = read_env_registry(shared), str(exc)
+    rows = []
+    for entry in registry["envs"]:
+        rows.append(dict(entry, url=env_home_url(entry["key"]), members=_env_member_counts(entry),
+                         folder="instance/" if entry["key"] == MAIN_ENV_KEY else "instance/{}/{}/".format(
+                             ENVS_DIRNAME, entry["key"])))
+    return {"envs": rows, "version": str(registry["version"]), "error": error, "multi": multi_env_enabled(),
+            "name_max": ENV_NAME_MAX, "inputs": inputs or {}}
+
+def _env_name_error(name, registry, key=None):
+    """環境の名前の誤り(無ければ None)。key は名前を変える環境(その環境の今の名前とは重複にしない)。"""
+    if not name:
+        return "環境の名前を入力してください。"
+    if len(name) > ENV_NAME_MAX:
+        return "環境の名前は{}文字以内で入力してください。".format(ENV_NAME_MAX)
+    if any(e["name"].casefold() == name.casefold() for e in registry["envs"] if e["key"] != key):
+        return "環境の名前「{}」は既に使われています。".format(name)
+    return None
+
+def _next_env_key(registry, shared):
+    """新しい環境のキー(e2 から順に。一覧にある・フォルダのあるキーは使わない)。"""
+    numbers = [int(e["key"][1:]) for e in registry["envs"] if e["key"] != MAIN_ENV_KEY]
+    number = max(numbers + [1]) + 1
+    while os.path.exists(env_instance_path(shared, "e{}".format(number))):
+        number += 1
+    return "e{}".format(number)
+
+def create_environment(name, username, display_name, created_by, expected_version):
+    """環境を追加する(DB を作り、最初のマネージャーを登録してから一覧に載せる)。戻り値: 一覧の行。
+
+    一覧が画面を開いた後に変わっていれば SettingsConflictError、名前が重複していれば ValueError、
+    一覧が読めなければ SettingsFileError、書けなければ OSError。
+    """
+    dispatcher = env_dispatcher()
+    shared = shared_instance_path()
+    with _env_registry_lock:
+        lock_file = _lock_settings_file(shared)  # 同じフォルダのほかのサーバーの変更と重ならないように
+        try:
+            registry = read_env_registry(shared, strict=True)
+            if registry["version"] != expected_version:
+                raise SettingsConflictError("画面を開いた後に環境の一覧が変わっています。")
+            problem = _env_name_error(name, registry)
+            if problem:
+                raise ValueError(problem)
+            key = _next_env_key(registry, shared)
+            app = dispatcher.build(key)
+            with app.app_context():
+                user = User.query.filter_by(username=username).first() or User(username=username)
+                user.display_name = display_name
+                user.role = ROLE_MANAGER
+                user.is_active = True
+                db.session.add(user)
+                db.session.commit()
+            entry = {"key": key, "name": name, "active": True,
+                     "created_at": datetime.now().strftime("%Y/%m/%d %H:%M"), "created_by": str(created_by)[:64]}
+            write_env_registry(shared, registry["envs"] + [entry], created_by, registry["version"])
+        finally:
+            _unlock_settings_file(lock_file)
+    return entry
+
+def change_environment(key, expected_version, username, name=None, active=None):
+    """環境の名前・停止/再開を変える。戻り値: 変えた後の行。例外は create_environment と同じ(無い環境は KeyError)。"""
+    shared = shared_instance_path()
+    with _env_registry_lock:
+        lock_file = _lock_settings_file(shared)
+        try:
+            registry = read_env_registry(shared, strict=True)
+            if registry["version"] != expected_version:
+                raise SettingsConflictError("画面を開いた後に環境の一覧が変わっています。")
+            entry = next((e for e in registry["envs"] if e["key"] == key), None)
+            if entry is None:
+                raise KeyError(key)
+            if name is not None:
+                problem = _env_name_error(name, registry, key)
+                if problem:
+                    raise ValueError(problem)
+                entry["name"] = name
+            if active is not None and key != MAIN_ENV_KEY:
+                entry["active"] = bool(active)
+            write_env_registry(shared, registry["envs"], username, registry["version"])
+        finally:
+            _unlock_settings_file(lock_file)
+    return entry
+
+def _form_version(form):
+    value = str(form.get("version", ""))
+    return int(value) if value.isascii() and value.isdigit() and len(value) <= 9 else -1
+
+def _envs_tab_url():
+    return url_for("system.settings", tab=TAB_ENVS)
+
+_ENVS_CHANGED = ("画面を開いた後に、ほかの操作（別のタブ・別のマネージャー）で環境の一覧が変わっていたため、{}"
+                 "。今の一覧を確認して、必要ならもう一度操作してください。")
+
+def _require_main_env():
+    """環境の一覧を変えられるのはメインの環境だけ(ほかの環境のマネージャーには見せない)。"""
+    if not is_main_env():
+        abort(404)
+
+def _env_form_errors(name, username, display_name):
+    """環境の追加の入力の誤り(一覧が読めなければ SettingsFileError)。"""
+    errors = []
+    problem = _env_name_error(name, read_env_registry(shared_instance_path(), strict=True))
+    if problem:
+        errors.append(problem)
+    if not username:
+        errors.append("最初のマネージャーのログインIDを入力してください。")
+    elif len(username) > ENV_USERNAME_MAX or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in username):
+        errors.append("ログインIDは{}文字以内で、空白を含めずに入力してください。".format(ENV_USERNAME_MAX))
+    if not display_name:
+        errors.append("最初のマネージャーの氏名を入力してください。")
+    elif len(display_name) > ENV_DISPLAY_NAME_MAX:
+        errors.append("氏名は{}文字以内で入力してください。".format(ENV_DISPLAY_NAME_MAX))
+    return errors
+
+@system_bp.route("/settings/envs", methods=["POST"])
+def create_env():
+    """環境を追加する(メインの環境のマネージャー)。
+
+    二度押しの2回目は、1回目が終わるまで待ってから「追加済み」と案内する(確認と追加を同じ鍵の中で行う)。
+    """
+    _require_main_env()
+    form = request.form
+    raw_name, raw_display = form.get("name", ""), form.get("display_name", "")
+    name = clean_env_name(raw_name)
+    username = form.get("username", "").strip()
+    display_name = " ".join(CONTROL_CHARS.sub("", raw_display).split())
+    inputs = {"name": raw_name, "username": username, "display_name": raw_display}
+    with _env_registry_lock:
+        if already_submitted(ENV_ONCE_KIND) is not None:
+            return flash_redirect("この環境は既に追加しました（同じ内容の2回目の送信は行っていません）。", "info",
+                                  _envs_tab_url())
+        try:
+            errors = _env_form_errors(name, username, display_name)
+        except SettingsFileError as exc:
+            return flash_redirect("環境を追加できませんでした（環境の一覧のファイルを読み込めないため）: {}".format(exc),
+                                  "danger", _envs_tab_url())
+        if errors:
+            for message in errors:
+                flash(message, "danger")
+            return _render_system_settings(TAB_ENVS, status=400, env_inputs=inputs)
+        try:
+            entry = create_environment(name, username, display_name, current_user.username, _form_version(form))
+        except SettingsConflictError:
+            return flash_redirect(_ENVS_CHANGED.format("追加していません"), "warning", _envs_tab_url())
+        except ValueError as exc:
+            flash(str(exc), "danger")
+            return _render_system_settings(TAB_ENVS, status=400, env_inputs=inputs)
+        except Exception as exc:
+            current_app.logger.exception("環境を追加できませんでした")
+            return flash_redirect("環境を追加できませんでした（{}）。".format(exc.__class__.__name__), "danger",
+                                  _envs_tab_url())
+        remember_submitted(ENV_ONCE_KIND, "")
+    current_app.logger.info("環境を追加しました: %s %s（%s）", entry["key"], entry["name"], current_user.username)
+    # 2つ目の環境で共通のログインが始まる: 追加した人のログインはそのまま続ける(load_user の portal_allows でも作る)
+    if multi_env_enabled() and portal_state()[0] is None:
+        try:
+            start_portal_session(current_user.username, current_user.display_name,
+                                 is_local_account(current_user.username), current_user.role)
+        except OSError:
+            current_app.logger.exception("共通のログインの記録を保存できませんでした")
+    return flash_redirect("環境「{}」を追加しました（URL: {}）。最初のマネージャー: {}（{}）。".format(
+        entry["name"], env_home_url(entry["key"]), display_name, username), "success", _envs_tab_url())
+
+@system_bp.route("/settings/envs/<key>/rename", methods=["POST"])
+def rename_env(key):
+    """環境の名前を変える(メインの環境のマネージャー)。"""
+    _require_main_env()
+    name = clean_env_name(request.form.get("name", ""))
+    try:
+        entry = change_environment(key, _form_version(request.form), current_user.username, name=name)
+    except SettingsConflictError:
+        return flash_redirect(_ENVS_CHANGED.format("名前を変えていません"), "warning", _envs_tab_url())
+    except KeyError:
+        abort(404)
+    except ValueError as exc:
+        return flash_redirect(str(exc), "danger", _envs_tab_url())
+    except (OSError, SettingsStoreError) as exc:
+        current_app.logger.exception("環境の名前を変えられませんでした")
+        return flash_redirect("環境の名前を変えられませんでした（{}）。".format(exc.__class__.__name__), "danger",
+                              _envs_tab_url())
+    return flash_redirect("環境の名前を「{}」にしました。".format(entry["name"]), "success", _envs_tab_url())
+
+@system_bp.route("/settings/envs/<key>/toggle", methods=["POST"])
+def toggle_env(key):
+    """環境を停止・再開する(メインの環境は停止できない)。"""
+    _require_main_env()
+    if key == MAIN_ENV_KEY:
+        abort(400)
+    want = request.form.get("active")
+    if want not in ("0", "1"):
+        abort(400)
+    try:
+        entry = change_environment(key, _form_version(request.form), current_user.username, active=want == "1")
+    except SettingsConflictError:
+        return flash_redirect(_ENVS_CHANGED.format("変更していません"), "warning", _envs_tab_url())
+    except KeyError:
+        abort(404)
+    except (OSError, SettingsStoreError) as exc:
+        current_app.logger.exception("環境を停止・再開できませんでした")
+        return flash_redirect("環境を変更できませんでした（{}）。".format(exc.__class__.__name__), "danger", _envs_tab_url())
+    current_app.logger.info("環境を%sしました: %s（%s）", "再開" if entry["active"] else "停止", key, current_user.username)
+    if entry["active"]:
+        return flash_redirect("環境「{}」を再開しました。".format(entry["name"]), "success", _envs_tab_url())
+    return flash_redirect("環境「{}」を停止しました（画面は開けず、定期メールも送りません。データは残っています）。".format(
+        entry["name"]), "success", _envs_tab_url())
