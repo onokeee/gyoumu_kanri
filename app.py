@@ -20847,8 +20847,11 @@ ENV_DISPLAY_NAME_MAX = 128
 # 基本設定の項目のうち環境ごとのもの(ほかの環境は、その環境の宛先の設定 ENV_MAIL_SETTINGS〔11-3〕を使う)
 ENV_LOCAL_KEYS = ("MAIL_TO", "MAIL_CC")
 
-_env_registry_lock = threading.RLock()
+_env_registry_lock = threading.RLock()   # 環境の一覧の読み書き(キャッシュ)だけ。この中で環境のアプリは作らない
 _env_registry_cache = {}   # {ファイルのパス: (ファイルの版, 整えた内容, 読めなかったときの例外)}
+# 環境の追加・変更を直列にする(環境のアプリを作る〔振り分けの鍵〕のはこの中。振り分けは一覧の鍵だけを短く使うため、
+# 鍵の順が逆になって止まることはない)
+_env_change_lock = threading.RLock()
 _env_scoped_lock = threading.Lock()
 
 def shared_instance_path(app=None):
@@ -21319,6 +21322,9 @@ def _env_refused_page(heading, message, status=403):
 def enter():
     """共通のログインで、この環境のログインを作る(環境の選択の画面・ログインの後・この環境のログインが切れたとき)。"""
     if not multi_env_enabled():
+        # 1つの環境のあいだは使わない(ほかの画面と同じく、未ログインはログインの画面へ)
+        if not current_user.is_authenticated:
+            return current_app.login_manager.unauthorized()
         return redirect(_safe_next(request.args.get("next")) or url_for("main.dashboard"))
     portal, state = portal_state()
     if portal is None:
@@ -21337,6 +21343,14 @@ def enter():
         user = _match_registered_user({"username": portal["u"], "display_name": portal["n"]})
         if user is None:
             session.pop(DROPPED_REQUEST_KEY, None)
+            if is_main_env():
+                # メインの環境(サーバーのトップの URL)に登録されていない人は、入れる環境へ(1つならその環境、
+                # 複数なら環境の選択。ほかの環境だけのメンバーがトップの URL・ブックマークから開いたとき)
+                rows = accessible_envs(portal["u"], portal["l"])
+                if len(rows) == 1:
+                    return redirect(rows[0]["url"])
+                if rows:
+                    return redirect(url_for("auth.envs"))
             return _env_refused_page(
                 "この環境には登録されていません",
                 "このIDは、この環境（{}）のメンバーとして登録されていないか、無効化されています。使う環境を選び直すか、"
@@ -21359,6 +21373,9 @@ def envs():
     if not is_main_env():
         return redirect(portal_url("/envs"))
     if not multi_env_enabled():
+        # 1つの環境のあいだは使わない(ほかの画面と同じく、未ログインはログインの画面へ)
+        if not current_user.is_authenticated:
+            return current_app.login_manager.unauthorized()
         return redirect(url_for("main.dashboard"))
     portal, state = portal_state()
     if portal is None:
@@ -21437,7 +21454,7 @@ def create_environment(name, username, display_name, created_by, expected_versio
     """
     dispatcher = env_dispatcher()
     shared = shared_instance_path()
-    with _env_registry_lock:
+    with _env_change_lock:
         lock_file = _lock_settings_file(shared)  # 同じフォルダのほかのサーバーの変更と重ならないように
         try:
             registry = read_env_registry(shared, strict=True)
@@ -21465,7 +21482,7 @@ def create_environment(name, username, display_name, created_by, expected_versio
 def change_environment(key, expected_version, username, name=None, active=None):
     """環境の名前・停止/再開を変える。戻り値: 変えた後の行。例外は create_environment と同じ(無い環境は KeyError)。"""
     shared = shared_instance_path()
-    with _env_registry_lock:
+    with _env_change_lock:
         lock_file = _lock_settings_file(shared)
         try:
             registry = read_env_registry(shared, strict=True)
@@ -21530,7 +21547,7 @@ def create_env():
     username = form.get("username", "").strip()
     display_name = " ".join(CONTROL_CHARS.sub("", raw_display).split())
     inputs = {"name": raw_name, "username": username, "display_name": raw_display}
-    with _env_registry_lock:
+    with _env_change_lock:
         if already_submitted(ENV_ONCE_KIND) is not None:
             return flash_redirect("この環境は既に追加しました（同じ内容の2回目の送信は行っていません）。", "info",
                                   _envs_tab_url())
