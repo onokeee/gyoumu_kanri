@@ -1846,7 +1846,7 @@
             <div class="form-text" id="rem-emails-note">追加の宛先（アドレス）を設定・変更できるのはマネージャーのみです（メンバーの画面では読み取り専用）。保存したアドレスには、この業務のリマインドを送ります（宛先を確かめてから保存してください）。{% if rem_emails_pending %}<br><span class="text-danger"><i class="bi bi-exclamation-triangle"></i> 今のアドレスは以前の版でメンバーが入力したもので、マネージャーの確認待ちのため送っていません。この画面で保存すると、欄のアドレスに送ります（不要なアドレスは消してから保存してください）。</span>{% endif %}</div>{% endif %}
           </div>
         </div>
-        <div class="form-text">追加の宛先にも、担当者と同じ内容（この業務の本日の実施予定・完了の入力がまだの回）を送ります。宛先ごとに、関係する業務をまとめて1通にします。</div>
+        <div class="form-text">追加の宛先にも、担当者と同じ内容（この業務の完了の入力がまだの回）を送ります。同じ人に関係する業務が複数あっても、1回の送信で届くメールは1通にまとめます。</div>
       </fieldset>
 
       <div class="d-flex gap-2">
@@ -1933,7 +1933,7 @@
 {%- endif %}
 <p style="margin:0 0 4px 0;">{{ mail.intro }}</p>
 <p style="margin:0 0 12px 0;">{{ mail.guide }}</p>
-{%- for title, items, color in [(today_title, mail.today_items, '#0d6efd'), (overdue_title, mail.overdue_items, '#dc3545')] %}
+{%- for title, items, color in ([(today_title, mail.today_items, '#0d6efd')] if mail.include_today else []) + [(overdue_title, mail.overdue_items, '#dc3545')] %}
 <p style="margin:18px 0 6px 0;padding:4px 8px;font-size:15px;font-weight:bold;background-color:#eef2f7;border-left:4px solid {{ color }};">■{{ title }}（{{ items|length }}件）</p>
 {%- if not items %}
 <p style="margin:4px 0 4px 12px;color:#6c757d;">{{ none_text }}</p>
@@ -6204,8 +6204,10 @@
    parse_reminder_settings_form。状況・プレビューは rm_status(reminder_status_context) #}
 <p class="small text-muted">
   定型・定期業務のリマインドの自動送信です。業務ごとの実施日・追加の宛先は、各業務の登録・編集の画面の「リマインド」で設定します。
-  実施日に担当者へメールで知らせ、その回の完了の入力があるまで、送信時刻1・2（1日2回）にリマインドします。
-  宛先ごとに、その宛先に関係する業務（本日実施予定・完了の入力がまだのもの）を1通にまとめて送ります。
+  実施のフォローのメールです。送信時刻1・2（1日2回）に、完了の入力がまだの回を担当者・追加の宛先へ送ります。
+  1日の最初の送信（送信時刻1・2の早いほう。既定 09:00）は予定日を過ぎた回だけ、最後の送信（遅いほう。既定 15:00）は、
+  それに加えて実施予定日が今日でまだ完了の入力が無い回も送ります。
+  同じ人に関係する業務が複数あっても、1回の送信で届くメールは1通にまとめます。
   設定は <code>instance/routine_reminder_settings.json</code> に保存され、基本設定（<code>instance/settings.json</code>）には保存しません。
 </p>
 {% if rm_status.address_problems %}
@@ -6236,7 +6238,7 @@
         <input class="form-check-input" type="checkbox" role="switch" id="reminder-enabled" name="enabled" value="1"
                {% if rm.settings.enabled %}checked{% endif %}>
         <label class="form-check-label fw-bold" for="reminder-enabled">自動送信する</label>
-        <div class="form-text">オンにすると、送信時刻1・2に、リマインドを設定した業務の本日の実施予定と完了の入力がまだの回を、担当者・追加の宛先へそのまま送信します（承認の手順はありません）。送るものが無い宛先には送りません。</div>
+        <div class="form-text">オンにすると、送信時刻1・2に、リマインドを設定した業務の完了の入力がまだの回（1日の最初の送信は予定日を過ぎた回だけ、最後の送信は今日の回も）を、担当者・追加の宛先へそのまま送信します（承認の手順はありません）。送るものが無い宛先には送りません。</div>
       </div>
       <div class="row g-3">
         <div class="col-sm-6 col-md-3">
@@ -6346,10 +6348,10 @@
   </div>
 </div>
 
-{# 今この時点のメールのプレビュー(宛先ごと) #}
+{# 次の送信のメールのプレビュー(宛先ごと) #}
 <div class="card shadow-sm mb-4">
   <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
-    <span class="fw-bold"><i class="bi bi-eye"></i> メールのプレビュー（今この時点の内容）</span>
+    <span class="fw-bold"><i class="bi bi-eye"></i> メールのプレビュー（{{ '次回の自動送信' if rm_status.planned_auto else '自動送信をオンにしたときの次の送信' }} {{ rm_status.planned.strftime('%Y/%m/%d %H:%M') }} の内容）</span>
     <span class="small">
       <span class="badge bg-primary">本日実施 {{ rm_status.data.today_count }}件</span>
       <span class="badge bg-danger">未完了 {{ rm_status.data.overdue_count }}件</span>
@@ -6358,8 +6360,11 @@
   </div>
   <div class="card-body">
     {# data は辞書のため、items は data['items'] で取り出す(data.items は辞書のメソッドになる) #}
+    {% if not rm_status.data.include_today and rm_status.data.today_waiting %}
+    <p class="small text-muted"><i class="bi bi-info-circle"></i> この送信は1日の最後の送信ではないため、実施予定日が今日の回（{{ rm_status.data.today_waiting }}件）は載せません（{{ rm_status.last_time }} の送信で、完了の入力が無ければ送ります）。</p>
+    {% endif %}
     {% if not rm_status.data['items'] %}
-    <p class="text-muted small">今、送る定型業務はありません（本日の実施予定・完了の入力がまだの回がありません）。</p>
+    <p class="text-muted small">この送信で送る定型業務はありません（完了の入力がまだの回がありません）。</p>
     {% endif %}
     {% if rm_status.data.unreachable %}
     <p class="small text-danger"><i class="bi bi-exclamation-triangle"></i> 宛先が1つも無いため送れない回: {{ rm_status.data.unreachable }}件（上の「送れない宛先」を確認してください）</p>

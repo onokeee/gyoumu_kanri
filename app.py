@@ -16000,6 +16000,16 @@ def reminder_send_times(settings):
     """送信の時刻("HH:MM")の一覧(早い順・重複なし)。"""
     return [at for at, _slot in reminder_send_slots(settings)]
 
+def reminder_includes_today(settings, now):
+    """その時刻(now)の送信に、実施予定日が今日の未完了の回(本日実施予定)を載せるか。
+
+    リマインドは実施のフォロー: 1日の最後の送信時刻(送信時刻1・2の遅いほう。既定 15:00)から後の送信だけに載せる。
+    それより前の送信(既定 09:00)は予定日を過ぎた未完了の回だけを送る(当日の分は、最後の送信時刻までに完了の
+    入力が無ければ送る)。送信時刻が読めないときは載せる。
+    """
+    times = reminder_send_times(settings)
+    return not times or now.strftime("%H:%M") >= times[-1]
+
 def parse_reminder_settings_form(form):
     """システム設定の「定型業務リマインド」タブの入力を検証する。戻り値: (values, errors)。"""
     errors = []
@@ -16053,10 +16063,11 @@ def next_reminder_run(settings, now):
     return None
 
 # ==== 10-6. リマインド: メールの作成(宛先ごとに1通) ===============================================
-# 未完了の回を宛先ごとにまとめ、1つの宛先に1通のメールを作る(件名・テキスト版・HTML版)。
-#   ■本日実施予定          : 実施予定日が今日のもの
+# 未完了の回を宛先ごとにまとめ、1つの宛先に1通のメールを作る(件名・テキスト版・HTML版)。実施のフォローのため、
+# 1日の最初の送信(送信時刻1・2の早いほう)は予定日を過ぎた回だけ、最後の送信(遅いほう)は今日の回も載せる。
+#   ■本日実施予定          : 実施予定日が今日のもの(1日の最後の送信だけ)
 #   ■【リマインド】未完了  : 実施予定日を過ぎたもの(予定日と経過した営業日数を付ける。古い順)
-# 件名の例: 【定型業務】本日実施 2件／未完了 1件
+# 件名の例: 【定型業務】本日実施 2件／未完了 1件(1日の最初の送信は 【定型業務】未完了 1件)
 # 各業務には担当者の名前、業務の画面へのリンクと完了の入力の画面へのリンク(APP_BASE_URL ＋ パス。印付き)を付ける。
 # APP_BASE_URL が空・不正ならリンクは付けない(期限超過通知と同じ。7-4 の link_base)。
 # HTML版はテンプレート(templates.html の routine/reminder_mail.html)で作り、すべての値をエスケープする。
@@ -16095,12 +16106,17 @@ def _reminder_item(occ, today, base):
         "complete_url": base + occurrence_path(occ.id, occ.row_key) if base else "",
     }
 
-def build_reminder_subject(today_count, overdue_count):
-    """件名(例: 【定型業務】本日実施 2件／未完了 1件)。"""
+def build_reminder_subject(today_count, overdue_count, include_today=True):
+    """件名(例: 【定型業務】本日実施 2件／未完了 1件。本日実施予定を載せない送信は 【定型業務】未完了 1件)。"""
+    if not include_today:
+        return "【定型業務】未完了 {}件".format(overdue_count)
     return "【定型業務】本日実施 {}件／未完了 {}件".format(today_count, overdue_count)
 
-def _reminder_mail(address, name, items, now, base, note=""):
-    """1通分のメール {"address", "name", "today_items", "overdue_items", "subject", "text", "html"}。"""
+def _reminder_mail(address, name, items, now, base, note="", include_today=True):
+    """1通分のメール {"address", "name", "today_items", "overdue_items", "subject", "text", "html"}。
+
+    include_today が False(1日の最後より前の送信)なら「本日実施予定」の欄を載せない(reminder_includes_today)。
+    """
     today_items = sorted((i for i in items if i["is_today"]), key=lambda i: (i["name"], i["id"]))
     overdue_items = sorted((i for i in items if not i["is_today"]), key=lambda i: (i["due_date"], i["name"], i["id"]))
     mail = {
@@ -16108,8 +16124,10 @@ def _reminder_mail(address, name, items, now, base, note=""):
         "name": name,
         "today_items": today_items,
         "overdue_items": overdue_items,
-        "subject": build_reminder_subject(len(today_items), len(overdue_items)),
-        "intro": ("{} 時点の、定型・定期業務の本日の実施予定と、完了の入力がまだのもののお知らせです。".format(
+        "include_today": include_today,
+        "subject": build_reminder_subject(len(today_items), len(overdue_items), include_today),
+        "intro": (("{} 時点の、定型・定期業務の本日の実施予定と、完了の入力がまだのもののお知らせです。"
+                   if include_today else "{} 時点で、予定日を過ぎても完了の入力がまだの定型・定期業務のお知らせです。").format(
             now.strftime("%Y/%m/%d %H:%M"))),
         "guide": ("実施したら、業務ごとの「完了の入力」から完了を入力してください（入力すると、その回のリマインドは止まります）。"
                   if base else
@@ -16130,7 +16148,8 @@ def build_reminder_text(mail):
     if mail["note"]:
         lines += [mail["note"], ""]
     lines += [mail["intro"], mail["guide"], ""]
-    for title, items in ((REMINDER_TODAY_TITLE, mail["today_items"]), (REMINDER_OVERDUE_TITLE, mail["overdue_items"])):
+    sections = ((REMINDER_TODAY_TITLE, mail["today_items"]),) if mail["include_today"] else ()
+    for title, items in sections + ((REMINDER_OVERDUE_TITLE, mail["overdue_items"]),):
         lines.append("■{}（{}件）".format(title, len(items)))
         if not items:
             lines.append(MAIL_NONE_TEXT)
@@ -16148,14 +16167,20 @@ def build_reminder_text(mail):
     lines.append(mail["footer"])
     return "\n".join(lines)
 
-def collect_reminder_mails(today, now):
+def collect_reminder_mails(today, now, include_today=True):
     """未完了の回を宛先ごとにまとめたメールを作る(送らない)。
 
-    戻り値: {"today", "now", "items"(すべての未完了の回), "mails"(宛先ごと。アドレスの順),
-             "today_count", "overdue_count", "unreachable"(宛先が1つも無い回の数),
-             "problems"(送れない宛先 [{"name", "reason", "kind", "count"}]), "link_problem", "base"}
+    include_today が False なら、実施予定日が今日の回は載せない(1日の最後より前の送信。reminder_includes_today)。
+    戻り値: {"today", "now", "items"(載せる未完了の回), "mails"(宛先ごと。アドレスの順),
+             "today_count", "overdue_count", "include_today", "today_waiting"(載せなかった今日の回の数),
+             "unreachable"(宛先が1つも無い回の数), "problems"(送れない宛先 [{"name", "reason", "kind", "count"}]),
+             "link_problem", "base"}
     """
     pending = pending_occurrences(today)
+    today_waiting = 0
+    if not include_today:
+        today_waiting = sum(1 for occ in pending if occ.due_date >= today)
+        pending = [occ for occ in pending if occ.due_date < today]
     base, link_problem = link_base()
     reminders = {r.routine_id: r for r in RoutineReminder.query.filter(RoutineReminder.enabled.is_(True)).all()}
     users = {u.id: u for u in User.query.all()}
@@ -16180,7 +16205,8 @@ def collect_reminder_mails(today, now):
             if not box["name"] and recipient["name"]:
                 box["name"] = recipient["name"]
             box["items"][item["id"]] = item
-    mails = [_reminder_mail(box["address"], box["name"], list(box["items"].values()), now, base)
+    mails = [_reminder_mail(box["address"], box["name"], list(box["items"].values()), now, base,
+                            include_today=include_today)
              for _key, box in sorted(boxes.items())]
     return {
         "today": today,
@@ -16189,6 +16215,8 @@ def collect_reminder_mails(today, now):
         "mails": mails,
         "today_count": sum(1 for i in items if i["is_today"]),
         "overdue_count": sum(1 for i in items if not i["is_today"]),
+        "include_today": include_today,
+        "today_waiting": today_waiting,
         "unreachable": unreachable,
         "problems": [{"name": n, "reason": r, "kind": k, "count": c} for (n, r, k), c in problems.items()],
         "link_problem": link_problem,
@@ -16235,7 +16263,11 @@ REMINDER_JOB = MailJob("定型業務リマインド", threading.Lock(), REMINDER
 def _send_reminder_mails(data):
     """本番の送信(宛先ごとに1通)。戻り値: (成否, 前回の結果のメッセージ)。"""
     parts = []
+    waiting = ("本日実施予定の {}件は、1日の最後の送信時刻に完了の入力が無ければ送ります".format(data["today_waiting"])
+               if data.get("today_waiting") else "")
     if not data["items"]:
+        if waiting:
+            return True, "予定日を過ぎた未完了の定型業務はありません（送信していません。{}）。".format(waiting)
         return True, "未完了の定型業務はありません（送信していません）。"
     sent, failures = 0, []
     if data["mails"]:
@@ -16250,6 +16282,8 @@ def _send_reminder_mails(data):
             failures.append("{}（{}）".format(mail["address"], message.rstrip("。")))
     parts.append("送信 {}通・失敗 {}通（本日実施 {}件・未完了 {}件）".format(
         sent, len(failures), data["today_count"], data["overdue_count"]))
+    if waiting:
+        parts.append(waiting)
     if data["unreachable"]:
         parts.append("宛先が無いため送れなかった回 {}件".format(data["unreachable"]))
     if data["problems"]:
@@ -16269,7 +16303,9 @@ def _deliver_reminders(app, trigger, now, test):
         # アドレスのため、差出人・送信サーバーだけを見る〔test=True〕)。そのため MailJob.deliver の check_test は使わない
         at = now or _now()
         ensure_routine_occurrences(at.date())
-        data = collect_reminder_mails(at.date(), at)
+        # テスト送信は今の未完了の回をすべて載せる。本番の送信は1日の最後の送信時刻から今日の分も載せる
+        include_today = test or reminder_includes_today(load_reminder_settings(), at)
+        data = collect_reminder_mails(at.date(), at, include_today=include_today)
         if not test:
             return _send_reminder_mails(data)
         problem = check_mail_settings(test=True)
@@ -16300,13 +16336,19 @@ def reminder_status_context():
     settings = load_reminder_settings()
     now = _now()
     refresh_occurrences_for_page(now.date())
-    data = collect_reminder_mails(now.date(), now)
     upcoming = next_reminder_run(settings, datetime.now())
-    test_mail = build_reminder_test_mail(data)
+    # プレビューは次の送信の内容(自動送信がオフなら、オンにしたときの次の送信。送るときに完了の入力があれば除く)
+    planned = next_reminder_run(dict(settings, enabled=True), now) or now
+    data = collect_reminder_mails(planned.date(), planned, include_today=reminder_includes_today(settings, planned))
+    test_mail = build_reminder_test_mail(collect_reminder_mails(now.date(), now))
+    times = reminder_send_times(settings)
     return dict(
         mail_feature_context(REMINDER_JOB, settings, upcoming, test_only=True),
         link_problem=data["link_problem"],
         data=data,
+        planned=planned,
+        planned_auto=bool(settings.get("enabled")),
+        last_time=times[-1] if times else "",
         previews=[dict(mail, document=_preview_document(mail["html"])) for mail in data["mails"]],
         test_mail=dict(test_mail, document=_preview_document(test_mail["html"])),
         address_problems=reminder_address_problems(),
