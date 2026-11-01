@@ -16,6 +16,7 @@
     メールアドレス　　  account/email.html
     個人ダッシュボード  main/dashboard.html
     タスク　　　　　　  tasks/list.html  tasks/detail.html  tasks/form.html  tasks/_recommend.html
+                        tasks/plan.html（計画の編集）
     定型業務　　　　　  routine/list.html  routine/detail.html  routine/form.html
                         routine/occurrence.html  routine/reminder_mail.html
     出勤表・年休　　　  leaves/list.html  leaves/calendar.html（出勤表）  leaves/detail.html  leaves/form.html
@@ -37,6 +38,7 @@
                         static/js/skill-item-form.js  static/js/skill-ai.js
                         static/js/weekly-settings.js  static/js/system-settings.js
                         static/js/shift-month.js  static/js/ai-analysis.js  static/js/env-features.js
+                        static/js/task-plan.js
 #}
 {#=== base.html ===#}
 <!doctype html>
@@ -232,7 +234,7 @@
 
 {# 「AIで分析」で AI の接続先に送る内容(マネージャーダッシュボード・システム設定の「AI分析」タブなどで同じ文を使う) #}
 {% macro ai_analysis_sent_items() -%}
-  タスクの名前・説明・コメント（書いた人の氏名・日時を含む）・状態の変更（日時を含む）・成果・メンバーの氏名・スキル（到達度と期間内の変更）
+  タスクの名前・説明・コメント（書いた人の氏名・日時を含む）・状態の変更（日時を含む）・成果・メンバーの氏名・スキル（到達度と期間内の変更）・タスクの計画（手順と実行予定日）
 {%- endmacro %}
 
 {# 環境の使う機能のチェックボックス(システム管理の「環境」の追加・使う機能の変更。app.py の 2-8)。rows は env_feature_rows の値、
@@ -487,10 +489,12 @@
           <th class="text-nowrap" data-type="num">優先度</th>
           <th class="text-nowrap" data-type="num">ステータス</th>
           <th class="text-nowrap">期限</th>
+          <th class="text-nowrap">計画</th>
         </tr>
       </thead>
       <tbody>
         {% for task in my_tasks %}
+        {% set p = my_plans[task.id] %}
         <tr>
           <td><a href="{{ url_for('tasks.detail', task_id=task.id) }}">{{ task.title }}</a></td>
           {# 並び替えキー: 優先度は 高→低、ステータスは 未着手→完了 の定義順 #}
@@ -505,9 +509,15 @@
             {{ task.due_date.strftime('%Y/%m/%d') if task.due_date else '―' }}
             {% if task.is_overdue %}<i class="bi bi-exclamation-circle"></i>{% endif %}
           </td>
+          {# 計画(app.py の 19 章): 完了の数/手順の数・次の手順の予定日。遅れは赤、手順が無ければ「計画なし」(計画の編集へ) #}
+          <td class="text-nowrap small {% if p.delayed %}text-danger fw-bold{% endif %}"
+              data-sort="{{ p.next.planned_date.strftime('%Y-%m-%d') if p.next and p.next.planned_date else '' }}">
+            {%- if p.total %}{{ p.done }}/{{ p.total }}{% if p.next_label %}・次 {{ p.next_label }}{% endif %}{% if p.delayed %} <span class="badge bg-danger">遅れ</span>{% endif %}
+            {%- else %}<a href="{{ url_for('tasks.edit_plan', task_id=task.id) }}" class="badge bg-warning text-dark text-decoration-none">計画なし</a>{% endif -%}
+          </td>
         </tr>
         {% else %}
-        <tr><td colspan="4" class="text-center text-muted py-4">担当している未完了タスクはありません。</td></tr>
+        <tr><td colspan="5" class="text-center text-muted py-4">担当している未完了タスクはありません。</td></tr>
         {% endfor %}
       </tbody>
     </table>
@@ -875,6 +885,13 @@
               data-sort="{{ task.due_date.strftime('%Y-%m-%d') if task.due_date else '' }}">
             {{ task.due_date.strftime('%Y/%m/%d') if task.due_date else '―' }}
           </td>
+          {% elif key == 'plan' %}
+          {# 計画(app.py の 19 章): 完了の数/手順の数・次の手順の予定日・遅れ。並び替えは次の手順の予定日 #}
+          {% set p = plans[task.id] %}
+          <td class="text-nowrap small" data-sort="{{ p.next.planned_date.strftime('%Y-%m-%d') if p.next and p.next.planned_date else '' }}">
+            {%- if p.total %}{{ p.done }}/{{ p.total }}{% if p.next_label %} <span class="text-muted">次 {{ p.next_label }}</span>{% endif %}{% if p.delayed %} <span class="badge bg-danger">遅れ</span>{% endif %}
+            {%- else %}―{% endif -%}
+          </td>
           {% elif key == 'scale' %}
           <td class="text-nowrap" data-sort="{{ task.scale_hours if task.scale_label else '' }}">
             {% if task.scale_label %}{{ task.scale_label }} <small class="text-muted">（約{{ task.scale_hours }}h）</small>{% else %}―{% endif %}
@@ -1047,6 +1064,65 @@
       </div>
     </div>
   </div>
+</div>
+
+{# 計画(手順と実行予定日。app.py の 19 章)。最初の未完了の手順が「次」。完了・戻すは担当者・マネージャーだけ #}
+<div class="card shadow-sm mt-3" id="plan">
+  <div class="card-header bg-white fw-bold d-flex flex-wrap justify-content-between align-items-center gap-2">
+    <span><i class="bi bi-signpost-split"></i> 計画（手順と実行予定日）</span>
+    {% if plan.total %}
+    <span class="small fw-normal d-flex align-items-center gap-2">完了 {{ plan.done }}/{{ plan.total }}
+      <span class="progress" style="width:6rem;height:6px;" role="progressbar" aria-label="計画の進み" aria-valuenow="{{ plan.percent }}" aria-valuemin="0" aria-valuemax="100"><span class="progress-bar bg-success" style="width:{{ plan.percent }}%"></span></span>
+    </span>
+    {% endif %}
+  </div>
+  {% if plan.total %}
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0">
+      <thead class="table-light">
+        <tr>
+          <th class="text-nowrap ps-3">順</th><th>手順</th><th class="text-nowrap">実行予定日</th><th class="text-nowrap">状態</th>
+          {% if can_edit %}<th class="pe-3"><span class="visually-hidden">操作</span></th>{% endif %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in plan.rows %}
+        <tr class="{% if row.is_next %}table-primary fw-bold{% elif row.state == 'done' %}text-muted{% endif %}">
+          <td class="text-nowrap ps-3">{{ loop.index }}{% if row.is_next %} <span class="badge bg-primary">次</span>{% endif %}</td>
+          <td>{{ row.step.title }}</td>
+          <td class="text-nowrap">{{ row.date_label }}{% if row.after_due %} <i class="bi bi-info-circle text-warning" title="タスクの期限（{{ plan.due_label }}）より後"></i>{% endif %}</td>
+          <td class="text-nowrap">
+            {%- if row.state == 'done' %}<span class="badge bg-success">完了</span> <span class="small fw-normal">{{ row.done_label }}</span>
+            {%- elif row.state == 'late' %}<span class="badge bg-danger">遅れ</span> <span class="small text-danger">{{ row.delay_label }}の遅れ</span>
+            {%- elif row.state == 'today' %}<span class="badge bg-warning text-dark">今日</span>
+            {%- else %}<span class="badge bg-light text-dark border">未完了</span>{% endif -%}
+          </td>
+          {% if can_edit %}
+          <td class="text-end pe-3">
+            <form method="post" action="{{ url_for('tasks.toggle_plan_step', task_id=task.id, step_id=row.step.id) }}" class="d-inline">
+              <input type="hidden" name="row" value="{{ task.row_key }}">
+              <input type="hidden" name="step_key" value="{{ row.step.row_key }}">
+              <input type="hidden" name="done" value="{{ '0' if row.state == 'done' else '1' }}">
+              {% if row.state == 'done' %}<button class="btn btn-sm btn-outline-secondary text-nowrap">戻す</button>
+              {% else %}<button class="btn btn-sm btn-outline-success text-nowrap"><i class="bi bi-check2"></i> 完了</button>{% endif %}
+            </form>
+          </td>
+          {% endif %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="card-body py-2"><p class="text-muted small mb-0">計画がまだありません。</p></div>
+  {% endif %}
+  {% if can_edit %}
+  <div class="card-footer bg-white">
+    <a href="{{ url_for('tasks.edit_plan', task_id=task.id) }}" class="btn btn-sm {{ 'btn-outline-primary' if plan.total else 'btn-primary' }}">
+      <i class="bi bi-{{ 'pencil' if plan.total else 'plus-lg' }}"></i> {{ '計画を編集' if plan.total else '計画を立てる' }}
+    </a>
+  </div>
+  {% endif %}
 </div>
 
 {# 進捗状況 #}
@@ -1417,6 +1493,102 @@
 {% if rec.ignored %}<div class="small text-muted">無効にしたスキル（{{ rec.ignored|map(attribute='name')|join('、') }}）は比べていません。</div>{% endif %}
 {% if rec.long_period %}<div class="small text-muted">期間が長いため、出勤日数と勤務表の休みは数えていません。</div>{% endif %}
 {% endif %}
+{#=== tasks/plan.html ===#}
+{# 計画(手順と実行予定日)の編集(app.py の 19-2)。1つのフォームで計画全体を保存する。行の欄の名前は行の番号 i 付き、
+   行の並びは hidden の rows(画面の行の順)。空の行はいつも3つ(JavaScript が無くても足せる)。
+   JavaScript(static/js/task-plan.js)があれば「行を追加」と「↑」「↓」(行の入れ替え)を出す。
+   current は、ほかの操作で計画が変わっていたときの今の計画(読み取りだけ) #}
+{% extends "base.html" %}
+{% block title %}計画の編集 &middot; {{ app_name }}{% endblock %}
+
+{% macro plan_row(r, no, date_min, date_max, title_max) %}
+<tr data-plan-row>
+  <td class="text-muted text-nowrap" data-plan-no>{{ no }}</td>
+  <td>
+    <input type="hidden" name="rows" value="{{ r.index }}">
+    <input type="hidden" name="step_{{ r.index }}" value="{{ r.step_id }}">
+    <input type="hidden" name="key_{{ r.index }}" value="{{ r.key }}">
+    <input type="text" name="title_{{ r.index }}" class="form-control form-control-sm" maxlength="{{ title_max }}" value="{{ r.title }}" aria-label="手順">
+  </td>
+  <td><input type="date" name="date_{{ r.index }}" class="form-control form-control-sm" min="{{ date_min }}" max="{{ date_max }}" value="{{ r.date }}" aria-label="実行予定日"></td>
+  <td class="text-center"><input type="checkbox" class="form-check-input" name="done_{{ r.index }}" value="1" aria-label="完了" {% if r.done %}checked{% endif %}></td>
+  <td class="text-center">{% if r.existing %}<input type="checkbox" class="form-check-input" name="del_{{ r.index }}" value="1" aria-label="削除" {% if r.delete %}checked{% endif %}>{% endif %}</td>
+  <td class="text-nowrap d-none" data-plan-move>
+    <button type="button" class="btn btn-sm btn-outline-secondary py-0" data-plan-up aria-label="上へ">↑</button>
+    <button type="button" class="btn btn-sm btn-outline-secondary py-0" data-plan-down aria-label="下へ">↓</button>
+  </td>
+</tr>
+{% endmacro %}
+
+{% block content %}
+<nav aria-label="breadcrumb">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('tasks.list_tasks') }}">タスク一覧</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('tasks.detail', task_id=task.id) }}">詳細</a></li>
+    <li class="breadcrumb-item active">計画の編集</li>
+  </ol>
+</nav>
+<h1 class="h4 mb-1"><i class="bi bi-signpost-split"></i> 計画（手順と実行予定日）</h1>
+<p class="text-muted small mb-3">{{ task.title }}{% if task.due_date %}（期限 {{ task.due_date.strftime('%Y/%m/%d') }}）{% endif %}</p>
+
+{% if current is not none %}
+<div class="card border-warning shadow-sm mb-3" id="current-plan">
+  <div class="card-header bg-white fw-bold">今の計画</div>
+  {% if current.total %}
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0">
+      <thead class="table-light"><tr><th class="text-nowrap ps-3">順</th><th>手順</th><th class="text-nowrap">実行予定日</th><th class="text-nowrap">状態</th></tr></thead>
+      <tbody>
+        {% for row in current.rows %}
+        <tr>
+          <td class="ps-3">{{ loop.index }}</td>
+          <td>{{ row.step.title }}</td>
+          <td class="text-nowrap">{{ row.date_label }}</td>
+          <td class="text-nowrap small">{% if row.state == 'done' %}完了 {{ row.done_label }}{% elif row.state == 'late' %}<span class="text-danger">遅れ</span>{% elif row.state == 'today' %}今日{% else %}未完了{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="card-body py-2"><p class="text-muted small mb-0">計画がまだありません。</p></div>
+  {% endif %}
+</div>
+{% endif %}
+
+<form method="post" class="card card-body shadow-sm" id="plan-form">
+  <input type="hidden" name="row" value="{{ task.row_key }}">
+  <input type="hidden" name="version" value="{{ version }}">
+  <input type="hidden" name="once" value="{{ submit_token() }}">
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-2">
+      <thead class="table-light">
+        <tr>
+          <th class="text-nowrap">順</th><th>手順</th><th class="text-nowrap">実行予定日</th>
+          <th class="text-nowrap text-center">完了</th><th class="text-nowrap text-center">削除</th>
+          <th class="d-none" data-plan-move><span class="visually-hidden">並べ替え</span></th>
+        </tr>
+      </thead>
+      <tbody id="plan-rows">
+        {% for r in rows %}{{ plan_row(r, loop.index, date_min, date_max, title_max) }}{% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="form-text mt-0 mb-2">手順と実行予定日を入れた行を保存します（空の行は無視）。</div>
+  <div>
+    <button type="button" class="btn btn-sm btn-outline-secondary d-none" id="plan-add-row"><i class="bi bi-plus-lg"></i> 行を追加</button>
+  </div>
+  <div class="d-flex gap-2 mt-3">
+    <button type="submit" class="btn btn-primary"><i class="bi bi-check-lg"></i> 保存</button>
+    <a href="{{ url_for('tasks.detail', task_id=task.id, _anchor='plan') }}" class="btn btn-outline-secondary">キャンセル</a>
+  </div>
+</form>
+{# 「行を追加」で足す行のひな形(フォームの外。__i__ を新しい行の番号にする) #}
+<template id="plan-row-template">{{ plan_row({"index": "__i__", "step_id": "", "key": "", "title": "", "date": "", "done": false, "delete": false, "existing": false}, "", date_min, date_max, title_max) }}</template>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/task-plan.js') }}"></script>
+{% endblock %}
 {#=== routine/list.html ===#}
 {% extends "base.html" %}
 {% from "_macros.html" import fmt_date, occurrence_complete_button %}
@@ -7250,5 +7422,83 @@ a:hover {
     document.addEventListener("DOMContentLoaded", init);
   } else {
     init();
+  }
+})();
+{#=== static/js/task-plan.js ===#}
+/* タスクの計画の編集(tasks/plan.html)用。
+ *
+ * ・「行を追加」: 空の行を足す(ひな形 #plan-row-template の __i__ を新しい行の番号にする)
+ * ・「↑」「↓」: 行を入れ替える(送った順がそのまま計画の並びになる。順の数字も付け直す)
+ * JavaScript が無効でも保存できる(空の行はいつも3つ出る。並べ替えはできない)。
+ */
+(function () {
+  "use strict";
+
+  function setup() {
+    var body = document.getElementById("plan-rows");
+    if (!body) return;
+    var template = document.getElementById("plan-row-template");
+    var addButton = document.getElementById("plan-add-row");
+
+    function rows() {
+      return Array.prototype.filter.call(body.children, function (tr) {
+        return tr.hasAttribute("data-plan-row");
+      });
+    }
+
+    function renumber() {
+      rows().forEach(function (tr, i) {
+        var cell = tr.querySelector("[data-plan-no]");
+        if (cell) cell.textContent = String(i + 1);
+      });
+    }
+
+    function showMove(root) {
+      root.querySelectorAll("[data-plan-move]").forEach(function (el) {
+        el.classList.remove("d-none");
+      });
+    }
+
+    function nextIndex() {
+      var max = 0;
+      body.querySelectorAll("input[name='rows']").forEach(function (input) {
+        var n = parseInt(input.value, 10);
+        if (!isNaN(n) && n > max) max = n;
+      });
+      return max + 1;
+    }
+
+    showMove(document.getElementById("plan-form") || body);
+    body.addEventListener("click", function (event) {
+      var button = event.target.closest("[data-plan-up], [data-plan-down]");
+      if (!button) return;
+      var tr = button.closest("tr");
+      if (button.hasAttribute("data-plan-up")) {
+        if (tr.previousElementSibling) body.insertBefore(tr, tr.previousElementSibling);
+      } else if (tr.nextElementSibling) {
+        body.insertBefore(tr.nextElementSibling, tr);
+      }
+      renumber();
+      button.focus();
+    });
+
+    if (addButton && template && template.content) {
+      addButton.classList.remove("d-none");
+      addButton.addEventListener("click", function () {
+        body.insertAdjacentHTML("beforeend", template.innerHTML.replace(/__i__/g, String(nextIndex())));
+        var all = rows();
+        var added = all[all.length - 1];
+        showMove(added);
+        renumber();
+        var input = added.querySelector("input[type='text']");
+        if (input) input.focus();
+      });
+    }
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", setup);
+  } else {
+    setup();
   }
 })();

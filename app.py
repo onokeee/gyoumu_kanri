@@ -131,6 +131,10 @@ Python のコードはすべてこの app.py にまとめている。ほかの�
       17-4. 画面(ログインの後の環境の選択・環境に入る)
       17-5. 環境の追加・名前の変更・使う機能・停止(システム管理の「環境」。固定ローカル管理者 admin だけ。18 章)
   18. システム管理(固定ローカル管理者 admin だけの画面)
+  19. タスクの計画(手順と実行予定日)
+      19-1. 計画の状況(遅れ・次の手順)
+      19-2. 計画の編集(入力の確かめ・保存)
+      19-3. 画面(タスクの Blueprint に足すルート)
 """
 import calendar
 import codecs
@@ -2373,6 +2377,13 @@ class Task(db.Model):
         back_populates="task",
         cascade="all, delete-orphan",
     )
+    # 計画の手順(TaskStep。19 章)。並びの順。タスクを削除すると一緒に消す
+    steps = db.relationship(
+        "TaskStep",
+        back_populates="task",
+        cascade="all, delete-orphan",
+        order_by="[TaskStep.position, TaskStep.id]",
+    )
 
     @property
     def sorted_skill_reqs(self):
@@ -2553,6 +2564,43 @@ class TaskSkill(db.Model):
 
     def __repr__(self):
         return f"<TaskSkill task={self.task_id} skill={self.skill_id} lv={self.level}>"
+
+class TaskStep(db.Model):
+    """タスクの計画の手順1つ(やることと実行予定日。完了を付けて進める。19 章)。
+
+    新しいテーブル(既存のテーブルは変更しない)。タスクを削除すると一緒に消える(Task.steps)。
+    番号(id)は再利用しない(AUTOINCREMENT。画面のボタン・フォームは手順の印〔make_row_key〕も送って照合する)。
+    実行予定日は画面では必須(DB は空も可)。未完了の手順は done_at が空。
+    """
+    __tablename__ = "task_steps"
+    __table_args__ = {"sqlite_autoincrement": True}
+
+    id = db.Column(db.Integer, primary_key=True)
+    task_id = db.Column(db.Integer, db.ForeignKey("tasks.id"), nullable=False, index=True)
+    position = db.Column(db.Integer, nullable=False)         # 並び(1から)
+    title = db.Column(db.String(200), nullable=False)         # 手順(やること)
+    planned_date = db.Column(db.Date)                         # 実行予定日
+    done_at = db.Column(db.DateTime)                          # 完了にした日時(未完了は空)
+    done_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    created_at = db.Column(db.DateTime, default=datetime.now)
+    created_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+    updated_by_id = db.Column(db.Integer, db.ForeignKey("users.id"))
+
+    task = db.relationship("Task", back_populates="steps")
+    done_by = db.relationship("User", foreign_keys=[done_by_id])
+
+    @property
+    def is_done(self):
+        return self.done_at is not None
+
+    @property
+    def row_key(self):
+        """画面のボタン・フォームでこの手順を指す印(make_row_key)。"""
+        return make_row_key(self)
+
+    def __repr__(self):
+        return f"<TaskStep {self.id} task={self.task_id} #{self.position}>"
 
 # ==== 3-3. 年休 ===================================================================================
 # チーム内での情報共有・見える化が目的。承認フローは持たない(登録=即共有)。
@@ -4933,10 +4981,13 @@ def main_dashboard():
             Task.assignees.any(User.id == current_user.id),
             Task.status != STATUS_DONE,
         )
+        .options(selectinload(Task.steps))
         .order_by(Task.due_date.is_(None), Task.due_date.asc())
         .all()
     )
     my_overdue = [t for t in my_tasks if t.is_overdue]
+    # 「計画」の列(19 章。手順が無ければ「計画なし」)
+    my_plans = {t.id: plan_progress(t.steps, date.today()) for t in my_tasks}
 
     status_counts = {s: Task.query.filter_by(status=s).count() for s in STATUS_CHOICES}
     my_status_counts = {
@@ -4956,6 +5007,7 @@ def main_dashboard():
         "main/dashboard.html",
         routine_panel=routine_panel,
         my_tasks=my_tasks,
+        my_plans=my_plans,
         my_overdue=my_overdue,
         status_counts=status_counts,
         my_status_counts=my_status_counts,
@@ -5288,6 +5340,7 @@ TASK_COLUMNS = (
     ("status", "ステータス", "num"),
     ("start_date", "開始日", None),
     ("due_date", "期限", None),
+    ("plan", "計画", None),          # 計画の進み(完了の数/手順の数・次の手順の予定日・遅れ。19 章)
     ("scale", "規模", "num"),
     ("skills", "必要スキル", None),
     ("outcome_estimate", "成果（見込み）", None),
@@ -5393,16 +5446,21 @@ def list_tasks():
         options.append(selectinload(Task.assignees).selectinload(User.departments))
     if "shifts" in columns:
         options.append(selectinload(Task.assignees).selectinload(User.shift_link).selectinload(UserShift.shift))
+    if "plan" in columns:
+        options.append(selectinload(Task.steps))
     tasks = query.options(*options).order_by(
         (Task.status == STATUS_DONE).asc(),
         Task.due_date.is_(None).asc(),
         Task.due_date.asc(),
         Task.id.desc(),
     ).all()
+    today = date.today()
 
     return render_template(
         "tasks/list.html",
         tasks=tasks,
+        # 「計画」の列(19 章): タスクごとの計画の進み
+        plans={t.id: plan_progress(t.steps, today) for t in tasks} if "plan" in columns else {},
         editable_ids={t.id for t in tasks if _can_edit(t)},
         users=users,
         teams=teams,
@@ -5544,6 +5602,7 @@ def _render_task_detail(task, draft=None, status=200):
     return render_template("tasks/detail.html", task=task, can_edit=_can_edit(task),
                            comment_versions=comment_versions, skill_judgments=judgments,
                            judgment_stale=judgment_is_stale, status_choices=STATUS_CHOICES,
+                           plan=task_plan_view(task, date.today()),   # 計画(手順と実行予定日。19 章)
                            draft=draft or {}), status
 
 @tasks_bp.route("/<int:task_id>/edit", methods=["GET", "POST"])
@@ -7809,7 +7868,8 @@ def gantt_full():
 departments_bp = Blueprint("departments", __name__, url_prefix="/departments")
 
 def _member_has_history(user):
-    """メンバーが業務データ(タスク/進捗/年休/スキル・その変更の記録・以前の版の相談・計画/定型業務・その完了の入力)を持つか。
+    """メンバーが業務データ(タスク/進捗/タスクの計画の手順/年休/スキル・その変更の記録・以前の版の相談・計画/定型業務・
+    その完了の入力)を持つか。
 
     履歴があるユーザーは物理削除するとタスク等の参照が壊れるため、無効化に切り替える。
     """
@@ -7817,6 +7877,9 @@ def _member_has_history(user):
         return True
     if TaskComment.query.filter_by(user_id=user.id).first():
         return True
+    if TaskStep.query.filter((TaskStep.created_by_id == user.id) | (TaskStep.updated_by_id == user.id)
+                             | (TaskStep.done_by_id == user.id)).first():
+        return True  # タスクの計画の手順を作った・直した・完了にした記録(19 章)
     if SkillRating.query.filter_by(rated_by_id=user.id).first():
         return True
     if SkillLevelChange.query.filter((SkillLevelChange.user_id == user.id) | (SkillLevelChange.created_by_id == user.id)
@@ -8161,9 +8224,10 @@ def _xlsx_response(sheets, filename):
 
 # ---- 各メニューのシート定義(現在データ＋履歴データ) ----
 def _tasks_sheets():
-    # 担当者・登録者はまとめて読む(行ごとに読みに行かない)
+    # 担当者・登録者・計画の手順はまとめて読む(行ごとに読みに行かない)
     tasks = Task.query.options(selectinload(Task.assignees), selectinload(Task.creator),
-                               selectinload(Task.skill_reqs).selectinload(TaskSkill.skill)).order_by(Task.id).all()
+                               selectinload(Task.skill_reqs).selectinload(TaskSkill.skill),
+                               selectinload(Task.steps).selectinload(TaskStep.done_by)).order_by(Task.id).all()
     t_headers = [
         "ID", "タイトル", "ステータス", "優先度", "開始日", "期限", "規模",
         "担当者", "登録者", "成果定量-見込み", "単位", "成果定量-実績", "単位",
@@ -8195,10 +8259,17 @@ def _tasks_sheets():
         cm.user.display_name if cm.user else "", cm.body, cm.created_at,
     ] for cm in comments]
 
+    # 計画の手順(19 章。タスクの順・並びの順)
+    s_rows = [[
+        t.id, t.title, position, s.title, s.planned_date, s.done_at is not None, s.done_at,
+        s.done_by.display_name if s.done_by else "",
+    ] for t in tasks for position, s in enumerate(t.steps, 1)]
+
     return [
         ("タスク(現在)", t_headers, t_rows),
         ("ステータス履歴", ["タスクID", "タスク", "ステータス", "変更日時"], c_rows),
         ("進捗状況(履歴)", ["タスクID", "タスク", "記載者", "進捗内容", "記載日時"], cm_rows),
+        ("タスクの計画", ["タスクID", "タスク", "順", "手順", "実行予定日", "完了", "完了日時", "完了した人"], s_rows),
     ]
 
 def _routine_sheets():
@@ -10913,7 +10984,7 @@ def skill_ai_panel_context():
 # マネージャーのみ(メンバーは画面・データのどれにもアクセスできない。403)。
 # チームの状況を4つの観点でまとめ、マネージャーが今やることを推奨アクションとして示す:
 #   ① タスクの進捗   進み(期間内の完了・着手)/遅れ(期限超過・期限が近いのに未着手・
-#                    進行中なのに記載がない)/課題(保留中)/マネージャーのコメントへの対応
+#                    進行中なのに記載がない・計画の遅れ・計画なし〔19 章〕)/課題(保留中)/マネージャーのコメントへの対応
 #   ② スキル状況     期間内のスキルの更新(自動更新・マネージャーの変更)/メンバーのスキル分布/偏り
 #   ③ 成果物の状況   期間内に完了したタスクの成果の確認(書き直し推奨)・成果の合計・リードタイム
 #   ④ 各人の能力     同時進行数・負荷・リードタイム・成果・書き方・マネージャーのコメントへの対応率
@@ -10936,9 +11007,10 @@ def skill_ai_panel_context():
 # 集計結果の形(collect_analysis の戻り値。日付・日時は date / datetime のまま):
 #   now, period(9-2), settings(9-1), members [{id, name}]
 #   tasks         {タスクID: タスクの材料(_analysis_task)。タイトル・説明・担当・状態・期限・規模・成果、
-#                  全コメント(記載者・日時・本文・マネージャーか・担当者か)・全状態の変更・完了日時(推定か)}
+#                  全コメント(記載者・日時・本文・マネージャーか・担当者か)・全状態の変更・完了日時(推定か)・
+#                  計画(plan。手順の数・完了の数・遅れの手順〔手順・予定日・営業日〕・次の手順)}
 #   person_task_ids {メンバーID: そのメンバーに関係するタスクIDの一覧(未完了・期間内に完了・期間内に動き)}
-#   progress      ① {done, started, overdue, due_soon, stale, hold, manager_comments, rows, team}
+#   progress      ① {done, started, overdue, due_soon, stale, hold, plan_delay, plan_missing, manager_comments, rows, team}
 #   skills        ② {updates, distribution, skills, thin_skills, operations, single_operations, concentration}
 #   outputs       ③ {tasks, rewrite, problem_counts, rows, team, lead_time}
 #   abilities     ④ {rows, progress_rewrite}
@@ -11124,12 +11196,25 @@ def _completion_of(task):
         return done_at, False
     return (task.updated_at or task.created_at), True
 
-def _analysis_task(task, period):
-    """1件のタスクの材料(全コメント・全状態の変更を含む。表示・AI の材料に使う素の値)。
+def _analysis_plan(task, today):
+    """タスクの計画(19 章)の材料: {total, done, steps〔並びの順〕, delayed〔遅れの手順。days は遅れの営業日数〕, next}。
+
+    遅れ = 未完了で実行予定日が今日(分析の基準の日)より前の手順。next は並びの最初の未完了の手順。
+    """
+    steps = [{"id": s.id, "position": s.position, "title": s.title or "", "planned_date": s.planned_date,
+              "done": s.done_at is not None} for s in task.steps]
+    open_steps = [s for s in steps if not s["done"]]
+    delayed = [dict(s, days=business_days_ago(s["planned_date"], today), calendar_days=(today - s["planned_date"]).days)
+               for s in open_steps if s["planned_date"] is not None and s["planned_date"] < today]
+    return {"total": len(steps), "done": len(steps) - len(open_steps), "steps": steps, "delayed": delayed,
+            "next": open_steps[0] if open_steps else None}
+
+def _analysis_task(task, period, today=None):
+    """1件のタスクの材料(全コメント・全状態の変更・計画を含む。表示・AI の材料に使う素の値)。
 
     担当者の名前(assignee_list・assignee_names)は、無効化した人に「［無効］」を付ける(一覧・AI の材料)。
     推奨アクションで声をかける相手は有効な担当者だけ(active_assignee_list。全員が無効なら担当者のいない
-    タスクと同じく「担当者を決めて…」にする)。
+    タスクと同じく「担当者を決めて…」にする)。today は計画の遅れを数える今日(分析の基準の日。省略時は _now())。
     """
     assignees = list(task.assignees)
     assignee_ids = [u.id for u in assignees]
@@ -11180,10 +11265,11 @@ def _analysis_task(task, period):
         "started_in": any(ch["status"] == STATUS_DOING and _in_period(ch["at"], period)
                           for ch in changes),
         "status_since": task.last_changed_to(task.status),
+        "plan": _analysis_plan(task, today or _now().date()),
     }
 
-def load_analysis_tasks(period):
-    """全タスクの材料 {タスクID: 材料}。
+def load_analysis_tasks(period, today=None):
+    """全タスクの材料 {タスクID: 材料}。today は計画の遅れを数える今日(分析の基準の日)。
 
     期間の後に登録されたタスクも含める(現時点の一覧〔期限超過・記載がないなど〕・未完了のタスクの全履歴・
     AI の材料は今の状態で見るため)。期間内の数(完了・着手・期間中に未完了だったタスクなど)は、
@@ -11194,11 +11280,13 @@ def load_analysis_tasks(period):
             selectinload(Task.assignees),
             selectinload(Task.comments).selectinload(TaskComment.user),
             selectinload(Task.status_changes),
+            selectinload(Task.steps),
         )
         .order_by(Task.id)
         .all()
     )
-    return {task.id: _analysis_task(task, period) for task in tasks}
+    today = today or _now().date()
+    return {task.id: _analysis_task(task, period, today) for task in tasks}
 
 def analysis_members():
     """対象者(有効なメンバー。表示名順)。"""
@@ -11222,6 +11310,8 @@ NOTE_SHORT_CHARS = 10
 PROGRESS_SHORT_CHARS = 10
 # スキルの集中: 対象者が3名以上で、Lv2以上の保有の合計のうち1名がこの割合以上を持っていれば「集中」
 CONCENTRATION_SHARE = 0.5
+# 計画なし(19 章): 開始日の無い未着手のタスクは、登録からこの営業日数以上たったら「計画なし」にする
+PLAN_MISSING_DAYS = 3
 
 # マネージャーのコメントへの対応(コードの判定。AI の判定は 対応済み/一部対応/未対応)
 MC_NO_REPLY = "返信なし"
@@ -11505,12 +11595,31 @@ def _manager_comments(tasks, period, now):
         "ack_count": len(acks),
     }
 
+def _plan_missing_reason(t, today, now):
+    """計画なしにするタスクの理由(当てはまらなければ None)。
+
+    計画なし: 未完了(未着手・進行中。保留は除く)で有効な担当者がいて手順が1つも無いタスクのうち、進行中のもの、
+    または開始日が今日以前(開始日が無ければ登録から PLAN_MISSING_DAYS 営業日以上たったもの)。
+    """
+    if t["status"] not in (STATUS_TODO, STATUS_DOING) or t["plan"]["total"] or not t["active_assignee_list"]:
+        return None
+    if t["status"] == STATUS_DOING:
+        return "進行中なのに計画が無い。"
+    start = t["start_date"]
+    if start is not None:
+        if start < today:
+            return "開始日（{}）を過ぎても計画が無い。".format(_date_label(start, now))
+        return "今日が開始日なのに計画が無い。" if start == today else None
+    days = business_days_ago(t["created_at"], now) if t["created_at"] else 0
+    return "登録から{}営業日たっても計画が無い。".format(days) if days >= PLAN_MISSING_DAYS else None
+
 def _progress_section(tasks, members, period, now, settings):
     """① タスクの進捗。"""
     today = now.date()
     due_soon_days = settings["due_soon_days"]
     stale_days = settings["stale_days"]
     done, started, overdue, due_soon, stale, hold = [], [], [], [], [], []
+    plan_delay, plan_missing = [], []   # 計画の遅れ・計画なし(19 章)
 
     for t in tasks.values():
         if t["completed_in"]:
@@ -11558,6 +11667,17 @@ def _progress_section(tasks, members, period, now, settings):
                              last_comment=_last_comment_view(t["comments"][-1] if t["comments"] else None),
                              # AI が全コメントから抜き出す課題・相談事項
                              ai=None))
+        plan = t["plan"]
+        if t["status"] in (STATUS_TODO, STATUS_DOING) and plan["delayed"]:
+            # 計画の遅れ: 予定日を過ぎて未完了の手順のあるタスク(1件に1つ。いちばん前の予定日の手順を挙げる)
+            worst = min(plan["delayed"], key=lambda s: (s["planned_date"], s["position"]))
+            plan_delay.append(dict(_task_ref(t), step_id=worst["id"], step_title=worst["title"],
+                                   step_date=worst["planned_date"], delay_days=worst["days"],
+                                   calendar_days=worst["calendar_days"], delayed_count=len(plan["delayed"]),
+                                   plan_done=plan["done"], plan_total=plan["total"]))
+        missing = _plan_missing_reason(t, today, now)
+        if missing:
+            plan_missing.append(dict(_task_ref(t), reason=missing, created_at=t["created_at"]))
 
     done.sort(key=lambda r: r["completed_at"] or datetime.min, reverse=True)
     started.sort(key=lambda r: r["started_at"], reverse=True)
@@ -11565,15 +11685,21 @@ def _progress_section(tasks, members, period, now, settings):
     due_soon.sort(key=lambda r: (r["days_left"], r["due_date"], r["task_id"]))
     stale.sort(key=lambda r: (-r["elapsed_days"], r["task_id"]))
     hold.sort(key=lambda r: (-(r["hold_days"] or 0), r["task_id"]))
+    plan_delay.sort(key=lambda r: (-r["delay_days"], r["step_date"], r["task_id"]))
+    # 計画なしは、進行中・開始日(無ければ登録日)の古いものを先に
+    plan_missing.sort(key=lambda r: (r["status"] != STATUS_DOING,
+                                     r["start_date"] or _to_date(r["created_at"]) or date.max, r["task_id"]))
 
     mc = _manager_comments(tasks, period, now)
     lists = {"done": done, "started": started, "overdue": overdue, "due_soon": due_soon,
-             "stale": stale, "hold": hold, "mc_total": mc["items"], "mc_no_reply": mc["follow"]}
+             "stale": stale, "hold": hold, "plan_delay": plan_delay, "plan_missing": plan_missing,
+             "mc_total": mc["items"], "mc_no_reply": mc["follow"]}
     rows = _count_rows(members, lists)
     team = {key: len(items) for key, items in lists.items()}
     return {
         "done": done, "started": started, "overdue": overdue, "due_soon": due_soon,
-        "stale": stale, "hold": hold, "manager_comments": mc,
+        "stale": stale, "hold": hold, "plan_delay": plan_delay, "plan_missing": plan_missing,
+        "manager_comments": mc,
         "rows": rows, "team": team,
         "due_soon_days": due_soon_days, "stale_days": stale_days,
         # AI が未完了のタスクと期間内に完了したタスクの全コメントから抜き出す課題・相談事項
@@ -11979,7 +12105,7 @@ def _is_relevant_to_period(t, period):
 def collect_analysis(period, now, settings):
     """AI分析の集計(コードで計算するものすべて)。DB は読み取りのみ。形は章の先頭の説明のとおり。"""
     members = analysis_members()
-    tasks = load_analysis_tasks(period)
+    tasks = load_analysis_tasks(period, now.date())
     progress = _progress_section(tasks, members, period, now, settings)
     skills = _skills_section(members, period, now)
     outputs = _outputs_section(tasks, members)
@@ -12008,8 +12134,8 @@ def collect_analysis(period, now, settings):
 # マネージャーが今やることを、集計結果から優先度の高い順に 5〜10件 選ぶ(AI を使わない)。
 # AI が未設定・失敗のときもこれを表示する(AI の推奨アクションは、この候補と集計結果をもとに作る)。
 # 候補(種類ごとの点数の目安。同じ種類の中は状況が重いものほど高い):
-#   期限超過(90〜)・マネージャーのコメントに返信なし(80〜)・進行中なのに記載がない(70〜)・
-#   期限が近いのに未着手(65〜70)・保留が長い(60〜)・負荷が高い(58〜)・対応できる人が1名以下の業務(55)・
+#   期限超過(90〜)・マネージャーのコメントに返信なし(80〜)・計画の遅れ(72〜79)・進行中なのに記載がない(70〜)・
+#   期限が近いのに未着手(65〜70)・計画なし(62)・保留が長い(60〜)・負荷が高い(58〜)・対応できる人が1名以下の業務(55)・
 #   保有者が1名以下のスキル(48〜)・成果の書き直し推奨(45〜)・進捗記載の書き直し推奨(40)
 # 同じ種類ばかりにならないよう種類ごとの上限(ACTION_CAPS)まで選び、5件に満たなければ上限を外して補う。
 
@@ -12018,8 +12144,10 @@ ACTION_MAX = 10
 ACTION_CAPS = {
     "overdue": 3,
     "manager_comment": 3,
+    "plan_delay": 2,
     "stale": 2,
     "due_soon": 2,
+    "plan_missing": 2,
     "hold": 1,
     "load": 2,
     "operation": 1,
@@ -12029,16 +12157,18 @@ ACTION_CAPS = {
 }
 # ルールの推奨アクションの元になる項目(画面の説明。_action_candidates で作る種類と揃える)
 RULE_ACTION_SOURCES = (
-    "期限超過", "マネージャーのコメントに返信なし", "進行中なのに記載がない", "期限が近いのに未着手", "長い保留",
-    "負荷が高い（{}h/月以上）".format(_LOAD_FULL), "対応できる人が1名以下の業務", "保有者が1名以下のスキル",
-    "成果や進捗の書き直し推奨",
+    "期限超過", "マネージャーのコメントに返信なし", "計画の遅れ", "進行中なのに記載がない", "期限が近いのに未着手",
+    "計画なし", "長い保留", "負荷が高い（{}h/月以上）".format(_LOAD_FULL), "対応できる人が1名以下の業務",
+    "保有者が1名以下のスキル", "成果や進捗の書き直し推奨",
 )
 
 ACTION_CATEGORY_LABELS = {
     "overdue": "期限超過",
     "manager_comment": "コメントへの対応",
+    "plan_delay": "計画の遅れ",
     "stale": "記載がない",
     "due_soon": "期限が近いのに未着手",
+    "plan_missing": "計画なし",
     "hold": "保留",
     "load": "負荷",
     "operation": "業務の偏り",
@@ -12141,6 +12271,19 @@ def _action_candidates(data):
             "進行中なのに{}から{}営業日、進捗の記載がない。".format(
                 item["basis"], item["elapsed_days"]),
             ["経過 {}営業日（しきい値 {}営業日）".format(item["elapsed_days"], progress["stale_days"])])
+    # 計画の遅れ(19 章。タスク1件に1つ。点数は 72〜79: 記載がない〔70〜〕の基点より上・返信なし〔80〜〕より下)
+    for item in progress.get("plan_delay") or []:
+        step = one_line(item["step_title"], 30)
+        others = item["delayed_count"] - 1
+        delay = plan_delay_label(item["delay_days"], item["calendar_days"])
+        add("plan_delay", 72 + min(item["delay_days"], 7),
+            _ask(item, "と計画の遅れ（手順「{}」）を確認する".format(step),
+                 "担当者を決めて、計画の遅れ（手順「{}」）を確認する".format(step)),
+            _task_target(item),
+            "手順「{}」の予定日（{}）を過ぎて未完了（{}）。{}".format(
+                step, _analysis_date(item["step_date"], data), delay, "ほかに遅れ {}件。".format(others) if others else ""),
+            ["遅れ {}".format(delay), "遅れの手順 {}件".format(item["delayed_count"]),
+             "完了 {}/{}".format(item["plan_done"], item["plan_total"])])
     for item in progress["due_soon"]:
         # 点数は 65〜70 の帯の中(ほかの種類と同じく上限あり。しきい値 N1 を大きくしても、期限超過・返信なし・
         # 記載がない〔70 より上〕より上にしない)。N1 が5以下(既定は5)なら今までどおり 65＋(N1−残り営業日)、
@@ -12152,6 +12295,16 @@ def _action_candidates(data):
             "期限（{}）まで残り{}営業日なのに未着手。".format(
                 _analysis_date(item["due_date"], data), item["days_left"]),
             ["残り {}営業日（しきい値 {}営業日）".format(item["days_left"], progress["due_soon_days"])])
+    # 計画なし(19 章。点数は 62: 期限が近いのに未着手〔65〜〕と保留〔60〜〕の間。有効な担当者のいるタスクだけ)
+    for item in progress.get("plan_missing") or []:
+        add("plan_missing", 62,
+            _ask(item, "にゴールまでの計画（手順と実行予定日）の登録を依頼する",
+                 "担当者を決めて、ゴールまでの計画（手順と実行予定日）を立てる"),
+            _task_target(item),
+            item["reason"],
+            ["手順 0件", "状態 {}".format(item["status"]),
+             "開始日 {}".format(_analysis_date(item["start_date"], data)) if item["start_date"]
+             else "登録 {}".format(_analysis_date(_to_date(item["created_at"]), data))])
     for item in progress["hold"]:
         days = item["hold_days"] or 0
         if days < progress["stale_days"]:
@@ -12341,6 +12494,12 @@ def _analysis_task_facts(data):
     for r in p["hold"]:
         if r["hold_days"] is not None:
             add(r["task_id"], "保留 {}営業日{}".format(r["hold_days"], "（推定）" if r["since_estimated"] else ""))
+    for r in p.get("plan_delay") or []:
+        # 手順の全文は計画の行(_plan_text_lines)にある。見出しは分けて送るときに繰り返すため短くする
+        add(r["task_id"], "計画の遅れ: 手順「{}」が予定日（{}）から{}{}".format(
+            _inline(one_line(r["step_title"], 40)), _fmt_d(r["step_date"]),
+            plan_delay_label(r["delay_days"], r["calendar_days"]),
+            "（ほかに遅れ {}件）".format(r["delayed_count"] - 1) if r["delayed_count"] > 1 else ""))
     for r in data["outputs"]["tasks"]:
         lt = r["lead_time"]
         if lt:
@@ -12352,11 +12511,26 @@ def _analysis_task_facts(data):
 def _part(text, comment_id=None, outcome=False):
     return {"text": text, "comment_id": comment_id, "outcome": outcome}
 
+def _plan_text_lines(t):
+    """タスクの計画(19 章)の材料の行(手順・実行予定日・完了。手順が無ければ空)。手順の文字は利用者が書いた本文として渡す。"""
+    plan = t.get("plan") or {}
+    if not plan.get("steps"):
+        return []
+    delayed = {s["id"]: s for s in plan["delayed"]}
+    lines = ["計画（手順と実行予定日・完了 {}/{}）:".format(plan["done"], plan["total"])]
+    for number, s in enumerate(plan["steps"], 1):
+        late = delayed.get(s["id"])
+        state = ("完了" if s["done"] else
+                 "遅れ " + plan_delay_label(late["days"], late["calendar_days"]) if late else "未完了")
+        lines.append("  {}. [{}] {}（予定 {}）".format(number, state, _inline(s["title"]), _fmt_d(s["planned_date"])))
+    return lines
+
 def task_parts(t, facts):
     """1件のタスクの材料を、分けられる部品のリストにする(最初の部品は見出し)。
 
     見出し: タイトル・状態・担当・優先度・規模・日付・アプリの計算・状態の変更(分けて送るときは毎回付ける)
-    部品: {"text", "comment_id"(コメントの部品だけ), "outcome"(完了したタスクの成果の部品か)}
+    部品: 説明・計画(手順があるときだけ)・コメント・成果。
+          {"text", "comment_id"(コメントの部品だけ), "outcome"(完了したタスクの成果の部品か)}
     """
     info = ["状態: {}".format(t["status"]), "担当: {}".format(_inline(t["assignee_names"]) or "なし"),
             "優先度: {}".format(t["priority"] or "―")]
@@ -12384,6 +12558,9 @@ def task_parts(t, facts):
         parts[0]["short"] = "\n".join(short)
     if t["description"].strip():
         parts.append(_part("説明:\n" + _indent(t["description"])))
+    plan_lines = _plan_text_lines(t)
+    if plan_lines:
+        parts.append(_part("\n".join(plan_lines)))
     if t["comments"]:
         parts.append(_part("コメント（古い順・{}件）:".format(len(t["comments"]))))
         for c in t["comments"]:
@@ -12431,13 +12608,14 @@ def task_allowed_numbers(t, facts, parts):
     return AllowedNumbers(task_written_text(t, facts), "\n".join(p["text"] for p in parts))
 
 def task_written_text(t, facts):
-    """そのタスクの、利用者が書いた本文(タイトル・説明・コメントの本文・成果)とアプリの計算
-    (task_allowed_numbers で数量として認める部分。登録・期限・コメントの日時と ID は含めない)。
+    """そのタスクの、利用者が書いた本文(タイトル・説明・コメントの本文・成果・計画の手順)とアプリの計算
+    (task_allowed_numbers で数量として認める部分。登録・期限・コメントの日時と ID は含めない。
+    計画の行の実行予定日〔年月日〕は日付としてだけ認められる)。
     """
     o = t["outcome"]
     content = [t["title"], t["description"]] + [c["body"] for c in t["comments"]] + [
         o["quant_estimate_label"] or "", o["quant_actual_label"] or "",
-        o["quant_note"], o["qual_estimate"], o["qual_actual"]] + list(facts.get(t["id"]) or [])
+        o["quant_note"], o["qual_estimate"], o["qual_actual"]] + list(facts.get(t["id"]) or []) + _plan_text_lines(t)
     return "\n".join(content)
 
 def _split_text(text, size):
@@ -14437,14 +14615,19 @@ def issue_fingerprint(t):
     return _fingerprint(t["title"], t["description"], [(c["id"], c["body"]) for c in t["comments"]], t["status"])
 
 def action_fingerprint(t):
-    """推奨アクションの対象のタスクの材料(状態・期限・担当者・コメント・状態の変更)の指紋。
+    """推奨アクションの対象のタスクの材料(状態・期限・担当者・コメント・状態の変更・計画の手順)の指紋。
 
-    分析の後にタスクが完了した・コメントに返信が来た・期限や担当者が変わったものは、保存した推奨アクションに
-    「分析の後に変更あり」の印を付ける(もう不要な催促をそのまま勧めないように。_checked_action)。
+    分析の後にタスクが完了した・コメントに返信が来た・期限や担当者が変わった・計画を立てた・手順を完了にしたものは、
+    保存した推奨アクションに「分析の後に変更あり」の印を付ける(もう不要な催促をそのまま勧めないように。_checked_action)。
+    計画の手順はあるときだけ含める(手順の無いタスクの指紋は、計画の無かった以前の版と同じ)。
     """
-    return _fingerprint(t["status"], t["due_date"], sorted(t["assignee_ids"]),
-                        [(c["id"], c["body"]) for c in t["comments"]],
-                        [(ch["status"], ch["at"]) for ch in t["changes"]])
+    values = [t["status"], t["due_date"], sorted(t["assignee_ids"]),
+              [(c["id"], c["body"]) for c in t["comments"]],
+              [(ch["status"], ch["at"]) for ch in t["changes"]]]
+    steps = (t.get("plan") or {}).get("steps") or []
+    if steps:
+        values.append([(s["id"], s["title"], s["planned_date"], s["done"]) for s in steps])
+    return _fingerprint(*values)
 
 def _changed(stored_fp, current_fp):
     """保存した指紋があり、今の材料の指紋と違うか(指紋の無い古い結果は変わっていないものとする)。"""
@@ -14872,21 +15055,38 @@ def _summary_period(stored, today):
 
 # エグゼクティブサマリーの「いま対応すること」に出す推奨アクションの種類(今すぐ対応が要るもの)。急がない改善
 # (業務・スキルの偏り・成果や進捗の書き方)は出さない
-URGENT_ACTION_CATEGORIES = ("overdue", "manager_comment", "stale", "due_soon", "hold", "load")
+URGENT_ACTION_CATEGORIES = ("overdue", "manager_comment", "plan_delay", "stale", "due_soon", "plan_missing", "hold",
+                            "load")
+# 「いま対応すること」でも種類ごとの上限(ACTION_CAPS)までにする種類(計画を使い始めたばかりの環境で、計画の遅れ・
+# 計画なしばかりにならないように。19 章)
+URGENT_CAPPED_CATEGORIES = ("plan_delay", "plan_missing")
+
+def _cap_urgent(actions):
+    """URGENT_CAPPED_CATEGORIES の種類を、種類ごとの上限(ACTION_CAPS)までにする(順番はそのまま)。"""
+    used, out = {}, []
+    for action in actions:
+        category = action.get("category")
+        if category in URGENT_CAPPED_CATEGORIES:
+            used[category] = used.get(category, 0) + 1
+            if used[category] > ACTION_CAPS[category]:
+                continue
+        out.append(action)
+    return out
 
 def urgent_actions(data, applied):
     """「いま対応すること」: AI の推奨アクション(AI の結果を反映したとき)のうち今すぐ対応が要る種類のもの。無ければ、
-    集計のルールの候補のうち今すぐ対応が要る種類のもの(点数の高い順)。どちらも最大 ACTION_MAX 件。
+    集計のルールの候補のうち今すぐ対応が要る種類のもの(点数の高い順)。どちらも最大 ACTION_MAX 件
+    (計画の遅れ・計画なしは、種類ごとの上限まで。_cap_urgent)。
 
     戻り値: (アクションの一覧, AI が選んだものか)。
     """
     if applied:
-        picked = [a for a in data.get("ai_actions") or [] if a.get("category") in URGENT_ACTION_CATEGORIES]
+        picked = _cap_urgent([a for a in data.get("ai_actions") or [] if a.get("category") in URGENT_ACTION_CATEGORIES])
         if picked:
             return picked[:ACTION_MAX], True
     candidates = sorted((a for a in _action_candidates(data) if a["category"] in URGENT_ACTION_CATEGORIES),
                         key=lambda a: -a["score"])
-    return candidates[:ACTION_MAX], False
+    return _cap_urgent(candidates)[:ACTION_MAX], False
 
 def executive_summary_text(data, period_label, applied):
     """エグゼクティブサマリーの文章: マネージャーが今対応することのまとめ(要対応の件数と、いま対応することの一覧)。
@@ -14897,6 +15097,8 @@ def executive_summary_text(data, period_label, applied):
     heavy = [r for r in data["abilities"]["rows"] if (r.get("load_h") or 0) >= _LOAD_FULL]
     counts = (("期限超過", progress["overdue"], "件"), ("期限が近いのに未着手", progress["due_soon"], "件"),
               ("進行中なのに記載がない", progress["stale"], "件"),
+              # 計画の遅れ(遅れの手順のあるタスク)・計画なし(19 章。数え方は 9-3)
+              ("計画の遅れ", progress.get("plan_delay", 0), "件"), ("計画なし", progress.get("plan_missing", 0), "件"),
               ("担当者の返信がないマネージャーのコメント", progress["mc_no_reply"], "件"), ("保留", progress["hold"], "件"),
               ("負荷がフルタイム（{}h/月）以上の人".format(_LOAD_FULL), len(heavy), "名"))
     shown = ["{} {}{}".format(label, n, unit) for label, n, unit in counts if n]
@@ -22164,6 +22366,7 @@ ENV_ACTIVITY_COLUMNS = (
     ("skill_ratings", "rated_at"), ("skill_level_changes", "created_at"), ("skills", "updated_at"),
     ("operations", "created_at"), ("departments", "updated_at"), ("users", "created_at"), ("user_emails", "updated_at"),
     ("user_shifts", "updated_at"), ("skill_chat_messages", "created_at"), ("skill_plans", "updated_at"),
+    ("task_steps", "updated_at"),
 )
 
 def _env_db_stats(entry):
@@ -22772,3 +22975,333 @@ def admin_test_ai():
             reply = reply[:AI_REPLY_MAX] + "…"
         flash("AI接続テスト: OK（応答: {}）".format(reply), "success")
     return redirect(_admin_settings_url())
+
+# #### 19. タスクの計画(手順と実行予定日) ###########################################################
+# タスクごとの計画(ゴールまでの手順と実行予定日の並び。TaskStep〔3-2〕・新しいテーブル task_steps)。担当者がまず計画を
+# 立て、手順ごとに完了を付けて進める。計画が無くても状態は変えられる(強制しない)。代わりに、計画が無い・計画より遅れて
+# いるタスクを、タスクの詳細・一覧(表示する項目の「計画」)・個人ダッシュボード・エグゼクティブサマリー(9-10)で目立たせる。
+#   遅れ     : 未完了の手順で、実行予定日が今日より前のもの(何営業日遅れているかを出す。営業日は 2-4)
+#   次の手順 : 並びの最初の未完了の手順
+#   計画なし : エグゼクティブサマリーの数え方は 9-3(_plan_missing_reason)。個人ダッシュボードは手順の無い担当タスク
+# 権限: 見るのはタスクの詳細を見られる人。計画の編集・完了の付け外しは進捗状況の記載と同じ人(_can_edit。担当者・
+# 登録者・マネージャー)で、ほかの人は 403。タスク管理を使わない環境(2-8)は、タスクの画面と同じく 404。
+
+# ==== 19-1. 計画の状況(遅れ・次の手順) ===========================================================
+
+TASK_STEPS_MAX = 50          # 1つのタスクの手順の数の上限
+TASK_STEP_TITLE_MAX = 200    # 手順の文字数の上限(task_steps.title の長さ)
+
+PLAN_STATE_DONE = "done"     # 完了
+PLAN_STATE_LATE = "late"     # 遅れ(未完了で実行予定日が今日より前)
+PLAN_STATE_TODAY = "today"   # 今日(実行予定日が今日で未完了)
+PLAN_STATE_OPEN = "open"     # 未完了
+
+def plan_delay_label(days, calendar_days):
+    """計画の遅れの日数の表示(「N営業日」。今日が土日祝で 0営業日のときは暦日の日数も付ける。overdue_days_label と同じ)。"""
+    if days == 0 and calendar_days:
+        return "0営業日（{}日超過・休日）".format(calendar_days)
+    return "{}営業日".format(days)
+
+def plan_progress(steps, today):
+    """計画の進み(手順の並び steps〔Task.steps〕と今日 today から。タスクの一覧・個人ダッシュボード・詳細で使う)。
+
+    戻り値: {"total", "done", "next"(最初の未完了の手順。無ければ None), "next_label"(その実行予定日の短い表記),
+            "delayed"(遅れの手順〔未完了で実行予定日が今日より前〕の一覧)}
+    """
+    steps = list(steps)
+    open_steps = [s for s in steps if s.done_at is None]
+    upcoming = open_steps[0] if open_steps else None
+    return {
+        "total": len(steps),
+        "done": len(steps) - len(open_steps),
+        "next": upcoming,
+        "next_label": _date_label(upcoming.planned_date, today) if upcoming is not None and upcoming.planned_date else "",
+        "delayed": [s for s in open_steps if s.planned_date is not None and s.planned_date < today],
+    }
+
+def _plan_day_label(d, today):
+    """表の実行予定日(今日と同じ年は mm/dd、違う年は yyyy/mm/dd。曜日付き。無ければ ―)。"""
+    return "{}（{}）".format(_date_label(d, today), WEEKDAY_LABELS[d.weekday()]) if d else "―"
+
+def task_plan_view(task, today):
+    """タスクの詳細の「計画」の表の値: plan_progress の値に、percent(完了の割合)・due_label(タスクの期限の短い表記)・
+    rows(手順ごとの表示)を足したもの。
+
+    rows: [{"step", "state"(PLAN_STATE_*), "is_next", "date_label", "delay_label", "after_due"(実行予定日がタスクの
+           期限より後), "done_label"(完了の日付・人)}]
+    """
+    view = plan_progress(task.steps, today)
+    due = task.due_date
+    rows = []
+    for step in task.steps:
+        planned = step.planned_date
+        if step.done_at is not None:
+            state = PLAN_STATE_DONE
+        elif planned is not None and planned < today:
+            state = PLAN_STATE_LATE
+        elif planned == today:
+            state = PLAN_STATE_TODAY
+        else:
+            state = PLAN_STATE_OPEN
+        done_label = ""
+        if step.done_at is not None:
+            done_label = "・".join(x for x in (_date_label(step.done_at.date(), today),
+                                               step.done_by.name_label if step.done_by is not None else "") if x)
+        rows.append({
+            "step": step,
+            "state": state,
+            "is_next": view["next"] is step,
+            "date_label": _plan_day_label(planned, today),
+            "delay_label": (plan_delay_label(business_days_ago(planned, today), (today - planned).days)
+                            if state == PLAN_STATE_LATE else ""),
+            "after_due": due is not None and planned is not None and planned > due,
+            "done_label": done_label,
+        })
+    view.update(rows=rows, percent=round(view["done"] * 100 / view["total"]) if view["total"] else 0,
+                due_label=_date_label(due, today) if due else "")
+    return view
+
+# ==== 19-2. 計画の編集(入力の確かめ・保存) =======================================================
+# 計画の編集の画面(tasks/plan.html)は、1つのフォームで計画全体を保存する。行ごとの欄は行の番号 i を付けた名前
+# (step_i: 手順の ID、key_i: 手順の印〔make_row_key〕、title_i、date_i、done_i、del_i)で、行の並びは hidden の rows
+# (行の番号を画面の行の順に1つずつ)。JavaScript の「↑」「↓」は行を入れ替えるだけで、送った順がそのまま並びになる。
+#   ・手順と実行予定日の両方が空の行は無視する(今の手順の行を両方とも空にしたときは、その手順を消す)。片方だけの行はエラー
+#   ・「削除」にチェックした今の手順は消す(その行の入力は確かめない)
+#   ・完了のチェックを付けた・外した手順だけ、完了の日時・人を付ける・外す(変えていない手順の完了の日時は変えない)
+#   ・送られた行に無い今の手順(画面を通さない送信など)は、消さずに後ろに残す
+#   ・エラーなら何も保存せず、入力のまま出し直す(400)
+#   ・画面を開いた後にほかの操作で計画が変わっていたら(hidden の version。plan_version)保存しない。入力を残し、今の計画と
+#     一緒に出し直す(409)。同じ画面からの同じ内容の2回目(二度押し。2-2 の already_submitted)と、入力のとおりに保存しても
+#     今の計画と同じになるものは「保存済み」とする
+
+PLAN_BLANK_ROWS = 3          # いつも出す空の行の数(JavaScript が無くても手順を足せるように)
+PLAN_FORM_ROWS_MAX = 200     # 1回の保存で読む行の数の上限(空の行を含む)
+PLAN_ONCE_KIND = "plan"      # 二度押しの印の種類(2-2 の already_submitted)
+_PLAN_FORBIDDEN = "計画を編集できるのは担当者・マネージャーのみです。"
+_PLAN_CONFLICT = "ほかの操作で計画が変わっています。今の計画を確かめてから保存し直してください。"
+_PLAN_ALREADY_SAVED = "この計画は既に保存されています（同じ内容の送信が2回届いたか、ほかの操作で同じ内容になっています）。"
+_PLAN_STEP_MISSING = "この手順は見つかりません（計画が変わった可能性があります）。"
+_PLAN_DATE_INVALID = "{}行目: 実行予定日は YYYY-MM-DD の実在する日付（{}年〜{}年）で入力してください。"
+
+def plan_version(steps):
+    """計画の控え(手順の ID・手順・実行予定日・完了・並びの指紋。計画の編集の画面の hidden の version)。"""
+    return _fingerprint([[s.id, s.title, s.planned_date, s.done_at is not None] for s in steps])
+
+def _plan_row(index, step=None, title="", date_text="", done=False, delete=False):
+    """計画の編集の画面の1行(テンプレートの値)。step は今の手順(新しい行は None)。"""
+    return {"index": index, "step_id": step.id if step is not None else "",
+            "key": step.row_key if step is not None else "", "title": title, "date": date_text,
+            "done": done, "delete": delete, "existing": step is not None, "missing": False}
+
+def _step_row(index, step):
+    """今の手順の行(今の値)。"""
+    return _plan_row(index, step, step.title, step.planned_date.isoformat() if step.planned_date else "",
+                     step.done_at is not None)
+
+def _is_blank_row(row):
+    return not row["existing"] and not row["title"] and not row["date"] and not row["done"]
+
+def _with_blank_rows(rows):
+    """末尾の空の行が PLAN_BLANK_ROWS 行になるまで空の行を足す(行の番号は、今の最大の番号の次から)。"""
+    trailing = 0
+    for row in reversed(rows):
+        if not _is_blank_row(row):
+            break
+        trailing += 1
+    start = max((r["index"] for r in rows), default=0) + 1
+    return list(rows) + [_plan_row(start + k) for k in range(max(PLAN_BLANK_ROWS - trailing, 0))]
+
+def plan_form_rows(steps):
+    """画面を開いたときの行: 今の計画の手順と、空の行。"""
+    return _with_blank_rows([_step_row(i, s) for i, s in enumerate(steps, 1)])
+
+def _plan_title(raw):
+    """手順の入力を保存する形にする(制御文字を除き、改行・タブは空白にする。前後の空白を除く)。"""
+    return clean_text(raw or "").replace("\n", " ").replace("\t", " ").strip()
+
+def read_plan_form(form, steps):
+    """計画の編集のフォームを読む(steps は今の計画の手順)。
+
+    戻り値: {"rows"(出し直す行。送られた順), "entries"(送られた行の並び [(今の手順 または None, 手順, 実行予定日, 完了)]),
+            "kept"(送られた行に無い今の手順。entries の後ろに残す。entries と同じ形), "deleted"(消す手順),
+            "stale"(画面を開いた後に無くなった手順〔削除・印の違い〕を残そうとする行があるか),
+            "errors"(入力の誤り。行は送られた順の何行目か)}
+    """
+    by_id = {s.id: s for s in steps}
+    indices = []
+    for raw in form.getlist("rows"):
+        index = to_int(raw)
+        if index is not None and index not in indices:
+            indices.append(index)
+    errors = []
+    if len(indices) > PLAN_FORM_ROWS_MAX:
+        errors.append("行が多すぎます（{}行）。手順は{}件までです。".format(len(indices), TASK_STEPS_MAX))
+        indices = indices[:PLAN_FORM_ROWS_MAX]
+    rows, entries, deleted, used = [], [], [], set()
+    stale = False
+    for number, index in enumerate(indices, 1):
+        raw_id = (form.get("step_{}".format(index)) or "").strip()
+        step = by_id.get(to_int(raw_id)) if raw_id else None
+        # 画面を開いた後に削除された手順・印の違う手順(同じ手順を2つの行で指すものも)は、今の手順として扱わない
+        missing = bool(raw_id) and (step is None or step.id in used
+                                    or (form.get("key_{}".format(index)) or "") != step.row_key)
+        if missing:
+            step = None
+        if step is not None:
+            used.add(step.id)
+        title = _plan_title(form.get("title_{}".format(index)))
+        date_text = (form.get("date_{}".format(index)) or "").strip()
+        done = form.get("done_{}".format(index)) == "1"
+        delete = form.get("del_{}".format(index)) == "1"
+        rows.append(dict(_plan_row(index, step, title, date_text, done, delete), missing=missing))
+        if delete or (not title and not date_text):
+            if step is not None:
+                deleted.append(step)
+            continue
+        stale = stale or missing
+        planned = parse_date(date_text)
+        if not title:
+            errors.append("{}行目: 手順を入力してください。".format(number))
+        elif len(title) > TASK_STEP_TITLE_MAX:
+            errors.append("{}行目: 手順は{}文字までです（{}文字）。".format(number, TASK_STEP_TITLE_MAX, len(title)))
+        if not date_text:
+            errors.append("{}行目: 実行予定日を入力してください。".format(number))
+        elif planned is None or not TASK_YEAR_MIN <= planned.year <= TASK_YEAR_MAX:
+            errors.append(_PLAN_DATE_INVALID.format(number, TASK_YEAR_MIN, TASK_YEAR_MAX))
+        entries.append((step, title, planned, done))
+    # 送られた行に無い今の手順は、消さずに後ろに残す
+    kept = [(s, s.title, s.planned_date, s.done_at is not None) for s in steps if s.id not in used]
+    if len(entries) + len(kept) > TASK_STEPS_MAX:
+        errors.append("手順は{}件までです（{}件あります）。".format(TASK_STEPS_MAX, len(entries) + len(kept)))
+    return {"rows": rows, "entries": entries, "kept": kept, "deleted": deleted, "stale": stale, "errors": errors}
+
+def plan_entries_same(entries, steps):
+    """送られた行の並び entries が、今の計画 steps と同じ内容(手順・実行予定日・完了・並び)か。
+
+    画面を開いた後に計画が変わっていても、同じなら上書きで失われるものが無い(二度押しの2回目で、1回目に足した手順が
+    新しい行のまま送られてきたときなど)。
+    """
+    return ([(title, planned, bool(done)) for _step, title, planned, done in entries]
+            == [(s.title, s.planned_date, s.done_at is not None) for s in steps])
+
+def plan_conflict_rows(rows, steps):
+    """ほかの操作で計画が変わっていたときに出し直す行: 送られた行(無くなった手順を残そうとする行は新しい手順の行にし、
+    無くなった手順を消す・空にした行と、空の行は除く)、送られた行に無い今の手順の行(画面を開いた後に足された手順など)、
+    空の行。
+    """
+    shown = []
+    for row in rows:
+        if row["missing"]:
+            if row["delete"] or not (row["title"] or row["date"]):
+                continue
+            row = dict(row, step_id="", key="", existing=False, delete=False, missing=False)
+        if not _is_blank_row(row):
+            shown.append(row)
+    known = {row["step_id"] for row in shown if row["existing"]}
+    start = max((r["index"] for r in rows), default=0) + 1
+    extra = [s for s in steps if s.id not in known]
+    shown += [_step_row(start + k, s) for k, s in enumerate(extra)]
+    return _with_blank_rows(shown)
+
+def apply_plan(task, entries, deleted, user_id):
+    """計画を entries の並びにする(並びは 1 から付け直す。commit は呼び出し側)。
+
+    変えた手順だけ更新する(更新した人を記録)。完了は付けた・外したときだけ、完了の日時・人を変える。
+    """
+    now = datetime.now()
+    for step in deleted:
+        task.steps.remove(step)
+    for position, (step, title, planned, done) in enumerate(entries, 1):
+        if step is None:
+            step = TaskStep(position=position, title=title, planned_date=planned,
+                            created_by_id=user_id, updated_by_id=user_id)
+            if done:
+                step.done_at, step.done_by_id = now, user_id
+            task.steps.append(step)
+            continue
+        changed = False
+        for name, value in (("position", position), ("title", title), ("planned_date", planned)):
+            if getattr(step, name) != value:
+                setattr(step, name, value)
+                changed = True
+        if done != (step.done_at is not None):
+            step.done_at, step.done_by_id = (now, user_id) if done else (None, None)
+            changed = True
+        if changed:
+            step.updated_by_id = user_id
+
+# ==== 19-3. 画面(タスクの Blueprint に足すルート) ================================================
+#   GET/POST /tasks/<id>/plan                    計画の編集(19-2)
+#   POST     /tasks/<id>/plan/<手順の ID>/done    詳細の計画の表の「完了」「戻す」(done=1 / 0 と手順の印 step_key)
+
+def _render_plan_form(task, rows, version, status=200, with_current=False):
+    """計画の編集の画面。with_current なら今の計画(読み取りだけ)も出す(ほかの操作で計画が変わっていたとき)。"""
+    return render_template(
+        "tasks/plan.html", task=task, rows=rows, version=version,
+        current=task_plan_view(task, date.today()) if with_current else None,
+        date_min=date(TASK_YEAR_MIN, 1, 1).isoformat(), date_max=date(TASK_YEAR_MAX, 12, 31).isoformat(),
+        title_max=TASK_STEP_TITLE_MAX), status
+
+@tasks_bp.route("/<int:task_id>/plan", methods=["GET", "POST"])
+@login_required
+def edit_plan(task_id):
+    """計画(手順と実行予定日)の編集。1つのフォームで計画全体を保存する。"""
+    if request.method == "POST":
+        lock_for_write()  # 確かめてから保存するまでの間に、ほかの保存・完了の付け外しが入らないように
+    task = get_or_404(Task, task_id)
+    if request.method == "POST" and not row_key_matches(task, request.form.get("row")):
+        return flash_redirect(_STALE_TASK, "warning", url_for("tasks.list_tasks"))
+    if not _can_edit(task):
+        abort(403, description=_PLAN_FORBIDDEN)
+    steps = list(task.steps)
+    if request.method == "GET":
+        return _render_plan_form(task, plan_form_rows(steps), plan_version(steps))
+
+    back = url_for("tasks.detail", task_id=task.id, _anchor="plan")
+    if already_submitted(PLAN_ONCE_KIND):
+        return flash_redirect(_PLAN_ALREADY_SAVED, "info", back)
+    plan = read_plan_form(request.form, steps)
+    current = plan_version(steps)
+    if request.form.get("version") != current or plan["stale"]:
+        if not plan["errors"] and not plan["stale"] and plan_entries_same(plan["entries"], steps):
+            return flash_redirect(_PLAN_ALREADY_SAVED, "info", back)
+        flash(_PLAN_CONFLICT, "warning")
+        return _render_plan_form(task, plan_conflict_rows(plan["rows"], steps), current, status=409,
+                                 with_current=True)
+    if plan["errors"]:
+        for message in plan["errors"]:
+            flash(message, "danger")
+        return _render_plan_form(task, _with_blank_rows(plan["rows"]), current, status=400)
+    apply_plan(task, plan["entries"] + plan["kept"], plan["deleted"], current_user.id)
+    commit_submitted(PLAN_ONCE_KIND, back)
+    return flash_redirect("計画を保存しました。", "success", back)
+
+@tasks_bp.route("/<int:task_id>/plan/<int:step_id>/done", methods=["POST"])
+@login_required
+def toggle_plan_step(task_id, step_id):
+    """詳細の計画の表の「完了」(done=1)・「戻す」(done=0)。
+
+    手順が見つからない・印が違う(削除された・計画が変わった)ときは 404 にせず、案内して詳細へ戻す。
+    既に同じ状態(二度押しの2回目など)なら何もしないで戻す。
+    """
+    lock_for_write()  # 同時に押された2回目は、1回目の後の状態で確かめる
+    task = get_or_404(Task, task_id)
+    back = url_for("tasks.detail", task_id=task.id, _anchor="plan")
+    if not row_key_matches(task, request.form.get("row")):
+        return flash_redirect(_STALE_TASK, "warning", url_for("tasks.list_tasks"))
+    if not _can_edit(task):
+        abort(403, description=_PLAN_FORBIDDEN)
+    wanted = request.form.get("done")
+    if wanted not in ("0", "1"):
+        abort(400)
+    step = db.session.get(TaskStep, step_id)
+    if step is None or step.task_id != task.id or (request.form.get("step_key") or "") != step.row_key:
+        return flash_redirect(_PLAN_STEP_MISSING, "warning", back)
+    done = wanted == "1"
+    if done == (step.done_at is not None):
+        return redirect(back)
+    step.done_at, step.done_by_id = (datetime.now(), current_user.id) if done else (None, None)
+    step.updated_by_id = current_user.id
+    db.session.commit()
+    return flash_redirect("手順「{}」を{}。".format(one_line(step.title, 40), "完了にしました" if done else "未完了に戻しました"),
+                          "success", back)
