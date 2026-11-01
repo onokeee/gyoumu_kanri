@@ -25,11 +25,11 @@
                         skills/operation_edit.html  skills/_ai_panel.html  skills/history.html
     マネージャー　　　  manager/dashboard.html  manager/_gantt.html  manager/gantt_full.html
     チーム管理　　　　  departments/manage.html
-    週報　　　　　　　  weekly/index.html
-    期限超過通知　　　  overdue/index.html  overdue/mail.html
-    システム設定　　　  system/settings.html  system/_recipients_tab.html（メールの宛先）  system/_weekly_tab.html
-                        system/_overdue_tab.html  system/_skill_ai_tab.html
-                        system/_analysis_tab.html  system/_reminder_tab.html
+    週報　　　　　　　  weekly/index.html（作成・送信）  weekly/settings.html（設定）
+    期限超過通知　　　  overdue/index.html（送信）  overdue/settings.html（設定）  overdue/mail.html
+    定型業務リマインド  reminder/index.html（送信）  reminder/settings.html（設定）
+    メールの宛先　　　  mail/recipients.html
+    システム設定　　　  system/settings.html  system/_skill_ai_tab.html  system/_analysis_tab.html
     システム管理(admin) admin/_layout.html  admin/envs.html  admin/env_delete.html  admin/env_features.html（使う機能）
                         admin/settings.html
                         system/_config_tab.html（基本設定のフォーム）  admin/shifts.html  admin/shift_month.html
@@ -94,9 +94,10 @@
           </li>
           {%- endif %}
           {% if current_user.is_manager and (feature_enabled('weekly') or feature_enabled('overdue') or feature_enabled('reminder')) %}
-          {# 定期メール(週報・期限超過通知・定型業務リマインドの設定)はマネージャーのみ #}
+          {# 定期メール(週報・期限超過通知・定型業務リマインドの送信と設定、週報・期限超過通知の宛先)はマネージャーのみ。
+             項目の画面と設定は、どれもこのメニューの中(app.py の 11-3) #}
           <li class="nav-item dropdown">
-            <a class="nav-link dropdown-toggle {% if request.blueprint in ('weekly', 'overdue') %}active{% endif %}"
+            <a class="nav-link dropdown-toggle {% if request.blueprint in ('weekly', 'overdue', 'reminder', 'mail') %}active{% endif %}"
                href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false"><i class="bi bi-envelope-paper"></i> 定期メール</a>
             <ul class="dropdown-menu">
               {%- if feature_enabled('weekly') %}
@@ -107,9 +108,13 @@
               <li><a class="dropdown-item {% if request.blueprint == 'overdue' %}active{% endif %}"
                      href="{{ url_for('overdue.index') }}"><i class="bi bi-alarm"></i> 期限超過通知</a></li>
               {%- endif %}
-              {# 定型業務リマインドは画面を持たず、システム設定のタブ(設定・プレビュー・テスト送信)で扱う #}
               {%- if feature_enabled('reminder') %}
-              <li><a class="dropdown-item" href="{{ url_for('system.settings', tab='reminder') }}"><i class="bi bi-bell"></i> 定型業務リマインド</a></li>
+              <li><a class="dropdown-item {% if request.blueprint == 'reminder' %}active{% endif %}"
+                     href="{{ url_for('reminder.index') }}"><i class="bi bi-bell"></i> 定型業務リマインド</a></li>
+              {%- endif %}
+              {%- if feature_enabled('weekly') or feature_enabled('overdue') %}
+              <li><a class="dropdown-item {% if request.blueprint == 'mail' %}active{% endif %}"
+                     href="{{ url_for('mail.recipients') }}"><i class="bi bi-envelope"></i> メールの宛先</a></li>
               {%- endif %}
             </ul>
           </li>
@@ -134,7 +139,7 @@
               {%- endif %}
               <li><a class="dropdown-item {% if request.blueprint == 'departments' %}active{% endif %}"
                      href="{{ url_for('departments.manage') }}"><i class="bi bi-diagram-3"></i> チーム管理</a></li>
-              {# システム設定(メールの宛先・週報・期限超過通知・スキル（AI）などの設定)はマネージャーのみ。出すタブが無い環境は出さない #}
+              {# システム設定(スキル（AI）・AI分析の設定)はマネージャーのみ。出すタブが無い環境は出さない #}
               {%- if has_system_settings() %}
               <li><a class="dropdown-item {% if request.blueprint == 'system' %}active{% endif %}"
                      href="{{ url_for('system.settings') }}"><i class="bi bi-gear"></i> システム設定</a></li>
@@ -282,6 +287,19 @@
       </div>
     </div>
   </div>
+{%- endmacro %}
+
+{# 機能の設定ファイル(instance/*.json)が読み込めないときの注意(設定の画面の先頭に出す)。ctx は app.py の settings_context の値 #}
+{% macro settings_file_error(ctx) %}{% if ctx.file_error %}<div class="alert alert-danger small"><i class="bi bi-x-octagon"></i> <strong>設定ファイルを読み込めません。</strong> {{ ctx.file_error }}<br>直すまで、このタブの設定は保存できません（{{ ctx.file_error_note }}）。</div>
+{% endif %}{% endmacro %}
+
+{# 定期メールの機能の画面の上のタブ(送信の画面〔index〕と設定の画面〔settings〕)。feature は weekly / overdue / reminder #}
+{% macro mail_tabs(feature, active) -%}
+<ul class="nav nav-tabs mb-3">
+  {%- for key, label, icon in (('index', '作成・送信' if feature == 'weekly' else '送信', 'bi-send'), ('settings', '設定', 'bi-gear')) %}
+  <li class="nav-item"><a class="nav-link{{ ' active' if key == active }}"{{ ' aria-current="page"'|safe if key == active }} href="{{ url_for(feature ~ '.' ~ key) }}"><i class="bi {{ icon }}"></i> {{ label }}</a></li>
+  {%- endfor %}
+</ul>
 {%- endmacro %}
 {#=== errors/too_large.html ===#}
 {# 送信された入力が大きすぎる(413)ときの画面。limit_bytes は1回の送信の上限(バイト) #}
@@ -1237,6 +1255,23 @@
   {%- else -%}{{ default }}{%- endif -%}
 {% endmacro %}
 
+{# 登録の画面の計画の1行(計画の画面 tasks/plan.html と同じ欄の名前。完了・削除の欄は無く、行を消すのは JavaScript の「×」) #}
+{% macro new_plan_row(r, no) %}
+<tr data-plan-row>
+  <td class="text-muted text-nowrap" data-plan-no>{{ no }}</td>
+  <td>
+    <input type="hidden" name="rows" value="{{ r.index }}">
+    <input type="text" name="title_{{ r.index }}" class="form-control form-control-sm" maxlength="{{ step_title_max }}" value="{{ r.title }}" aria-label="手順">
+  </td>
+  <td><input type="date" name="date_{{ r.index }}" class="form-control form-control-sm" min="{{ plan_date_min }}" max="{{ plan_date_max }}" value="{{ r.date }}" aria-label="実行予定日"></td>
+  <td class="text-nowrap d-none" data-plan-move>
+    <button type="button" class="btn btn-sm btn-outline-secondary py-0" data-plan-up aria-label="上へ">↑</button>
+    <button type="button" class="btn btn-sm btn-outline-secondary py-0" data-plan-down aria-label="下へ">↓</button>
+    <button type="button" class="btn btn-sm btn-outline-secondary py-0" data-plan-remove aria-label="この行を消す">×</button>
+  </td>
+</tr>
+{% endmacro %}
+
 {% block content %}
 <div class="row justify-content-center">
   <div class="col-lg-9">
@@ -1370,7 +1405,7 @@
       {% endif %}
 
       <div class="mb-3">
-        <label class="form-label">担当者(複数選択可){% if not can_plan %} <span class="text-muted small">（マネージャーのみ変更可）</span>{% endif %}</label>
+        <label class="form-label">担当者(複数選択可){% if not editing %} <span class="text-danger">*</span>{% endif %}{% if not can_plan %} <span class="text-muted small">（マネージャーのみ変更可）</span>{% endif %}</label>
         <div class="row row-cols-2 row-cols-md-3 g-1 border rounded p-2">
           {% for u in users %}
           <div class="col">
@@ -1457,16 +1492,51 @@
         <p class="text-muted small mt-1 mb-0"><i class="bi bi-info-circle"></i> 「完了」にするには成果（実績）の入力が必要です。</p>
       </div>
 
+      {# 計画(手順と実行予定日。app.py の 19 章)。登録の画面は、計画の画面と同じ欄の名前(行の番号 i 付き。行の並びは
+         hidden の rows)で、タスクと一緒に保存する(空の行は無視。空でも登録できる)。JavaScript(static/js/task-plan.js)が
+         あれば「行を追加」・「↑」「↓」(行の入れ替え)・「×」(行を消す)。編集の画面は計画の画面へのリンクだけ #}
+      <div class="mb-3">
+        <label class="form-label fw-bold mb-2"><i class="bi bi-signpost-split"></i> 計画（手順と実行予定日）
+          {%- if not editing %} <i class="bi bi-info-circle text-muted fw-normal" title="手順と実行予定日を入れた行を登録します（空の行は無視）。登録した後も、タスクの詳細の計画から直せます。"></i>{% endif %}</label>
+        {% if editing %}
+        <div><a href="{{ url_for('tasks.edit_plan', task_id=task.id) }}" class="btn btn-sm btn-outline-primary"><i class="bi bi-pencil"></i> 計画を編集</a></div>
+        {% else %}
+        <div class="border rounded p-2">
+          <div class="table-responsive">
+            <table class="table table-sm align-middle mb-2">
+              <thead class="table-light">
+                <tr>
+                  <th class="text-nowrap">順</th><th>手順</th><th class="text-nowrap">実行予定日</th>
+                  <th class="d-none" data-plan-move><span class="visually-hidden">並べ替え</span></th>
+                </tr>
+              </thead>
+              <tbody id="plan-rows">
+                {% for r in plan_rows %}{{ new_plan_row(r, loop.index) }}{% endfor %}
+              </tbody>
+            </table>
+          </div>
+          <button type="button" class="btn btn-sm btn-outline-secondary d-none" id="plan-add-row"><i class="bi bi-plus-lg"></i> 行を追加</button>
+        </div>
+        {% endif %}
+      </div>
+
       <div class="d-flex gap-2">
         <button type="submit" class="btn btn-primary"><i class="bi bi-check-lg"></i> {{ '更新' if editing else '登録' }}</button>
         <a href="{{ url_for('tasks.detail', task_id=task.id) if editing else url_for('tasks.list_tasks') }}"
            class="btn btn-outline-secondary">キャンセル</a>
       </div>
     </form>
+    {% if not editing %}
+    {# 「行を追加」・メールからの下書きで足す計画の行のひな形(フォームの外。__i__ を新しい行の番号にする) #}
+    <template id="plan-row-template">{{ new_plan_row({"index": "__i__", "title": "", "date": ""}, "") }}</template>
+    {% endif %}
   </div>
 </div>
 {% endblock %}
 {% block scripts %}
+{% if not editing %}
+<script src="{{ url_for('static', filename='js/task-plan.js') }}"></script>
+{% endif %}
 {% if can_plan %}
 <script src="{{ url_for('static', filename='js/task-form.js') }}"></script>
 {% endif %}
@@ -1877,7 +1947,7 @@
     {% endfor %}
     {% if reminder.rem.enabled and not reminder.sending_enabled %}
     <div class="alert alert-secondary small py-2">
-      <i class="bi bi-info-circle"></i> システム設定の「定型業務リマインド」で自動送信がオフのため、今はメールは送られません。
+      <i class="bi bi-info-circle"></i> 定期メールの「定型業務リマインド」の設定で自動送信がオフのため、今はメールは送られません。
     </div>
     {% endif %}
     <dl class="row mb-2 small">
@@ -2043,7 +2113,7 @@
           <label class="form-check-label" for="rem-enabled">実施日に担当者へメールで知らせる</label>
         </div>
         {% if not rem_ctx.sending_enabled %}
-        <div class="form-text mb-2"><span class="text-warning-emphasis"><i class="bi bi-info-circle"></i> システム設定の「定型業務リマインド」で自動送信がオフのため、今はメールは送られません。</span></div>
+        <div class="form-text mb-2"><span class="text-warning-emphasis"><i class="bi bi-info-circle"></i> 定期メールの「定型業務リマインド」の設定で自動送信がオフのため、今はメールは送られません。</span></div>
         {% endif %}
         <div class="row g-2 mb-2">
           <div class="col-md-4">
@@ -4394,15 +4464,14 @@
 </div>
 {% endblock %}
 {#=== weekly/index.html ===#}
+{# 週報の「作成・送信」のタブ(/weekly/。app.py の 6-8)。「設定」のタブは weekly/settings.html #}
 {% extends "base.html" %}
-{% from "_macros.html" import last_result_card %}
+{% from "_macros.html" import last_result_card, mail_tabs %}
 {% block title %}週報 &middot; {{ app_name }}{% endblock %}
 
 {% block content %}
-<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
-  <h1 class="h3 mb-0"><i class="bi bi-file-earmark-text"></i> 週報</h1>
-  <a href="{{ url_for('system.settings', tab='weekly') }}" class="small"><i class="bi bi-gear"></i> 設定はシステム設定で変更</a>
-</div>{% if settings_error %}
+<h1 class="h3 mb-3"><i class="bi bi-file-earmark-text"></i> 週報</h1>
+{{ mail_tabs('weekly', 'index') }}{% if settings_error %}
 <div class="alert alert-danger small">
   <i class="bi bi-x-octagon"></i> <strong>週報の設定ファイルを読み込めません。</strong> {{ settings_error }}<br>
   直すまで、自動送信は行われず、今すぐ作成もできません。
@@ -4438,7 +4507,7 @@
   {# 前回の結果(1件だけ。毎回上書き) #}
   {{ last_result_card(url_for('weekly.index'), last, sending) }}
 
-  {# メール・AIの設定状況(読み取り専用。変更はシステム管理の「基本設定」〔admin〕・宛先は「メールの宛先」タブ) #}
+  {# メール・AIの設定状況(読み取り専用。変更はシステム管理の「基本設定」〔admin〕・宛先は定期メールの「メールの宛先」) #}
   <div class="col-lg-4">
     <div class="card shadow-sm h-100">
       <div class="card-header bg-white fw-bold"><i class="bi bi-gear"></i> メール・AIの設定（読み取り専用）</div>
@@ -4466,7 +4535,7 @@
         </dl>
         <hr>
         <div class="text-muted">
-          宛先は<a href="{{ url_for('system.settings', tab='recipients') }}">「メールの宛先」タブ</a>で変更します。
+          宛先は<a href="{{ url_for('mail.recipients') }}">「メールの宛先」</a>で変更します。
         </div>
       </div>
     </div>
@@ -4513,11 +4582,11 @@
   </div>
 </div>
 
-{# 現在の設定の概要とファイル名・件名のプレビュー(変更はシステム設定の「週報」タブ) #}
+{# 現在の設定の概要とファイル名・件名のプレビュー(変更は「設定」のタブ) #}
 <div class="card shadow-sm mb-4">
   <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
     <span class="fw-bold"><i class="bi bi-card-checklist"></i> 現在の設定</span>
-    <a href="{{ url_for('system.settings', tab='weekly') }}" class="small"><i class="bi bi-gear"></i> 設定はシステム設定で変更</a>
+    <a href="{{ url_for('weekly.settings') }}" class="small"><i class="bi bi-gear"></i> 設定を変更</a>
   </div>
   <div class="card-body small">
     <dl class="row mb-0">
@@ -4540,316 +4609,17 @@
   </div>
 </div>
 {% endblock %}
-{#=== overdue/index.html ===#}
+{#=== weekly/settings.html ===#}
+{# 週報の「設定」のタブ(/weekly/settings。instance/weekly_settings.json に保存。表示と保存は app.py の 11-3、
+   入力チェックは parse_weekly_form)。wk は weekly_form_context の値 #}
 {% extends "base.html" %}
-{% from "_macros.html" import last_result_card %}
-{% block title %}期限超過通知 &middot; {{ app_name }}{% endblock %}
+{% from "_macros.html" import mail_tabs, settings_file_error %}
+{% block title %}週報の設定 &middot; {{ app_name }}{% endblock %}
 
 {% block content %}
-<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
-  <h1 class="h3 mb-0"><i class="bi bi-alarm"></i> 期限超過通知</h1>
-  <a href="{{ url_for('system.settings', tab='overdue') }}" class="small"><i class="bi bi-gear"></i> 設定はシステム設定で変更</a>
-</div>{% if settings_error %}
-<div class="alert alert-danger small">
-  <i class="bi bi-x-octagon"></i> <strong>期限超過通知の設定ファイルを読み込めません。</strong> {{ settings_error }}<br>
-  直すまで、自動送信は行われず、今すぐ送信もできません。
-</div>{% endif %}
-
-{% if link_problem %}
-<div class="alert alert-warning small py-2">
-  <i class="bi bi-exclamation-triangle"></i> {{ link_problem }}
-</div>
-{% endif %}
-
-<div class="row g-3 mb-4">
-  {# 次回の自動送信 #}
-  <div class="col-lg-4">
-    <div class="card shadow-sm h-100">
-      <div class="card-header bg-white fw-bold"><i class="bi bi-alarm"></i> 次回の自動送信</div>
-      <div class="card-body">
-        {% if upcoming %}
-        <div class="fs-5 fw-bold">
-          {{ upcoming.strftime('%Y/%m/%d') }}（{{ weekday_labels[upcoming.weekday()] }}）{{ upcoming.strftime('%H:%M') }}
-        </div>
-        {% if scheduler_stopped %}
-        <div class="small text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> 自動送信のスケジューラが動いていません。「flask --app app run」でサーバーを起動してください。</div>
-        {% endif %}
-        {% if mail_problem %}
-        <div class="small text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> メールの設定が不足しているため送信できません。</div>
-        {% endif %}
-        {% else %}
-        <div class="fs-5 fw-bold text-muted">停止中</div>
-        {% endif %}
-      </div>
-    </div>
-  </div>
-
-  {# 前回の結果(1件だけ。毎回上書き) #}
-  {{ last_result_card(url_for('overdue.index'), last, sending) }}
-
-  {# メール・リンクの設定状況(読み取り専用。変更はシステム管理の「基本設定」〔admin〕・宛先は「メールの宛先」タブ) #}
-  <div class="col-lg-4">
-    <div class="card shadow-sm h-100">
-      <div class="card-header bg-white fw-bold"><i class="bi bi-gear"></i> メール・リンクの設定（読み取り専用）</div>
-      <div class="card-body small">
-        <dl class="row mb-0">
-          <dt class="col-5">送信サーバー</dt>
-          <dd class="col-7">
-            {% if mail.server %}設定あり
-            <span class="text-muted">（ポート {{ mail.port }}）</span>
-            {% else %}<span class="text-danger">未設定</span>{% endif %}
-          </dd>
-          <dt class="col-5">差出人（From）</dt>
-          <dd class="col-7 text-break">{% if mail.mail_from %}{{ mail.mail_from }}{% else %}<span class="text-danger">未設定</span>{% endif %}</dd>
-          <dt class="col-5">本番の宛先</dt>
-          <dd class="col-7">
-            {% if to_count %}To {{ to_count }}件・Cc {{ cc_count }}件{% else %}<span class="text-danger">未設定</span>{% endif %}
-          </dd>
-          <dt class="col-5">テスト送信先</dt>
-          <dd class="col-7">差出人宛て（Cc なし）</dd>
-          <dt class="col-5">リンクの基準URL</dt>
-          <dd class="col-7 text-break">
-            {% if base_url %}<span class="text-success">設定あり</span> <span class="text-muted">{{ base_url }}</span>
-            {% else %}<span class="text-danger">{% if link_configured %}形式が不正{% else %}未設定{% endif %}</span>（リンクなしで送信）{% endif %}
-          </dd>
-        </dl>
-        <hr>
-        <div class="text-muted">
-          宛先は<a href="{{ url_for('system.settings', tab='recipients') }}">「メールの宛先」タブ</a>で変更します。
-        </div>
-      </div>
-    </div>
-  </div>
-</div>
-
-{# 今すぐ送信(保存済みの設定で、今この時点の内容を送る) #}
-<div class="card shadow-sm mb-4">
-  <div class="card-header bg-white fw-bold"><i class="bi bi-lightning-charge"></i> 今すぐ送信</div>
-  <div class="card-body">
-    <form method="post" action="{{ url_for('overdue.run_now') }}" class="d-flex flex-wrap gap-2">
-      <button name="action" value="test" class="btn btn-sm btn-outline-secondary"
-              {% if test_problem or sending %}disabled{% endif %}>
-        <i class="bi bi-envelope"></i> テスト送信
-      </button>
-      <button name="action" value="send" class="btn btn-sm btn-danger"
-              {% if mail_problem or sending %}disabled{% endif %}
-              onclick="return confirm('本番の宛先（To {{ to_count }}件・Cc {{ cc_count }}件）に期限超過通知を送信します。よろしいですか？');">
-        <i class="bi bi-send"></i> 今すぐ本番の宛先に送信
-      </button>
-    </form>
-    <div class="small text-muted mt-2">下のプレビューと同じ内容を送信します。</div>
-    {% if mail_problem %}
-    <div class="small text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> {{ mail_problem }}</div>
-    {% endif %}
-    {% if test_problem and test_problem != mail_problem %}
-    <div class="small text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> テスト送信: {{ test_problem }}</div>
-    {% endif %}
-  </div>
-</div>
-
-{# 現在の設定の概要(変更はシステム設定の「期限超過通知」タブ) #}
-<div class="card shadow-sm mb-4">
-  <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
-    <span class="fw-bold"><i class="bi bi-card-checklist"></i> 現在の設定</span>
-    <a href="{{ url_for('system.settings', tab='overdue') }}" class="small"><i class="bi bi-gear"></i> 設定はシステム設定で変更</a>
-  </div>
-  <div class="card-body small">
-    <dl class="row mb-0">
-      <dt class="col-sm-3">自動送信</dt>
-      <dd class="col-sm-9">{% if settings.enabled %}する（営業日の {{ settings.time }}）{% else %}しない{% endif %}</dd>
-      <dt class="col-sm-3">表示するコメント件数</dt>
-      <dd class="col-sm-9">{{ settings.comment_count }}件</dd>
-    </dl>
-  </div>
-</div>
-
-{# 今この時点のメールのプレビュー #}
-<div class="card shadow-sm mb-4">
-  <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
-    <span class="fw-bold"><i class="bi bi-eye"></i> メールのプレビュー</span>
-    <span class="small">
-      <span class="badge bg-primary">未着手・進行中 {{ preview.counts.active }}件</span>
-      <span class="badge bg-warning text-dark">保留 {{ preview.counts.hold }}件</span>
-    </span>
-  </div>
-  <div class="card-body">
-    <div class="small mb-2"><span class="text-muted">件名:</span> <span class="fw-bold">{{ preview.subject }}</span></div>
-    <ul class="nav nav-tabs small" role="tablist">
-      <li class="nav-item" role="presentation">
-        <button class="nav-link active" id="tab-html" data-bs-toggle="tab" data-bs-target="#pane-html"
-                type="button" role="tab" aria-controls="pane-html" aria-selected="true">HTML版</button>
-      </li>
-      <li class="nav-item" role="presentation">
-        <button class="nav-link" id="tab-text" data-bs-toggle="tab" data-bs-target="#pane-text"
-                type="button" role="tab" aria-controls="pane-text" aria-selected="false">テキスト版</button>
-      </li>
-    </ul>
-    <div class="tab-content border border-top-0 rounded-bottom">
-      <div class="tab-pane fade show active" id="pane-html" role="tabpanel" aria-labelledby="tab-html">
-        {# メール本文はスクリプトを実行できない iframe(sandbox)の中に表示する #}
-        <iframe class="overdue-preview" title="メールのプレビュー（HTML版）"
-                sandbox="allow-popups allow-popups-to-escape-sandbox"
-                srcdoc="{{ preview_document }}"></iframe>
-      </div>
-      <div class="tab-pane fade" id="pane-text" role="tabpanel" aria-labelledby="tab-text">
-        <pre class="overdue-preview-text small mb-0 p-3">{{ preview.text }}</pre>
-      </div>
-    </div>
-  </div>
-</div>
-{% endblock %}
-{#=== overdue/mail.html ===#}
-{#- 期限超過通知メールのHTML版(app.py の build_overdue_html で作成)。
-    メールソフト(Outlook など)で崩れにくいよう、外部CSS・スクリプトは使わず簡単なインラインスタイルだけにする。
-    値はすべて自動でエスケープされる。 -#}
-<!DOCTYPE html>
-<html lang="ja">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{ subject }}</title>
-</head>
-<body style="margin:0;padding:12px;background-color:#ffffff;">
-<div style="font-family:'Meiryo UI',Meiryo,'Yu Gothic UI','Hiragino Sans',sans-serif;font-size:14px;line-height:1.6;color:#212529;word-wrap:break-word;overflow-wrap:break-word;">
-<p style="margin:0 0 12px 0;">{{ intro }}</p>
-{%- for section in data.sections %}
-<p style="margin:18px 0 6px 0;padding:4px 8px;font-size:15px;font-weight:bold;background-color:#eef2f7;border-left:4px solid #0d6efd;">{{ heading(section) }}</p>
-{%- if not section.groups %}
-<p style="margin:4px 0 4px 12px;color:#6c757d;">{{ none_text }}</p>
-{%- endif %}
-{%- for group in section.groups %}
-<p style="margin:10px 0 2px 0;font-weight:bold;">{{ group.label }}</p>
-<ul style="margin:0 0 6px 0;padding-left:24px;">
-{%- for task in group.tasks %}
-<li style="margin:0 0 4px 0;">
-{%- if task.url %}<a href="{{ task.url }}" style="color:#0d6efd;">{{ task.title }}</a>{% else %}{{ task.title }}{% endif %}
-<span style="color:#dc3545;">{{ task.meta }}</span>
-{#- コメントはタスク名の次の行から1件ずつ表示する #}
-{%- for c in task.comments %}
-<br><span style="color:#6c757d;">{{ c.head }}</span>{{ c.text }}
-{%- else %}
-<br><span style="color:#6c757d;">{{ no_comment }}</span>
-{%- endfor %}</li>
-{%- endfor %}
-</ul>
-{%- endfor %}
-{%- endfor %}
-<p style="margin:18px 0 0 0;font-size:12px;color:#6c757d;">{{ footer }}</p>
-</div>
-</body>
-</html>
-{#=== system/settings.html ===#}
-{% extends "base.html" %}
-{% block title %}システム設定 &middot; {{ app_name }}{% endblock %}
-
-{# 機能の設定ファイル(instance/*.json)が読み込めないときの注意(タブの先頭に出す) #}
-{% macro file_error_alert(ctx) %}{% if ctx.file_error %}<div class="alert alert-danger small"><i class="bi bi-x-octagon"></i> <strong>設定ファイルを読み込めません。</strong> {{ ctx.file_error }}<br>直すまで、このタブの設定は保存できません（{{ ctx.file_error_note }}）。</div>
-{% endif %}{% endmacro %}
-
-{% block content %}
-<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
-  <h1 class="h3 mb-0"><i class="bi bi-gear"></i> システム設定</h1>
-</div>
-{%- if not tabs %}
-<div class="alert alert-light border small"><i class="bi bi-info-circle"></i> この環境で使う機能には、ここで変える設定がありません。</div>
-{%- endif %}
-
-<ul class="nav nav-tabs" id="system-tabs" role="tablist">
-  {% for key, label, icon in tabs %}
-  <li class="nav-item" role="presentation">
-    <a class="nav-link {% if tab == key %}active{% endif %}" id="tab-{{ key }}"
-       href="{{ url_for('system.settings', tab=key) }}" data-tab="{{ key }}"
-       data-bs-toggle="tab" data-bs-target="#pane-{{ key }}" role="tab"
-       aria-controls="pane-{{ key }}" aria-selected="{{ 'true' if tab == key else 'false' }}"><i class="bi {{ icon }}"></i> {{ label }}</a>
-  </li>
-  {% endfor %}
-</ul>
-
-<div class="tab-content pt-3">
-  {%- if 'recipients' in shown_tabs %}
-  <div class="tab-pane fade {% if tab == 'recipients' %}show active{% endif %}" id="pane-recipients" role="tabpanel" aria-labelledby="tab-recipients">
-    {{ file_error_alert(rc) }}{% include "system/_recipients_tab.html" %}
-  </div>
-  {%- endif %}
-  {%- if 'weekly' in shown_tabs %}
-  <div class="tab-pane fade {% if tab == 'weekly' %}show active{% endif %}" id="pane-weekly" role="tabpanel" aria-labelledby="tab-weekly">
-    {{ file_error_alert(wk) }}{% include "system/_weekly_tab.html" %}
-  </div>
-  {%- endif %}
-  {%- if 'overdue' in shown_tabs %}
-  <div class="tab-pane fade {% if tab == 'overdue' %}show active{% endif %}" id="pane-overdue" role="tabpanel" aria-labelledby="tab-overdue">
-    {{ file_error_alert(od) }}{% include "system/_overdue_tab.html" %}
-  </div>
-  {%- endif %}
-  {%- if 'skill_ai' in shown_tabs %}
-  <div class="tab-pane fade {% if tab == 'skill_ai' %}show active{% endif %}" id="pane-skill_ai" role="tabpanel" aria-labelledby="tab-skill_ai">
-    {{ file_error_alert(sa) }}{% include "system/_skill_ai_tab.html" %}
-  </div>
-  {%- endif %}
-  {%- if 'analysis' in shown_tabs %}
-  <div class="tab-pane fade {% if tab == 'analysis' %}show active{% endif %}" id="pane-analysis" role="tabpanel" aria-labelledby="tab-analysis">
-    {{ file_error_alert(an) }}{% include "system/_analysis_tab.html" %}
-  </div>
-  {%- endif %}
-  {%- if 'reminder' in shown_tabs %}
-  <div class="tab-pane fade {% if tab == 'reminder' %}show active{% endif %}" id="pane-reminder" role="tabpanel" aria-labelledby="tab-reminder">
-    {{ file_error_alert(rm) }}{% include "system/_reminder_tab.html" %}
-  </div>
-  {%- endif %}
-</div>
-{% endblock %}
-
-{% block scripts %}
-<script src="{{ url_for('static', filename='js/weekly-settings.js') }}"></script>
-<script src="{{ url_for('static', filename='js/system-settings.js') }}"></script>
-{% endblock %}
-{#=== system/_recipients_tab.html ===#}
-{# システム設定「メールの宛先」タブ(app.py の 11-3)。rc は env_mail_form_context の値。この環境の宛先
-   (instance/env_mail_settings.json。ほかの環境は instance/envs/<キー>/)を編集する #}
-<p class="small text-muted">週報と期限超過通知の宛先です{% if env_nav %}（この環境: {{ rc.env_name }}）{% endif %}。</p>
-{% if rc.mail_problem %}
-<div class="alert alert-warning small py-2"><i class="bi bi-exclamation-triangle"></i> {{ rc.mail_problem }}</div>
-{% endif %}
-<form method="post" action="{{ url_for('system.save_recipients') }}" autocomplete="off" novalidate>
-  <input type="hidden" name="version" value="{{ rc.version }}">
-  <div class="card shadow-sm mb-3">
-    <div class="card-header bg-white fw-bold"><i class="bi bi-envelope"></i> この環境のメールの宛先</div>
-    <div class="card-body pb-1">
-      <div class="row g-2 mb-3">
-        <div class="col-md-4">
-          <label class="form-label small fw-bold mb-0" for="env-mail-to">{{ rc.to_field.label }}</label>
-          <div class="small"><code>MAIL_TO</code></div>
-        </div>
-        <div class="col-md-8">
-          <textarea class="form-control form-control-sm" id="env-mail-to" name="MAIL_TO" rows="3" spellcheck="false"
-                    placeholder="name@example.com（1行に1件）">{{ rc.to_text }}</textarea>
-          <div class="form-text">1行に1件。空にすると送りません。</div>
-        </div>
-      </div>
-      <div class="row g-2 mb-3">
-        <div class="col-md-4">
-          <label class="form-label small fw-bold mb-0" for="env-mail-cc">{{ rc.cc_field.label }}</label>
-          <div class="small"><code>MAIL_CC</code></div>
-        </div>
-        <div class="col-md-8">
-          <textarea class="form-control form-control-sm" id="env-mail-cc" name="MAIL_CC" rows="3" spellcheck="false"
-                    placeholder="name@example.com（1行に1件）">{{ rc.cc_text }}</textarea>
-          <div class="form-text">1行に1件。{% if rc.domains_label %}送信を許可するドメイン（{{ rc.domains_label }}）のアドレスだけを保存できます。{% endif %}</div>
-        </div>
-      </div>
-    </div>
-  </div>
-  <div class="d-flex justify-content-end mb-4">
-    <button class="btn btn-primary"><i class="bi bi-save"></i> 宛先を保存</button>
-  </div>
-</form>
-{#=== system/_weekly_tab.html ===#}
-{# システム設定「週報」タブ(instance/weekly_settings.json に保存)。入力チェックは app.py の parse_weekly_form #}
-<p class="small text-muted d-flex flex-wrap justify-content-end gap-2">
-  <a href="{{ url_for('weekly.index') }}"><i class="bi bi-box-arrow-up-right"></i> 週報の画面</a>
-</p>
-
-<form method="post" action="{{ url_for('system.save_weekly') }}" id="weekly-settings-form"
+<h1 class="h3 mb-3"><i class="bi bi-file-earmark-text"></i> 週報</h1>
+{{ mail_tabs('weekly', 'settings') }}
+{{ settings_file_error(wk) }}<form method="post" action="{{ url_for('weekly.save_settings') }}" id="weekly-settings-form"
       data-preview-url="{{ url_for('weekly.preview') }}">
   <input type="hidden" name="version" value="{{ wk.version }}">
 
@@ -4990,13 +4760,179 @@
     <button class="btn btn-primary"><i class="bi bi-save"></i> 週報の設定を保存</button>
   </div>
 </form>
-{#=== system/_overdue_tab.html ===#}
-{# システム設定「期限超過通知」タブ(instance/overdue_settings.json に保存)。入力チェックは app.py の parse_overdue_form #}
-<p class="small text-muted d-flex flex-wrap justify-content-end gap-2">
-  <a href="{{ url_for('overdue.index') }}"><i class="bi bi-box-arrow-up-right"></i> 期限超過通知の画面</a>
-</p>
+{% endblock %}
 
-<form method="post" action="{{ url_for('system.save_overdue') }}">
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/weekly-settings.js') }}"></script>
+{% endblock %}
+{#=== overdue/index.html ===#}
+{# 期限超過通知の「送信」のタブ(/overdue/。app.py の 7-6)。「設定」のタブは overdue/settings.html #}
+{% extends "base.html" %}
+{% from "_macros.html" import last_result_card, mail_tabs %}
+{% block title %}期限超過通知 &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<h1 class="h3 mb-3"><i class="bi bi-alarm"></i> 期限超過通知</h1>
+{{ mail_tabs('overdue', 'index') }}{% if settings_error %}
+<div class="alert alert-danger small">
+  <i class="bi bi-x-octagon"></i> <strong>期限超過通知の設定ファイルを読み込めません。</strong> {{ settings_error }}<br>
+  直すまで、自動送信は行われず、今すぐ送信もできません。
+</div>{% endif %}
+
+{% if link_problem %}
+<div class="alert alert-warning small py-2">
+  <i class="bi bi-exclamation-triangle"></i> {{ link_problem }}
+</div>
+{% endif %}
+
+<div class="row g-3 mb-4">
+  {# 次回の自動送信 #}
+  <div class="col-lg-4">
+    <div class="card shadow-sm h-100">
+      <div class="card-header bg-white fw-bold"><i class="bi bi-alarm"></i> 次回の自動送信</div>
+      <div class="card-body">
+        {% if upcoming %}
+        <div class="fs-5 fw-bold">
+          {{ upcoming.strftime('%Y/%m/%d') }}（{{ weekday_labels[upcoming.weekday()] }}）{{ upcoming.strftime('%H:%M') }}
+        </div>
+        {% if scheduler_stopped %}
+        <div class="small text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> 自動送信のスケジューラが動いていません。「flask --app app run」でサーバーを起動してください。</div>
+        {% endif %}
+        {% if mail_problem %}
+        <div class="small text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> メールの設定が不足しているため送信できません。</div>
+        {% endif %}
+        {% else %}
+        <div class="fs-5 fw-bold text-muted">停止中</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  {# 前回の結果(1件だけ。毎回上書き) #}
+  {{ last_result_card(url_for('overdue.index'), last, sending) }}
+
+  {# メール・リンクの設定状況(読み取り専用。変更はシステム管理の「基本設定」〔admin〕・宛先は定期メールの「メールの宛先」) #}
+  <div class="col-lg-4">
+    <div class="card shadow-sm h-100">
+      <div class="card-header bg-white fw-bold"><i class="bi bi-gear"></i> メール・リンクの設定（読み取り専用）</div>
+      <div class="card-body small">
+        <dl class="row mb-0">
+          <dt class="col-5">送信サーバー</dt>
+          <dd class="col-7">
+            {% if mail.server %}設定あり
+            <span class="text-muted">（ポート {{ mail.port }}）</span>
+            {% else %}<span class="text-danger">未設定</span>{% endif %}
+          </dd>
+          <dt class="col-5">差出人（From）</dt>
+          <dd class="col-7 text-break">{% if mail.mail_from %}{{ mail.mail_from }}{% else %}<span class="text-danger">未設定</span>{% endif %}</dd>
+          <dt class="col-5">本番の宛先</dt>
+          <dd class="col-7">
+            {% if to_count %}To {{ to_count }}件・Cc {{ cc_count }}件{% else %}<span class="text-danger">未設定</span>{% endif %}
+          </dd>
+          <dt class="col-5">テスト送信先</dt>
+          <dd class="col-7">差出人宛て（Cc なし）</dd>
+          <dt class="col-5">リンクの基準URL</dt>
+          <dd class="col-7 text-break">
+            {% if base_url %}<span class="text-success">設定あり</span> <span class="text-muted">{{ base_url }}</span>
+            {% else %}<span class="text-danger">{% if link_configured %}形式が不正{% else %}未設定{% endif %}</span>（リンクなしで送信）{% endif %}
+          </dd>
+        </dl>
+        <hr>
+        <div class="text-muted">
+          宛先は<a href="{{ url_for('mail.recipients') }}">「メールの宛先」</a>で変更します。
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{# 今すぐ送信(保存済みの設定で、今この時点の内容を送る) #}
+<div class="card shadow-sm mb-4">
+  <div class="card-header bg-white fw-bold"><i class="bi bi-lightning-charge"></i> 今すぐ送信</div>
+  <div class="card-body">
+    <form method="post" action="{{ url_for('overdue.run_now') }}" class="d-flex flex-wrap gap-2">
+      <button name="action" value="test" class="btn btn-sm btn-outline-secondary"
+              {% if test_problem or sending %}disabled{% endif %}>
+        <i class="bi bi-envelope"></i> テスト送信
+      </button>
+      <button name="action" value="send" class="btn btn-sm btn-danger"
+              {% if mail_problem or sending %}disabled{% endif %}
+              onclick="return confirm('本番の宛先（To {{ to_count }}件・Cc {{ cc_count }}件）に期限超過通知を送信します。よろしいですか？');">
+        <i class="bi bi-send"></i> 今すぐ本番の宛先に送信
+      </button>
+    </form>
+    <div class="small text-muted mt-2">下のプレビューと同じ内容を送信します。</div>
+    {% if mail_problem %}
+    <div class="small text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> {{ mail_problem }}</div>
+    {% endif %}
+    {% if test_problem and test_problem != mail_problem %}
+    <div class="small text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> テスト送信: {{ test_problem }}</div>
+    {% endif %}
+  </div>
+</div>
+
+{# 現在の設定の概要(変更は「設定」のタブ) #}
+<div class="card shadow-sm mb-4">
+  <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <span class="fw-bold"><i class="bi bi-card-checklist"></i> 現在の設定</span>
+    <a href="{{ url_for('overdue.settings') }}" class="small"><i class="bi bi-gear"></i> 設定を変更</a>
+  </div>
+  <div class="card-body small">
+    <dl class="row mb-0">
+      <dt class="col-sm-3">自動送信</dt>
+      <dd class="col-sm-9">{% if settings.enabled %}する（営業日の {{ settings.time }}）{% else %}しない{% endif %}</dd>
+      <dt class="col-sm-3">表示するコメント件数</dt>
+      <dd class="col-sm-9">{{ settings.comment_count }}件</dd>
+    </dl>
+  </div>
+</div>
+
+{# 今この時点のメールのプレビュー #}
+<div class="card shadow-sm mb-4">
+  <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <span class="fw-bold"><i class="bi bi-eye"></i> メールのプレビュー</span>
+    <span class="small">
+      <span class="badge bg-primary">未着手・進行中 {{ preview.counts.active }}件</span>
+      <span class="badge bg-warning text-dark">保留 {{ preview.counts.hold }}件</span>
+    </span>
+  </div>
+  <div class="card-body">
+    <div class="small mb-2"><span class="text-muted">件名:</span> <span class="fw-bold">{{ preview.subject }}</span></div>
+    <ul class="nav nav-tabs small" role="tablist">
+      <li class="nav-item" role="presentation">
+        <button class="nav-link active" id="tab-html" data-bs-toggle="tab" data-bs-target="#pane-html"
+                type="button" role="tab" aria-controls="pane-html" aria-selected="true">HTML版</button>
+      </li>
+      <li class="nav-item" role="presentation">
+        <button class="nav-link" id="tab-text" data-bs-toggle="tab" data-bs-target="#pane-text"
+                type="button" role="tab" aria-controls="pane-text" aria-selected="false">テキスト版</button>
+      </li>
+    </ul>
+    <div class="tab-content border border-top-0 rounded-bottom">
+      <div class="tab-pane fade show active" id="pane-html" role="tabpanel" aria-labelledby="tab-html">
+        {# メール本文はスクリプトを実行できない iframe(sandbox)の中に表示する #}
+        <iframe class="overdue-preview" title="メールのプレビュー（HTML版）"
+                sandbox="allow-popups allow-popups-to-escape-sandbox"
+                srcdoc="{{ preview_document }}"></iframe>
+      </div>
+      <div class="tab-pane fade" id="pane-text" role="tabpanel" aria-labelledby="tab-text">
+        <pre class="overdue-preview-text small mb-0 p-3">{{ preview.text }}</pre>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{#=== overdue/settings.html ===#}
+{# 期限超過通知の「設定」のタブ(/overdue/settings。instance/overdue_settings.json に保存。表示と保存は app.py の 11-3、
+   入力チェックは parse_overdue_form)。od は overdue_form_context の値 #}
+{% extends "base.html" %}
+{% from "_macros.html" import mail_tabs, settings_file_error %}
+{% block title %}期限超過通知の設定 &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<h1 class="h3 mb-3"><i class="bi bi-alarm"></i> 期限超過通知</h1>
+{{ mail_tabs('overdue', 'settings') }}
+{{ settings_file_error(od) }}<form method="post" action="{{ url_for('overdue.save_settings') }}">
   <input type="hidden" name="version" value="{{ od.version }}">
   <div class="card shadow-sm mb-4">
     <div class="card-header bg-white fw-bold"><i class="bi bi-sliders"></i> 期限超過通知の設定</div>
@@ -5027,6 +4963,329 @@
     </div>
   </div>
 </form>
+{% endblock %}
+{#=== overdue/mail.html ===#}
+{#- 期限超過通知メールのHTML版(app.py の build_overdue_html で作成)。
+    メールソフト(Outlook など)で崩れにくいよう、外部CSS・スクリプトは使わず簡単なインラインスタイルだけにする。
+    値はすべて自動でエスケープされる。 -#}
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ subject }}</title>
+</head>
+<body style="margin:0;padding:12px;background-color:#ffffff;">
+<div style="font-family:'Meiryo UI',Meiryo,'Yu Gothic UI','Hiragino Sans',sans-serif;font-size:14px;line-height:1.6;color:#212529;word-wrap:break-word;overflow-wrap:break-word;">
+<p style="margin:0 0 12px 0;">{{ intro }}</p>
+{%- for section in data.sections %}
+<p style="margin:18px 0 6px 0;padding:4px 8px;font-size:15px;font-weight:bold;background-color:#eef2f7;border-left:4px solid #0d6efd;">{{ heading(section) }}</p>
+{%- if not section.groups %}
+<p style="margin:4px 0 4px 12px;color:#6c757d;">{{ none_text }}</p>
+{%- endif %}
+{%- for group in section.groups %}
+<p style="margin:10px 0 2px 0;font-weight:bold;">{{ group.label }}</p>
+<ul style="margin:0 0 6px 0;padding-left:24px;">
+{%- for task in group.tasks %}
+<li style="margin:0 0 4px 0;">
+{%- if task.url %}<a href="{{ task.url }}" style="color:#0d6efd;">{{ task.title }}</a>{% else %}{{ task.title }}{% endif %}
+<span style="color:#dc3545;">{{ task.meta }}</span>
+{#- コメントはタスク名の次の行から1件ずつ表示する #}
+{%- for c in task.comments %}
+<br><span style="color:#6c757d;">{{ c.head }}</span>{{ c.text }}
+{%- else %}
+<br><span style="color:#6c757d;">{{ no_comment }}</span>
+{%- endfor %}</li>
+{%- endfor %}
+</ul>
+{%- endfor %}
+{%- endfor %}
+<p style="margin:18px 0 0 0;font-size:12px;color:#6c757d;">{{ footer }}</p>
+</div>
+</body>
+</html>
+{#=== reminder/index.html ===#}
+{# 定型業務リマインドの「送信」のタブ(/reminder/。app.py の 10-8): 送れない宛先・次回の自動送信・前回の結果・テスト送信・
+   メールのプレビュー。rm_status は reminder_status_context、rm は設定(settings_context)の値。「設定」のタブは reminder/settings.html #}
+{% extends "base.html" %}
+{% from "_macros.html" import mail_tabs %}
+{% block title %}定型業務リマインド &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<h1 class="h3 mb-3"><i class="bi bi-bell"></i> 定型業務リマインド</h1>
+{{ mail_tabs('reminder', 'index') }}
+{%- if rm.file_error %}
+<div class="alert alert-danger small">
+  <i class="bi bi-x-octagon"></i> <strong>定型業務リマインドの設定ファイルを読み込めません。</strong> {{ rm.file_error }}<br>
+  直すまで、{{ rm.file_error_note }}。
+</div>
+{%- endif %}
+{% if rm_status.address_problems %}
+<div class="alert alert-warning small">
+  <i class="bi bi-exclamation-triangle"></i> <strong>送れない宛先があります</strong>:
+  <ul class="mb-1">
+    {% for p in rm_status.address_problems %}
+    <li><a href="{{ url_for('routine.detail', routine_id=p.routine.id) }}">{{ p.routine.name }}</a> — {{ p.kind }}: {{ p.name }}（{{ p.reason }}）</li>
+    {% endfor %}
+  </ul>
+  メールアドレスは<a href="{{ url_for('departments.manage') }}">チーム管理</a>か、各自のユーザーメニューの「メールアドレス」で登録します。{% if rm_status.address_problems|selectattr('reason', 'equalto', rm_status.emails_pending_reason)|list %}
+  「マネージャーの確認待ち」は、その業務の「編集」で保存すると送ります。{% endif %}
+</div>
+{% endif %}
+{% if rm_status.link_problem %}
+<div class="alert alert-warning small py-2">
+  <i class="bi bi-exclamation-triangle"></i> リンクの基準URL（<code>APP_BASE_URL</code>）が未設定・不正のため、メールにリンクを付けられません。admin の「基本設定」で設定してください。
+</div>
+{% endif %}
+
+<div class="row g-3 mb-4">
+  {# 次回の自動送信 #}
+  <div class="col-lg-4">
+    <div class="card shadow-sm h-100">
+      <div class="card-header bg-white fw-bold"><i class="bi bi-alarm"></i> 次回の自動送信</div>
+      <div class="card-body small">
+        {% if rm_status.upcoming %}
+        <div class="fs-5 fw-bold">
+          {{ rm_status.upcoming.strftime('%Y/%m/%d') }}（{{ rm_status.weekday_labels[rm_status.upcoming.weekday()] }}）{{ rm_status.upcoming.strftime('%H:%M') }}
+        </div>
+        {% if rm_status.scheduler_stopped %}
+        <div class="text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> 自動送信のスケジューラが動いていません。「flask --app app run」でサーバーを起動してください。</div>
+        {% endif %}
+        {% if rm_status.mail_problem %}
+        <div class="text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> {{ rm_status.mail_problem }}</div>
+        {% endif %}
+        {% else %}
+        <div class="fs-5 fw-bold text-muted">停止中</div>
+        {% endif %}
+        <hr>
+        <div class="text-muted">リマインドを設定した業務: {{ rm_status.enabled_count }}件</div>
+      </div>
+    </div>
+  </div>
+
+  {# 前回の結果(1件だけ。毎回上書き) #}
+  <div class="col-lg-4">
+    <div class="card shadow-sm h-100">
+      <div class="card-header bg-white d-flex justify-content-between align-items-center">
+        <span class="fw-bold"><i class="bi bi-clipboard-check"></i> 前回の結果</span>
+        <a href="{{ url_for('reminder.index') }}" class="btn btn-sm btn-outline-secondary"><i class="bi bi-arrow-clockwise"></i> 更新</a>
+      </div>
+      <div class="card-body small">
+        {% if rm_status.sending %}
+        <div class="alert alert-info py-1 px-2 mb-2">
+          <span class="spinner-border spinner-border-sm" role="status"></span> 送信処理中です。しばらくしてから「更新」を押してください。
+        </div>
+        {% endif %}
+        {% if rm_status.last %}
+        <div class="mb-1">
+          {% if rm_status.last.ok %}<span class="badge bg-success">成功</span>{% else %}<span class="badge bg-danger">失敗</span>{% endif %}
+          <span class="badge bg-light text-dark">{{ rm_status.last.trigger }}</span>
+          <span class="text-muted">{{ rm_status.last.at }}</span>
+        </div>
+        <div class="pre-wrap">{{ rm_status.last.message }}</div>
+        {% else %}
+        <div class="text-muted">まだ送信していません。</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  {# テスト送信 #}
+  <div class="col-lg-4">
+    <div class="card shadow-sm h-100">
+      <div class="card-header bg-white fw-bold"><i class="bi bi-envelope"></i> テスト送信</div>
+      <div class="card-body small">
+        <form method="post" action="{{ url_for('reminder.test') }}">
+          <button class="btn btn-sm btn-outline-secondary" {% if rm_status.mail_problem or rm_status.sending or rm.file_error %}disabled{% endif %}>
+            <i class="bi bi-envelope"></i> テスト送信（差出人宛て）
+          </button>
+        </form>
+        {% if rm_status.mail_problem %}
+        <div class="text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> {{ rm_status.mail_problem }}</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+{# 次の送信のメールのプレビュー(宛先ごと) #}
+<div class="card shadow-sm mb-4">
+  <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <span class="fw-bold"><i class="bi bi-eye"></i> メールのプレビュー（{{ '次回の自動送信' if rm_status.planned_auto else 'オンにしたときの次の送信' }} {{ rm_status.planned.strftime('%Y/%m/%d %H:%M') }}）
+      <i class="bi bi-info-circle text-muted" title="件名の件数は、その宛先に送る回の数です。HTMLを表示できないメールソフトではテキスト版が表示されます。"></i></span>
+    <span class="small">
+      <span class="badge bg-primary">本日実施 {{ rm_status.data.today_count }}件</span>
+      <span class="badge bg-danger">未完了 {{ rm_status.data.overdue_count }}件</span>
+      <span class="badge bg-secondary">宛先 {{ rm_status.previews|length }}件</span>
+    </span>
+  </div>
+  <div class="card-body">
+    {# data は辞書のため、items は data['items'] で取り出す(data.items は辞書のメソッドになる) #}
+    {% if not rm_status.data.include_today and rm_status.data.today_waiting %}
+    <p class="small text-muted"><i class="bi bi-info-circle"></i> 実施予定日が今日の回（{{ rm_status.data.today_waiting }}件）は載せません（{{ rm_status.last_time }} の送信で、完了の入力が無ければ送ります）。</p>
+    {% endif %}
+    {% if not rm_status.data['items'] %}
+    <p class="text-muted small">この送信で送る定型業務はありません。</p>
+    {% endif %}
+    {% if rm_status.data.unreachable %}
+    <p class="small text-danger"><i class="bi bi-exclamation-triangle"></i> 宛先が1つも無いため送れない回: {{ rm_status.data.unreachable }}件（上の「送れない宛先」を確認してください）</p>
+    {% endif %}
+    {% for mail in rm_status.previews %}
+    <details class="mb-2" {% if loop.first %}open{% endif %}>
+      <summary class="small"><span class="fw-bold">{{ mail.name or mail.address }}</span> &lt;{{ mail.address }}&gt; — {{ mail.subject }}</summary>
+      {# メール本文はスクリプトを実行できない iframe(sandbox)の中に表示する #}
+      <iframe class="overdue-preview border rounded mt-2" title="メールのプレビュー（HTML版）"
+              sandbox="allow-popups allow-popups-to-escape-sandbox" srcdoc="{{ mail.document }}"></iframe>
+      <details class="mt-1">
+        <summary class="small text-muted">テキスト版</summary>
+        <pre class="overdue-preview-text small border rounded mb-0 p-2">{{ mail.text }}</pre>
+      </details>
+    </details>
+    {% endfor %}
+    <details class="mt-3">
+      <summary class="small text-muted">テスト送信の内容 — {{ rm_status.test_mail.subject }}</summary>
+      <iframe class="overdue-preview border rounded mt-2" title="テスト送信のプレビュー（HTML版）"
+              sandbox="allow-popups allow-popups-to-escape-sandbox" srcdoc="{{ rm_status.test_mail.document }}"></iframe>
+    </details>
+  </div>
+</div>
+{% endblock %}
+{#=== reminder/settings.html ===#}
+{# 定型業務リマインドの「設定」のタブ(/reminder/settings。instance/routine_reminder_settings.json に保存。表示と保存は
+   app.py の 11-3、入力チェックは parse_reminder_settings_form)。rm は reminder_settings_form_context の値 #}
+{% extends "base.html" %}
+{% from "_macros.html" import mail_tabs, settings_file_error %}
+{% block title %}定型業務リマインドの設定 &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<h1 class="h3 mb-3"><i class="bi bi-bell"></i> 定型業務リマインド</h1>
+{{ mail_tabs('reminder', 'settings') }}
+{{ settings_file_error(rm) }}<p class="small text-muted">業務ごとの実施日・宛先は、各業務の編集の「リマインド」で設定します。</p>
+<form method="post" action="{{ url_for('reminder.save_settings') }}">
+  <input type="hidden" name="version" value="{{ rm.version }}">
+  <div class="card shadow-sm mb-4">
+    <div class="card-header bg-white fw-bold"><i class="bi bi-sliders"></i> 定型業務リマインドの設定</div>
+    <div class="card-body">
+      <div class="form-check form-switch mb-3">
+        <input class="form-check-input" type="checkbox" role="switch" id="reminder-enabled" name="enabled" value="1"
+               {% if rm.settings.enabled %}checked{% endif %}>
+        <label class="form-check-label fw-bold" for="reminder-enabled">自動送信する</label>
+        <div class="form-text">早い時刻は予定日を過ぎた回、遅い時刻は今日の回も送ります。</div>
+      </div>
+      <div class="row g-3">
+        <div class="col-sm-6 col-md-3">
+          <label class="form-label small mb-1" for="reminder-time1">送信時刻1</label>
+          <input type="time" name="time1" id="reminder-time1" class="form-control form-control-sm" value="{{ rm.settings.time1 }}" required>
+        </div>
+        <div class="col-sm-6 col-md-3">
+          <label class="form-label small mb-1" for="reminder-time2">送信時刻2</label>
+          <input type="time" name="time2" id="reminder-time2" class="form-control form-control-sm" value="{{ rm.settings.time2 }}" required>
+        </div>
+        <div class="col-md-6">
+          <div class="form-check form-switch mt-md-4">
+            <input class="form-check-input" type="checkbox" role="switch" id="reminder-business-days" name="business_days_only" value="1"
+                   {% if rm.settings.business_days_only %}checked{% endif %}>
+            <label class="form-check-label" for="reminder-business-days">営業日（土日・祝日以外）だけ送る</label>
+          </div>
+        </div>
+      </div>
+      <div class="form-text mt-3">送信時刻1・2は違う時刻にします。</div>
+    </div>
+    <div class="card-footer bg-white d-flex justify-content-end">
+      <button class="btn btn-primary btn-sm"><i class="bi bi-save"></i> 定型業務リマインドの設定を保存</button>
+    </div>
+  </div>
+</form>
+{% endblock %}
+{#=== mail/recipients.html ===#}
+{# 定期メールの「メールの宛先」(/mail/recipients。app.py の 11-3)。週報・期限超過通知の宛先。rc は env_mail_form_context の値。
+   この環境の宛先(instance/env_mail_settings.json。ほかの環境は instance/envs/<キー>/)を編集する #}
+{% extends "base.html" %}
+{% from "_macros.html" import settings_file_error %}
+{% block title %}メールの宛先 &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<h1 class="h3 mb-3"><i class="bi bi-envelope"></i> メールの宛先</h1>
+{{ settings_file_error(rc) }}<p class="small text-muted">週報と期限超過通知の宛先です{% if env_nav %}（この環境: {{ rc.env_name }}）{% endif %}。</p>
+{% if rc.mail_problem %}
+<div class="alert alert-warning small py-2"><i class="bi bi-exclamation-triangle"></i> {{ rc.mail_problem }}</div>
+{% endif %}
+<form method="post" action="{{ url_for('mail.save_recipients') }}" autocomplete="off" novalidate>
+  <input type="hidden" name="version" value="{{ rc.version }}">
+  <div class="card shadow-sm mb-3">
+    <div class="card-header bg-white fw-bold"><i class="bi bi-envelope"></i> この環境のメールの宛先</div>
+    <div class="card-body pb-1">
+      <div class="row g-2 mb-3">
+        <div class="col-md-4">
+          <label class="form-label small fw-bold mb-0" for="env-mail-to">{{ rc.to_field.label }}</label>
+          <div class="small"><code>MAIL_TO</code></div>
+        </div>
+        <div class="col-md-8">
+          <textarea class="form-control form-control-sm" id="env-mail-to" name="MAIL_TO" rows="3" spellcheck="false"
+                    placeholder="name@example.com（1行に1件）">{{ rc.to_text }}</textarea>
+          <div class="form-text">1行に1件。空にすると送りません。</div>
+        </div>
+      </div>
+      <div class="row g-2 mb-3">
+        <div class="col-md-4">
+          <label class="form-label small fw-bold mb-0" for="env-mail-cc">{{ rc.cc_field.label }}</label>
+          <div class="small"><code>MAIL_CC</code></div>
+        </div>
+        <div class="col-md-8">
+          <textarea class="form-control form-control-sm" id="env-mail-cc" name="MAIL_CC" rows="3" spellcheck="false"
+                    placeholder="name@example.com（1行に1件）">{{ rc.cc_text }}</textarea>
+          <div class="form-text">1行に1件。{% if rc.domains_label %}送信を許可するドメイン（{{ rc.domains_label }}）のアドレスだけを保存できます。{% endif %}</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="d-flex justify-content-end mb-4">
+    <button class="btn btn-primary"><i class="bi bi-save"></i> 宛先を保存</button>
+  </div>
+</form>
+{% endblock %}
+{#=== system/settings.html ===#}
+{# システム設定(管理。/system/settings?tab=。app.py の 11-3): スキル（AI）・AI分析のタブ #}
+{% extends "base.html" %}
+{% from "_macros.html" import settings_file_error %}
+{% block title %}システム設定 &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+  <h1 class="h3 mb-0"><i class="bi bi-gear"></i> システム設定</h1>
+</div>
+{%- if not tabs %}
+<div class="alert alert-light border small"><i class="bi bi-info-circle"></i> この環境で使う機能には、ここで変える設定がありません。</div>
+{%- endif %}
+
+<ul class="nav nav-tabs" id="system-tabs" role="tablist">
+  {% for key, label, icon in tabs %}
+  <li class="nav-item" role="presentation">
+    <a class="nav-link {% if tab == key %}active{% endif %}" id="tab-{{ key }}"
+       href="{{ url_for('system.settings', tab=key) }}" data-tab="{{ key }}"
+       data-bs-toggle="tab" data-bs-target="#pane-{{ key }}" role="tab"
+       aria-controls="pane-{{ key }}" aria-selected="{{ 'true' if tab == key else 'false' }}"><i class="bi {{ icon }}"></i> {{ label }}</a>
+  </li>
+  {% endfor %}
+</ul>
+
+<div class="tab-content pt-3">
+  {%- if 'skill_ai' in shown_tabs %}
+  <div class="tab-pane fade {% if tab == 'skill_ai' %}show active{% endif %}" id="pane-skill_ai" role="tabpanel" aria-labelledby="tab-skill_ai">
+    {{ settings_file_error(sa) }}{% include "system/_skill_ai_tab.html" %}
+  </div>
+  {%- endif %}
+  {%- if 'analysis' in shown_tabs %}
+  <div class="tab-pane fade {% if tab == 'analysis' %}show active{% endif %}" id="pane-analysis" role="tabpanel" aria-labelledby="tab-analysis">
+    {{ settings_file_error(an) }}{% include "system/_analysis_tab.html" %}
+  </div>
+  {%- endif %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/system-settings.js') }}"></script>
+{% endblock %}
 {#=== system/_skill_ai_tab.html ===#}
 {# システム設定「スキル（AI）」タブ(instance/skill_ai_settings.json に保存)。入力チェックは app.py の parse_skill_ai_form #}
 <p class="small text-muted d-flex flex-wrap justify-content-end gap-2">
@@ -5109,175 +5368,6 @@
     </div>
   </div>
 </form>
-{#=== system/_reminder_tab.html ===#}
-{# システム設定「定型業務リマインド」タブ(instance/routine_reminder_settings.json に保存)。入力チェックは app.py の
-   parse_reminder_settings_form。状況・プレビューは rm_status(reminder_status_context) #}
-<p class="small text-muted">業務ごとの実施日・宛先は、各業務の編集の「リマインド」で設定します。</p>
-{% if rm_status.address_problems %}
-<div class="alert alert-warning small">
-  <i class="bi bi-exclamation-triangle"></i> <strong>送れない宛先があります</strong>:
-  <ul class="mb-1">
-    {% for p in rm_status.address_problems %}
-    <li><a href="{{ url_for('routine.detail', routine_id=p.routine.id) }}">{{ p.routine.name }}</a> — {{ p.kind }}: {{ p.name }}（{{ p.reason }}）</li>
-    {% endfor %}
-  </ul>
-  メールアドレスは<a href="{{ url_for('departments.manage') }}">チーム管理</a>か、各自のユーザーメニューの「メールアドレス」で登録します。{% if rm_status.address_problems|selectattr('reason', 'equalto', rm_status.emails_pending_reason)|list %}
-  「マネージャーの確認待ち」は、その業務の「編集」で保存すると送ります。{% endif %}
-</div>
-{% endif %}
-{% if rm_status.link_problem %}
-<div class="alert alert-warning small py-2">
-  <i class="bi bi-exclamation-triangle"></i> リンクの基準URL（<code>APP_BASE_URL</code>）が未設定・不正のため、メールにリンクを付けられません。admin の「基本設定」で設定してください。
-</div>
-{% endif %}
-
-<form method="post" action="{{ url_for('system.save_reminder') }}">
-  <input type="hidden" name="version" value="{{ rm.version }}">
-  <div class="card shadow-sm mb-4">
-    <div class="card-header bg-white fw-bold"><i class="bi bi-sliders"></i> 定型業務リマインドの設定</div>
-    <div class="card-body">
-      <div class="form-check form-switch mb-3">
-        <input class="form-check-input" type="checkbox" role="switch" id="reminder-enabled" name="enabled" value="1"
-               {% if rm.settings.enabled %}checked{% endif %}>
-        <label class="form-check-label fw-bold" for="reminder-enabled">自動送信する</label>
-        <div class="form-text">早い時刻は予定日を過ぎた回、遅い時刻は今日の回も送ります。</div>
-      </div>
-      <div class="row g-3">
-        <div class="col-sm-6 col-md-3">
-          <label class="form-label small mb-1" for="reminder-time1">送信時刻1</label>
-          <input type="time" name="time1" id="reminder-time1" class="form-control form-control-sm" value="{{ rm.settings.time1 }}" required>
-        </div>
-        <div class="col-sm-6 col-md-3">
-          <label class="form-label small mb-1" for="reminder-time2">送信時刻2</label>
-          <input type="time" name="time2" id="reminder-time2" class="form-control form-control-sm" value="{{ rm.settings.time2 }}" required>
-        </div>
-        <div class="col-md-6">
-          <div class="form-check form-switch mt-md-4">
-            <input class="form-check-input" type="checkbox" role="switch" id="reminder-business-days" name="business_days_only" value="1"
-                   {% if rm.settings.business_days_only %}checked{% endif %}>
-            <label class="form-check-label" for="reminder-business-days">営業日（土日・祝日以外）だけ送る</label>
-          </div>
-        </div>
-      </div>
-      <div class="form-text mt-3">送信時刻1・2は違う時刻にします。</div>
-    </div>
-    <div class="card-footer bg-white d-flex justify-content-end">
-      <button class="btn btn-primary btn-sm"><i class="bi bi-save"></i> 定型業務リマインドの設定を保存</button>
-    </div>
-  </div>
-</form>
-
-<div class="row g-3 mb-4">
-  {# 次回の自動送信 #}
-  <div class="col-lg-4">
-    <div class="card shadow-sm h-100">
-      <div class="card-header bg-white fw-bold"><i class="bi bi-alarm"></i> 次回の自動送信</div>
-      <div class="card-body small">
-        {% if rm_status.upcoming %}
-        <div class="fs-5 fw-bold">
-          {{ rm_status.upcoming.strftime('%Y/%m/%d') }}（{{ rm_status.weekday_labels[rm_status.upcoming.weekday()] }}）{{ rm_status.upcoming.strftime('%H:%M') }}
-        </div>
-        {% if rm_status.scheduler_stopped %}
-        <div class="text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> 自動送信のスケジューラが動いていません。「flask --app app run」でサーバーを起動してください。</div>
-        {% endif %}
-        {% if rm_status.mail_problem %}
-        <div class="text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> {{ rm_status.mail_problem }}</div>
-        {% endif %}
-        {% else %}
-        <div class="fs-5 fw-bold text-muted">停止中</div>
-        {% endif %}
-        <hr>
-        <div class="text-muted">リマインドを設定した業務: {{ rm_status.enabled_count }}件</div>
-      </div>
-    </div>
-  </div>
-
-  {# 前回の結果(1件だけ。毎回上書き) #}
-  <div class="col-lg-4">
-    <div class="card shadow-sm h-100">
-      <div class="card-header bg-white d-flex justify-content-between align-items-center">
-        <span class="fw-bold"><i class="bi bi-clipboard-check"></i> 前回の結果</span>
-        <a href="{{ url_for('system.settings', tab='reminder') }}" class="btn btn-sm btn-outline-secondary"><i class="bi bi-arrow-clockwise"></i> 更新</a>
-      </div>
-      <div class="card-body small">
-        {% if rm_status.sending %}
-        <div class="alert alert-info py-1 px-2 mb-2">
-          <span class="spinner-border spinner-border-sm" role="status"></span> 送信処理中です。しばらくしてから「更新」を押してください。
-        </div>
-        {% endif %}
-        {% if rm_status.last %}
-        <div class="mb-1">
-          {% if rm_status.last.ok %}<span class="badge bg-success">成功</span>{% else %}<span class="badge bg-danger">失敗</span>{% endif %}
-          <span class="badge bg-light text-dark">{{ rm_status.last.trigger }}</span>
-          <span class="text-muted">{{ rm_status.last.at }}</span>
-        </div>
-        <div class="pre-wrap">{{ rm_status.last.message }}</div>
-        {% else %}
-        <div class="text-muted">まだ送信していません。</div>
-        {% endif %}
-      </div>
-    </div>
-  </div>
-
-  {# テスト送信 #}
-  <div class="col-lg-4">
-    <div class="card shadow-sm h-100">
-      <div class="card-header bg-white fw-bold"><i class="bi bi-envelope"></i> テスト送信</div>
-      <div class="card-body small">
-        <form method="post" action="{{ url_for('system.test_reminder') }}">
-          <button class="btn btn-sm btn-outline-secondary" {% if rm_status.mail_problem or rm_status.sending or rm.file_error %}disabled{% endif %}>
-            <i class="bi bi-envelope"></i> テスト送信（差出人宛て）
-          </button>
-        </form>
-        {% if rm_status.mail_problem %}
-        <div class="text-danger mt-1"><i class="bi bi-exclamation-triangle"></i> {{ rm_status.mail_problem }}</div>
-        {% endif %}
-      </div>
-    </div>
-  </div>
-</div>
-
-{# 次の送信のメールのプレビュー(宛先ごと) #}
-<div class="card shadow-sm mb-4">
-  <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
-    <span class="fw-bold"><i class="bi bi-eye"></i> メールのプレビュー（{{ '次回の自動送信' if rm_status.planned_auto else 'オンにしたときの次の送信' }} {{ rm_status.planned.strftime('%Y/%m/%d %H:%M') }}）
-      <i class="bi bi-info-circle text-muted" title="件名の件数は、その宛先に送る回の数です。HTMLを表示できないメールソフトではテキスト版が表示されます。"></i></span>
-    <span class="small">
-      <span class="badge bg-primary">本日実施 {{ rm_status.data.today_count }}件</span>
-      <span class="badge bg-danger">未完了 {{ rm_status.data.overdue_count }}件</span>
-      <span class="badge bg-secondary">宛先 {{ rm_status.previews|length }}件</span>
-    </span>
-  </div>
-  <div class="card-body">
-    {# data は辞書のため、items は data['items'] で取り出す(data.items は辞書のメソッドになる) #}
-    {% if not rm_status.data.include_today and rm_status.data.today_waiting %}
-    <p class="small text-muted"><i class="bi bi-info-circle"></i> 実施予定日が今日の回（{{ rm_status.data.today_waiting }}件）は載せません（{{ rm_status.last_time }} の送信で、完了の入力が無ければ送ります）。</p>
-    {% endif %}
-    {% if not rm_status.data['items'] %}
-    <p class="text-muted small">この送信で送る定型業務はありません。</p>
-    {% endif %}
-    {% if rm_status.data.unreachable %}
-    <p class="small text-danger"><i class="bi bi-exclamation-triangle"></i> 宛先が1つも無いため送れない回: {{ rm_status.data.unreachable }}件（上の「送れない宛先」を確認してください）</p>
-    {% endif %}
-    {% for mail in rm_status.previews %}
-    <details class="mb-2" {% if loop.first %}open{% endif %}>
-      <summary class="small"><span class="fw-bold">{{ mail.name or mail.address }}</span> &lt;{{ mail.address }}&gt; — {{ mail.subject }}</summary>
-      {# メール本文はスクリプトを実行できない iframe(sandbox)の中に表示する #}
-      <iframe class="overdue-preview border rounded mt-2" title="メールのプレビュー（HTML版）"
-              sandbox="allow-popups allow-popups-to-escape-sandbox" srcdoc="{{ mail.document }}"></iframe>
-      <details class="mt-1">
-        <summary class="small text-muted">テキスト版</summary>
-        <pre class="overdue-preview-text small border rounded mb-0 p-2">{{ mail.text }}</pre>
-      </details>
-    </details>
-    {% endfor %}
-    <details class="mt-3">
-      <summary class="small text-muted">テスト送信の内容 — {{ rm_status.test_mail.subject }}</summary>
-      <iframe class="overdue-preview border rounded mt-2" title="テスト送信のプレビュー（HTML版）"
-              sandbox="allow-popups allow-popups-to-escape-sandbox" srcdoc="{{ rm_status.test_mail.document }}"></iframe>
-    </details>
-  </div>
-</div>
 {#=== admin/_layout.html ===#}
 {# システム管理の画面(固定ローカル管理者 admin だけ。app.py の 18 章)の共通の枠。ナビはシステム管理の項目だけ #}
 {% extends "base.html" %}
@@ -5513,7 +5603,7 @@
   </ol>
 </nav>
 <h1 class="h3 mb-1"><i class="bi bi-sliders"></i> 基本設定</h1>
-<p class="text-muted small">すべての環境で共通の設定です（メールの宛先は各環境のシステム設定で設定します）。</p>
+<p class="text-muted small">すべての環境で共通の設定です（メールの宛先は各環境の定期メールの「メールの宛先」で設定します）。</p>
 
 {% if cfg.file_error %}
 <div class="alert alert-danger small">
@@ -5537,7 +5627,7 @@
 {% endblock %}
 {#=== system/_config_tab.html ===#}
 {# システム管理の「基本設定」のフォーム(admin だけ。admin/settings.html から読む)。項目の定義は app.py の FIELDS。
-   宛先(MAIL_TO・MAIL_CC)は環境ごとの設定(各環境の「メールの宛先」タブ)のため、ここには出さない。
+   宛先(MAIL_TO・MAIL_CC)は環境ごとの設定(各環境の定期メールの「メールの宛先」)のため、ここには出さない。
    値は2つの層(初期値 config.py ＋ 画面の設定 instance/settings.json)から決まり、画面で編集するのは画面の設定の層だけ #}
 {% macro layer_line(row) %}
 {# 値の2つの層(初期値・画面の設定)と有効な値 #}
@@ -6004,6 +6094,25 @@ a:hover {
 .navbar-nav .nav-link,
 .navbar-nav .dropdown-item {
   white-space: nowrap;
+}
+
+/* メニューを横に並べる幅で項目が1行に入りきらないとき(使う機能が多い環境・admin の「システム管理」・画面の拡大率が
+   大きいとき)は、項目を次の行に折り返す(ヘッダーが画面の右へはみ出して、ページ全体が横にスクロールしないように)。
+   次の行に回ったユーザーのメニューは右に寄せる */
+@media (min-width: 992px) {
+  .navbar-expand-lg .navbar-collapse,
+  .navbar-expand-xl .navbar-collapse {
+    flex-wrap: wrap;
+    min-width: 0;
+    row-gap: .25rem;
+  }
+  .navbar-expand-lg .navbar-nav,
+  .navbar-expand-xl .navbar-nav {
+    flex-wrap: wrap;
+  }
+  .navbar-collapse > .navbar-nav:last-child {
+    margin-left: auto;
+  }
 }
 
 /* 並び替え可能な表のヘッダ(sort-table.js) */
@@ -6544,8 +6653,9 @@ a:hover {
  * ・規模の案内: 規模・開始日・期限・担当者を変えるたびに、GET /tasks/capacity で、規模が期間の出勤日数を超えるかを
  *   確かめて欄の下に出す。超えるまま保存するときは、保存の前に確かめる(保存は止めない)。
  * ・メールから下書き(登録の画面だけ): メールのファイル(.msg・.eml)をこの画面にドロップする(または「ファイルを選ぶ」)と、
- *   POST /tasks/draft-from-mail にファイルそのものを送り、返ってきた下書きをタイトル・内容・優先度・日付・必要スキルの
- *   欄に入れる(保存はしない。下書きに無い日付・必要スキルは今の入力のまま)。入力中の内容があれば、置き換える前に確認する。
+ *   POST /tasks/draft-from-mail にファイルそのものを送り、返ってきた下書きをタイトル・内容・優先度・日付・規模・必要スキル・
+ *   担当者・成果の見込み・計画(task-plan.js の window.TaskPlan)の欄に入れる(保存はしない。下書きに無い日付・規模・必要スキル・
+ *   担当者・成果の見込み・計画は今の入力のまま)。入力中の内容があれば、置き換える前に確認する。
  */
 (function () {
   "use strict";
@@ -6698,7 +6808,26 @@ a:hover {
     var aiNote = byId("mail-ai-note");
     var ai = !!(aiNote && aiNote.getAttribute("data-ai") === "1");
     var busy = false;
-    var FIELDS = ["title", "description", "priority", "start_date", "due_date", "scale"];
+    var FIELDS = ["title", "description", "priority", "start_date", "due_date", "scale", "outcome_quant_estimate",
+                  "outcome_quant_estimate_unit", "outcome_quant_note", "outcome_qual_estimate"];
+    // 入力があれば置き換える前に確かめる欄(優先度・単位は選んだままのことが多いため除く)
+    var TEXT_FIELDS = ["title", "description", "start_date", "due_date", "scale", "outcome_quant_estimate",
+                       "outcome_quant_note", "outcome_qual_estimate"];
+
+    function assigneeBoxes() {
+      return Array.prototype.filter.call(form.querySelectorAll("input"), function (el) {
+        return el.name === "assignee_ids";
+      });
+    }
+
+    // 計画の行の入力欄(手順・実行予定日)
+    function planInputs() {
+      var body = byId("plan-rows");
+      if (!body) return [];
+      return Array.prototype.filter.call(body.querySelectorAll("input"), function (el) {
+        return el.type === "text" || el.type === "date";
+      });
+    }
 
     function hasFiles(event) {
       var types = event.dataTransfer && event.dataTransfer.types;
@@ -6741,15 +6870,19 @@ a:hover {
         var el = form.elements[name];
         return el ? el.value : "";
       });
-      return values.concat(skillSelects(form).map(function (el) { return el.value; })).join("\u0001");
+      return values.concat(skillSelects(form).map(function (el) { return el.value; }))
+        .concat(assigneeBoxes().map(function (el) { return el.checked ? "1" : ""; }))
+        .concat(planInputs().map(function (el) { return el.name + "=" + el.value; })).join("\u0001");
     }
 
     function hasInput() {
-      var filled = ["title", "description", "start_date", "due_date", "scale"].some(function (name) {
+      var filled = TEXT_FIELDS.some(function (name) {
         var el = form.elements[name];
         return el && el.value && el.value.trim();
       });
-      return filled || skillSelects(form).some(function (el) { return el.value; });
+      return filled || skillSelects(form).some(function (el) { return el.value; }) ||
+        assigneeBoxes().some(function (el) { return el.checked; }) ||
+        planInputs().some(function (el) { return el.value && el.value.trim(); });
     }
 
     function setValue(name, value) {
@@ -6771,7 +6904,23 @@ a:hover {
         var details = byId("task-skills");
         if (details) details.open = true;
       }
+      // 担当者(アプリが推定した、推奨の表の1位)
+      if (data.assignee_ids && data.assignee_ids.length) {
+        var wanted = {};
+        data.assignee_ids.forEach(function (key) { wanted[key] = true; });
+        assigneeBoxes().forEach(function (el) { if (!el.disabled) el.checked = !!wanted[el.value]; });
+      }
+      // 成果の見込み(定量は値・単位・根拠〔補足〕をそろえて入れる)と計画の手順(AI で下書きを作ったときだけ届く)
+      if (data.outcome_quant_estimate) {
+        setValue("outcome_quant_estimate", data.outcome_quant_estimate);
+        setValue("outcome_quant_estimate_unit", data.outcome_quant_estimate_unit || "");
+        setValue("outcome_quant_note", data.outcome_quant_note || "");
+      }
+      if (data.outcome_qual_estimate) setValue("outcome_qual_estimate", data.outcome_qual_estimate);
+      if (data.steps && data.steps.length && window.TaskPlan) window.TaskPlan.setSteps(data.steps);
       updateSkillSummary(form);
+      var panel = byId("recommend-panel");
+      if (panel) syncAssignButtons(panel);
       if (refreshRecommend) refreshRecommend();
       if (refreshCapacity) refreshCapacity();
     }
@@ -7081,7 +7230,7 @@ a:hover {
   }
 })();
 {#=== static/js/weekly-settings.js ===#}
-/* 週報の設定フォーム(システム設定の「週報」タブ。system/_weekly_tab.html)用。
+/* 週報の設定フォーム(週報の「設定」のタブ。weekly/settings.html)用。
  *
  * ・対象者の「全員選択」「全解除」ボタンと、選択人数の表示
  * ・ファイル名・件名のプレビュー更新
@@ -7380,10 +7529,12 @@ a:hover {
   }
 })();
 {#=== static/js/task-plan.js ===#}
-/* タスクの計画の編集(tasks/plan.html)用。
+/* タスクの計画の編集(tasks/plan.html)と、タスクの登録の画面(tasks/form.html)の計画の行用。
  *
  * ・「行を追加」: 空の行を足す(ひな形 #plan-row-template の __i__ を新しい行の番号にする)
  * ・「↑」「↓」: 行を入れ替える(送った順がそのまま計画の並びになる。順の数字も付け直す)
+ * ・「×」(登録の画面): 行を消す
+ * ・window.TaskPlan.setSteps(手順の一覧 [{title, date}]): 行をその手順にする(メールからの下書き。task-form.js から)
  * JavaScript が無効でも保存できる(空の行はいつも3つ出る。並べ替えはできない)。
  */
 (function () {
@@ -7423,8 +7574,27 @@ a:hover {
       return max + 1;
     }
 
-    showMove(document.getElementById("plan-form") || body);
+    // 行を足す(ひな形から。足した行を返す)
+    function addRow() {
+      body.insertAdjacentHTML("beforeend", template.innerHTML.replace(/__i__/g, String(nextIndex())));
+      var all = rows();
+      var added = all[all.length - 1];
+      showMove(added);
+      renumber();
+      return added;
+    }
+
+    // 見出しの並べ替えの列も出す(計画の画面は #plan-form、登録の画面はタスクのフォーム)
+    showMove(body.closest("form") || body);
     body.addEventListener("click", function (event) {
+      var remove = event.target.closest("[data-plan-remove]");
+      if (remove) {
+        var gone = remove.closest("tr");
+        if (gone && gone.parentNode === body) body.removeChild(gone);
+        renumber();
+        if (addButton) addButton.focus();
+        return;
+      }
       var button = event.target.closest("[data-plan-up], [data-plan-down]");
       if (!button) return;
       var tr = button.closest("tr");
@@ -7440,14 +7610,23 @@ a:hover {
     if (addButton && template && template.content) {
       addButton.classList.remove("d-none");
       addButton.addEventListener("click", function () {
-        body.insertAdjacentHTML("beforeend", template.innerHTML.replace(/__i__/g, String(nextIndex())));
-        var all = rows();
-        var added = all[all.length - 1];
-        showMove(added);
-        renumber();
-        var input = added.querySelector("input[type='text']");
+        var input = addRow().querySelector("input[type='text']");
         if (input) input.focus();
       });
+      window.TaskPlan = {
+        // 行を手順の一覧 steps([{title, date}])にする(今の行は消す。値は DOM の value に入れる)
+        setSteps: function (steps) {
+          rows().forEach(function (tr) { body.removeChild(tr); });
+          (steps || []).forEach(function (step) {
+            var added = addRow();
+            var title = added.querySelector("input[type='text']");
+            var day = added.querySelector("input[type='date']");
+            if (title) title.value = step.title || "";
+            if (day) day.value = step.date || "";
+          });
+          renumber();
+        }
+      };
     }
   }
 
