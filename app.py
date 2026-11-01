@@ -2297,6 +2297,23 @@ class Task(db.Model):
         """画面に出す担当者名(assignee_names と同じ。無効化された人は「［無効］」付き)。"""
         return "、".join(u.name_label for u in self.assignees)
 
+    @property
+    def team_labels(self):
+        """担当者のチーム(重複なし・チームの並び順。無効化したチームは「［無効］」付き。タスク一覧の「チーム」の列)。"""
+        teams = {d.id: d for u in self.assignees for d in u.departments}
+        return "、".join(d.name + ("" if d.is_active else INACTIVE_MARK)
+                        for d in sorted(teams.values(), key=lambda d: (d.sort_order, d.name)))
+
+    @property
+    def shift_labels(self):
+        """担当者の勤務(重複なし・勤務の並び順。タスク一覧の「勤務」の列)。"""
+        shifts = {}
+        for u in self.assignees:
+            shift = u.work_shift
+            if shift is not None:
+                shifts[shift.id] = shift
+        return "、".join(s.label for s in sorted(shifts.values(), key=lambda s: (s.sort_order, s.name)))
+
     def is_assigned_to(self, user):
         return user is not None and any(u.id == user.id for u in self.assignees)
 
@@ -5142,6 +5159,8 @@ def save_user_pref(user, key, value):
 # タスク一覧の表に表示できる項目(タイトルは常に表示)。(キー, 見出し, 並び替えの型〔None=文字〕)
 TASK_COLUMNS = (
     ("assignees", "担当者", None),
+    ("teams", "チーム", None),       # 担当者のチーム
+    ("shifts", "勤務", None),        # 担当者の勤務
     ("priority", "優先度", "num"),
     ("status", "ステータス", "num"),
     ("start_date", "開始日", None),
@@ -5167,11 +5186,33 @@ def task_columns_for(user):
         return list(TASK_COLUMNS_DEFAULT)
     return [key for key in TASK_COLUMN_KEYS if key in saved]
 
+def task_team_choices(selected_ids=()):
+    """タスク一覧の絞り込みのチームの選択肢: 有効なチームと、選択中の無効化したチーム(「［無効］」を付けて表示)。"""
+    teams = ordered_rows(Department)
+    known = {d.id for d in teams}
+    extra = [d for d in Department.query.filter(Department.id.in_(list(selected_ids))).all() if d.id not in known] \
+        if selected_ids else []
+    return teams + sorted(extra, key=lambda d: (d.sort_order, d.name))
+
+def task_shift_choices(selected_ids=()):
+    """タスク一覧の絞り込みの勤務の選択肢: この環境の有効なメンバーのだれかの勤務と、選択中の勤務(並び順・名前の順)。
+
+    勤務はすべての環境で共通のため、この環境で使われていない勤務は出さない(出勤表と同じ)。
+    """
+    used = {link.shift_id for link in UserShift.query.join(User, UserShift.user_id == User.id)
+            .filter(User.is_active.is_(True)).all()}
+    ids = used | set(selected_ids)
+    if not ids:
+        return []
+    return sorted(WorkShift.query.filter(WorkShift.id.in_(list(ids))).all(), key=lambda s: (s.sort_order, s.name))
+
 @tasks_bp.route("/")
 @login_required
 def list_tasks():
     statuses = [s for s in request.args.getlist("status") if s in STATUS_CHOICES]
     assignee_ids = to_ints(request.args.getlist("assignee"))
+    team_ids = to_ints(request.args.getlist("team"))     # チーム: 担当者のだれかがそのチームのメンバー
+    shift_ids = to_ints(request.args.getlist("shift"))   # 勤務: 担当者のだれかがその勤務
     scope = request.args.get("scope", "")  # "mine" なら自分の担当のみ
     # 「完了」を除く: 条件なしで開いたときは除く(絞り込みのフォームは hidden の f=1 を送るため、チェックを外した
     # ときも条件ありになる。ほかの画面からの status=完了 などのリンクはそのまま)
@@ -5184,6 +5225,11 @@ def list_tasks():
                                 if current_user.is_manager else None)
     known = {u.id for u in users}
     assignee_ids = [i for i in assignee_ids if i in known]
+    # チーム・勤務の選択肢と、選択肢に無い番号は条件に使わない(削除されたチーム・勤務など)
+    teams = task_team_choices(team_ids)
+    team_ids = [i for i in team_ids if i in {d.id for d in teams}]
+    shifts = task_shift_choices(shift_ids)
+    shift_ids = [i for i in shift_ids if i in {s.id for s in shifts}]
 
     query = Task.query
 
@@ -5191,6 +5237,10 @@ def list_tasks():
         query = query.filter(Task.status.in_(statuses))
     if assignee_ids:
         query = query.filter(Task.assignees.any(User.id.in_(assignee_ids)))
+    if team_ids:
+        query = query.filter(Task.assignees.any(User.departments.any(Department.id.in_(team_ids))))
+    if shift_ids:
+        query = query.filter(Task.assignees.any(User.shift_link.has(UserShift.shift_id.in_(shift_ids))))
     if scope == "mine":
         query = query.filter(Task.assignees.any(User.id == current_user.id))
     if hide_done:
@@ -5206,6 +5256,10 @@ def list_tasks():
         options.append(selectinload(Task.creator))
     if "skills" in columns:
         options.append(selectinload(Task.skill_reqs).selectinload(TaskSkill.skill))
+    if "teams" in columns:
+        options.append(selectinload(Task.assignees).selectinload(User.departments))
+    if "shifts" in columns:
+        options.append(selectinload(Task.assignees).selectinload(User.shift_link).selectinload(UserShift.shift))
     tasks = query.options(*options).order_by(
         (Task.status == STATUS_DONE).asc(),
         Task.due_date.is_(None).asc(),
@@ -5218,13 +5272,15 @@ def list_tasks():
         tasks=tasks,
         editable_ids={t.id for t in tasks if _can_edit(t)},
         users=users,
+        teams=teams,
+        shifts=shifts,
         status_choices=STATUS_CHOICES,
         task_colors=STATUS_COLORS,
         priority_choices=PRIORITY_CHOICES,
         columns=columns,
         column_defs=TASK_COLUMNS,
         filters={
-            "statuses": statuses, "assignees": assignee_ids,
+            "statuses": statuses, "assignees": assignee_ids, "teams": team_ids, "shifts": shift_ids,
             "scope": scope, "hide_done": hide_done, "q": keyword,
         },
     )
