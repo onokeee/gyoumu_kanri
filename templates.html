@@ -127,14 +127,14 @@
             <a class="nav-link dropdown-toggle {% if request.blueprint in ('skills', 'departments', 'system') %}active{% endif %}"
                href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false"><i class="bi bi-sliders"></i> 管理</a>
             <ul class="dropdown-menu">
-              {# スキルはマネージャーのみ。メンバーにはタブを出さない #}
+              {# スキル(マネージャーのみ。スキル管理を使う環境だけ) #}
               {%- if feature_enabled('skills') %}
               <li><a class="dropdown-item {% if request.blueprint == 'skills' %}active{% endif %}"
                      href="{{ url_for('skills.list_skills') }}"><i class="bi bi-mortarboard"></i> スキル</a></li>
               {%- endif %}
               <li><a class="dropdown-item {% if request.blueprint == 'departments' %}active{% endif %}"
                      href="{{ url_for('departments.manage') }}"><i class="bi bi-diagram-3"></i> チーム管理</a></li>
-              {# システム設定(基本設定・週報・期限超過通知・スキル（AI）などの設定)はマネージャーのみ。出すタブが無い環境は出さない #}
+              {# システム設定(メールの宛先・週報・期限超過通知・スキル（AI）などの設定)はマネージャーのみ。出すタブが無い環境は出さない #}
               {%- if has_system_settings() %}
               <li><a class="dropdown-item {% if request.blueprint == 'system' %}active{% endif %}"
                      href="{{ url_for('system.settings') }}"><i class="bi bi-gear"></i> システム設定</a></li>
@@ -253,6 +253,36 @@
   {% endfor %}
 </div>
 {% endmacro %}
+
+{# 定期メールの画面(週報・期限超過通知)の「前回の結果」のカード。last は前回の結果(1件だけ。毎回上書き)、
+   sending は送信中か、refresh_url は「更新」のリンク先 #}
+{% macro last_result_card(refresh_url, last, sending) -%}
+  <div class="col-lg-4">
+    <div class="card shadow-sm h-100">
+      <div class="card-header bg-white d-flex justify-content-between align-items-center">
+        <span class="fw-bold"><i class="bi bi-clipboard-check"></i> 前回の結果</span>
+        <a href="{{ refresh_url }}" class="btn btn-sm btn-outline-secondary"><i class="bi bi-arrow-clockwise"></i> 更新</a>
+      </div>
+      <div class="card-body">
+        {% if sending %}
+        <div class="alert alert-info py-1 px-2 small mb-2">
+          <span class="spinner-border spinner-border-sm" role="status"></span> 送信処理中です。しばらくしてから「更新」を押してください。
+        </div>
+        {% endif %}
+        {% if last %}
+        <div class="mb-1">
+          {% if last.ok %}<span class="badge bg-success">成功</span>{% else %}<span class="badge bg-danger">失敗</span>{% endif %}
+          <span class="badge bg-light text-dark">{{ last.trigger }}</span>
+          <span class="small text-muted">{{ last.at }}</span>
+        </div>
+        <div class="small pre-wrap">{{ last.message }}</div>
+        {% else %}
+        <div class="text-muted small">まだ送信していません。</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+{%- endmacro %}
 {#=== errors/too_large.html ===#}
 {# 送信された入力が大きすぎる(413)ときの画面。limit_bytes は1回の送信の上限(バイト) #}
 {% extends "base.html" %}
@@ -2384,6 +2414,15 @@
 {% from "_macros.html" import fmt_date_jp, fmt_datetime %}
 {% block title %}年休詳細 &middot; {{ app_name }}{% endblock %}
 
+{# 「取消」のボタン(取消できるのは本人と、無効化したメンバーの年休のときのマネージャー。app.py の _can_cancel_leave) #}
+{% macro cancel_form() -%}
+    <form method="post" action="{{ url_for('leaves.cancel_leave', leave_id=leave.id) }}"
+          onsubmit="return confirm('この年休を取消しますか?');">
+      <input type="hidden" name="row" value="{{ leave.row_key }}">
+      <button class="btn btn-sm btn-outline-danger"><i class="bi bi-x-lg"></i> 取消</button>
+    </form>
+{%- endmacro %}
+
 {% block content %}
 <nav aria-label="breadcrumb">
   <ol class="breadcrumb">
@@ -2417,19 +2456,11 @@
   {% if can_modify %}
   <div class="card-footer bg-white d-flex flex-wrap gap-2">
     <a href="{{ url_for('leaves.edit_leave', leave_id=leave.id) }}" class="btn btn-sm btn-secondary"><i class="bi bi-pencil"></i> 編集</a>
-    <form method="post" action="{{ url_for('leaves.cancel_leave', leave_id=leave.id) }}"
-          onsubmit="return confirm('この年休を取消しますか?');">
-      <input type="hidden" name="row" value="{{ leave.row_key }}">
-      <button class="btn btn-sm btn-outline-danger"><i class="bi bi-x-lg"></i> 取消</button>
-    </form>
+    {{ cancel_form() }}
   </div>
   {% elif can_cancel %}
   <div class="card-footer bg-white d-flex flex-wrap gap-2 align-items-center">
-    <form method="post" action="{{ url_for('leaves.cancel_leave', leave_id=leave.id) }}"
-          onsubmit="return confirm('この年休を取消しますか?');">
-      <input type="hidden" name="row" value="{{ leave.row_key }}">
-      <button class="btn btn-sm btn-outline-danger"><i class="bi bi-x-lg"></i> 取消</button>
-    </form>
+    {{ cancel_form() }}
     <span class="text-muted small"><i class="bi bi-info-circle"></i> 編集は本人のみです。</span>
   </div>
   {% else %}
@@ -2497,7 +2528,7 @@
   </div>
 </div>
 
-{# AIのスキル分析・相談・計画・最近の自動更新(app.py の 8 章) #}
+{# AIのスキル分析・最近の自動更新(app.py の 8 章) #}
 {% include "skills/_ai_panel.html" %}
 
 {# 見方の切り替え(メンバーの到達度・業務に必要なスキル・業務ごとの対応可否。skills/_view_tabs.html) #}
@@ -3227,7 +3258,7 @@
 {% endblock %}
 {#=== skills/_ai_panel.html ===#}
 {# スキルマップの上部: AIの分析コメント・最近の自動更新(app.py の 8 章。マネージャーのみ)。変数 ai(skill_ai_panel_context) #}
-{% from "_macros.html" import fmt_date, fmt_datetime %}
+{% from "_macros.html" import fmt_date %}
 {% set an = ai.analysis %}
 <div class="card shadow-sm mb-3" id="skill-ai" data-state-url="{{ url_for('skills.ai_state') }}"
      data-analysis-running="{{ '1' if an.running else '' }}">
@@ -3318,9 +3349,9 @@
   </div>
 </div>
 {#=== skills/history.html ===#}
-{# 到達度の変更の記録と、タスクの完了からの自動更新の判定(app.py の 8-6。マネージャーのみ) #}
+{# 到達度の変更の記録と、タスクの完了からの自動更新の判定(app.py の 8-5。マネージャーのみ) #}
 {% extends "base.html" %}
-{% from "_macros.html" import fmt_date, fmt_datetime %}
+{% from "_macros.html" import fmt_datetime %}
 {% block title %}スキルの変更の履歴 &middot; {{ app_name }}{% endblock %}
 
 {% block content %}
@@ -4009,9 +4040,9 @@
 <script src="{{ url_for('static', filename='js/ai-analysis.js') }}"></script>
 {% endblock %}
 {#=== manager/_gantt.html ===#}
-{# 全タスクのガントチャート(ダッシュボード内蔵・全画面ページで共用) #}
+{# タスクのガントチャート(マネージャーダッシュボード・全画面のページ・個人のダッシュボード〔gpersonal: 自分のタスク〕で共用) #}
 {# 必要な変数: gantt, gfrom, gto, gsort, gdir, ghide, gassignee, gticks, gtoday_left,
-   status_colors, gusers, gantt_endpoint, gantt_extra #}
+   status_colors, gusers, gpersonal, gdone_shown, gantt_endpoint, gantt_extra #}
 <div class="d-flex justify-content-between align-items-center mt-4 mb-1 flex-wrap gap-2">
   <h2 class="h4 mb-0">
     <i class="bi bi-bar-chart-steps"></i>
@@ -4217,7 +4248,7 @@
             <td><code>{{ u.username }}</code></td>
             <td><span class="badge bg-light text-dark">{{ u.role_label }}</span></td>
             <td>
-              {# 勤務(app.py の 16 章。出勤表の行・担当者の推奨に使う)。開いたときの勤務(orig)とログインID(画面を開いた後の
+              {# 勤務(app.py の 16 章。出勤表の行・担当者の推奨・タスク一覧の絞り込みと列に使う)。開いたときの勤務(orig)とログインID(画面を開いた後の
                  削除・IDの再利用の確認)を一緒に送る。無効にした勤務は、その人の今の勤務のときだけ選択肢に残す #}
               {% set cur = user_shifts.get(u.id) %}
               <form method="post" action="{{ url_for('departments.save_member_shift', user_id=u.id) }}" class="d-flex gap-1">
@@ -4364,6 +4395,7 @@
 {% endblock %}
 {#=== weekly/index.html ===#}
 {% extends "base.html" %}
+{% from "_macros.html" import last_result_card %}
 {% block title %}週報 &middot; {{ app_name }}{% endblock %}
 
 {% block content %}
@@ -4404,31 +4436,7 @@
   </div>
 
   {# 前回の結果(1件だけ。毎回上書き) #}
-  <div class="col-lg-4">
-    <div class="card shadow-sm h-100">
-      <div class="card-header bg-white d-flex justify-content-between align-items-center">
-        <span class="fw-bold"><i class="bi bi-clipboard-check"></i> 前回の結果</span>
-        <a href="{{ url_for('weekly.index') }}" class="btn btn-sm btn-outline-secondary"><i class="bi bi-arrow-clockwise"></i> 更新</a>
-      </div>
-      <div class="card-body">
-        {% if sending %}
-        <div class="alert alert-info py-1 px-2 small mb-2">
-          <span class="spinner-border spinner-border-sm" role="status"></span> 送信処理中です。しばらくしてから「更新」を押してください。
-        </div>
-        {% endif %}
-        {% if last %}
-        <div class="mb-1">
-          {% if last.ok %}<span class="badge bg-success">成功</span>{% else %}<span class="badge bg-danger">失敗</span>{% endif %}
-          <span class="badge bg-light text-dark">{{ last.trigger }}</span>
-          <span class="small text-muted">{{ last.at }}</span>
-        </div>
-        <div class="small pre-wrap">{{ last.message }}</div>
-        {% else %}
-        <div class="text-muted small">まだ送信していません。</div>
-        {% endif %}
-      </div>
-    </div>
-  </div>
+  {{ last_result_card(url_for('weekly.index'), last, sending) }}
 
   {# メール・AIの設定状況(読み取り専用。変更はシステム管理の「基本設定」〔admin〕・宛先は「メールの宛先」タブ) #}
   <div class="col-lg-4">
@@ -4534,6 +4542,7 @@
 {% endblock %}
 {#=== overdue/index.html ===#}
 {% extends "base.html" %}
+{% from "_macros.html" import last_result_card %}
 {% block title %}期限超過通知 &middot; {{ app_name }}{% endblock %}
 
 {% block content %}
@@ -4576,31 +4585,7 @@
   </div>
 
   {# 前回の結果(1件だけ。毎回上書き) #}
-  <div class="col-lg-4">
-    <div class="card shadow-sm h-100">
-      <div class="card-header bg-white d-flex justify-content-between align-items-center">
-        <span class="fw-bold"><i class="bi bi-clipboard-check"></i> 前回の結果</span>
-        <a href="{{ url_for('overdue.index') }}" class="btn btn-sm btn-outline-secondary"><i class="bi bi-arrow-clockwise"></i> 更新</a>
-      </div>
-      <div class="card-body">
-        {% if sending %}
-        <div class="alert alert-info py-1 px-2 small mb-2">
-          <span class="spinner-border spinner-border-sm" role="status"></span> 送信処理中です。しばらくしてから「更新」を押してください。
-        </div>
-        {% endif %}
-        {% if last %}
-        <div class="mb-1">
-          {% if last.ok %}<span class="badge bg-success">成功</span>{% else %}<span class="badge bg-danger">失敗</span>{% endif %}
-          <span class="badge bg-light text-dark">{{ last.trigger }}</span>
-          <span class="small text-muted">{{ last.at }}</span>
-        </div>
-        <div class="small pre-wrap">{{ last.message }}</div>
-        {% else %}
-        <div class="text-muted small">まだ送信していません。</div>
-        {% endif %}
-      </div>
-    </div>
-  </div>
+  {{ last_result_card(url_for('overdue.index'), last, sending) }}
 
   {# メール・リンクの設定状況(読み取り専用。変更はシステム管理の「基本設定」〔admin〕・宛先は「メールの宛先」タブ) #}
   <div class="col-lg-4">
@@ -4820,7 +4805,7 @@
 {% endblock %}
 {#=== system/_recipients_tab.html ===#}
 {# システム設定「メールの宛先」タブ(app.py の 11-3)。rc は env_mail_form_context の値。この環境の宛先
-   (instance/env_mail_settings.json。ほかの環境は instance/envs/<キー>/)を編集し、すべての環境で共通の設定は読み取り専用で表示する #}
+   (instance/env_mail_settings.json。ほかの環境は instance/envs/<キー>/)を編集する #}
 <p class="small text-muted">週報と期限超過通知の宛先です{% if env_nav %}（この環境: {{ rc.env_name }}）{% endif %}。</p>
 {% if rc.mail_problem %}
 <div class="alert alert-warning small py-2"><i class="bi bi-exclamation-triangle"></i> {{ rc.mail_problem }}</div>
@@ -5555,7 +5540,7 @@
    宛先(MAIL_TO・MAIL_CC)は環境ごとの設定(各環境の「メールの宛先」タブ)のため、ここには出さない。
    値は2つの層(初期値 config.py ＋ 画面の設定 instance/settings.json)から決まり、画面で編集するのは画面の設定の層だけ #}
 {% macro layer_line(row) %}
-{% set f = row.field %}
+{# 値の2つの層(初期値・画面の設定)と有効な値 #}
 <div class="small text-muted cfg-layers">
   <span class="me-2">初期値（config.py）: <span class="cfg-initial">{{ row.initial_text }}</span>{% if not row.has_override %} <span class="badge bg-primary">有効</span>{% endif %}</span>
   <span class="me-2">画面の設定: {% if row.has_override %}<span class="cfg-override">{{ row.override_text }}</span> <span class="badge bg-primary">有効</span>{% else %}<span class="cfg-override">（なし）</span>{% endif %}</span>
@@ -5963,20 +5948,17 @@ body {
 
 /* 改行・空白は保持しつつ、スペースの無い長い連続文字も必ず折り返す。
    min-width:0 は flex/grid の子が内容幅より縮めるようにするため(枠の飛び出し防止)。 */
-.exec-summary {
-  max-height: 32rem;
-  overflow-y: auto;
-  line-height: 1.7;
-}
 .pre-wrap {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   word-break: break-word;
   min-width: 0;
 }
-
-main.container {
-  min-height: calc(100vh - 130px);
+/* マネージャーダッシュボードのエグゼクティブサマリーの本文(長いときは枠の中でスクロール) */
+.exec-summary {
+  max-height: 32rem;
+  overflow-y: auto;
+  line-height: 1.7;
 }
 
 .card {
@@ -6078,7 +6060,6 @@ a:hover {
   position: relative;
   min-height: 26px;
 }
-.gantt-bar,
 .gantt-seg {
   position: absolute;
   top: 5px;
@@ -6091,7 +6072,6 @@ a:hover {
   overflow: hidden;
   white-space: nowrap;
 }
-.gantt-bar { border-radius: 3px; }
 /* 進捗記載の印(棒の上の小さなマーカー) */
 .gantt-mark {
   position: absolute;
@@ -6138,7 +6118,7 @@ a:hover {
   min-height: 22px;
 }
 
-/* 期限超過通知: メールのプレビュー(HTML版は sandbox の iframe、テキスト版は折り返して表示) */
+/* 期限超過通知・定型業務リマインドのメールのプレビュー(HTML版は sandbox の iframe、テキスト版は折り返して表示) */
 .overdue-preview {
   display: block;
   width: 100%;
@@ -6359,9 +6339,6 @@ a:hover {
   height: 1.1rem;
   vertical-align: -0.2rem;
   background-color: #eceff1;
-}
-.shift-codes {
-  resize: vertical;
 }
 /* 複数の環境(グループ): ナビの環境の名前。長い名前は省略し、狭い画面ではメニューのボタンと同じ行に収める */
 .env-badge {
@@ -7042,31 +7019,23 @@ a:hover {
 /* スキルマップの上部「AIのスキル分析」(skills/_ai_panel.html)用。
  *
  * ・URL の #skill-ai-updates などで、そのタブを開く
- * ・分析の実行中は状態(/skills/ai/state)を見て、終わったら画面を読み直す(欄に入力中なら、読み直さずに案内を出す)
+ * ・分析の実行中は状態(/skills/ai/state)を見て、終わったら画面を読み直す
  * JavaScript が無効でも、フォームの送信と画面の再読み込みで使える。
  */
 (function () {
   "use strict";
 
   var POLL_MS = 3000;
-  var LOGIN_EXPIRED = "ログインの有効期限が切れています。画面を開き直してください。";
-  var dirty = false;  // AIの欄の入力欄に入力したか(分析が終わったときに画面を読み直してよいか)
 
-  function readJson(response) {
-    if (response.status === 401 || response.redirected) throw new Error(LOGIN_EXPIRED);
-    return response.json().catch(function () {
-      throw new Error(response.status === 404 ? "見つかりません（削除された可能性があります）。画面を開き直してください。"
-                                              : "サーバーの応答を読み取れませんでした（" + response.status + "）。");
-    }).then(function (data) {
-      if (!response.ok && !(data && data.message)) {
-        throw new Error("処理できませんでした（" + response.status + "）。画面を開き直してください。");
-      }
-      return { ok: response.ok, data: data };
+  // 分析の状態(JSON)。401・ログイン画面への転送(ログインの有効期限切れ)・読み取れない応答・message の無いエラーの応答は失敗
+  function getState(url) {
+    return fetch(url, { credentials: "same-origin", headers: { "Accept": "application/json" } }).then(function (response) {
+      if (response.status === 401 || response.redirected) throw new Error(String(response.status));
+      return response.json().then(function (data) {
+        if (!response.ok && !(data && data.message)) throw new Error(String(response.status));
+        return data;
+      });
     });
-  }
-
-  function getJson(url) {
-    return fetch(url, { credentials: "same-origin", headers: { "Accept": "application/json" } }).then(readJson);
   }
 
   function showTabFromHash() {
@@ -7085,25 +7054,12 @@ a:hover {
     var url = panel.getAttribute("data-state-url");
     var status = document.getElementById("skill-ai-analysis-status");
     function poll() {
-      getJson(url).then(function (res) {
-        if (res.data.analysis_running) {
+      getState(url).then(function (data) {
+        if (data.analysis_running) {
           setTimeout(poll, POLL_MS);
           return;
         }
-        if (!dirty) {
-          window.location.reload();
-          return;
-        }
-        // 入力中の内容を消さないよう、読み直しはボタンで行う
-        if (status) {
-          status.textContent = "分析が終わりました。";
-          var button = document.createElement("button");
-          button.type = "button";
-          button.className = "btn btn-sm btn-outline-primary ms-2 py-0";
-          button.textContent = "画面を更新して表示する（入力中の内容は消えます）";
-          button.addEventListener("click", function () { window.location.reload(); });
-          status.appendChild(button);
-        }
+        window.location.reload();
       }).catch(function () {
         if (status) status.textContent = "分析の状態を確かめられませんでした。画面を更新してください。";
       });
@@ -7114,7 +7070,6 @@ a:hover {
   function init() {
     var panel = document.getElementById("skill-ai");
     if (!panel) return;
-    panel.addEventListener("input", function () { dirty = true; });
     showTabFromHash();
     watchAnalysis(panel);
   }
@@ -7215,7 +7170,7 @@ a:hover {
   }
 })();
 {#=== static/js/system-settings.js ===#}
-/* システム設定の画面(system/settings.html)用。
+/* システム設定(system/settings.html)と、システム管理の基本設定(admin/settings.html)の画面用。
  *
  * ・開いているタブを URL(?tab=...)に残す(再読み込み・ブックマークでも同じタブを開く)。
  *   #weekly のような URL の末尾(フラグメント)でもタブを指定できる。

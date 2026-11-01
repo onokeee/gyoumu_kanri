@@ -129,7 +129,7 @@ Python のコードはすべてこの app.py にまとめている。ほかの�
       17-2. 環境ごとのアプリと振り分け(EnvDispatcher)
       17-3. 共通のログイン(instance/portal_sessions.json)
       17-4. 画面(ログインの後の環境の選択・環境に入る)
-      17-5. 環境の追加・名前の変更・使う機能・停止(システム管理の「環境」。固定ローカル管理者 admin だけ。18 章)
+      17-5. 環境の追加・名前の変更・使う機能・停止・削除(システム管理の「環境」。固定ローカル管理者 admin だけ。18 章)
   18. システム管理(固定ローカル管理者 admin だけの画面)
   19. タスクの計画(手順と実行予定日)
       19-1. 計画の状況(遅れ・次の手順)
@@ -221,7 +221,7 @@ from itsdangerous import BadSignature
 from jinja2 import BaseLoader, TemplateNotFound
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
-from sqlalchemy import case, func, inspect, text
+from sqlalchemy import func, inspect, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import DatabaseError, IntegrityError, OperationalError
 from sqlalchemy.orm import selectinload
@@ -669,12 +669,13 @@ def _unauthorized():
         return jsonify(ok=False, login_required=True, message=LOGIN_EXPIRED_JSON), 401
     # 送り先のパスは、この環境の URL の先頭(ほかの環境の /env/<キー>。17 章)を含めて扱う
     path = request.script_root + request.path
+    sent = request.method not in ("GET", "HEAD", "OPTIONS")  # 保存・変更などの送信(行われない)
     changed_for = g.get("local_password_changed")
     if not changed_for and multi_env_enabled() and portal_state()[0] is not None:
         # 複数の環境で、共通のログインは有効(この環境のログインが無い・切れた): 案内を出さずにこの環境に入り直す(17 章)。
         # 送信(GET 以外)は行わず、入り直した後に「直前の操作は行われていません」と案内する(ログインの後と同じ。
         # 戻る先は _redirect_after_login が GET で開ける画面にする)
-        if request.method not in ("GET", "HEAD", "OPTIONS"):
+        if sent:
             session[DROPPED_REQUEST_KEY] = path
         return redirect(url_for("auth.enter", next=_next_path(request.url)))
     if changed_for:
@@ -684,14 +685,14 @@ def _unauthorized():
         # 行っていないことも伝え、ログインの後に期限切れの案内を出さないよう、戻る先は GET で開ける画面にする
         message = LOCAL_PASSWORD_CHANGED.format(changed_for)
         next_url = request.url
-        if request.method not in ("GET", "HEAD", "OPTIONS"):
+        if sent:
             message += LOCAL_PASSWORD_CHANGED_POST
             next_url, _post_only = _page_for_next(path)
         session.pop(DROPPED_REQUEST_KEY, None)
         flash(message, "warning")
         return redirect(login_url(login_manager.login_view, next_url=next_url) if next_url
                         else url_for(login_manager.login_view))
-    if request.method not in ("GET", "HEAD", "OPTIONS"):
+    if sent:
         session[DROPPED_REQUEST_KEY] = path
     if g.get("login_expired"):
         # ログインしてから LOGIN_LIFETIME_HOURS 時間が過ぎた(load_user)
@@ -721,7 +722,7 @@ def prefers_json():
 
 # ---- 文字・画面の案内 ----
 # 改行・タブ以外の制御文字と、XML 1.0 で使えない文字(サロゲート・U+FFFE/U+FFFF)。
-# AIの応答・AIが作った問題・Excel(.xlsx)・Word(.docx)の出力から除く(1文字でも残っていると、Excel・Word の
+# AIの応答・Excel(.xlsx)・Word(.docx)の出力から除く(1文字でも残っていると、Excel・Word の
 # ファイル全体を作れないため。画面表示でも問題になる)
 CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ud800-\udfff\ufffe\uffff]")
 
@@ -914,6 +915,17 @@ def member_choices(keep=()):
     keep_ids = {u.id for u in keep}
     return [u for u in get_active_users() if is_env_member(u) or u.id in keep_ids]
 
+def assignee_choices(assigned=()):
+    """編集画面の担当者の選択肢(タスク・定型業務): member_choices と、担当のまま無効化されたユーザー(表示名順)。
+
+    無効化されたユーザーは選択肢(get_active_users)に出ないため、そのままでは保存のたびに担当から外れてしまう
+    (担当の履歴・成果・Excel出力・期限超過通知の担当者が消える)。担当のまま残し、画面では「［無効］」を付けて
+    表示する(マネージャーがチェックを外したときだけ外す)。
+    """
+    users = member_choices(assigned)
+    inactive = [u for u in assigned if not u.is_active]
+    return users + sorted(inactive, key=lambda u: u.display_name or "")
+
 def ordered_rows(model, active_only=True):
     """業務(Operation)・チーム(Department)の一覧(並び順・名前の順)。active_only なら有効なものだけ。"""
     query = model.query.filter_by(is_active=True) if active_only else model.query
@@ -948,8 +960,9 @@ def user_filter_choices(raw, with_work=None):
 
     戻り値: (選択肢, 絞り込みの値〔どのユーザーでもない番号なら ""〕, そのユーザーID〔絞り込まないなら None〕)。
     """
-    users = filter_user_choices([to_int(raw)], with_work)
-    selected = to_int(raw) if to_int(raw) in {u.id for u in users} else None
+    number = to_int(raw)
+    users = filter_user_choices([number], with_work)
+    selected = number if number in {u.id for u in users} else None
     return users, (raw if selected is not None else ""), selected
 
 def set_active_from_form(obj):
@@ -1114,7 +1127,7 @@ def _value_digest(value):
     elif isinstance(value, (list, tuple)):
         text_value = ",".join(str(v) for v in value)
     elif isinstance(value, dict):
-        # 画面で編集する設定(JSON)の辞書の値(レベルごとの問題数・週報の対象者など)。キーの順番によらない
+        # 画面で編集する設定(JSON)の辞書の値(週報の対象者など)。キーの順番によらない
         text_value = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
     else:
         text_value = lf_text(value).strip()
@@ -1709,6 +1722,12 @@ def is_business_day(d):
     d = _to_date(d)
     return d.weekday() < 5 and not is_holiday(d)
 
+def business_delay_label(days, calendar_days):
+    """過ぎた日数の表示(「N営業日」。今日が土日祝で 0営業日のときは暦日の日数も付ける。期限超過・計画の遅れ)。"""
+    if days == 0 and calendar_days:
+        return "0営業日（{}日超過・休日）".format(calendar_days)
+    return "{}営業日".format(days)
+
 def business_days_ago(past_date, today):
     """past_date より後〜today までの営業日の日数(past_date < d <= today)。"""
     past_date, today = _to_date(past_date), _to_date(today)
@@ -2061,7 +2080,7 @@ def check_env_feature():
 
 # ==== 3-1. ユーザー ===============================================================================
 # 認証はLDAP-APIで行う想定のため、パスワードはこのテーブルには保存しない。
-# LDAPで認証成功したユーザーの情報(表示名・役割)をミラーリングして保持する。
+# LDAPで認証成功したユーザーの氏名(表示名)は LDAP に合わせる。役割はアプリの登録(チーム管理)で決める(5-1)。
 # 組織のグルーピングは「チーム」(Department モデル＋user_departments 多対多)のみで管理する。
 
 ROLE_MANAGER = "manager"  # マネージャー:全機能(スキル/各ダッシュボード/チーム管理など)
@@ -2073,10 +2092,7 @@ ROLE_MEMBER = "member"    # メンバー:一般利用
 sys.modules.setdefault("app.models", sys.modules[__name__])
 sys.modules.setdefault("app.models.user", sys.modules[__name__])
 
-ROLE_LABELS = {
-    ROLE_MANAGER: "manager",
-    ROLE_MEMBER: "member",
-}
+ROLE_LABELS = {ROLE_MANAGER: "manager", ROLE_MEMBER: "member"}
 
 # 無効化されたユーザーの名前に付ける印(担当者の表示・期限超過通知・AI分析の材料など)
 INACTIVE_MARK = "［無効］"
@@ -2099,7 +2115,7 @@ class User(UserMixin, db.Model):
         "Task", secondary="task_assignees", back_populates="assignees"
     )
 
-    # リレーション(年休)。本人として申請したもの(承認者としての分は含まない)
+    # リレーション(年休。本人の年休)
     leave_requests = db.relationship(
         "LeaveRequest",
         foreign_keys="LeaveRequest.user_id",
@@ -2227,23 +2243,14 @@ STATUS_HOLD = "保留"
 STATUS_DONE = "完了"
 STATUS_CHOICES = [STATUS_TODO, STATUS_DOING, STATUS_HOLD, STATUS_DONE]
 
-STATUS_COLORS = {
-    STATUS_TODO: "secondary",
-    STATUS_DOING: "primary",
-    STATUS_HOLD: "warning",
-    STATUS_DONE: "success",
-}
+STATUS_COLORS = {STATUS_TODO: "secondary", STATUS_DOING: "primary", STATUS_HOLD: "warning", STATUS_DONE: "success"}
 
 PRIORITY_LOW = "低"
 PRIORITY_MID = "中"
 PRIORITY_HIGH = "高"
 PRIORITY_CHOICES = [PRIORITY_HIGH, PRIORITY_MID, PRIORITY_LOW]
 
-PRIORITY_COLORS = {
-    PRIORITY_HIGH: "danger",
-    PRIORITY_MID: "info",
-    PRIORITY_LOW: "light",
-}
+PRIORITY_COLORS = {PRIORITY_HIGH: "danger", PRIORITY_MID: "info", PRIORITY_LOW: "light"}
 
 OUTCOME_UNITS = ["￥/年", "￥/月", "￥/日", "ｈ/年", "ｈ/月", "ｈ/日"]
 
@@ -2278,6 +2285,12 @@ def _fmt_amount(v):
     ip = "{:,}".format(int(ip)) if ip else "0"
     out = ip + ("." + fp if fp else "")
     return ("-" + out) if float(v) < 0 else out
+
+def _outcome_label(value, unit):
+    """成果(定量)の値と単位の表示(「1,200 ￥/年」。値が無ければ None)。"""
+    if value is None:
+        return None
+    return "{} {}".format(_fmt_amount(value), unit or "").strip()
 
 # タスクの規模(=担当者が完了までに要する実働工数の目安。マネージャがスキル/キャパを
 # 考慮して選ぶため、能力差は規模選択の時点で反映される)。負荷合算のため実働時間(h)に
@@ -2480,21 +2493,11 @@ class Task(db.Model):
 
     @property
     def outcome_quant_estimate_label(self):
-        if self.outcome_quant_estimate is None:
-            return None
-        return "{} {}".format(
-            _fmt_amount(self.outcome_quant_estimate),
-            self.outcome_quant_estimate_unit or "",
-        ).strip()
+        return _outcome_label(self.outcome_quant_estimate, self.outcome_quant_estimate_unit)
 
     @property
     def outcome_quant_actual_label(self):
-        if self.outcome_quant_actual is None:
-            return None
-        return "{} {}".format(
-            _fmt_amount(self.outcome_quant_actual),
-            self.outcome_quant_actual_unit or "",
-        ).strip()
+        return _outcome_label(self.outcome_quant_actual, self.outcome_quant_actual_unit)
 
     @property
     def has_outcome_actual(self):
@@ -2881,12 +2884,7 @@ class RoutineWork(db.Model):
         """月あたりの所要時間(分)= 回数 × 1回所要 × 月換算係数。期・年は小数第1位まで(整数になるなら整数)。"""
         factor = self.MONTH_FACTORS.get(self.frequency_unit)
         if self.frequency_count and self.minutes_per and factor:
-            value = self.frequency_count * self.minutes_per * factor
-            if isinstance(value, float):
-                value = round(value, 1)
-                if value.is_integer():
-                    value = int(value)
-            return value
+            return _round_minutes(self.frequency_count * self.minutes_per * factor)
         return None
 
     @property
@@ -3012,11 +3010,7 @@ SKILL_TYPE_LABELS = {
     SKILL_CONCEPTUAL: "コンセプチュアルスキル",
     SKILL_HUMAN: "ヒューマンスキル",
 }
-SKILL_TYPE_COLORS = {
-    SKILL_TECHNICAL: "primary",
-    SKILL_CONCEPTUAL: "success",
-    SKILL_HUMAN: "info",
-}
+SKILL_TYPE_COLORS = {SKILL_TECHNICAL: "primary", SKILL_CONCEPTUAL: "success", SKILL_HUMAN: "info"}
 
 # --- 到達尺度(すべての区分で共通。リストの index = レベル値) ---
 # 以前の版は区分ごとに違う尺度(テクニカル Lv0〜6、ほかは Lv0〜5)だった。起動のときに一度だけ Lv0〜3 に
@@ -3028,14 +3022,8 @@ SKILL_SCALE = [
     "教えることができる（自律）",
 ]
 SKILL_MAX_LEVEL = len(SKILL_SCALE) - 1
-SKILL_SCALES = {stype: SKILL_SCALE for stype in SKILL_TYPE_CHOICES}
 
-SKILL_LEVEL_COLORS = {
-    0: "light",
-    1: "secondary",
-    2: "primary",
-    3: "success",
-}
+SKILL_LEVEL_COLORS = {0: "light", 1: "secondary", 2: "primary", 3: "success"}
 
 # 「単独でできる（自立）」とみなす到達度の下限(スキル保有状況の指標で使用)
 SKILL_PROFICIENT_LEVEL = 2
@@ -3091,12 +3079,9 @@ def description_headings(text):
     found = description_heading_keys(text)
     return [heading for heading in SKILL_DESCRIPTION_HEADINGS if heading in found]
 
-def scale_for(skill_type):
-    return SKILL_SCALES.get(skill_type, SKILL_SCALES[SKILL_TECHNICAL])
-
-def level_label(skill_type, level):
-    scale = scale_for(skill_type)
-    return scale[level] if 0 <= level < len(scale) else str(level)
+def level_label(_skill_type, level):
+    """到達度 level の表示名(到達尺度はすべての区分で共通のため、区分〔1つ目の引数〕は使わない)。"""
+    return SKILL_SCALE[level] if 0 <= level < len(SKILL_SCALE) else str(level)
 
 class Skill(db.Model):
     __tablename__ = "skills"
@@ -3135,11 +3120,11 @@ class Skill(db.Model):
 
     @property
     def max_level(self):
-        return len(scale_for(self.skill_type)) - 1
+        return SKILL_MAX_LEVEL
 
     @property
     def level_labels(self):
-        return scale_for(self.skill_type)
+        return SKILL_SCALE
 
     @property
     def row_key(self):
@@ -3190,12 +3175,11 @@ class SkillRating(db.Model):
 # ==== 3-6. 業務(Operation)と必要スキル ============================================================
 # スキルマップの縦軸=スキル項目に対し、横軸を『ヒト』だけでなく『業務』でも見られる。
 # 業務に必要なスキルは OperationSkill で持ち、必要到達レベルは
-# ヒトのスキル到達度(SkillRating)と同じ到達尺度(scale_for)を使う。
+# ヒトのスキル到達度(SkillRating)と同じ到達尺度(SKILL_SCALE。3-5)を使う。
 
 class OperationSkill(db.Model):
-    """業務に必要なスキルと、その必要到達レベル。
+    """業務に必要なスキルと、その必要到達レベル(ヒトのスキル管理と同じ到達尺度)。
 
-    レベルはスキル区分ごとの到達尺度(ヒトのスキル管理と同じ)。
     レベル0(不要)はレコードを作らない(スパース)。
     """
     __tablename__ = "operation_skills"
@@ -3276,7 +3260,7 @@ class Department(db.Model):
 
 # ==== 3-8. スキルの到達度の変更の記録・自動更新・スキルマップのAI ==================================
 # どれも新しいテーブル(既存のテーブルは変更しない。以前の版のスキルテストのテーブルは DB に残したまま使わない)。
-# 番号(id)は再利用しない(AUTOINCREMENT。会話を削除した後の新しい会話に、作成中だった応答が入らないように)。
+# 番号(id)は再利用しない(AUTOINCREMENT。削除した行の番号を次の行に使わない)。
 #   skill_level_changes   到達度の変更1件ずつの記録(タスクの完了からの自動更新・マネージャーの変更・到達尺度の変換)。
 #                         自動更新はマネージャーが取り消せる(取り消した日時・人を残し、到達度を元に戻す。8-3)
 #   skill_auto_judgments  タスクの完了からの自動更新の判定1回分(対象者・AI の提案・結果。8-3)
@@ -3401,11 +3385,10 @@ def _json_list(text):
         return []
     return value if isinstance(value, list) else []
 
-CHAT_ROLE_USER = "user"
+# 以前の版の相談の発言・計画の値(role・status。今は書かない。status の列の既定値と、動作確認で以前の版の行を作るときに使う)
 CHAT_ROLE_AI = "assistant"
-CHAT_PENDING = "pending"
 CHAT_DONE = "done"
-CHAT_ERROR = "error"
+PLAN_ACTIVE = "active"
 
 class SkillChatThread(db.Model):
     """以前の版のスキルマップの「AIに相談」の会話1つ(今は使わない。DB の表はそのまま)。"""
@@ -3423,10 +3406,6 @@ class SkillChatThread(db.Model):
     created_by = db.relationship("User", foreign_keys=[created_by_id])
     messages = db.relationship("SkillChatMessage", back_populates="thread", order_by="SkillChatMessage.id",
                                cascade="all, delete-orphan")
-
-    @property
-    def row_key(self):
-        return make_row_key(self)
 
     def __repr__(self):
         return f"<SkillChatThread {self.id} {self.title}>"
@@ -3449,27 +3428,8 @@ class SkillChatMessage(db.Model):
     thread = db.relationship("SkillChatThread", back_populates="messages")
     author = db.relationship("User")
 
-    @property
-    def is_ai(self):
-        return self.role == CHAT_ROLE_AI
-
     def __repr__(self):
         return f"<SkillChatMessage {self.id} {self.role} {self.status}>"
-
-PLAN_KINDS = (
-    ("strength", "強み"),
-    ("weakness", "弱み・課題"),
-    ("action", "アクションアイテム"),
-    ("midterm", "中期計画"),
-    ("education", "教育計画"),
-    ("other", "メモ"),
-)
-PLAN_KIND_LABELS = dict(PLAN_KINDS)
-PLAN_KIND_COLORS = {"strength": "success", "weakness": "warning", "action": "primary", "midterm": "info",
-                    "education": "secondary", "other": "light"}
-PLAN_ACTIVE = "active"
-PLAN_DONE = "done"
-PLAN_STATUS_LABELS = {PLAN_ACTIVE: "進行中", PLAN_DONE: "完了"}
 
 class SkillPlan(db.Model):
     """以前の版の「計画・メモ」1件(今は使わない。DB の表はそのまま)。"""
@@ -3493,22 +3453,6 @@ class SkillPlan(db.Model):
     created_by = db.relationship("User", foreign_keys=[created_by_id])
     updated_by = db.relationship("User", foreign_keys=[updated_by_id])
 
-    @property
-    def kind_label(self):
-        return PLAN_KIND_LABELS.get(self.kind, self.kind)
-
-    @property
-    def kind_color(self):
-        return PLAN_KIND_COLORS.get(self.kind, "secondary")
-
-    @property
-    def status_label(self):
-        return PLAN_STATUS_LABELS.get(self.status, self.status)
-
-    @property
-    def row_key(self):
-        return make_row_key(self)
-
     def __repr__(self):
         return f"<SkillPlan {self.id} {self.kind}: {self.title}>"
 
@@ -3527,7 +3471,7 @@ class AppMark(db.Model):
 
 # ==== 4-1. ChatGPT(OpenAI互換)API クライアント ====================================================
 # ChatGPT(OpenAI互換)API クライアント(アプリ共通。週報の文章整形・スキルの説明の下書き・AI分析・
-# スキルの自動更新・スキルマップのAI〔分析〕で使用)。
+# スキルの自動更新・スキルマップのAI〔分析〕・メールからのタスクの下書き〔15-4〕・AI接続テスト〔18 章〕で使用)。
 # どの機能からも ai_chat() で使う(機能ごとに接続部分を持たない)。
 # 接続設定(AI_API_URL・AI_MODEL・AI_TIMEOUT・AI_API_KEY)は基本設定(1)から読む(コードには書かず、既定の接続先・
 # モデル名も持たない。画面で保存するとすぐに反映される)。
@@ -4073,16 +4017,14 @@ def smtp_refusal_hint(replies):
         return SMTP_HINT_SIZE
     return ""
 
-def _refused_list(refused):
-    """拒否された宛先 {アドレス: (コード, 本文)} を「アドレス（コード 本文）」の一覧の文字列にする。"""
-    items = []
-    for addr, reply in refused.items():
-        code, message = reply if isinstance(reply, tuple) and len(reply) == 2 else (None, reply)
-        items.append("{}（{}）".format(addr, smtp_reply_text(code, message) or "理由の表示なし"))
-    return "、".join(items)
-
 def _refused_replies(refused):
+    """拒否された宛先 {アドレス: (コード, 本文)} の応答の一覧 [(コード, 本文)](形の違う値はコードなしの本文)。"""
     return [reply if isinstance(reply, tuple) and len(reply) == 2 else (None, reply) for reply in refused.values()]
+
+def _refused_list(refused):
+    """拒否された宛先を「アドレス（コード 本文）」の一覧の文字列にする。"""
+    return "、".join("{}（{}）".format(addr, smtp_reply_text(code, message) or "理由の表示なし")
+                    for addr, (code, message) in zip(refused, _refused_replies(refused)))
 
 SMTP_HINT_CONNECT = ("送信サーバーの管理者に、このPCからの送信を受け付けているかを確認してください"
                      "（一時的な混雑のときは、しばらく待ってから送り直すと送れることがあります）。")
@@ -4512,26 +4454,25 @@ def _local_credential_mark(username):
     if username == ADMIN_USERNAME and expected:
         material = "config:" + expected
     else:
-        import ldap_client  # 本番環境ごとに差し替えるファイル(使うときに読み込む)
-
-        accounts = getattr(ldap_client, "_LOCAL_ACCOUNTS", None)
-        local = accounts.get(username) if isinstance(accounts, dict) else None
+        local = _local_accounts().get(username)
         password = local.get("password") if isinstance(local, dict) else None
         material = "ldap_client:" + str(password or "")
     key = str(current_app.config.get("SECRET_KEY") or "").encode("utf-8")
     return hmac.new(key, (str(username) + ":" + material).encode("utf-8"), hashlib.sha256).hexdigest()
+
+def _local_accounts():
+    """ldap_client.py の固定ローカルアカウント(_LOCAL_ACCOUNTS。辞書でなければ空の辞書)。"""
+    import ldap_client  # 本番環境ごとに差し替えるファイル(使うときに読み込む)
+
+    accounts = getattr(ldap_client, "_LOCAL_ACCOUNTS", None)
+    return accounts if isinstance(accounts, dict) else {}
 
 def is_local_account(username):
     """固定ローカル管理者(admin と ldap_client.py の _LOCAL_ACCOUNTS)のログインIDか。
 
     固定ローカル管理者はアプリの登録・有効/無効に関係なくログインでき、ログインのたびに有効に戻る。
     """
-    if username == ADMIN_USERNAME:
-        return True
-    import ldap_client  # 本番環境ごとに差し替えるファイル(使うときに読み込む)
-
-    accounts = getattr(ldap_client, "_LOCAL_ACCOUNTS", None)
-    return isinstance(accounts, dict) and username in accounts
+    return username == ADMIN_USERNAME or username in _local_accounts()
 
 def _login_display_name(info):
     """認証の結果の氏名(display_name)。文字列で空白以外の文字があればその値(前後の空白を除く)、無ければ None。
@@ -4694,12 +4635,7 @@ def login():
         if not posted or posted == current_user.username:
             return _redirect_after_login()
         previous = current_user.display_name
-        end_login_session()
-        logout_user()
-        session.pop(DROPPED_REQUEST_KEY, None)
-        session.pop(LOCAL_AUTH_KEY, None)
-        session.pop(LOGIN_SOURCE_KEY, None)
-        end_portal_session()  # 複数の環境だったときの共通のログインが残っていれば消す(17 章)
+        _end_logins(source=True)  # 複数の環境だったときの共通のログインが残っていれば、それも消す(17 章)
         flash(f"{previous} さんのログインを終了しました（別のIDが入力されたため）。", "info")
 
     if request.method == "POST":
@@ -4709,7 +4645,8 @@ def login():
         if response is not None:
             return response
 
-        if info.get("source") == "local":
+        local = info.get("source") == "local"
+        if local:
             # 固定ローカル管理者は常に許可(アプリ登録チェック免除)
             user = _ensure_local_user(info)
         else:
@@ -4736,7 +4673,7 @@ def login():
         else:
             session.pop(LOCAL_AUTH_KEY, None)
         # どの認証で入ったか(環境を追加したときに、このログインから共通のログインを作るときに使う。17 章)
-        session[LOGIN_SOURCE_KEY] = LOGIN_SOURCE_LOCAL if info.get("source") == "local" else LOGIN_SOURCE_LDAP
+        session[LOGIN_SOURCE_KEY] = LOGIN_SOURCE_LOCAL if local else LOGIN_SOURCE_LDAP
         flash(f"ようこそ、{user.display_name} さん。", "success")
         response = _redirect_after_login()
         end_env_logins(response)
@@ -4748,12 +4685,18 @@ def _portal_login_action(next_url):
     """共通の入口のログイン(メインの環境の /login)の URL(next はログインの後に開く画面)。"""
     return portal_url("/login") + ("?" + urlencode({"next": next_url}) if next_url else "")
 
-def _end_main_logins():
-    """メインの環境のこのブラウザのログインと共通のログインを終える(共用の PC で別の人がログインするとき)。"""
+def _end_logins(source=False):
+    """このブラウザのログインと共通のログイン(17 章)を終える(ログアウト・共用の PC で別の人がログインするとき)。
+
+    ログインの印(控えたクッキーを後で使わせない)・ログインが切れた状態で送った操作の印・固定ローカル管理者の
+    パスワードの印を消す。source なら、ログインしたときの認証の記録(LOGIN_SOURCE_KEY)も消す。
+    """
     end_login_session()
     logout_user()
     session.pop(DROPPED_REQUEST_KEY, None)
     session.pop(LOCAL_AUTH_KEY, None)
+    if source:
+        session.pop(LOGIN_SOURCE_KEY, None)
     end_portal_session()
 
 def _after_portal_login(portal, next_url, rows=None):
@@ -4770,7 +4713,7 @@ def _after_portal_login(portal, next_url, rows=None):
     if len(rows) == 1:
         return redirect(rows[0]["url"])
     if not rows:
-        _end_main_logins()
+        _end_logins()
         return flash_redirect(LOGIN_NOT_REGISTERED, "danger", url_for("auth.login"))
     return redirect(url_for("auth.envs"))
 
@@ -4798,7 +4741,7 @@ def _portal_login():
             return _after_portal_login(portal, next_url)   # 別のタブで既にログインした
         if portal is not None or logged_in:
             previous = current_user.display_name if logged_in else (portal["d"] or portal["u"])
-            _end_main_logins()
+            _end_logins()
             flash(f"{previous} さんのログインを終了しました（別のIDが入力されたため）。", "info")
         info, response = _check_login_form(username, password)
         if response is not None:
@@ -4938,13 +4881,8 @@ def logout():
     # またログアウトしてしまうため)。
     # GET はナビのリンク(このアプリの画面から開いたもの)用。送り元の分からない GET は check_same_origin が
     # 案内の画面にし、そのボタン(POST。送り元は Origin で確かめる)でログアウトする
-    end_login_session()  # このブラウザのログインの印を消す(控えたクッキーをログアウトの後に使わせない)
-    logout_user()
-    session.pop(DROPPED_REQUEST_KEY, None)  # ログインが切れた状態で送った操作の印も消す
-    session.pop(LOCAL_AUTH_KEY, None)  # 固定ローカル管理者のパスワードの印も消す
-    session.pop(LOGIN_SOURCE_KEY, None)
-    # 共通のログインと、このブラウザのほかの環境のログイン(クッキー)も終える(17 章。1つの環境のときは何もしない)
-    end_portal_session()
+    # 共通のログインと、ほかの環境のログイン(クッキー。end_env_logins)も終える(17 章。1つの環境のときは何もしない)
+    _end_logins(source=True)
     if not is_main_env():
         # ほかの環境: メインの環境のログインの印もここで消してから(メインの環境のクッキーは書き換えられないため)、
         # 共通の入口のログアウトへ(クッキーを消して「ログアウトしました」を出す。開かれなくてもログインは終わっている)
@@ -4986,8 +4924,9 @@ def main_dashboard():
         .all()
     )
     my_overdue = [t for t in my_tasks if t.is_overdue]
+    today = date.today()
     # 「計画」の列(19 章。手順が無ければ「計画なし」)
-    my_plans = {t.id: plan_progress(t.steps, date.today()) for t in my_tasks}
+    my_plans = {t.id: plan_progress(t.steps, today) for t in my_tasks}
 
     status_counts = {s: Task.query.filter_by(status=s).count() for s in STATUS_CHOICES}
     my_status_counts = {
@@ -4997,7 +4936,6 @@ def main_dashboard():
         for s in STATUS_CHOICES
     }
 
-    today = date.today()
     actx = _build_activity(today, [me], include_unassigned=False)
     # 成果の按分(担当者数で割る)を全体と揃えるため、母集団は有効ユーザー全員を渡す
     octx = _build_outcomes(today, get_active_users(), only_user_id=me.id)
@@ -5109,7 +5047,7 @@ def _render_task_form(task, users, form, selected, version=None, skills=None):
         date_bounds=_task_date_bounds(task),  # 開始日・期限の欄の min/max
         skill_groups=task_skill_choices(task) if can_plan and use_skills else [], selected_skills=skills,
         skill_levels=TASK_SKILL_LEVELS, skill_scale=SKILL_SCALE, rec=rec, capacity=capacity,
-        mail_max_mb=MAIL_DRAFT_MAX_BYTES // 1000000, ai_enabled=ai_is_configured(), ai_status=ai_status_label(),
+        mail_max_mb=MAIL_DRAFT_MAX_BYTES // 1000000, **ai_context(),
     )
 
 def _task_date_bounds(task):
@@ -5173,6 +5111,20 @@ _STALE_TASK = ("画面を開いた後に、このタスクは削除されてい�
 _STALE_ROUTINE = ("画面を開いた後に、この定型・定期業務は削除されています（同じ番号が新しい別の業務に使われています）。"
                   "操作は行っていません。一覧から開き直してください。")
 
+def _task_for_update(task_id):
+    """タスクの保存・変更の画面のタスク(無ければ 404)。戻り値: (タスク, 応答 または None)。
+
+    送信(POST)は、確かめてから保存するまでの間にほかの保存・削除が入らないよう、書き込みのロックを取ってから読み、
+    送られた印(row)が違えば(画面を開いた後に削除され、同じ番号が別のタスクに使われた)一覧へ戻す応答を返す。
+    """
+    posted = request.method == "POST"
+    if posted:
+        lock_for_write()
+    task = get_or_404(Task, task_id)
+    if posted and not row_key_matches(task, request.form.get("row")):
+        return task, flash_redirect(_STALE_TASK, "warning", url_for("tasks.list_tasks"))
+    return task, None
+
 def _back_to_referrer(default):
     """前の画面(Referer)へ戻る URL。このアプリの中の画面(同じホスト)のときだけ使い、それ以外は default。
 
@@ -5203,11 +5155,7 @@ def _log_status(task, status):
 
 def _can_edit(task):
     """編集・状態の変更・進捗の記載の権限:作成者・担当者(いずれか)・マネージャーのみ。"""
-    return (
-        current_user.is_manager
-        or task.creator_id == current_user.id
-        or task.is_assigned_to(current_user)
-    )
+    return current_user.is_manager or task.creator_id == current_user.id or task.is_assigned_to(current_user)
 
 _STALE_ASSIGNEE = ("担当者の選択に、画面を開いた後に削除・無効化されたメンバーが含まれています。"
                    "画面を開き直して、担当者を選び直してください。")
@@ -5245,19 +5193,6 @@ def _read_task_dates(task=None):
 def _selected_assignees(users):
     """フォームの assignee_ids(複数。値は「ユーザーID:ログインID」)から担当ユーザーを選ぶ。"""
     return users_from_form_keys(request.form.getlist("assignee_ids"), users)
-
-def _assignee_choices(task):
-    """編集画面の担当者の選択肢: 有効なユーザーと、そのタスクの担当のまま無効化されたユーザー。
-
-    無効化されたユーザーは選択肢(get_active_users)に出ないため、そのままでは保存のたびに担当から
-    外れてしまう(担当の履歴・成果・Excel出力・期限超過通知の担当者が消える)。担当のまま残し、
-    画面では「［無効］」を付けて表示する(マネージャーがチェックを外したときだけ外す)。
-    """
-    users = member_choices(task.assignees if task is not None else ())
-    if task is None:
-        return users
-    inactive = [u for u in task.assignees if not u.is_active]
-    return users + sorted(inactive, key=lambda u: u.display_name or "")
 
 _LIKE_ESCAPE = "\\"
 
@@ -5520,39 +5455,37 @@ def new_task():
         title = request.form.get("title", "").strip()
         assignees, stale = _selected_assignees(users)
         sel = [u.id for u in assignees]
+
+        def form_error(message, form=None):
+            """入力の誤りを案内し、入力を残したまま登録の画面を出し直す。"""
+            flash(message, "danger")
+            return _render_task_form(None, users, request.form if form is None else form, sel)
+
         if not title:
-            flash("タイトルは必須です。", "danger")
-            return _render_task_form(None, users, request.form, sel)
+            return form_error("タイトルは必須です。")
         if stale:
-            flash(_STALE_ASSIGNEE, "danger")
-            return _render_task_form(None, users, request.form, sel)
+            return form_error(_STALE_ASSIGNEE)
 
         data, err = _read_outcomes()
         if err:
-            flash(err, "danger")
-            return _render_task_form(None, users, request.form, sel)
+            return form_error(err)
 
         status = _read_choice("status", STATUS_CHOICES, STATUS_CHOICES[0])
         priority = _read_choice("priority", PRIORITY_CHOICES, PRIORITY_MID)
         if status is None or priority is None:
-            flash(_INVALID_CHOICE, "danger")
-            return _render_task_form(None, users, request.form, sel)
+            return form_error(_INVALID_CHOICE)
         if status == STATUS_DONE and not _outcomes_have_actual(data):
-            flash(_COMPLETE_NEEDS_OUTCOME, "danger")
-            return _render_task_form(None, users, request.form, sel)
+            return form_error(_COMPLETE_NEEDS_OUTCOME)
         start_date, due_date, shown = _read_task_dates()
         if shown is not None:
-            flash(_TASK_DATE_INVALID, "danger")
-            return _render_task_form(None, users, shown, sel)
+            return form_error(_TASK_DATE_INVALID, shown)
         if start_date and due_date and start_date > due_date:
-            flash(_START_AFTER_DUE, "danger")
-            return _render_task_form(None, users, request.form, sel)
+            return form_error(_START_AFTER_DUE)
         # スキル管理を使わない環境(2-8)は必要スキルを付けない
         chosen_skills, err = (read_task_skills(request.form, task_skill_choices()) if feature_enabled(FEAT_SKILLS)
                               else ({}, None))
         if err:
-            flash(err, "danger")
-            return _render_task_form(None, users, request.form, sel)
+            return form_error(err)
 
         task = Task(
             title=title,
@@ -5608,15 +5541,13 @@ def _render_task_detail(task, draft=None, status=200):
 @tasks_bp.route("/<int:task_id>/edit", methods=["GET", "POST"])
 @login_required
 def edit_task(task_id):
-    if request.method == "POST":
-        lock_for_write()  # 確かめてから保存するまでの間に、ほかの保存・削除が入らないように
-    task = get_or_404(Task, task_id)
-    if request.method == "POST" and not row_key_matches(task, request.form.get("row")):
-        return flash_redirect(_STALE_TASK, "warning", url_for("tasks.list_tasks"))
+    task, response = _task_for_update(task_id)
+    if response is not None:
+        return response
     if not _can_edit(task):
         return flash_redirect("このタスクを編集する権限がありません。", "danger", url_for("tasks.detail", task_id=task.id))
 
-    users = _assignee_choices(task)
+    users = assignee_choices(task.assignees)
 
     if request.method == "POST" and request.form.get("recommend") == "1" and current_user.is_manager:
         # 「推奨の担当者を表示」(JavaScript が無効なとき。15-2): 入力を残したまま推奨を表示し直す(保存しない)
@@ -5630,17 +5561,20 @@ def edit_task(task_id):
         else:
             assignees = list(task.assignees)
         sel = [u.id for u in assignees]
+
+        def form_error(message, form=None):
+            """入力の誤りを案内し、入力を残したまま編集の画面を出し直す。"""
+            flash(message, "danger")
+            return _render_task_form(task, users, request.form if form is None else form, sel)
+
         if not title:
-            flash("タイトルは必須です。", "danger")
-            return _render_task_form(task, users, request.form, sel)
+            return form_error("タイトルは必須です。")
         if stale:
-            flash(_STALE_ASSIGNEE, "danger")
-            return _render_task_form(task, users, request.form, sel)
+            return form_error(_STALE_ASSIGNEE)
 
         data, err = _read_outcomes()
         if err:
-            flash(err, "danger")
-            return _render_task_form(task, users, request.form, sel)
+            return form_error(err)
 
         # 状態・優先度は選択肢の値だけ(今の値が選択肢に無い古い値なら、そのままの保存は可)
         status = request.form.get("status") or task.status
@@ -5649,24 +5583,20 @@ def edit_task(task_id):
             priority = request.form.get("priority") or task.priority
         if (status not in STATUS_CHOICES and status != task.status) or \
                 (priority not in PRIORITY_CHOICES and priority != task.priority):
-            flash(_INVALID_CHOICE, "danger")
-            return _render_task_form(task, users, request.form, sel)
+            return form_error(_INVALID_CHOICE)
         # 完了のタスクは成果(実績)が必要。既に完了のタスクでも、実績を消して保存はできない
         # (以前の版で実績なしのまま完了になっているタスクは、そのままの編集を妨げない)
         if status == STATUS_DONE and not _outcomes_have_actual(data) and \
                 (task.status != STATUS_DONE or task.has_outcome_actual):
-            flash(_COMPLETE_NEEDS_OUTCOME, "danger")
-            return _render_task_form(task, users, request.form, sel)
+            return form_error(_COMPLETE_NEEDS_OUTCOME)
         start_date, due_date, scale = task.start_date, task.due_date, task.scale
         if current_user.is_manager:
             start_date, due_date, shown = _read_task_dates(task)
             if shown is not None:
-                flash(_TASK_DATE_INVALID, "danger")
-                return _render_task_form(task, users, shown, sel)
+                return form_error(_TASK_DATE_INVALID, shown)
             scale = _read_scale()
             if start_date and due_date and start_date > due_date:
-                flash(_START_AFTER_DUE, "danger")
-                return _render_task_form(task, users, request.form, sel)
+                return form_error(_START_AFTER_DUE)
         # 必要スキル(15-1)もマネージャーだけが変えられる(メンバーと、スキル管理を使わない環境〔2-8〕は今の値のまま)
         chosen_skills = task_skill_levels(task)
         if current_user.is_manager and feature_enabled(FEAT_SKILLS):
@@ -5680,8 +5610,7 @@ def edit_task(task_id):
                     form, selected, skills = _task_conflict_form(task, changed)
                     return _render_task_form(task, users, form, sel if selected is None else selected,
                                              version=TASK_VERSION.version(current), skills=skills)
-                flash(err, "danger")
-                return _render_task_form(task, users, request.form, sel)
+                return form_error(err)
         description = request.form.get("description", "").strip()
 
         current = _task_values(task)
@@ -5736,11 +5665,10 @@ def update_status(task_id):
     同じ状態を続けて記録しない(書き込みのロックを取ってから、記録を読み直して比べる)。
     選んだ状態が今の状態と同じときは何も変えず、変更していないことを表示する(変更したとは表示しない)。
     """
-    lock_for_write()
-    task = get_or_404(Task, task_id)
+    task, response = _task_for_update(task_id)
+    if response is not None:
+        return response
     back = _back_to_referrer(url_for("tasks.list_tasks"))
-    if not row_key_matches(task, request.form.get("row")):
-        return flash_redirect(_STALE_TASK, "warning", url_for("tasks.list_tasks"))
     if not _can_edit(task):
         return flash_redirect("このタスクを更新する権限がありません。", "danger", back)
 
@@ -5778,10 +5706,9 @@ def add_comment(task_id):
     入力を残して画面を出し直す。status の欄の無い以前の画面からの送信は、今までどおり記載だけ(状態は変えない)。
     書き込みのロックを取ってからタスクを確かめる(同時に削除されたタスクに記載を残さない)。
     """
-    lock_for_write()
-    task = get_or_404(Task, task_id)
-    if not row_key_matches(task, request.form.get("row")):
-        return flash_redirect(_STALE_TASK, "warning", url_for("tasks.list_tasks"))
+    task, response = _task_for_update(task_id)
+    if response is not None:
+        return response
     if not _can_edit(task):
         return flash_redirect("進捗状況を記載できるのは担当者・マネージャーのみです。", "danger", url_for("tasks.detail", task_id=task_id))
     body = request.form.get("body", "").strip()
@@ -5834,26 +5761,25 @@ def _can_edit_comment(comment):
 @login_required
 def edit_comment(task_id, comment_id):
     """進捗状況の記載内容を変更する。記載者本人・マネージャーのみ。"""
-    lock_for_write()
-    task = get_or_404(Task, task_id)
-    if not row_key_matches(task, request.form.get("row")):
-        return flash_redirect(_STALE_TASK, "warning", url_for("tasks.list_tasks"))
+    task, response = _task_for_update(task_id)
+    if response is not None:
+        return response
     comment = db.session.get(TaskComment, comment_id)
     if comment is None or comment.task_id != task.id:
         abort(404)
+    back = url_for("tasks.detail", task_id=task_id)
     if not _can_edit_comment(comment):
-        return flash_redirect("進捗状況を変更できるのは記載者本人・マネージャーのみです。", "danger", url_for("tasks.detail", task_id=task_id))
+        return flash_redirect("進捗状況を変更できるのは記載者本人・マネージャーのみです。", "danger", back)
 
     body = request.form.get("body", "").strip()
     if not body:
-        return flash_redirect("進捗状況の内容を入力してください。", "danger", url_for("tasks.detail", task_id=task_id))
+        return flash_redirect("進捗状況の内容を入力してください。", "danger", back)
     _changed, conflicts = COMMENT_VERSION.conflicts(COMMENT_VERSION.values(comment), {"body": body})
     if conflicts:
-        return flash_redirect(COMMENT_VERSION.conflict_message(conflicts), "warning",
-                              url_for("tasks.detail", task_id=task_id))
+        return flash_redirect(COMMENT_VERSION.conflict_message(conflicts), "warning", back)
     comment.body = body
     db.session.commit()
-    return flash_redirect("進捗状況を更新しました。", "success", url_for("tasks.detail", task_id=task_id))
+    return flash_redirect("進捗状況を更新しました。", "success", back)
 
 @tasks_bp.route("/<int:task_id>/delete", methods=["POST"])
 @login_required
@@ -5882,7 +5808,7 @@ def delete_task(task_id):
 routine_bp = Blueprint("routine", __name__, url_prefix="/routine")
 
 def _round_minutes(value):
-    """分の合計を小数第1位までにする(整数になるなら整数)。"""
+    """分(月間の所要時間・その合計)を小数第1位までにする(整数になるなら整数。整数はそのまま)。"""
     if isinstance(value, float):
         value = round(value, 1)
         if value.is_integer():
@@ -5941,18 +5867,14 @@ def _can_edit_routine(rw):
     return current_user.is_manager or rw.is_assigned_to(current_user)
 
 def _assignee_users(routine=None):
-    """担当者の選択肢(マネージャー): 有効なユーザーと、その業務の担当のまま無効化されたユーザー。
+    """担当者の選択肢(マネージャー): 有効なユーザーと、その業務の担当のまま無効化されたユーザー(assignee_choices)。
 
-    無効化された担当者も選択肢に残す(マネージャーが担当を付け替えずにほかの項目を直せるように。
-    画面では「［無効］」を付ける)。メンバーは担当者を選べない(登録は自分、編集は今の担当者のまま)。
+    無効化された担当者も選択肢に残す(マネージャーが担当を付け替えずにほかの項目を直せるように)。
+    メンバーは担当者を選べない(登録は自分、編集は今の担当者のまま)。
     """
     if not current_user.is_manager:
         return [current_user]
-    users = member_choices(routine.assignee_list if routine is not None else ())
-    if routine is not None:
-        inactive = [u for u in routine.assignee_list if not u.is_active]
-        users += sorted(inactive, key=lambda u: u.display_name or "")
-    return users
+    return assignee_choices(routine.assignee_list if routine is not None else ())
 
 def _render_routine_form(routine, users, form=None, version=None, rem_state=None, rem_version=None, selected=None):
     """登録・編集の画面を表示する(form は入力エラーで再表示する入力)。
@@ -6330,16 +6252,12 @@ def _duplicate_on(user_id, leave_date, exclude_id=None):
     return q.first()
 
 def _registration_messages(leave_date):
-    """登録/更新後に出すメッセージ(今週の取得の連絡のお願い)をflashする。"""
-    # 今週(月〜日)の取得なら、チャット/メール/口頭での連絡を促す
+    """登録/更新後に出すメッセージ(今週〔月〜日〕の取得なら、チャット・メール・口頭での連絡のお願い)をflashする。"""
     today = date.today()
     monday = today - timedelta(days=today.weekday())
     sunday = monday + timedelta(days=6)
     if monday <= leave_date <= sunday:
-        flash(
-            "今週の取得です。チャット・メール・口頭のいずれかで関係者へ連絡をお願いします。",
-            "info",
-        )
+        flash("今週の取得です。チャット・メール・口頭のいずれかで関係者へ連絡をお願いします。", "info")
 
 @leaves_bp.route("/")
 @login_required
@@ -6378,7 +6296,6 @@ def calendar_view():
         next=(next_year, next_month) if next_year <= LEAVE_YEAR_MAX else None,
         leave_marks=ROSTER_LEAVE_MARKS,
         kind_css=SHIFT_KIND_CSS,
-        month_key=month_key(year, month),
         # 勤務パターン(勤務表の入力・勤務の設定)は admin だけ(システム管理の画面。18 章)
         shift_admin_urls={"month": admin_url("shifts/month?month=" + month_key(year, month)),
                           "settings": admin_url("shifts")} if is_system_admin() else None,
@@ -6453,14 +6370,12 @@ def new_leave():
             if dup:
                 return flash_redirect("その取得日の年休は既に登録されています。", "warning", url_for("leaves.detail", leave_id=dup.id))
 
-            leave = LeaveRequest(
-                user_id=current_user.id, leave_date=leave_date, leave_type=leave_type
-            )
+            leave = LeaveRequest(user_id=current_user.id, leave_date=leave_date, leave_type=leave_type)
             db.session.add(leave)
             commit_submitted("leave", calendar_url)
         flash("年休を登録しました。", "success")
         _registration_messages(leave_date)
-        return redirect(url_for("leaves.calendar_view", year=leave_date.year, month=leave_date.month))
+        return redirect(calendar_url)
 
     # 出勤表の自分の行の日(?date=YYYY-MM-DD)から開いたときは、その日を取得日に入れておく
     picked = parse_date(request.args.get("date"))
@@ -6559,11 +6474,7 @@ def _skill_users():
     manager権限のユーザーは評価・育成の対象外なので、スキルマップの列や
     業務×ヒトの対応表には出さない。
     """
-    return (
-        User.query.filter_by(is_active=True, role=ROLE_MEMBER)
-        .order_by(User.display_name)
-        .all()
-    )
+    return User.query.filter_by(is_active=True, role=ROLE_MEMBER).order_by(User.display_name).all()
 
 def _is_skill_target(user):
     """その人がスキル管理の対象か(メンバーかつ有効)。"""
@@ -6609,7 +6520,7 @@ def list_skills():
             "type": t,
             "label": SKILL_TYPE_LABELS[t],
             "color": SKILL_TYPE_COLORS.get(t, "secondary"),
-            "scale": scale_for(t),
+            "scale": SKILL_SCALE,
             "skills": sk,
         })
 
@@ -6617,9 +6528,7 @@ def list_skills():
     operations = ordered_rows(Operation) if show_op else []
     req_by_skill = {sid: {} for sid in all_skill_ids}
     if show_op and all_skill_ids:
-        for r in OperationSkill.query.filter(
-            OperationSkill.skill_id.in_(all_skill_ids)
-        ).all():
+        for r in OperationSkill.query.filter(OperationSkill.skill_id.in_(all_skill_ids)).all():
             if r.skill_id in req_by_skill:
                 req_by_skill[r.skill_id][r.operation_id] = r.level
 
@@ -6627,19 +6536,14 @@ def list_skills():
     users = _skill_users() if show_person else []
     level_by_skill = {sid: {} for sid in all_skill_ids}
     if show_person and all_skill_ids:
-        for r in SkillRating.query.filter(
-            SkillRating.skill_id.in_(all_skill_ids)
-        ).all():
+        for r in SkillRating.query.filter(SkillRating.skill_id.in_(all_skill_ids)).all():
             if r.skill_id in level_by_skill:
                 level_by_skill[r.skill_id][r.user_id] = r
 
     # 「単独可」の人数もスキル管理の対象者(メンバー)だけで数える
     target_ids = {u.id for u in users}
     holder_counts = {
-        sid: sum(
-            1 for uid, r in per.items()
-            if uid in target_ids and r.level >= SKILL_PROFICIENT_LEVEL
-        )
+        sid: sum(1 for uid, r in per.items() if uid in target_ids and r.level >= SKILL_PROFICIENT_LEVEL)
         for sid, per in level_by_skill.items()
     }
     # 今の到達度がタスクの完了からの自動更新によるもの(取り消していない・その後に変わっていない。セルに印を付ける)
@@ -6741,9 +6645,7 @@ def coverage():
     req_skill_ids = {r.skill_id for op in operations for r in op.active_skill_reqs}
     level_lookup = {}
     if req_skill_ids:
-        for sr in SkillRating.query.filter(
-            SkillRating.skill_id.in_(req_skill_ids)
-        ).all():
+        for sr in SkillRating.query.filter(SkillRating.skill_id.in_(req_skill_ids)).all():
             level_lookup[(sr.user_id, sr.skill_id)] = sr.level
 
     rows = []
@@ -6755,27 +6657,17 @@ def coverage():
             if not reqs:
                 cells.append({"state": "none"})
                 continue
-            met = sum(
-                1 for r in reqs
-                if level_lookup.get((u.id, r.skill_id), 0) >= r.level
-            )
+            met = sum(1 for r in reqs if level_lookup.get((u.id, r.skill_id), 0) >= r.level)
             full = met == len(reqs)
             if full:
                 doable += 1
-            cells.append({
-                "state": "full" if full else "partial",
-                "met": met, "total": len(reqs),
-            })
+            cells.append({"state": "full" if full else "partial", "met": met, "total": len(reqs)})
         rows.append({"op": op, "req_count": len(reqs), "cells": cells, "doable": doable})
 
-    per_user_doable = [
-        sum(1 for row in rows if row["cells"][i].get("state") == "full")
-        for i in range(len(users))
-    ]
+    per_user_doable = [sum(1 for row in rows if row["cells"][i].get("state") == "full") for i in range(len(users))]
 
     return render_template(
         "skills/coverage.html",
-        operations=operations,
         users=users,
         rows=rows,
         per_user_doable=per_user_doable,
@@ -6796,17 +6688,11 @@ def member(user_id):
                .order_by(SkillLevelChange.created_at.desc(), SkillLevelChange.id.desc()).limit(20).all())
 
     # --- 育成計画: 業務ごとの必要スキルに対する本人の過不足 ---
-    current = {
-        sr.skill_id: sr.level
-        for sr in SkillRating.query.filter_by(user_id=member.id).all()
-    }
+    current = {sr.skill_id: sr.level for sr in SkillRating.query.filter_by(user_id=member.id).all()}
     op_rows = []
     need = {}  # skill_id -> 育成が必要なスキルの集約
     for op in ordered_rows(Operation):
-        reqs = sorted(
-            op.active_skill_reqs,
-            key=lambda r: (r.skill.skill_type, r.skill.sort_order, r.skill.name),
-        )
+        reqs = sorted(op.active_skill_reqs, key=lambda r: (r.skill.skill_type, r.skill.sort_order, r.skill.name))
         if not reqs:
             continue  # 必要スキル未設定の業務は対象外
         lines = []
@@ -6819,26 +6705,15 @@ def member(user_id):
                 unmet += 1
                 e = need.get(r.skill_id)
                 if e is None:
-                    e = need[r.skill_id] = {
-                        "skill": r.skill, "target": 0, "current": cur, "ops": [],
-                    }
+                    e = need[r.skill_id] = {"skill": r.skill, "target": 0, "current": cur, "ops": []}
                 e["target"] = max(e["target"], r.level)  # 複数業務なら最大の必要レベル
                 e["ops"].append(op.name)
-            lines.append({
-                "skill": r.skill, "required": r.level,
-                "current": cur, "gap": gap, "met": met,
-            })
-        op_rows.append({
-            "op": op, "lines": lines, "unmet": unmet,
-            "can_do": unmet == 0, "total": len(reqs),
-        })
+            lines.append({"skill": r.skill, "required": r.level, "current": cur, "gap": gap, "met": met})
+        op_rows.append({"op": op, "lines": lines, "unmet": unmet, "can_do": unmet == 0, "total": len(reqs)})
 
     for e in need.values():
         e["gap"] = e["current"] - e["target"]  # 負の不足量
-    training = sorted(
-        need.values(),
-        key=lambda e: (e["gap"], e["skill"].skill_type, e["skill"].name),
-    )
+    training = sorted(need.values(), key=lambda e: (e["gap"], e["skill"].skill_type, e["skill"].name))
     doable = sum(1 for row in op_rows if row["can_do"])
 
     return render_template(
@@ -6941,9 +6816,7 @@ SKILL_USAGE_LABELS = (("ratings", "メンバーの到達度"), ("operations", "�
 
 @skills_bp.route("/items")
 def items():
-    skills = Skill.query.order_by(
-        Skill.skill_type, Skill.sort_order, Skill.name
-    ).all()
+    skills = Skill.query.order_by(Skill.skill_type, Skill.sort_order, Skill.name).all()
     # 評価済の人数: スキル管理の対象者(有効なメンバー)のうち、到達度(Lv1以上)が登録されている人
     # (スキルマップ・対応表と同じ対象。無効化した人・マネージャー・Lv0 のメモだけの行は数えない)
     rated_counts = dict(
@@ -7039,9 +6912,8 @@ def build_description_messages(name, skill_type, current=""):
 def clean_description_draft(text, skill_type=None):
     """AIの応答を説明の下書きに整える(コードブロック・Markdown の記号を除き、見出しを「■」にそろえる)。
 
-    「レベルごとの目安」の見出しは DESC_LEVELS(Lv1〜Lv3)にそろえる(skill_type は以前の呼び出しとの互換)。
+    「レベルごとの目安」の見出しは DESC_LEVELS(Lv1〜Lv3)にそろえる(skill_type は使わない。以前の呼び出しとの互換)。
     """
-    levels_heading = DESC_LEVELS
     body = strip_code_fence(lf_text(text or ""))
     lines = []
     for line in body.split("\n"):
@@ -7051,8 +6923,7 @@ def clean_description_draft(text, skill_type=None):
         heading = re.match(r"^#{1,6}\s*(.+)$", stripped)
         if known and _HEADING_TAIL.match(stripped, known.end()):
             # 見出しだけの行(「## 対象範囲」「【対象外の内容】」など)は「■見出し」にそろえる
-            key = _DESCRIPTION_HEADING_KEYS[known.group(1)]
-            line = "■" + (levels_heading if key == DESC_LEVELS else key)
+            line = "■" + _DESCRIPTION_HEADING_KEYS[known.group(1)]
         elif heading:
             line = "■" + heading.group(1).strip().lstrip("■").strip()
         elif re.match(r"^[-*]\s+", stripped):
@@ -7073,7 +6944,7 @@ def draft_skill_description(name, skill_type, current=""):
     text, error = ai_chat(build_description_messages(name, skill_type, current))
     if error:
         return None, "AIで下書きを作成できませんでした: {}".format(error)
-    draft = clean_description_draft(text, skill_type)
+    draft = clean_description_draft(text)
     if not draft:
         return None, "AIの応答が空でした。もう一度お試しください。"
     message = "AIの下書きを説明の欄に入れました（まだ保存していません）。内容を確認・修正してから保存してください。"
@@ -7150,7 +7021,8 @@ def description_draft():
     skill = None
     raw_id = request.values.get("skill_id", "").strip()
     if raw_id:
-        skill = db.session.get(Skill, to_int(raw_id)) if to_int(raw_id) is not None else None
+        number = to_int(raw_id)
+        skill = db.session.get(Skill, number) if number is not None else None
         if skill is None:
             abort(404)
     # 区分は、編集中のスキルならそのスキルの区分(変更できないため)、追加中なら選択中の区分
@@ -7386,32 +7258,20 @@ def _build_activity(today, users, include_unassigned=True):
                 grp = {"task": c.task, "comments": []}
                 task_map[c.task_id] = grp
             grp["comments"].append(c)
-        return sorted(
-            task_map.values(),
-            key=lambda g: g["comments"][-1].created_at, reverse=True,
-        )
+        return sorted(task_map.values(), key=lambda g: g["comments"][-1].created_at, reverse=True)
 
     rows = []
     for u in users:
-        mine = [
-            c for c in act_comments
-            if c.task is not None and c.task.is_assigned_to(u)
-        ]
+        mine = [c for c in act_comments if c.task is not None and c.task.is_assigned_to(u)]
         rows.append({"user": u, "label": u.display_name, "tasks": group_by_task(mine)})
 
     # 担当者未割当のタスク・担当者が全員無効化されたタスクへの記載はどの枠にも出ないため、別枠でまとめる
     # (無効化した人の担当タスクは、引き継ぎのために記載を見る必要がある)
     if include_unassigned:
         user_ids = {u.id for u in users}
-        unassigned = [
-            c for c in act_comments
-            if c.task is not None and not c.task.assignees
-        ]
+        unassigned = [c for c in act_comments if c.task is not None and not c.task.assignees]
         if unassigned:
-            rows.append({
-                "user": None, "label": "担当者未割当のタスク",
-                "tasks": group_by_task(unassigned),
-            })
+            rows.append({"user": None, "label": "担当者未割当のタスク", "tasks": group_by_task(unassigned)})
         orphaned = [
             c for c in act_comments
             if c.task is not None and c.task.assignees
@@ -7477,8 +7337,7 @@ def _build_outcomes(today, users, only_user_id=None):
 
     def other_row(user):
         if user.id not in others:
-            label = user.display_name + ("" if user.is_active else INACTIVE_MARK)
-            others[user.id] = blank(user, label)
+            others[user.id] = blank(user, user.name_label)
         return others[user.id]
     qual_rows = []   # 定性成果(記載のあるタスク)
     undated = 0      # 期限・開始日が無く集計対象外になったタスク
@@ -7529,11 +7388,7 @@ def _build_outcomes(today, users, only_user_id=None):
                 d["hour_act"] += a_val / n
 
         if has_qual:
-            qual_rows.append({
-                "task": t,
-                "estimate": t.outcome_qual_estimate,
-                "actual": t.outcome_qual_actual,
-            })
+            qual_rows.append({"task": t, "estimate": t.outcome_qual_estimate, "actual": t.outcome_qual_actual})
 
     rows = [d for d in acc.values() if d["tasks"]]
     rows.extend(d for d in others.values() if d["tasks"])
@@ -7680,10 +7535,7 @@ def _build_gantt(today, only_user_id=None):
                         st = _changes[0].status if _changes else _task.status
                     return st
 
-                cuts = sorted({
-                    c.changed_at.date() for c in changes
-                    if vs < c.changed_at.date() <= ve
-                })
+                cuts = sorted({c.changed_at.date() for c in changes if vs < c.changed_at.date() <= ve})
                 bounds = [vs] + cuts + [ve + timedelta(days=1)]
                 for i in range(len(bounds) - 1):
                     seg_s, seg_e = bounds[i], bounds[i + 1]
@@ -7787,14 +7639,8 @@ def manager_dashboard():
     skill_rows = []
     for s in tech_skills:
         # 保有人数もメンバーに限定して数える(分母と母集団を揃える)
-        holders = sum(
-            1 for r in s.ratings
-            if r.level >= SKILL_PROFICIENT_LEVEL and r.user_id in member_ids
-        )
-        skill_rows.append(
-            {"skill": s, "holders": holders, "total": member_count,
-             "weak": holders < weak_threshold}
-        )
+        holders = sum(1 for r in s.ratings if r.level >= SKILL_PROFICIENT_LEVEL and r.user_id in member_ids)
+        skill_rows.append({"skill": s, "holders": holders, "total": member_count, "weak": holders < weak_threshold})
 
     # メンバー別 平均到達度(全テクニカル項目に対して。未評価=0)
     tech_ids = [s.id for s in tech_skills]
@@ -7913,6 +7759,7 @@ def manage():
     membership = {d.id: {u.id for u in d.users} for d in departments}
     versions = {d.id: DEPARTMENT_VERSION.version(d) for d in departments}
     emails = user_email_map(u.id for u in users)
+    domains = allowed_mail_domains()
     return render_template(
         "departments/manage.html",
         departments=departments,
@@ -7920,8 +7767,8 @@ def manage():
         emails=emails,
         email_versions={u.id: email_version(emails.get(u.id, "")) for u in users},
         email_max=EMAIL_MAX,
-        allowed_domains=allowed_mail_domains(),
-        email_outside={uid for uid, email in emails.items() if not mail_domain_allowed(email, allowed_mail_domains())},
+        allowed_domains=domains,
+        email_outside={uid for uid, email in emails.items() if not mail_domain_allowed(email, domains)},
         users=users,
         local_usernames={u.username for u in users if is_local_account(u.username)},
         inactive_members=inactive_members,
@@ -7959,12 +7806,7 @@ def new_member():
     elif shift_error:
         flash(shift_error, "danger")
     else:
-        user = User(
-            username=username,
-            display_name=display_name,
-            role=role,
-            is_active=True,
-        )
+        user = User(username=username, display_name=display_name, role=role, is_active=True)
         if shift is not None:
             user.shift_link = UserShift(shift=shift)
         db.session.add(user)
@@ -7986,6 +7828,21 @@ def _same_member(user):
     flash(_STALE_MEMBERS, "warning")
     return False
 
+def _member_for_change(user_id):
+    """チーム管理のメンバーの表のフォーム(削除・メールアドレス・勤務)の対象の人。戻り値: (人, 応答 または None)。
+
+    書き込みのロックを取ってから読む。削除された人は「既に削除」、開いたときのログインIDと違う人(IDの再利用)は
+    案内して(_same_member)、チーム管理へ戻す応答を返す。
+    """
+    lock_for_write()
+    back = url_for("departments.manage")
+    user = db.session.get(User, user_id)
+    if user is None:
+        return None, flash_redirect("このメンバーは既に削除されています。", "info", back)
+    if not _same_member(user):
+        return user, redirect(back)
+    return user, None
+
 @departments_bp.route("/members/<int:user_id>/delete", methods=["POST"])
 @manager_required
 def delete_member(user_id):
@@ -7998,19 +7855,17 @@ def delete_member(user_id):
     書き込みのロックを取ってから業務データの有無を確かめる(同時に保存されたタスクの担当などを見落として、
     行ごと削除しないように。削除した人のIDは次に追加した人に再利用されるため)。
     """
-    lock_for_write()
-    user = db.session.get(User, user_id)
-    if user is None:
-        return flash_redirect("このメンバーは既に削除されています。", "info", url_for("departments.manage"))
-    if not _same_member(user):
-        return redirect(url_for("departments.manage"))
+    user, done = _member_for_change(user_id)
+    if done:
+        return done
+    back = url_for("departments.manage")
     if user.id == current_user.id:
-        return flash_redirect("自分自身は削除できません。", "warning", url_for("departments.manage"))
+        return flash_redirect("自分自身は削除できません。", "warning", back)
     if is_local_account(user.username):
         # 固定ローカル管理者はログインのたびに有効に戻る(無効化してもログインは止まらない)
         return flash_redirect(f"「{user.display_name}」({user.username})は固定ローカル管理者のため、削除・無効化できません"
                               "（ログインを止めるにはシステム管理の「基本設定」（admin）で ADMIN_PASSWORD を変更してください。"
-                              "変更すると、既にログインしているブラウザもログイン画面に戻ります）。", "warning", url_for("departments.manage"))
+                              "変更すると、既にログインしているブラウザもログイン画面に戻ります）。", "warning", back)
 
     name = user.display_name
     if _member_has_history(user):
@@ -8038,7 +7893,7 @@ def delete_member(user_id):
         db.session.commit()
         _revoke_login_sessions(user_key)
         flash(f"メンバー「{name}」を削除しました。", "success")
-    return redirect(url_for("departments.manage"))
+    return redirect(back)
 
 @departments_bp.route("/members/<int:user_id>/reactivate", methods=["POST"])
 @manager_required
@@ -8048,18 +7903,19 @@ def reactivate_member(user_id):
     無効化のときに外したチームの紐づけは戻らないため、紐づけが無ければその旨を案内する。
     """
     lock_for_write()  # 確かめてから保存するまでの間に、同時に押された復帰・削除が入らないように
+    back = url_for("departments.manage")
     user = get_or_404(User, user_id)
     if not _same_member(user):
-        return redirect(url_for("departments.manage"))
+        return redirect(back)
     if user.is_active:
-        return flash_redirect(f"メンバー「{user.display_name}」は既に有効です（変更していません）。", "info", url_for("departments.manage"))
+        return flash_redirect(f"メンバー「{user.display_name}」は既に有効です（変更していません）。", "info", back)
     user.is_active = True
     db.session.commit()
     flash(f"メンバー「{user.display_name}」を復帰しました。", "success")
     if not user.departments:
         flash("チームの紐づけは外れたままです（無効化したときに外しました）。"
               "必要なら下の「メンバーの紐づけ」で設定してください。", "info")
-    return redirect(url_for("departments.manage"))
+    return redirect(back)
 
 @departments_bp.route("/new", methods=["POST"])
 @manager_required
@@ -8106,11 +7962,12 @@ def save_memberships():
     diff_mode = request.form.get("was_shown") == "1"
     # 紐づける人の確認から保存までの間に、その人が削除されないように(メンバーの削除と1つずつにする)
     lock_for_write()
+    back = url_for("departments.manage")
     if not shown_dept_ids and Department.query.count() == 0:
-        return flash_redirect(_NO_DEPARTMENTS, "info", url_for("departments.manage"))
+        return flash_redirect(_NO_DEPARTMENTS, "info", back)
     if not shown_keys or not shown_dept_ids:
         return flash_redirect("紐づけの表の内容を読み取れませんでした（保存していません）。画面を開き直してから保存してください。",
-                              "warning", url_for("departments.manage"))
+                              "warning", back)
     members, stale = users_from_form_keys(shown_keys, get_active_users())
     # チームは件数が少ないため、すべて読んでから選ぶ(送られたIDの一覧を SQL に渡すと、件数がとても多い
     # 送信で SQL の変数の上限を超えて内部エラーになる)
@@ -8134,14 +7991,14 @@ def save_memberships():
                 elif not wanted and user in current:
                     dept.users.remove(user)
     if not commit_or_conflict():
-        return redirect(url_for("departments.manage"))
+        return redirect(back)
     flash("チームの紐づけを保存しました。", "success")
     if kept:
         flash(f"画面を開いた後に、ほかの操作で変更された紐づけ（{kept}件）は、今の状態のまま残しています"
               "（この画面で付けた・外したチェックだけを保存しました）。", "info")
     if stale:
         flash("画面を開いた後に削除・無効化されたメンバーの紐づけは変更していません。", "info")
-    return redirect(url_for("departments.manage"))
+    return redirect(back)
 
 # ==== 5-9. Excel データ出力 =======================================================================
 # 全データの Excel(.xlsx) 出力。マネージャーのみ(Blueprint 全体を managers_only〔2-5〕で確認)。
@@ -8168,12 +8025,7 @@ def _fmt(v):
         if len(v) * 2 > XLSX_CELL_MAX and _utf16_len(v) > XLSX_CELL_MAX:
             # Excel のセルの上限を超える部分は省略する(何も書かずに切り捨てられないよう、印を付ける)
             v = _cut_utf16(v, XLSX_CELL_MAX - _utf16_len(XLSX_TRUNCATED_MARK)) + XLSX_TRUNCATED_MARK
-        return v
     return v
-
-def _choices4(question):
-    """問題(または回答)の選択肢を4つに(足りない分は空。選択肢A〜Dの列)。"""
-    return (question.choice_list + ["", "", "", ""])[:4]
 
 def _utf16_len(text):
     """Excel が数える文字数(UTF-16 の単位。絵文字など U+10000 以上の文字は 2 と数える)。"""
@@ -8201,7 +8053,7 @@ def _xlsx_response(sheets, filename):
             values = [_fmt(c) for c in row]
             ws.append(values)
             # openpyxl は「=」で始まる文字列を数式として保存するため、文字列として書き出す
-            # (タスク名・コメント・AIが作った問題文や選択肢などが数式として計算されないように)。
+            # (タスク名・進捗の記載・スキルの説明などが数式として計算されないように)。
             # 追加した行のセルは行番号で取り出す(ws.max_row・ws[行] は書いたすべてのセルを数えるため、
             # 行ごとに使うと行の数の2乗の時間がかかる)
             for column in range(1, len(values) + 1):
@@ -8218,9 +8070,11 @@ def _xlsx_response(sheets, filename):
     wb.save(bio)
     return Response(
         bio.getvalue(),
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        mimetype=XLSX_MIMETYPE,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+XLSX_MIMETYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"   # Excel の応答(勤務表のひな形も)
 
 # ---- 各メニューのシート定義(現在データ＋履歴データ) ----
 def _tasks_sheets():
@@ -8244,16 +8098,10 @@ def _tasks_sheets():
         t.description, t.created_at, t.updated_at, t.skill_req_labels,
     ] for t in tasks]
 
-    changes = TaskStatusChange.query.order_by(
-        TaskStatusChange.task_id, TaskStatusChange.changed_at
-    ).all()
-    c_rows = [[
-        ch.task_id, ch.task.title if ch.task else "", ch.status, ch.changed_at,
-    ] for ch in changes]
+    changes = TaskStatusChange.query.order_by(TaskStatusChange.task_id, TaskStatusChange.changed_at).all()
+    c_rows = [[ch.task_id, ch.task.title if ch.task else "", ch.status, ch.changed_at] for ch in changes]
 
-    comments = TaskComment.query.order_by(
-        TaskComment.task_id, TaskComment.created_at
-    ).all()
+    comments = TaskComment.query.order_by(TaskComment.task_id, TaskComment.created_at).all()
     cm_rows = [[
         cm.task_id, cm.task.title if cm.task else "",
         cm.user.display_name if cm.user else "", cm.body, cm.created_at,
@@ -8309,9 +8157,7 @@ def _routine_sheets():
 
 def _skills_sheets():
     skills = Skill.query.order_by(Skill.skill_type, Skill.sort_order, Skill.name).all()
-    s_rows = [[
-        s.id, s.name, s.type_label, s.description, s.is_active, s.sort_order,
-    ] for s in skills]
+    s_rows = [[s.id, s.name, s.type_label, s.description, s.is_active, s.sort_order] for s in skills]
 
     ratings = SkillRating.query.order_by(SkillRating.user_id, SkillRating.skill_id).all()
     r_rows = [[
@@ -8444,10 +8290,7 @@ _RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"} | {
 
 def period_for(send_date, rule):
     """送信日と期間のルールから、対象期間 (開始日, 終了日) を返す(両端を含む7日間)。"""
-    if rule == PERIOD_INCL7:
-        end = send_date
-    else:
-        end = send_date - timedelta(days=1)
+    end = send_date if rule == PERIOD_INCL7 else send_date - timedelta(days=1)
     return end - timedelta(days=6), end
 
 def period_label(start, end):
@@ -8747,9 +8590,7 @@ COMMENT_MAX = 400
 def _join_lines(text, limit=None):
     """複数行のテキストを「 / 」区切りの1行にまとめる(長すぎる場合は切り詰める)。"""
     text = " / ".join(line.strip() for line in (text or "").splitlines() if line.strip())
-    if limit and len(text) > limit:
-        text = text[:limit] + "…"
-    return text
+    return _shorten(text, limit) if limit else text
 
 def _sort_key(fact):
     """期限の近い順(期限なしは最後)→タイトル順。"""
@@ -9009,6 +8850,11 @@ def _outcome(f):
     parts = [p for p in (f["outcome_quant"], f["outcome_qual"]) if p]
     return " ／ ".join(parts)
 
+def _outcome_suffix(f, prefix):
+    """成果(実績)の表記の前に prefix を付けたもの。成果が無ければ空文字。"""
+    outcome = _outcome(f)
+    return prefix + outcome if outcome else ""
+
 def _task_line(f):
     """タスク1件の1行表記(タイトル【状態】(優先度・開始・期限・規模))。"""
     info = ["優先度 {}".format(f["priority"] or "―"),
@@ -9042,9 +8888,7 @@ def person_material_text(p, period):
         "",
     ]
     _section(lines, "期間内に完了したタスク（成果は実績）", [
-        "{}（完了日 {}）{}".format(
-            f["title"], _mmdd(f["completed_on"]),
-            " 成果: " + _outcome(f) if _outcome(f) else "")
+        "{}（完了日 {}）{}".format(f["title"], _mmdd(f["completed_on"]), _outcome_suffix(f, " 成果: "))
         for f in p["completed"]
     ])
     _section(lines, "期間内の進捗記載（日付・タスク・記載者・内容）", [
@@ -9097,9 +8941,7 @@ def team_material_text(material, person_texts, period):
         for r in team["rows"]
     ])
     _section(lines, "期間内に完了したタスク", [
-        "{}（担当 {}）{}".format(
-            f["title"], f["assignees"] or "未割当",
-            " 成果: " + _outcome(f) if _outcome(f) else "")
+        "{}（担当 {}）{}".format(f["title"], f["assignees"] or "未割当", _outcome_suffix(f, " 成果: "))
         for f in team["completed_tasks"]
     ])
     _section(lines, "期限超過の未完了タスク", [
@@ -9176,9 +9018,7 @@ def team_rule_text(material, period):
     results = ["成果の合計（年換算）: 金額 {} ／ 時間 {}".format(
         _money(team["money_act"]), _hour(team["hour_act"]))] if team["completed"] else []
     results.extend(
-        "{}（担当 {}）{}".format(
-            f["title"], f["assignees"] or "未割当",
-            ": " + _outcome(f) if _outcome(f) else "")
+        "{}（担当 {}）{}".format(f["title"], f["assignees"] or "未割当", _outcome_suffix(f, ": "))
         for f in team["completed_tasks"]
     )
     _block(lines, "今週完了したタスクと成果", results)
@@ -9224,27 +9064,25 @@ class _AiSession:
         self.fallback = 0
 
     def write(self, messages, rule_text):
-        """AIで書く。使えなければ rule_text を使う。戻り値: (本文, AIを使ったか, 注記)"""
+        """AIで書く。使えなければ rule_text を使う。戻り値: (本文, 注記〔AIで書けたときは None〕)"""
         if not self.configured:
             self.fallback += 1
-            return rule_text, False, NOTE_AI_OFF
+            return rule_text, NOTE_AI_OFF
         text, error = ai_chat(messages)
         text = _clean_ai_reply(text) if error is None else ""
         if text:
             self.used += 1
-            return text, True, None
+            return text, None
         if self.error is None:
             self.error = error or "AIの応答が空でした。"
         self.fallback += 1
-        return rule_text, False, NOTE_AI_FAILED
+        return rule_text, NOTE_AI_FAILED
 
 def write_report(material, settings, created_on):
     """材料から、チーム全体と各人の文章を作る。
 
-    戻り値:
-      {"team": {"text", "ai", "note"},
-       "persons": [{"name", "text", "ai", "note", "no_activity"}],
-       "ai_configured", "ai_error", "ai_used", "ai_fallback"}
+    戻り値: {"team": {"text", "note"}, "persons": [{"name", "text", "note"}],
+             "ai_configured", "ai_error", "ai_used", "ai_fallback"}
     """
     period = period_label(material["start"], material["end"])
     ai = _AiSession()
@@ -9252,8 +9090,7 @@ def write_report(material, settings, created_on):
     persons = []
     for p in material["persons"]:
         if not p["has_activity"]:
-            persons.append({"name": p["name"], "text": no_activity_text(p),
-                            "ai": False, "note": None, "no_activity": True})
+            persons.append({"name": p["name"], "text": no_activity_text(p), "note": None})
             continue
         messages = _messages(
             _fill(settings["person_sample"], period, p["name"], created_on),
@@ -9262,9 +9099,8 @@ def write_report(material, settings, created_on):
             "上の材料だけを使って、{}の週報（個人分）を【見本】の見出し・順序・口調・分量に"
             "合わせて作成してください。氏名の見出しは不要です。".format(p["name"]),
         )
-        text, used_ai, note = ai.write(messages, person_rule_text(p))
-        persons.append({"name": p["name"], "text": text, "ai": used_ai,
-                        "note": note, "no_activity": False})
+        text, note = ai.write(messages, person_rule_text(p))
+        persons.append({"name": p["name"], "text": text, "note": note})
 
     team_name = "チーム全体"
     messages = _messages(
@@ -9274,10 +9110,10 @@ def write_report(material, settings, created_on):
         "上の材料だけを使って、チーム全体の週報を【見本】の見出し・順序・口調・分量に"
         "合わせて作成してください。メンバー別の集計表はシステムが別に付けるため、表は作らないでください。",
     )
-    text, used_ai, note = ai.write(messages, team_rule_text(material, period))
+    text, note = ai.write(messages, team_rule_text(material, period))
 
     return {
-        "team": {"text": text, "ai": used_ai, "note": note},
+        "team": {"text": text, "note": note},
         "persons": persons,
         "ai_configured": ai.configured,
         "ai_error": ai.error,
@@ -9459,6 +9295,7 @@ SEND_ACTIONS = {DELIVER_TEST: (TRIGGER_TEST, "テスト送信"), DELIVER_SEND: (
 
 DOCX_MAINTYPE = "application"
 DOCX_SUBTYPE = "vnd.openxmlformats-officedocument.wordprocessingml.document"
+DOCX_MIMETYPE = DOCX_MAINTYPE + "/" + DOCX_SUBTYPE
 
 _weekly_send_lock = threading.Lock()
 
@@ -9507,10 +9344,8 @@ def _build_weekly(app, start, end, send_date):
 
     material = collect_weekly_material(start, end, users)
     written = write_report(material, settings, send_date)
-    data = build_docx(
-        material, written, datetime.now(), display_app_name(app))
     return {
-        "data": data,
+        "data": build_docx(material, written, datetime.now(), display_app_name(app)),
         "filename": build_weekly_filename(settings["filename_pattern"], start, end, send_date),
         "subject": build_weekly_subject(settings["subject_pattern"], start, end, send_date),
         "body": render_pattern(settings["mail_body"], start, end, send_date),
@@ -9568,7 +9403,6 @@ def start_weekly_background(app, start, end, trigger, deliver, send_date=None):
 
 weekly_bp = managers_blueprint("weekly", "/weekly")  # マネージャーのみ(2-5)
 
-DOCX_MIMETYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 RUN_MAX_DAYS = 366
 # 「今すぐ作成」で指定できる期間の終わりの上限(期限が近いタスク〔終わりの DUE_SOON_DAYS 日後まで〕や
 # 期限超過〔終わりの翌日より前〕の判定で、date.max を超える日付を計算しないように)
@@ -9658,8 +9492,7 @@ def weekly_run_now():
     app = current_app._get_current_object()
 
     if action == DELIVER_DOWNLOAD:
-        result = run_weekly(
-            app, start, end, TRIGGER_MANUAL, DELIVER_DOWNLOAD)
+        result = run_weekly(app, start, end, TRIGGER_MANUAL, DELIVER_DOWNLOAD)
         if not result["ok"]:
             return flash_redirect(result["message"], "danger", url_for("weekly.index"))
         return _docx_response(result["data"], result["filename"], start, end)
@@ -10260,6 +10093,10 @@ def _comments_fingerprint(comments):
     raw = "\n".join("{}:{}".format(c.id, _value_digest(c.body)) for c in comments)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
+def _reply_line(value, limit):
+    """AI の応答の値を1行の文にする(制御文字を除き、長ければ limit 文字で切る)。"""
+    return one_line(clean_text(str(value or "")), limit)
+
 def queue_skill_judgment_safely(task_id, triggered_by_id):
     """queue_skill_judgment を呼ぶ(失敗してもタスクの保存の画面を 500 にしない。ログと案内を残す)。"""
     try:
@@ -10277,6 +10114,10 @@ def queue_skill_judgment(task_id, triggered_by_id):
     task = db.session.get(Task, task_id)
     if task is None:
         return None
+    return _start_new_judgment(task, triggered_by_id)
+
+def _start_new_judgment(task, triggered_by_id):
+    """タスクの判定の記録(待ち)を作って commit し、判定を始める。戻り値: 判定の記録。"""
     judgment = SkillAutoJudgment(task_id=task.id, task_title=one_line(task.title, 200),
                                  triggered_by_id=triggered_by_id, status=JUDGE_PENDING)
     db.session.add(judgment)
@@ -10333,8 +10174,16 @@ def _skill_order(skills):
     type_order = {t: i for i, t in enumerate(SKILL_TYPE_CHOICES)}
     return sorted(skills, key=lambda s: (type_order.get(s.skill_type, 99), s.sort_order, s.name))
 
+def _rating_levels(user_ids):
+    """メンバーの到達度 {(ユーザーID, スキルID): レベル}(user_ids が空なら DB を読まずに空)。"""
+    user_ids = list(user_ids)
+    if not user_ids:
+        return {}
+    return {(r.user_id, r.skill_id): r.level
+            for r in SkillRating.query.filter(SkillRating.user_id.in_(user_ids)).all()}
+
 def judgment_targets(task):
-    """判定の対象者: タスクに進捗を記載した有効なメンバー {ユーザーID: {"user", "comments"}}(記載の古い順)。"""
+    """(タスクのコメント〔記載の古い順〕, 判定の対象者〔進捗を記載した有効なメンバー {ユーザーID: {"user", "comments"}}〕)。"""
     comments = sorted(task.comments, key=lambda c: (c.created_at or datetime.min, c.id))
     targets = {}
     for c in comments:
@@ -10375,8 +10224,7 @@ def run_skill_judgment(judgment_id):
     if not ai_is_configured():
         return _finish_judgment(judgment, JUDGE_SKIPPED, "AIが未設定のため判定していません（{}）。設定の後に「判定し直す」で判定できます。".format(
             ai_missing_label()))
-    levels = {(r.user_id, r.skill_id): r.level
-              for r in SkillRating.query.filter(SkillRating.user_id.in_(list(targets))).all()}
+    levels = _rating_levels(targets)
     messages, omitted = build_judgment_messages(task, comments, targets, skills, levels)
     judgment.model = _ai_settings()["model"][:100]
     db.session.commit()  # AI の応答を待つ間、読み込みの取引を残さない
@@ -10386,8 +10234,8 @@ def run_skill_judgment(judgment_id):
         return None
     if error:
         return _finish_judgment(judgment, JUDGE_ERROR, "AIで判定できませんでした: {}".format(error))
-    data = parse_json_reply(reply_text, "{", "}")
-    if not isinstance(data, dict) or not isinstance(data.get("updates"), list):
+    data = _extract_json_object(reply_text)
+    if data is None or not isinstance(data.get("updates"), list):
         return _finish_judgment(judgment, JUDGE_ERROR, "AIの応答を読み取れませんでした（決められた形の JSON ではありません）。")
     applied, proposals, skipped = apply_judgment(judgment, data["updates"], load_skill_ai_settings()["step_limit"])
     if skipped is None:
@@ -10398,7 +10246,7 @@ def run_skill_judgment(judgment_id):
     message = "{}件のスキルを上げました。".format(applied) if applied else "上げられるスキルはありませんでした。"
     if omitted:
         message += "（記載が長いため、{}件の記載は材料に入れていません）".format(omitted)
-    note = one_line(clean_text(str(data.get("note") or "")), 300)
+    note = _reply_line(data.get("note"), 300)
     if note:
         message += " AIのメモ: {}".format(note)
     judgment.proposals = json.dumps(proposals, ensure_ascii=False)
@@ -10434,9 +10282,7 @@ def build_judgment_messages(task, comments, targets, skills, levels):
         "【スキル項目（有効なものすべて）】",
     ]
     for s in skills:
-        desc = _inline(s.description or "")
-        if len(desc) > SKILL_DESC_MAX:
-            desc = desc[:SKILL_DESC_MAX] + "…"
+        desc = _shorten(_inline(s.description or ""), SKILL_DESC_MAX)
         lines.append("S{} [{}] {}{}".format(s.id, s.skill_type, _inline(s.name), "：" + desc if desc else ""))
     lines += ["", "【対象者と今の到達度（書いていないスキルは Lv0）】"]
     for uid, t in targets.items():
@@ -10464,12 +10310,9 @@ def build_judgment_messages(task, comments, targets, skills, levels):
             role = "マネージャー"
         else:
             role = "対象外"
-        body = lf_text(c.body or "")
-        if len(body) > JUDGE_COMMENT_MAX:
-            body = body[:JUDGE_COMMENT_MAX] + "（以下省略）"
         entry = "C{} {} {}（{}）:\n{}".format(
             c.id, c.created_at.strftime("%Y/%m/%d %H:%M") if c.created_at else "―",
-            _inline(author.display_name if author else "（削除されたユーザー）"), role, _indent(body))
+            _inline(author.display_name if author else "（削除されたユーザー）"), role, _indent(_capped(c.body)))
         entries.append({"target": c.user_id in targets, "text": entry})
     # 長すぎるときは、対象者でない人の記載・古い記載から省く(対象者の最新の記載は残す)
     omitted = 0
@@ -10523,8 +10366,8 @@ def apply_judgment(judgment, updates, step_limit):
             continue
         p = {"user_id": int_like(item.get("user_id")), "skill_id": int_like(item.get("skill_id")),
              "level": int_like(item.get("level")),
-             "reason": one_line(clean_text(str(item.get("reason") or "")), 300),
-             "evidence": one_line(clean_text(str(item.get("evidence") or "")), 300), "result": ""}
+             "reason": _reply_line(item.get("reason"), 300), "evidence": _reply_line(item.get("evidence"), 300),
+             "result": ""}
         target = targets.get(p["user_id"])
         if target is None:
             p["result"] = "使わない（対象者ではない）"
@@ -10645,9 +10488,7 @@ def undoable_change_ids(changes):
     user_ids = {c.user_id for c in changes if c.source == CHANGE_AUTO and not c.is_undone}
     if not user_ids:
         return set()
-    levels = {(r.user_id, r.skill_id): r.level
-              for r in SkillRating.query.filter(SkillRating.user_id.in_(list(user_ids))).all()}
-    return {change.id for change in current_auto_changes(user_ids, levels).values()}
+    return {change.id for change in current_auto_changes(user_ids, _rating_levels(user_ids)).values()}
 
 def auto_marks_for(user_id, ratings):
     """今の到達度が自動更新によるもの {スキルID: 変更}(current_auto_changes)。ratings は {スキルID: 到達度の行}。"""
@@ -10661,7 +10502,9 @@ def auto_marks_for(user_id, ratings):
 # 最近90日の到達度の変更・前回の分析コメント。数値・一覧はアプリが作り、AI には作らせない。
 
 SKILL_MAP_AI_FILENAME = "skill_map_ai.json"
+SKILL_MAP_AI_LABEL = "スキルマップのAIの分析の結果"
 SKILL_MAP_AI_LOCK = threading.Lock()
+SKILL_AI_FILE_LOCK = threading.Lock()   # 結果のファイルの読み書き(_save_skill_map_ai)
 SKILL_MAP_AI_KEYS = (("summary", "まとめ", 3), ("strengths", "チームの強み", 5),
                      ("weaknesses", "チームの弱み・リスク", 5), ("actions", "アクションアイテム", 7))
 SKILL_MAP_MEMBER_KEYS = (("strengths", "強み"), ("weaknesses", "弱み"), ("next", "次に伸ばすこと"))
@@ -10676,7 +10519,7 @@ def _skill_map_ai_path():
 def load_skill_map_ai():
     """保存済みの分析コメント(無ければ空の辞書)。読めないファイルは error に理由を入れる。"""
     try:
-        data = read_json(_skill_map_ai_path(), "スキルマップのAIの分析の結果")
+        data = read_json(_skill_map_ai_path(), SKILL_MAP_AI_LABEL)
     except SettingsFileError as exc:
         return {"status": JUDGE_ERROR, "error": str(exc)}
     if not isinstance(data, dict):
@@ -10712,7 +10555,7 @@ def _skill_map_result(value, member_ids=None):
         uid = int_like(item.get("user_id"))
         if uid is None or (member_ids is not None and uid not in member_ids):
             continue
-        entry = {"user_id": uid, "name": one_line(clean_text(str(item.get("name") or "")), 60)}
+        entry = {"user_id": uid, "name": _reply_line(item.get("name"), 60)}
         entry.update({key: _str_items(item.get(key), SKILL_MAP_MEMBER_ITEMS) for key, _label in SKILL_MAP_MEMBER_KEYS})
         if any(entry[key] for key, _label in SKILL_MAP_MEMBER_KEYS):
             members.append(entry)
@@ -10723,14 +10566,12 @@ def _save_skill_map_ai(**values):
     """分析の状態・結果を保存する(渡さなかった項目は今の値のまま)。"""
     with SKILL_AI_FILE_LOCK:
         try:
-            current = read_json(_skill_map_ai_path(), "スキルマップのAIの分析の結果")
+            current = read_json(_skill_map_ai_path(), SKILL_MAP_AI_LABEL)
         except SettingsFileError:
             current = None
         current = current if isinstance(current, dict) else {}
         current.update(values)
         write_json(_skill_map_ai_path(), current)
-
-SKILL_AI_FILE_LOCK = threading.Lock()
 
 def skill_map_ai_lock(app=None):
     """スキルマップのAI分析の実行中の印(環境ごと。メインの環境は SKILL_MAP_AI_LOCK。17 章)。"""
@@ -10749,10 +10590,7 @@ def skill_map_material():
     members = _skill_users()
     member_ids = [u.id for u in members]
     skills = _skill_order(Skill.query.filter_by(is_active=True).all())
-    level = {}
-    if member_ids:
-        for r in SkillRating.query.filter(SkillRating.user_id.in_(member_ids)).all():
-            level[(r.user_id, r.skill_id)] = r.level
+    level = _rating_levels(member_ids)
     lines = ["【到達尺度（すべてのスキル共通）】"] + ["Lv{}: {}".format(i, label) for i, label in enumerate(SKILL_SCALE)]
     lines += ["", "【メンバー（スキル管理の対象。{}名）】".format(len(members))]
     lines += ["P{} {}（チーム: {}）".format(u.id, _inline(u.display_name), _inline(u.department_names) or "なし")
@@ -10760,9 +10598,7 @@ def skill_map_material():
     lines += ["", "【スキル項目（有効なもの {}件）と、Lv{}以上の人】".format(len(skills), SKILL_PROFICIENT_LEVEL)]
     for s in skills:
         holders = [u for u in members if level.get((u.id, s.id), 0) >= SKILL_PROFICIENT_LEVEL]
-        desc = _inline(s.description or "")
-        if len(desc) > 150:
-            desc = desc[:150] + "…"
+        desc = _shorten(_inline(s.description or ""), 150)
         lines.append("S{} [{}] {} ／ Lv{}以上 {}名{}{}".format(
             s.id, s.skill_type, _inline(s.name),
             SKILL_PROFICIENT_LEVEL, len(holders),
@@ -10802,9 +10638,10 @@ def skill_map_material():
             "。タスク「{}」".format(_inline(ch.task_title)) if ch.task_title else ""))
     if not changes:
         lines.append("（ありません）")
-    analysis = load_skill_map_ai().get("result")
+    previous = load_skill_map_ai()
+    analysis = previous.get("result")
     if analysis:
-        lines += ["", "【前回の AI の分析コメント（{}）】".format(load_skill_map_ai().get("generated_at") or "")]
+        lines += ["", "【前回の AI の分析コメント（{}）】".format(previous.get("generated_at") or "")]
         for key, label, _limit in SKILL_MAP_AI_KEYS:
             lines += ["・{}: {}".format(label, _inline(item)) for item in analysis.get(key) or []]
     return "\n".join(lines)
@@ -10863,8 +10700,8 @@ def run_skill_map_analysis(username):
         if error:
             _save_skill_map_ai(status=JUDGE_ERROR, error="AIで分析できませんでした: {}".format(error))
             return
-        data = parse_json_reply(text_value, "{", "}")
-        if not isinstance(data, dict):
+        data = _extract_json_object(text_value)
+        if data is None:
             _save_skill_map_ai(status=JUDGE_ERROR, error="AIの応答を読み取れませんでした（決められた形の JSON ではありません）。")
             return
         names = {u.id: u.display_name for u in members}
@@ -10887,9 +10724,6 @@ def run_skill_map_analysis(username):
 # 以前の版の「AIに相談」(/skills/chat/…)・「計画・メモ」(/skills/plans…)はなくした(404)
 
 HISTORY_PAGE_SIZE = 100
-
-def _wants_json():
-    return request.accept_mimetypes.best_match(["application/json", "text/html"]) == "application/json"
 
 def _skill_map_url(anchor="skill-ai"):
     return url_for("skills.list_skills") + "#" + anchor
@@ -10948,11 +10782,7 @@ def rerun_judgment(judgment_id):
         return flash_redirect("タスクが「完了」ではないため、判定し直せません（完了にすると判定します）。", "warning", back)
     if old.status in (JUDGE_PENDING, JUDGE_RUNNING):
         _finish_judgment(old, JUDGE_ERROR, "サーバーの停止・再起動などで中断しました（判定し直しました）。")
-    judgment = SkillAutoJudgment(task_id=task.id, task_title=one_line(task.title, 200),
-                                 triggered_by_id=current_user.id, status=JUDGE_PENDING)
-    db.session.add(judgment)
-    db.session.commit()
-    start_skill_judgment(current_app._get_current_object(), judgment.id)
+    _start_new_judgment(task, current_user.id)
     return flash_redirect("タスク「{}」の判定を始めました（数十秒かかることがあります。この画面を更新すると結果が表示されます）。".format(
         one_line(task.title, 60)), "info", back)
 
@@ -10993,11 +10823,12 @@ def skill_ai_panel_context():
 # 数値・一覧はすべてコード(この章)で計算する。AI には数値を計算・創作させない。
 # AI(課題の抽出・コメントへの対応の判定・あいまいさの判定・書き直し案・所見・まとめ・推奨アクション)は、
 # collect_analysis() の戻り値(下の「集計結果の形」)と、タスク・コメントなどの本文すべてを材料にする(9-5)。
-# 画面を開くとコードの集計がすぐに表示され、「AIで分析」は別スレッドで実行して instance/ai_analysis.json に
-# 最新の1回分だけを保存する(9-7)。AI が未設定・失敗のときも、コードの集計とルールによる推奨アクションは
-# そのまま表示する。
+# 画面に出すのは、そのうちの今すぐ対応が要る推奨アクションだけ(9-10)。
+# ダッシュボードを開くたびにコードで集計してまとめを作り(保存した AI の結果があれば反映する。9-8)、「AIで分析」は
+# 別スレッドで実行して instance/ai_analysis.json に最新の1回分だけを保存する(9-7)。AI が未設定・失敗のときは、
+# コードの集計とルールによる推奨アクションで表示する。
 # 期間:
-#   「期間内」  画面で選ぶ(直近 7/14/30/90 日、または日付の範囲。既定は直近30日。両端の日を含む)
+#   「期間内」  保存した AI の結果の期間、無ければ直近30日(「AIで分析」も直近30日。両端の日を含む。9-10)
 #   「現時点」  期限超過・期限が近いのに未着手・記載がない・保留・負荷・スキルの分布と偏り(今の状態)
 #   未完了のタスクは、期間に関係なく全履歴(すべてのコメント・状態の変更)を読む
 # 営業日は土日・祝日を除いて数える(2-4)。基準の日時は _now()(動作確認では app._now を差し替える)。
@@ -11005,14 +10836,14 @@ def skill_ai_panel_context():
 # チームの件数は、担当者のいないタスク・マネージャーだけが担当のタスクも含めて1件ずつ数える。
 # DB は読み取りのみ(テーブルは追加・変更しない)。
 # 集計結果の形(collect_analysis の戻り値。日付・日時は date / datetime のまま):
-#   now, period(9-2), settings(9-1), members [{id, name}]
+#   now, period(9-2), settings(9-1), members [{id, name, username}]
 #   tasks         {タスクID: タスクの材料(_analysis_task)。タイトル・説明・担当・状態・期限・規模・成果、
 #                  全コメント(記載者・日時・本文・マネージャーか・担当者か)・全状態の変更・完了日時(推定か)・
 #                  計画(plan。手順の数・完了の数・遅れの手順〔手順・予定日・営業日〕・次の手順)}
 #   person_task_ids {メンバーID: そのメンバーに関係するタスクIDの一覧(未完了・期間内に完了・期間内に動き)}
 #   progress      ① {done, started, overdue, due_soon, stale, hold, plan_delay, plan_missing, manager_comments, rows, team}
 #   skills        ② {updates, distribution, skills, thin_skills, operations, single_operations, concentration}
-#   outputs       ③ {tasks, rewrite, problem_counts, rows, team, lead_time}
+#   outputs       ③ {tasks, rewrite, problem_labels, rows, team}
 #   abilities     ④ {rows, progress_rewrite}
 #   actions       推奨アクション [{rank, category, title, target, reason, numbers, score}]
 # AI の結果を入れる欄(ai / suggestion)は None にしてある(保存した AI の結果を 9-8 で反映する)。
@@ -11083,7 +10914,7 @@ def ai_analysis_form_context(settings):
     }
 
 # ==== 9-2. AI分析: 期間と材料 =====================================================================
-# 期間の解釈(画面の ?period=7|14|30|90|range&from=YYYY-MM-DD&to=YYYY-MM-DD)と、
+# 期間の解釈(「AIで分析」のフォームの period=7|14|30|90|range・from・to〔YYYY-MM-DD〕。9-9)と、
 # タスク・コメント・状態の変更の読み込み(全タスク。DB は読み取りのみ)。
 # 完了日時 = 最後に「完了」にした状態の変更の日時。変更の記録が無い完了タスク(古いデータなど)は
 #            更新日時で代用し「推定」とする。
@@ -11092,23 +10923,23 @@ def ai_analysis_form_context(settings):
 ANALYSIS_PERIOD_DAYS = (7, 14, 30, 90)
 ANALYSIS_DEFAULT_DAYS = 30
 ANALYSIS_PERIOD_RANGE = "range"
+_ANALYSIS_PERIOD_ARGS = ("period", "from", "to")   # 期間の指定の項目(「AIで分析」のフォーム)
 # 日付で指定できる最初の日(これより前の日は指定の誤りとして直近30日で表示する。祝日の計算の範囲外を防ぐ)
 ANALYSIS_MIN_DATE = date(2000, 1, 1)
 
-# 画面・AI に渡す本文の1件あたりの最大文字数(一覧の表示用。AI には全文を渡す)
+# 一覧の行の最後の記載(last_comment)の本文の最大文字数(AI には全文を渡す)
 ANALYSIS_TEXT_PREVIEW = 120
 
 def analysis_period(args, today):
-    """画面の指定から期間を決める。
+    """期間の指定(「AIで分析」のフォーム・保存した結果の期間)から期間を決める。
 
     戻り値: {kind, days, start, end, start_dt, end_dt, label, business_days, error}
       kind  : "7" / "14" / "30" / "90" / "range"
       start / end : 期間の最初と最後の日(両端を含む)。範囲の指定で今日より後の日は今日にする
       error : 指定が正しくないときのメッセージ(そのときは直近30日)。ANALYSIS_MIN_DATE より前の日、
               すべてが今日より後の期間(開始日が今日より後。今日だけの1日に置き換えずに知らせる)も誤りとする
-      note  : 直近N日の指定と一緒に、表示の期間と違う開始日・終了日が送られたときの案内(日付は使わない)。
-              画面の期間のフォームは、開いたときの日付(shown_from / shown_to)も送る。日付の欄がそのまま
-              (前の期間の日付)なら、利用者は日付を指定していないので案内しない
+      note  : 直近N日の指定と一緒に、その期間と違う開始日・終了日が送られたときの案内(日付は使わない)。
+              shown_from / shown_to(以前の画面のフォームが送っていた、開いたときの日付)と同じ日付は案内しない
     直近N日の指定は半角の数字だけ(「030」は「30」にそろえる。全角の数字・長すぎる数字は誤り)。
     """
     kind = str(args.get("period") or "").strip()
@@ -11134,7 +10965,7 @@ def analysis_period(args, today):
                                 "{}〜{}".format(start.strftime("%Y/%m/%d"), end.strftime("%Y/%m/%d")))
         kind = ""
     if kind.isascii() and kind.isdigit() and len(kind) <= 4 and int(kind) in ANALYSIS_PERIOD_DAYS:
-        kind = str(int(kind))  # 「030」→「30」(画面の選択肢・AIで分析の hidden・保存する結果と同じ形にする)
+        kind = str(int(kind))  # 「030」→「30」(フォームの値・保存する結果と同じ形にする)
     else:
         if kind:
             error = error or "期間の指定が正しくありません（直近{}日で表示しています）。".format(
@@ -11146,10 +10977,8 @@ def analysis_period(args, today):
     if error is None:
         sent = [args.get("from"), args.get("to")]
         shown = [result["start"].isoformat(), result["end"].isoformat()]
-        # 画面を開いたときに日付の欄に入っていた日付(変えていない日付は指定とみなさない)
         before = [args.get("shown_from"), args.get("shown_to")]
         if any(v not in (None, "", w, b) for v, w, b in zip(sent, shown, before)):
-            # 日付の欄を変えても「期間内」が直近N日のままだと、日付は使われない(案内を出す)
             result["note"] = ("開始日・終了日の指定は、「期間内」で「日付で指定」を選んだときだけ使います"
                               "（直近{}日で表示しています）。".format(days))
     return result
@@ -11297,7 +11126,7 @@ def analysis_members():
     )
 
 # ==== 9-3. AI分析: 集計(①〜④) =====================================================================
-# ルールによる確認(AI を使わない)のしきい値。N1/N2 だけは画面(9-1)で変更できる。
+# ルールによる確認(AI を使わない)のしきい値。N1/N2 だけはシステム設定(9-1)で変更できる。
 
 # 件数がこれ未満の中央値・割合には「対象○件のため参考値」と付ける
 SMALL_SAMPLE = 5
@@ -11499,7 +11328,6 @@ def _task_ref(t):
         "task_id": t["id"],
         "title": t["title"],
         "status": t["status"],
-        "status_color": STATUS_COLORS.get(t["status"], "secondary"),
         "priority": t["priority"],
         "assignee_ids": t["assignee_ids"],
         "assignee_list": t["assignee_list"],
@@ -11565,14 +11393,12 @@ def _manager_comments(tasks, period, now):
                 in_period=in_period,
                 replied=bool(replies),
                 replied_user_ids=sorted({x["user_id"] for x in replies}),
-                first_reply_at=replies[0]["at"] if replies else None,
                 # 返信までの営業日数 / 返信が無いときは今までの経過営業日数
                 response_days=business_days_ago(c["at"], replies[0]["at"]) if replies else None,
                 elapsed_days=None if replies else business_days_ago(c["at"], now),
                 # 書かれてから今までの営業日数(返信の有無にかかわらず。要フォローの並べ替えに使う)
                 age_days=business_days_ago(c["at"], now),
                 later_comment_ids=[x["id"] for x in later],
-                later_changes=[ch for ch in t["changes"] if ch["at"] and c["at"] and ch["at"] > c["at"]],
                 judgement=MC_REPLIED if replies else MC_NO_REPLY,
                 # AI の判定(指示・質問・依頼の内容 / 対応済み・一部対応・未対応 / 残っている対応 / 根拠)
                 ai=None,
@@ -11739,23 +11565,18 @@ def _skill_updates_status(members, period):
     team = {key: sum(r[key] for r in rows) for key in ("auto_ups", "manual_ups", "manual_downs")}
     return {"changes": views, "rows": rows, "team": team}
 
-def _skills_section(members, period, now):
+def _skills_section(members, period):
     """② スキル状況(スキルの更新は期間内、分布・偏りは現時点)。
 
-    スキル管理を使わない環境(2-8)は、スキル項目・業務が無いときと同じ(空。画面にも出さない)。
+    スキル管理を使わない環境(2-8)は、スキル項目・業務が無いときと同じ(空)。
     """
     use_skills = feature_enabled(FEAT_SKILLS)
-    member_ids = [u.id for u in members]
     type_order = {t: i for i, t in enumerate(SKILL_TYPE_CHOICES)}
-    skills = sorted(Skill.query.filter_by(is_active=True).all(),
-                    key=lambda s: (type_order.get(s.skill_type, 99), s.sort_order, s.name)) if use_skills else []
-    level = {}
-    if member_ids and use_skills:
-        for r in SkillRating.query.filter(SkillRating.user_id.in_(member_ids)).all():
-            level[(r.user_id, r.skill_id)] = r.level
+    skills = _skill_order(Skill.query.filter_by(is_active=True).all()) if use_skills else []
+    level = _rating_levels([u.id for u in members]) if use_skills else {}
 
     # メンバーのスキル分布(区分ごとの Lv2以上の数・平均到達度・得意なスキル)
-    # strengths は画面用の上位5件、held は Lv1以上のすべて(AI の材料。省略しない)
+    # strengths は上位5件、held は Lv1以上のすべて(AI の材料。省略しない)
     distribution = []
     for u in members:
         types = {}
@@ -11774,8 +11595,7 @@ def _skills_section(members, period, now):
             "name": u.display_name,
             "types": types,
             "proficient_total": sum(t["proficient"] for t in types.values()),
-            "strengths": [{"skill_id": s.id, "name": s.name, "level": lv,
-                           "level_label": level_label(s.skill_type, lv)} for lv, s in held[:5]],
+            "strengths": [{"skill_id": s.id, "name": s.name, "level": lv} for lv, s in held[:5]],
             "held": [{"skill_id": s.id, "name": s.name, "level": level.get((u.id, s.id), 0),
                       "skill_type": s.skill_type}
                      for s in skills if level.get((u.id, s.id), 0) >= 1],
@@ -11800,8 +11620,6 @@ def _skills_section(members, period, now):
             "skill_id": s.id,
             "name": s.name,
             "skill_type": s.skill_type,
-            "type_label": s.type_label,
-            "type_color": s.type_color,
             "holders": holders,
             "holder_count": len(holders),
             "thin": bool(members) and len(holders) <= 1,
@@ -11812,11 +11630,9 @@ def _skills_section(members, period, now):
 
     # 業務ごとに、必要スキルをすべて満たすメンバー。1名以下は「偏り」
     op_rows = []
-    no_reqs = 0
     for op in operations:
         reqs = [r for r in op.skill_reqs if r.skill_id in active_ids]
         if not reqs:
-            no_reqs += 1
             continue
         capable = [u for u in members
                    if all(level.get((u.id, r.skill_id), 0) >= r.level for r in reqs)]
@@ -11825,7 +11641,6 @@ def _skills_section(members, period, now):
             "name": op.name,
             "req_count": len(reqs),
             "capable": [u.display_name for u in capable],
-            "capable_ids": [u.id for u in capable],
             "capable_count": len(capable),
             "single": bool(members) and len(capable) <= 1,
         })
@@ -11854,10 +11669,7 @@ def _skills_section(members, period, now):
         "thin_skills": thin,
         "operations": op_rows,
         "single_operations": single_ops,
-        "operations_without_reqs": no_reqs,
         "concentration": concentration,
-        "proficient": SKILL_PROFICIENT_LEVEL,
-        "type_labels": SKILL_TYPE_LABELS,
     }
 
 # ---- ③ 成果物の状況 ----
@@ -11967,14 +11779,8 @@ def _outputs_section(tasks, members):
             suggestion=None,
         ))
     rows.sort(key=lambda r: r["completed_at"] or datetime.min, reverse=True)
-    result = {
-        "tasks": rows,
-        "gap_low": round(OUTCOME_GAP_LOW * 100),
-        "gap_high": round(OUTCOME_GAP_HIGH * 100),
-    }
-    result.update(outputs_summary(rows, [{"id": u.id, "name": u.display_name} for u in members],
-                                  OUTCOME_PROBLEM_LABELS))
-    return result
+    return {"tasks": rows, **outputs_summary(rows, [{"id": u.id, "name": u.display_name} for u in members],
+                                             OUTCOME_PROBLEM_LABELS)}
 
 def outputs_summary(rows, members, labels):
     """③ の書き直し推奨・指摘の種類ごとの件数・成果の合計・リードタイム(チームとヒト別)。
@@ -12026,8 +11832,14 @@ def _was_open_during(t, period):
         return False
     return t["completed_at"] is None or t["completed_at"] >= period["start_dt"]
 
+def _progress_rewrite_item(t, c, user_id, name, reason):
+    """④ の進捗記載の書き直し推奨の1件(t はタスクの材料、c はそのコメント)。"""
+    return {"task_id": t["id"], "title": t["title"], "status": t["status"], "comment_id": c["id"],
+            "user_id": user_id, "name": name, "at": c["at"], "body": c["body"], "reason": reason,
+            "ai": None, "suggestion": None}
+
 def _abilities_section(tasks, members, period, now, progress, outputs):
-    """④ 各人の能力(総合)。指導の参考の表(順位・点数は付けない。表示名順)。"""
+    """④ 各人の能力(総合)。指導の参考の値(順位・点数は付けない。表示名順)。"""
     today = now.date()
     # マネージャーダッシュボードと同じく有効なユーザー全員で計算する(マネージャーとの共同担当のタスクも
     # 同じ人数で均等割りにする。メンバーだけで計算すると、メンバーに全部の工数が計上されるため)
@@ -12042,20 +11854,13 @@ def _abilities_section(tasks, members, period, now, progress, outputs):
     for u in members:
         mine = [t for t in tasks.values() if u.id in t["assignee_ids"]]
         open_during = [t for t in mine if _was_open_during(t, period)]
-        comments = [dict(c, task_id=t["id"], title=t["title"], status=t["status"],
-                         status_color=STATUS_COLORS.get(t["status"], "secondary"))
-                    for t in mine for c in t["comments"]
-                    if c["user_id"] == u.id and _in_period(c["at"], period)]
-        comments.sort(key=lambda c: c["at"])
+        comments = sorted(((t, c) for t in mine for c in t["comments"]
+                           if c["user_id"] == u.id and _in_period(c["at"], period)), key=lambda tc: tc[1]["at"])
         vague = []
-        for c in comments:
+        for t, c in comments:
             reason = progress_comment_issue(c["body"])
             if reason:
-                item = {"task_id": c["task_id"], "title": c["title"], "status": c["status"],
-                        "status_color": c["status_color"],
-                        "comment_id": c["id"], "user_id": u.id, "name": u.display_name,
-                        "at": c["at"], "body": c["body"], "reason": reason,
-                        "ai": None, "suggestion": None}
+                item = _progress_rewrite_item(t, c, u.id, u.display_name, reason)
                 vague.append(item)
                 progress_rewrite.append(item)
         frequency = (round(len(comments) / (len(open_during) * weeks), 2)
@@ -12091,7 +11896,7 @@ def _abilities_section(tasks, members, period, now, progress, outputs):
             "ai": None,
         })
     progress_rewrite.sort(key=lambda i: i["at"], reverse=True)
-    return {"rows": rows, "progress_rewrite": progress_rewrite, "weeks": round(weeks, 1)}
+    return {"rows": rows, "progress_rewrite": progress_rewrite}
 
 # ---- 対象者ごとの関係するタスク(AI の材料の単位) ----
 def _is_relevant_to_period(t, period):
@@ -12107,7 +11912,7 @@ def collect_analysis(period, now, settings):
     members = analysis_members()
     tasks = load_analysis_tasks(period, now.date())
     progress = _progress_section(tasks, members, period, now, settings)
-    skills = _skills_section(members, period, now)
+    skills = _skills_section(members, period)
     outputs = _outputs_section(tasks, members)
     abilities = _abilities_section(tasks, members, period, now, progress, outputs)
     person_task_ids = {
@@ -12155,7 +11960,7 @@ ACTION_CAPS = {
     "outcome": 2,
     "progress_writing": 1,
 }
-# ルールの推奨アクションの元になる項目(画面の説明。_action_candidates で作る種類と揃える)
+# ルールの推奨アクションの元になる項目(_action_candidates で作る種類と揃える)
 RULE_ACTION_SOURCES = (
     "期限超過", "マネージャーのコメントに返信なし", "計画の遅れ", "進行中なのに記載がない", "期限が近いのに未着手",
     "計画なし", "長い保留", "負荷が高い（{}h/月以上）".format(_LOAD_FULL), "対応できる人が1名以下の業務",
@@ -12195,10 +12000,8 @@ def _ask(item, with_assignee, without_assignee):
     return who + with_assignee if who else without_assignee
 
 def overdue_days_label(item):
-    """期限超過の日数の表示(「N営業日」。今日が土日祝で 0営業日のときは暦日の超過日数も付ける)。"""
-    if item["overdue_days"] == 0 and item.get("calendar_days"):
-        return "0営業日（{}日超過・休日）".format(item["calendar_days"])
-    return "{}営業日".format(item["overdue_days"])
+    """期限超過の日数の表示(business_delay_label。item は期限超過の行)。"""
+    return business_delay_label(item["overdue_days"], item.get("calendar_days"))
 
 def _analysis_date(d, data):
     """推奨アクション・AI に送る候補とチームの材料の日付(分析の基準の日時と同じ年は mm/dd、それ以外は yyyy/mm/dd)。
@@ -13887,7 +13690,7 @@ class AnalysisRun:
         skipped_no_task = 0
         if self.skipped is not None:
             # 途中で中止した: まとめた「未読込」から保存しない作業用の値を外し、中止したことを結果の先頭に書く
-            # (行わなかった呼び出しの回数 calls は残す。画面の「読み込めなかった呼び出し」の回数に使う)
+            # (行わなかった呼び出しの回数 calls は残す。_ai_result_summary の unread_calls に使う)
             calls = self.skipped["calls"]
             skipped_no_task = self.skipped.pop("no_task_calls")
             self.skipped.pop("task_ids")
@@ -14038,7 +13841,7 @@ class AnalysisRun:
     def take_chunk(self, parsed, items):
         """1回分の応答から、判定を頼んだ項目の結果を取り出す(数値はそのタスクの材料にあるものだけ)。
 
-        判定に使った材料の指紋(fp)を一緒に保存する(分析の後に材料が変わった項目は、画面で判定を使わない。9-8)。
+        判定に使った材料の指紋(fp)を一緒に保存する(分析の後に材料が変わった項目は、反映のときに判定を使わない。9-8)。
         """
         tasks = self.data["tasks"]
         result = self.result
@@ -14459,7 +14262,7 @@ def _set_progress(done, total, step):
 def run_ai_analysis_job(app, args):
     """AIで分析して結果を保存する(呼び出したスレッドで最後まで実行)。
 
-    args は期間の指定(画面の period / from / to)。戻り値: (ok, message)。例外は外に出さない。
+    args は期間の指定(「AIで分析」のフォームの period / from / to)。戻り値: (ok, message)。例外は外に出さない。
     """
     with app.app_context():
         try:
@@ -14487,8 +14290,8 @@ def run_ai_analysis_job(app, args):
         return ok, message
 
 def start_ai_analysis(app, args):
-    """AI分析を別スレッドで始める(画面の「AIで分析」)。既に実行中なら何もせず False を返す。"""
-    args = {key: str(args.get(key) or "") for key in ("period", "from", "to")}
+    """AI分析を別スレッドで始める(ダッシュボードの「AIで分析」)。既に実行中なら何もせず False を返す。"""
+    args = {key: str(args.get(key) or "") for key in _ANALYSIS_PERIOD_ARGS}
     # 期間の表示は始める前に決めておく(スレッドが期間を計算するまでの間も、実行中の表示に期間を出す)
     try:
         label = analysis_period(args, _now().date())["label"]
@@ -14504,8 +14307,8 @@ def start_ai_analysis(app, args):
 
 # ==== 9-8. AI分析: 結果の反映(画面・チームのまとめの材料) =========================================
 # 保存した AI の結果を、コードの集計(collect_analysis の戻り値)に ID で結び付けて反映する。
-# 画面では、表示している期間と結果の期間(開始日・終了日)が同じときだけ反映する
-# (違うときは、結果の期間で表示するためのリンクを出す)。
+# 集計の期間と結果の期間(開始日・終了日)が同じときだけ反映する(_analysis_ai_view。エグゼクティブサマリーは
+# 結果の期間で集計する。9-10)。
 # AI の結果が無い項目は ai_state に「未読込」(読めなかった材料)・「判定なし」(読んだが応答に無い)・
 # 「分析の後に追加」(分析の後に増えた項目)を入れる。
 # 分析の後に判定の材料が変わった項目(後のコメント・状態の変更・コメントの書き換え・成果の書き直しなど)は、
@@ -14690,10 +14493,8 @@ def recount_manager_comments(data):
         mine = [i for i in items if row["user_id"] in i["assignee_ids"]]
         row["mc_total"] = len(mine)
         row["mc_no_reply"] = sum(1 for i in mine if not i["replied"])
-        row["mc_follow"] = sum(1 for i in mine if i["judgement"] in MC_FOLLOW)
     progress["team"]["mc_total"] = len(items)
     progress["team"]["mc_no_reply"] = mc["no_reply"]
-    progress["team"]["mc_follow"] = len(follow)
     # ④ のマネージャーのコメントへの返信(期間内に書かれたもの。対応不要と判定されたものは除く)。
     # 返信は本人が書いたものだけを数える(複数担当で共同担当だけが返信したものは mc_replied_other)。
     # 対応済みはタスクとしての判定(だれが対応したかは問わない)
@@ -14852,11 +14653,8 @@ def apply_ai_result(data, stored):
             t, c = found
             if c["user_id"] not in member_names or c["user_id"] not in t["assignee_ids"]:
                 continue
-            item = {"task_id": t["id"], "title": t["title"], "status": t["status"],
-                    "status_color": STATUS_COLORS.get(t["status"], "secondary"),
-                    "comment_id": cid, "user_id": c["user_id"], "name": member_names[c["user_id"]],
-                    "at": c["at"], "body": c["body"], "reason": "AIの判定: {}".format(ai.get("reason") or "具体性が低い"),
-                    "ai": None, "suggestion": None}
+            item = _progress_rewrite_item(t, c, c["user_id"], member_names[c["user_id"]],
+                                          "AIの判定: {}".format(ai.get("reason") or "具体性が低い"))
             ab["progress_rewrite"].append(item)
             by_id[cid] = item
         item["ai"] = ai
@@ -14891,7 +14689,7 @@ def apply_ai_result(data, stored):
     # 担当者のいないタスクを読んだ結果(チームのまとめの材料)
     data["ai_other_notes"] = _str_list(stored.get("other_notes"))
 
-    # ② スキル・まとめ・推奨アクション(画面で箇条書きにする値は文字列のリストに整える)
+    # ② スキル・まとめ・推奨アクション(箇条書きの値は文字列のリストに整える)
     data["skills"]["ai"] = _str_lists(stored.get("skills"), SKILLS_AI_KEYS)
     team = _dict_or_empty(stored.get("team"))
     data["ai_summary"] = _str_lists(team.get("summary"), SUMMARY_KEYS)
@@ -14906,7 +14704,7 @@ def _checked_action(action, data):
     """保存した AI の推奨アクションの対象が今もあるかを確かめる(無い・別のものになっていれば target に stale)。
 
     タスクの ID は削除した後に別のタスクに再利用されることがあるため、分析のときのタスクの印(tid)と比べる
-    (stale の対象はリンクにせず「分析の後に変更あり」などと表示する)。分析の後にタスクの材料が変わったもの
+    (stale はエグゼクティブサマリーで対象の後ろに書く。9-10)。分析の後にタスクの材料が変わったもの
     (完了した・コメントに返信が来たなど。保存した指紋 fp と比べる)も「分析の後に変更あり」にする。
     target が無い・辞書でない(手で書き換えたファイルなど)ときは、対象なしとして表示する(画面を 500 にしない)。
     """
@@ -14945,8 +14743,6 @@ def ai_result_matches(stored, period):
 # GET  /manager/analysis          以前の「AI分析（サマリーと推奨アクション）」の画面の URL。画面はなくした
 #                                 (エグゼクティブサマリーだけを使う)ため、マネージャーダッシュボードへ移す
 # マネージャーのみ(manager_required〔2-5〕。メンバーは 403、未ログインはログイン画面)。
-
-_ANALYSIS_PERIOD_ARGS = ("period", "from", "to")
 
 def _ai_result_summary(stored):
     """保存した結果の見出しの表示用の値(型の違う値は既定の値にする。手で書き換えたファイルなど)。"""
@@ -15018,14 +14814,13 @@ def analysis_dashboard():
 def analysis_run():
     """「AIで分析」: 送られた期間(ダッシュボードは既定の直近N日)で別スレッドの実行を始め、ダッシュボードに戻る。"""
     args = {key: request.form.get(key, "").strip() for key in _ANALYSIS_PERIOD_ARGS}
-    back = url_for("manager.dashboard")
     if not ai_is_configured():
         flash("AIが未設定のため、AIで分析できません。{}。".format(ai_missing_label()), "danger")
     elif start_ai_analysis(current_app._get_current_object(), args):
         flash("AIで分析を始めました。終わると結果がこの画面に表示されます（人数・タスクの数によっては数分かかります）。", "info")
     else:
         flash("AIで分析しています。終わってからもう一度お試しください。", "warning")
-    return redirect(back)
+    return redirect(url_for("manager.dashboard"))
 
 @manager_bp.route("/analysis/status", endpoint="analysis_status")
 @manager_required
@@ -15039,10 +14834,9 @@ def analysis_status():
 #   期間 : 保存した AI の結果があればその期間(AI の推奨アクションをそのまま出すため)、無ければ既定の直近30日
 #   文章 : 時点・人数 → 要対応の件数 → いま対応すること(今すぐ対応が要る種類の推奨アクションだけ。AI の結果が
 #          あれば AI が選んだもの、無ければ集計のルールで選んだもの。急がない改善と状況の説明は出さない)
-# 「AIで分析」はダッシュボードからも実行できる(既定の直近30日。終わるとダッシュボードを読み直して表示する)。
+# 「AIで分析」はダッシュボードから実行する(既定の直近30日。終わるとダッシュボードを読み直して表示する)。
 
-ANALYSIS_BACK_DASHBOARD = "dashboard"   # 「AIで分析」のフォームの back(以前の画面との区別。今はいつもダッシュボードに戻る)
-SUMMARY_REASON_MAX = 200                # 推奨アクションの理由の文字数(まとめの中。長ければ「…」)
+SUMMARY_REASON_MAX = 200   # 推奨アクションの理由の文字数(まとめの中。長ければ「…」)
 
 def _summary_period(stored, today):
     """まとめの期間: 保存した AI の結果の期間(読めて正しければ)、無ければ既定の直近N日。"""
@@ -15237,7 +15031,7 @@ def shift_to_business_day(d, holiday_rule):
 
 def last_business_day_of_month(year, month):
     """その月の最終営業日。"""
-    d = date(year, month, calendar.monthrange(year, month)[1])
+    d = date(year, month, month_days(year, month))
     for _ in range(_SEARCH_DAYS):
         if is_business_day(d):
             return d
@@ -15258,7 +15052,7 @@ def _raw_rule_dates(rule, first, last):
     elif rule.rule_type == RULE_MONTHLY:
         year, month = first.year, first.month
         while (year, month) <= (last.year, last.month):
-            end = calendar.monthrange(year, month)[1]
+            end = month_days(year, month)
             for value in rule.month_days:
                 if value == MONTH_LAST_BUSINESS_DAY:
                     yield last_business_day_of_month(year, month), False
@@ -15559,7 +15353,7 @@ def forget_user_for_reminders(user_id):
 # - 追加の宛先(アドレス)は、メンバーの保存では今の値のまま(画面の欄も読み取り専用)。送るのは、今のアドレスを
 #   マネージャーが保存したものだけ(routine_reminder_email_checks。以前の版でメンバーが入力したアドレスは、
 #   マネージャーが保存するまで送らず、業務の詳細・システム設定に「マネージャーの確認待ち」と表示する)。
-#   ログインできる人なら誰でも、会社の差出人で任意の社外のアドレスへ繰り返し送れてしまわないように
+#   ログインできる人なら誰でも、アプリの差出人で任意の外部のアドレスへ繰り返し送れてしまわないように
 
 REMINDER_FORM_MARK = "rem_shown"
 REMINDER_EXTRA_EMAILS_MAX = 10
@@ -15588,11 +15382,11 @@ def reminder_values(rem):
         return dict(REMINDER_DEFAULTS)
     return {
         "enabled": bool(rem.enabled),
-        "rule_type": rem.rule_type if rem.rule_type in RULE_TYPES else RULE_WEEKLY,
+        "rule_type": choice_or_default(rem.rule_type, RULE_TYPES, RULE_WEEKLY),
         "weekdays": rem.weekdays or "",
         "month_days": rem.month_days or "",
         "dates": rem.dates or "",
-        "holiday_rule": rem.holiday_rule if rem.holiday_rule in HOLIDAY_RULES else HOLIDAY_PREV,
+        "holiday_rule": choice_or_default(rem.holiday_rule, HOLIDAY_RULES, HOLIDAY_PREV),
         "start_date": rem.start_date,
         "extra_user_ids": rem.extra_user_ids or "",
         "extra_emails": rem.extra_emails or "",
@@ -15703,10 +15497,8 @@ def parse_reminder_form(form, choices, today, current_start=None, kept_emails=No
     errors = []
     values = dict(REMINDER_DEFAULTS)
     values["enabled"] = form.get("rem_enabled") == "1"
-    rule_type = form.get("rem_rule_type") or RULE_WEEKLY
-    values["rule_type"] = rule_type if rule_type in RULE_TYPES else RULE_WEEKLY
-    holiday_rule = form.get("rem_holiday_rule") or HOLIDAY_PREV
-    values["holiday_rule"] = holiday_rule if holiday_rule in HOLIDAY_RULES else HOLIDAY_PREV
+    values["rule_type"] = choice_or_default(form.get("rem_rule_type"), RULE_TYPES, RULE_WEEKLY)
+    values["holiday_rule"] = choice_or_default(form.get("rem_holiday_rule"), HOLIDAY_RULES, HOLIDAY_PREV)
 
     # 「²」のように isdigit() は真でも int() で読めない値は除く(to_ints。500 にしないため)
     weekdays = sorted({n for n in to_ints(form.getlist("rem_weekdays")) if n <= 6})
@@ -15889,28 +15681,34 @@ def reminder_recipients_for(routine, rem, users, emails):
     """業務のリマインドの宛先と、送れない宛先。
 
     users: {ユーザーID: User}、emails: {ユーザーID: アドレス}。
-    戻り値: (宛先 [{"address", "name", "kind", "user_id"}], 送れない宛先 [{"name", "reason", "kind"}])。
+    戻り値: (宛先 [{"address", "name", "kind", "user_id"}], 送れない宛先 [{"name", "reason", "kind"}。担当者は "user_id" も])。
     user_id はメンバーのアドレス(ユーザーの登録)ならそのユーザーID、追加の宛先に入力したアドレスなら None
     (業務の詳細で、ほかの人が登録したアドレスを表示してよいかの判断に使う)。
-    担当者(複数担当は全員)・追加の宛先(メンバー)は、有効でメールアドレスがある人だけに送る。無効化された人・
-    アドレスの無い人は送れない宛先にする。担当者でもある追加の宛先のメンバーは、担当者として1回だけ数える。追加の宛先のアドレスは、マネージャーが保存したもの(reminder_emails_checked)だけを送り、
+    担当者(複数担当は全員)・追加の宛先(メンバー)は、有効で送信を許可するドメインのアドレスがある人だけに送り、
+    ほかは送れない宛先にする。担当者でもある追加の宛先のメンバーは、担当者として1回だけ数える。
+    追加の宛先のアドレスは、マネージャーが保存したもの(reminder_emails_checked)だけを送り、
     確認待ちのものは送れない宛先(「アドレス N件」・マネージャーの確認待ち)にする。
     """
     recipients, problems = [], []
     domains = allowed_mail_domains()
+
+    def member_problem(user, user_id):
+        """メンバーに送れない理由(送れるなら None)。"""
+        if not user.is_active:
+            return "無効化されたメンバー"
+        if not emails.get(user_id):
+            return "メールアドレス未登録"
+        if not mail_domain_allowed(emails[user_id], domains):
+            return MAIL_DOMAIN_REASON
+        return None
+
     assignees = routine.assignee_list
     if not assignees:
         problems.append({"name": "（担当者なし）", "reason": "担当者がいません", "kind": "担当者"})
     for assignee in assignees:
-        if not assignee.is_active:
-            problems.append({"name": assignee.display_name, "reason": "無効化されたメンバー", "kind": "担当者",
-                             "user_id": assignee.id})
-        elif not emails.get(assignee.id):
-            problems.append({"name": assignee.display_name, "reason": "メールアドレス未登録", "kind": "担当者",
-                             "user_id": assignee.id})
-        elif not mail_domain_allowed(emails[assignee.id], domains):
-            problems.append({"name": assignee.display_name, "reason": MAIL_DOMAIN_REASON, "kind": "担当者",
-                             "user_id": assignee.id})
+        reason = member_problem(assignee, assignee.id)
+        if reason:
+            problems.append({"name": assignee.display_name, "reason": reason, "kind": "担当者", "user_id": assignee.id})
         else:
             recipients.append({"address": emails[assignee.id], "name": assignee.display_name, "kind": "担当者",
                                "user_id": assignee.id})
@@ -15919,12 +15717,9 @@ def reminder_recipients_for(routine, rem, users, emails):
         user = users.get(user_id)
         if user is None or user_id in assignee_ids:
             continue  # 削除された人(削除のときに除いているため、通常は無い)・担当者でもある人
-        if not user.is_active:
-            problems.append({"name": user.display_name, "reason": "無効化されたメンバー", "kind": "追加の宛先"})
-        elif not emails.get(user_id):
-            problems.append({"name": user.display_name, "reason": "メールアドレス未登録", "kind": "追加の宛先"})
-        elif not mail_domain_allowed(emails[user_id], domains):
-            problems.append({"name": user.display_name, "reason": MAIL_DOMAIN_REASON, "kind": "追加の宛先"})
+        reason = member_problem(user, user_id)
+        if reason:
+            problems.append({"name": user.display_name, "reason": reason, "kind": "追加の宛先"})
         else:
             recipients.append({"address": emails[user_id], "name": user.display_name, "kind": "追加の宛先",
                                "user_id": user_id})
@@ -15967,8 +15762,7 @@ REMINDER_SETTINGS = JsonSettings(
     "routine_reminder_settings.json", "定型業務リマインドの設定ファイル", REMINDER_SETTINGS_DEFAULTS,
     (("enabled", _as_bool), ("business_days_only", _as_bool)) + tuple((slot, hhmm_text) for slot in REMINDER_SLOTS),
     keep_auto_slots)
-load_reminder_settings = REMINDER_SETTINGS.load              # 現在の設定(読み込めなければ既定値)
-save_reminder_settings = REMINDER_SETTINGS.save              # 画面で編集した項目を保存する
+load_reminder_settings = REMINDER_SETTINGS.load  # 現在の設定(読み込めなければ既定値)
 
 def reminder_send_slots(settings):
     """送信の枠と時刻 [("HH:MM", 枠)] の一覧(早い順。同じ時刻の枠は先の枠〔time1〕だけ)。"""
@@ -16154,7 +15948,7 @@ def collect_reminder_mails(today, now, include_today=True):
     """未完了の回を宛先ごとにまとめたメールを作る(送らない)。
 
     include_today が False なら、実施予定日が今日の回は載せない(1日の最後より前の送信。reminder_includes_today)。
-    戻り値: {"today", "now", "items"(載せる未完了の回), "mails"(宛先ごと。アドレスの順),
+    戻り値: {"now", "items"(載せる未完了の回), "mails"(宛先ごと。アドレスの順),
              "today_count", "overdue_count", "include_today", "today_waiting"(載せなかった今日の回の数),
              "unreachable"(宛先が1つも無い回の数), "problems"(送れない宛先 [{"name", "reason", "kind", "count"}]),
              "link_problem", "base"}
@@ -16192,7 +15986,6 @@ def collect_reminder_mails(today, now, include_today=True):
                             include_today=include_today)
              for _key, box in sorted(boxes.items())]
     return {
-        "today": today,
         "now": now,
         "items": items,
         "mails": mails,
@@ -16245,7 +16038,6 @@ REMINDER_JOB = MailJob("定型業務リマインド", threading.Lock(), REMINDER
 
 def _send_reminder_mails(data):
     """本番の送信(宛先ごとに1通)。戻り値: (成否, 前回の結果のメッセージ)。"""
-    parts = []
     waiting = ("本日実施予定の {}件は、1日の最後の送信時刻に完了の入力が無ければ送ります".format(data["today_waiting"])
                if data.get("today_waiting") else "")
     if not data["items"]:
@@ -16263,8 +16055,8 @@ def _send_reminder_mails(data):
             sent += 1
         else:
             failures.append("{}（{}）".format(mail["address"], message.rstrip("。")))
-    parts.append("送信 {}通・失敗 {}通（本日実施 {}件・未完了 {}件）".format(
-        sent, len(failures), data["today_count"], data["overdue_count"]))
+    parts = ["送信 {}通・失敗 {}通（本日実施 {}件・未完了 {}件）".format(
+        sent, len(failures), data["today_count"], data["overdue_count"])]
     if waiting:
         parts.append(waiting)
     if data["unreachable"]:
@@ -16352,8 +16144,6 @@ account_bp = Blueprint("account", __name__, url_prefix="/account")
 
 _STALE_OCCURRENCE = ("この定型業務の回は見つかりません（業務・リマインドが削除された可能性があります）。"
                      "操作は行っていません。定型・定期業務の一覧から開き直してください。")
-# 完了の入力の後に戻る画面(フォームの back)
-OCCURRENCE_BACK_PAGES = ("list", "detail", "dashboard", "occurrence")
 
 def routine_list_panel(today, user):
     """定型業務の一覧の「未完了の定型業務」(リマインドが有効な業務が無い・リマインドを使わない環境〔2-8〕は None)。"""
@@ -16415,7 +16205,7 @@ def routine_reminder_panel(routine, today, user):
     }
 
 def _occurrence_back_url(occ, back):
-    """完了の入力・取り消しの後に戻る画面の URL。"""
+    """完了の入力・取り消しの後に戻る画面の URL(フォームの back: list・dashboard・occurrence。ほかは業務の詳細)。"""
     if back == "list" or occ is None:
         return url_for("routine.list_routines")
     if back == "dashboard":
@@ -16533,12 +16323,9 @@ def account_email():
 @manager_required
 def save_member_email(user_id):
     """メンバーのメールアドレスを保存する(チーム管理のメンバーの表。マネージャーのみ。空なら削除)。"""
-    lock_for_write()
-    user = db.session.get(User, user_id)
-    if user is None:
-        return flash_redirect("このメンバーは既に削除されています。", "info", url_for("departments.manage"))
-    if not _same_member(user):
-        return redirect(url_for("departments.manage"))
+    user, done = _member_for_change(user_id)
+    if done:
+        return done
     raw = request.form.get("email", "")
     value, error = check_email(raw)
     if error:
@@ -16558,7 +16345,8 @@ def save_member_email(user_id):
                           "success", url_for("departments.manage"))
 
 # #### 11. システム設定 ############################################################################
-# マネージャーのみ。アプリのすべての設定を1つの画面(タブ)で変更する。
+# 基本設定(すべての環境で共通の設定)の項目の定義・入力チェック・保存(11-1・11-2。画面はシステム管理〔admin だけ。
+# 18 章〕)と、システム設定の画面(11-3。マネージャーのみ。その環境のメールの宛先と機能の設定をタブで変更する)。
 # 週報・期限超過通知・スキル（AI）・AI分析・定型業務リマインドの入力チェックと表示用の値は、各機能の設定フォーム
 # (6-3・7-3・8-2・9-1・10-5)にあり(保存先も各機能の設定の保存のまま)、この画面から使う。
 # 各機能の画面には、実行・状況の表示だけが残る(設定はこの画面へのリンク)。
@@ -17132,11 +16920,7 @@ def _shown_unchanged(field, raw, current_value):
     """
     if field.type == TYPE_URL and url_has_userinfo(str(current_value or "")):
         return False
-
-    def norm(text):
-        return lf_text(text).strip()
-
-    return norm(raw) == norm(_display(field, current_value))
+    return lf_text(raw).strip() == lf_text(_display(field, current_value)).strip()
 
 def parse_config_form(form, initial, overrides):
     """フォームの入力を検証する。
@@ -17224,9 +17008,9 @@ def parse_config_form(form, initial, overrides):
 MAIL_DOMAIN_KEYS = ("MAIL_FROM",)
 
 def _check_mail_domains(initial, overrides, changes, errors):
-    """保存の後の差出人・宛先(To)・同報(Cc)が、送信を許可するドメインのアドレスか(この保存で変える項目だけ)。
+    """保存の後の差出人(MAIL_DOMAIN_KEYS)が、送信を許可するドメインのアドレスか(この保存で変える項目だけ)。
 
-    送信を許可するドメインを変えるときは、今の差出人・宛先・同報もそのドメインでなければならない
+    送信を許可するドメインを変えるときは、今の差出人もそのドメインでなければならない
     (先に直すか、同じ保存で直す)。ほかの項目だけの保存は、ここでは止めない(送信のときに除く。send_mail)。
     """
     key = "MAIL_ALLOWED_DOMAINS"
@@ -17386,7 +17170,7 @@ def _summary(field, value):
         text = "、".join(_display(field, value).split("\n"))
     else:
         text = str(value)
-    text = mask_url_userinfo(text) if field.type == TYPE_URL else _URL_USERINFO_IN_VALUE.sub(r"\1***@", text)
+    text = mask_url_userinfo(text) if field.type == TYPE_URL else _mask_userinfo_in_value(text)
     return text if len(text) <= 120 else text[:117] + "..."
 
 def _other_rows(app, initial):
@@ -17438,7 +17222,7 @@ URL_USERINFO_NOTICE = ("この URL には ID・パスワード（user:pass@ の�
                        "（このままでは基本設定を保存できません）。")
 
 def config_form_context(app, state=None, errors=None):
-    """基本設定タブの表示用の値。state / errors は保存エラーで再表示するときの入力と誤り。"""
+    """基本設定の画面(システム管理。18 章)の表示用の値。state / errors は保存エラーで再表示するときの入力と誤り。"""
     errors = errors or {}
     try:
         # 保存(一時ファイルからの置き換え)と同時に読むと、Windows では置き換えが PermissionError になるため、
@@ -17469,7 +17253,6 @@ def config_form_context(app, state=None, errors=None):
                 "field": field,
                 "is_set": _is_set(current.get(key)),
                 "has_override": has_override,
-                "in_initial": key in initial,
                 "initial_text": _summary(field, initial.get(key)) if key in initial else "（config.py に記載なし）",
                 "override_text": _summary(field, overrides.get(key)) if has_override else "",
                 "effective_text": _summary(field, current.get(key)),
@@ -17496,32 +17279,29 @@ def config_form_context(app, state=None, errors=None):
                     row["placeholder"] = ("初期値: {}".format(row["initial_text"]) if key in initial
                                           else _summary(field, None))
             rows.append(row)
-        groups.append({"key": group_key, "label": group_label, "rows": rows})
+        groups.append({"label": group_label, "rows": rows})
 
     return {
         "file_error": file_error,
         "can_save": file_error is None,
-        "exists": bool(store and store["exists"]),
         "version": str(store["version"]) if store is not None else "",
         "updated_at": store["updated_at"] if store is not None else "",
         "updated_by": store["updated_by"] if store is not None else "",
         "groups": groups,
         "other": _other_rows(app, initial),
         "pending": pending,
-        "error_count": len(errors),
         "mail_test_problem": check_mail_settings(test=True),
-        "mail_from": mail_settings()["mail_from"],
         **ai_context(),
     }
 
 # ==== 11-3. システム設定: 画面 ====================================================================
-# システム設定の画面(GET /system/settings?tab=<タブ>。タブ: config / weekly / overdue / skill_ai / analysis / reminder)。
-# マネージャーのみ(未ログインはログイン画面へ、メンバーは403)。保存は POST /system/settings/<タブ>(基本設定は
-# instance/settings.json〔画面の設定の層〕、機能の設定は FEATURES の各 JSON ファイル)。接続テスト(保存済みの設定で、
-# 差出人宛ての短いメール / 短い問い合わせ)は POST /system/settings/test-mail・test-ai、定型業務リマインドのテスト送信は
-# POST /system/settings/reminder/test。
+# システム設定の画面(GET /system/settings?tab=<タブ>。タブ: recipients / weekly / overdue / skill_ai / analysis /
+# reminder のうち、この環境で使う機能〔2-8〕のもの)。マネージャーのみ(未ログインはログイン画面へ、メンバーは403)。
+# 保存は POST /system/settings/<タブ>(FEATURES の各 JSON ファイル)、定型業務リマインドのテスト送信は
+# POST /system/settings/reminder/test。以前の基本設定・環境のタブと、基本設定の保存・接続テストの URL は
+# システム管理(18 章)へ送る(ADMIN_MOVED_TABS・_moved_to_admin)。
 # タブごとに別のフォーム・保存ボタンを持ち、保存後は同じタブに戻る(?tab= で開くタブを指定)。
-# 入力に誤りがあれば何も保存せず、入力中の内容(秘密の値は除く)を残して同じタブを再表示する。
+# 入力に誤りがあれば何も保存せず、入力中の内容を残して同じタブを再表示する。
 
 system_bp = managers_blueprint("system", "/system")  # マネージャーのみ(2-5)
 
@@ -17531,9 +17311,8 @@ TAB_SKILL_AI = "skill_ai"
 TAB_ANALYSIS = "analysis"
 TAB_REMINDER = "reminder"
 TAB_RECIPIENTS = "recipients"   # この環境のメールの宛先(週報・期限超過通知の宛先 MAIL_TO・MAIL_CC)
-# 以前のタブ(基本設定・環境)。システム管理(admin だけ。18 章)に移した(?tab= で開かれたときの移動先)
-TAB_CONFIG = "config"
-TAB_ENVS = "envs"
+# 以前のタブ(基本設定・環境)。システム管理(admin だけ。18 章)に移した({?tab= の値: 開いたときの移動先のパス})
+ADMIN_MOVED_TABS = {"config": "settings", "envs": "envs"}
 
 # (キー, 表示名, アイコン)
 TABS = (
@@ -17632,7 +17411,6 @@ def env_mail_form_context(settings):
     """「メールの宛先」タブの表示用の値(この環境の宛先)。すべての環境で共通の設定(基本設定)は出さない。"""
     domains = allowed_mail_domains()
     return {
-        "settings": settings,
         "to_text": "\n".join(settings["MAIL_TO"]),
         "cc_text": "\n".join(settings["MAIL_CC"]),
         "to_field": FIELD_MAP["MAIL_TO"],
@@ -17647,33 +17425,32 @@ def env_mail_form_context(settings):
 #   saved_message : 保存したときのメッセージ
 #   store         : 設定ファイル(2-3 の JsonSettings。読み込み・保存・読み込めないときの表示)
 #   parse         : フォームの入力の検証 → (保存する値, エラーメッセージの一覧)
-#   with_input    : 入力エラーで再表示するとき、保存済みの設定に入力中の値を重ねる
 #   context       : フォームの表示に使う値
 #   file_note     : 設定ファイルが読み込めないあいだの動き(タブに表示する)
-SettingsFeature = namedtuple("SettingsFeature", "label saved_message store parse with_input context file_note")
+SettingsFeature = namedtuple("SettingsFeature", "label saved_message store parse context file_note")
 
 FEATURES = {
     TAB_WEEKLY: SettingsFeature(
-        "週報", "週報の設定を保存しました。", WEEKLY_SETTINGS, parse_weekly_form, settings_with_input,
+        "週報", "週報の設定を保存しました。", WEEKLY_SETTINGS, parse_weekly_form,
         weekly_form_context, "週報は自動送信されず、週報の画面から作成・送信もできません"),
     TAB_OVERDUE: SettingsFeature(
-        "期限超過通知", "期限超過通知の設定を保存しました。", OVERDUE_SETTINGS, parse_overdue_form, settings_with_input,
+        "期限超過通知", "期限超過通知の設定を保存しました。", OVERDUE_SETTINGS, parse_overdue_form,
         overdue_form_context, "期限超過通知は自動送信されず、期限超過通知の画面から送信もできません"),
     TAB_SKILL_AI: SettingsFeature(
-        "スキル（AI）", "スキル（AI）の設定を保存しました。", SKILL_AI_SETTINGS, parse_skill_ai_form, settings_with_input,
+        "スキル（AI）", "スキル（AI）の設定を保存しました。", SKILL_AI_SETTINGS, parse_skill_ai_form,
         skill_ai_form_context, "スキルの自動更新は既定値の設定で動きます"),
     TAB_ANALYSIS: SettingsFeature(
-        "AI分析", "AI分析の設定を保存しました。", AI_ANALYSIS_SETTINGS, parse_ai_analysis_form, settings_with_input,
+        "AI分析", "AI分析の設定を保存しました。", AI_ANALYSIS_SETTINGS, parse_ai_analysis_form,
         ai_analysis_form_context, "AI分析は既定値の設定で動きます"),
     TAB_REMINDER: SettingsFeature(
         "定型業務リマインド", "定型業務リマインドの設定を保存しました。", REMINDER_SETTINGS, parse_reminder_settings_form,
-        settings_with_input, reminder_settings_form_context, "定型業務リマインドは自動送信されず、テスト送信もできません"),
+        reminder_settings_form_context, "定型業務リマインドは自動送信されず、テスト送信もできません"),
     TAB_RECIPIENTS: SettingsFeature(
         "メールの宛先", "メールの宛先を保存しました。", ENV_MAIL_SETTINGS, parse_env_mail_form,
-        settings_with_input, env_mail_form_context, "週報・期限超過通知は宛先に送れません"),
+        env_mail_form_context, "週報・期限超過通知は宛先に送れません"),
 }
 
-# AI接続テストで送る問い合わせ(短く、応答も短くなるもの)
+# システム管理(18 章)の AI接続テストで送る問い合わせ(短く、応答も短くなるもの)と、表示する応答の最大文字数
 AI_TEST_MESSAGES = [
     {"role": "user", "content": "接続テストです。「OK」とだけ返してください。"},
 ]
@@ -17694,12 +17471,8 @@ def _render_system_settings(tab, status=200, inputs=None, versions=None):
     contexts = {}
     for key, feature in FEATURES.items():
         saved = feature.store.load()
-        settings = inputs[key] if key in inputs else saved
-        contexts[key] = feature.context(settings)
+        contexts[key] = feature.context(inputs[key] if key in inputs else saved)
         contexts[key]["version"] = versions.get(key) or feature.store.version(saved)
-        if key in inputs:
-            # 入力中の値で再表示するとき、「保存済みの設定」の表示には保存済みの値を使う
-            contexts[key]["saved"] = feature.context(feature.store.load())
         # 設定ファイルが壊れている(読み込めない)ときは、タブにその旨を出す(表示は既定値。保存はできない)
         contexts[key]["file_error"] = feature.store.load_error()
         contexts[key]["file_error_note"] = feature.file_note
@@ -17734,8 +17507,6 @@ def system_settings():
 
 # 以前の基本設定の保存・接続テストの URL(POST)。システム管理(18 章)に移した(開いたままの以前の画面から送られた
 # とき用。admin だけが使える。エンドポイントの名前は以前と同じ。環境の追加・変更の URL は 17-5)
-ADMIN_MOVED_TABS = {TAB_CONFIG: "settings", TAB_ENVS: "envs"}
-
 def _moved_to_admin(path, **values):
     """システム管理の path へ 307 で送り直す(path の {名前} には URL の値を入れる)。"""
     return redirect(admin_url(path.format(**{k: quote(str(v), safe="") for k, v in values.items()})), code=307)
@@ -17745,7 +17516,7 @@ for _old, _endpoint, _path in (("config", "save_config", "settings"), ("test-mai
     system_bp.add_url_rule("/settings/" + _old, _endpoint, partial(_moved_to_admin, _path), methods=["POST"])
 del _old, _endpoint, _path
 
-# ---- 機能ごとの設定(週報・期限超過通知・スキル（AI）・AI分析・定型業務リマインド) ----
+# ---- 機能ごとの設定(メールの宛先・週報・期限超過通知・スキル（AI）・AI分析・定型業務リマインド) ----
 _SETTINGS_EDITED_ELSEWHERE = ("画面を開いた後に、ほかの操作（別のタブ・別のマネージャー）で{}の設定が変更されていたため、"
                               "保存していません。ほかの操作で変わった項目は今の設定にしてあります。"
                               "確認して、必要ならもう一度変更して保存してください。")
@@ -17761,32 +17532,33 @@ def _save_feature(tab):
     store = feature.store
     sent_version = request.form.get("version")
     values, errors = feature.parse(request.form)
+
+    def redisplay(status):
+        # 入力中の内容を残したまま再表示する(保存はしない。控えは開いたときのまま)
+        return _render_system_settings(tab, status=status, inputs={tab: settings_with_input(store.load(), values)},
+                                       versions={tab: sent_version})
+
     if errors:
         for message in errors:
             flash(message, "danger")
-        # 入力中の内容を残したまま再表示する(保存はしない。控えは開いたときのまま)
-        return _render_system_settings(tab, status=400,
-                                       inputs={tab: feature.with_input(store.load(), values)},
-                                       versions={tab: sent_version})
+        return redisplay(400)
     try:
         saved, changed = store.save_checked(values, sent_version)
     except OSError as exc:
         current_app.logger.exception("%sの設定を保存できませんでした", feature.label)
         flash("設定を保存できませんでした: {}".format(exc), "danger")
-        return _render_system_settings(tab, status=500,
-                                       inputs={tab: feature.with_input(store.load(), values)},
-                                       versions={tab: sent_version})
+        return redisplay(500)
     if saved is None:
         flash(_SETTINGS_EDITED_ELSEWHERE.format(feature.label), "warning")
         current = store.load()
         kept = {key: value for key, value in values.items() if key not in changed}
         return _render_system_settings(tab, status=409,
-                                       inputs={tab: feature.with_input(copy.deepcopy(current), kept)},
+                                       inputs={tab: settings_with_input(copy.deepcopy(current), kept)},
                                        versions={tab: store.version(current)})
     return flash_redirect(feature.saved_message, "success", _tab_url(tab))
 
-# POST /system/settings/<タブ> でそのタブの設定を保存する。エンドポイントは system.save_weekly / save_overdue / save_skill_ai /
-# save_analysis / save_reminder(画面の url_for で使う)
+# POST /system/settings/<タブ> でそのタブの設定を保存する。エンドポイントは system.save_recipients / save_weekly /
+# save_overdue / save_skill_ai / save_analysis / save_reminder(画面の url_for で使う)
 for _tab in FEATURES:
     system_bp.add_url_rule("/settings/" + _tab, "save_" + _tab, partial(_save_feature, _tab), methods=["POST"])
 del _tab
@@ -17810,7 +17582,8 @@ def test_reminder():
 
 # ==== 12-1. スケジューラ(週報・期限超過通知・定型業務リマインド) ==================================
 # 定期メールの自動送信スケジューラ(バックグラウンドのスレッド1本で、3つの仕事を確認する)。
-# 約30秒ごとに、ジョブ(JOBS: weekly 週報・overdue 期限超過通知・reminder 定型業務リマインド)ごとに設定(instance/ の JSON)を読み、
+# 約30秒ごとに、環境(17 章)ごと・ジョブ(JOBS: weekly 週報・overdue 期限超過通知・reminder 定型業務リマインド。
+# その環境で使う機能〔2-8〕のものだけ)ごとに設定(その環境の instance/ の JSON)を読み、
 # 実行時刻(各機能の due_key。リマインドは送信時刻1・2の枠ごと)なら1回だけ実行する。
 # - 起動するのは「flask --app app run」でサーバーとして動かしたときだけ(create_app() の最後で
 #   start_scheduler_once() を呼ぶ。seed / migrate コマンド・テスト・import では起動しない)。
@@ -17884,12 +17657,15 @@ def _execute(app, job, settings, now):
         except Exception:
             app.logger.exception("%sの前回の結果を保存できませんでした", job.label)
 
+def _auto_run_label(key):
+    """実行の分の表示(「2026/10/09 09:00」。リマインドは「2026/10/09 送信時刻1」)。key は due_key の戻り値。"""
+    return "{} {}".format(key[0].strftime("%Y/%m/%d"), REMINDER_SLOT_LABELS.get(key[1], key[1]))
+
 def _auto_started_message(key):
     """自動送信を始めたときに前回の結果に書いておく文(実行が終われば上書きされる)。key は due_key の戻り値。"""
-    slot = REMINDER_SLOT_LABELS.get(key[1], key[1])
-    return ("自動送信を開始しました（{} {} の分。開始 {}）。完了の記録がありません（処理中か、処理の途中で"
+    return ("自動送信を開始しました（{} の分。開始 {}）。完了の記録がありません（処理中か、処理の途中で"
             "サーバーが停止・再起動したなどで中断した可能性があります。中断した分は自動では送り直しません）。".format(
-                key[0].strftime("%Y/%m/%d"), slot, datetime.now().strftime("%H:%M")))
+                _auto_run_label(key), datetime.now().strftime("%H:%M")))
 
 def _check_job(app, job, fired, now, start_thread=True):
     """1つのジョブの確認。実行を始めた場合はそのスレッド(start_thread=False なら True)を返す。"""
@@ -17912,9 +17688,8 @@ def _check_job(app, job, fired, now, start_thread=True):
             app.logger.exception("%sの自動送信: 実行の印を記録できなかったため、実行していません（次の確認でもう一度試します）",
                                  job.label)
             try:
-                slot = REMINDER_SLOT_LABELS.get(key[1], key[1])
-                job.record_failure("自動送信の実行の印を設定ファイルに記録できなかったため、{} {} の分を実行していません"
-                                   "（同じ分のうちにもう一度試します）: {}".format(key[0].strftime("%Y/%m/%d"), slot, exc))
+                job.record_failure("自動送信の実行の印を設定ファイルに記録できなかったため、{} の分を実行していません"
+                                   "（同じ分のうちにもう一度試します）: {}".format(_auto_run_label(key), exc))
             except Exception:
                 app.logger.exception("%sの前回の結果を保存できませんでした", job.label)
             return None
@@ -17932,10 +17707,8 @@ def _check_job(app, job, fired, now, start_thread=True):
     if not start_thread:
         _execute(app, job, settings, now)
         return True
-    thread = threading.Thread(
-        target=_execute, args=(app, job, settings, now),
-        name="scheduled-{}".format(job.name), daemon=True,
-    )
+    thread = threading.Thread(target=_execute, args=(app, job, settings, now), name="scheduled-{}".format(job.name),
+                              daemon=True)
     thread.start()
     return thread
 
@@ -17989,9 +17762,7 @@ def start_scheduler(app, interval=CHECK_INTERVAL):
     with _scheduler_start_lock:
         if _scheduler_thread is not None and _scheduler_thread.is_alive():
             return _scheduler_thread
-        _scheduler_thread = threading.Thread(
-            target=_loop, args=(app, interval), name="mail-scheduler", daemon=True
-        )
+        _scheduler_thread = threading.Thread(target=_loop, args=(app, interval), name="mail-scheduler", daemon=True)
         _scheduler_thread.start()
     app.logger.info("定期メール（週報・期限超過通知・定型業務リマインド）の自動送信スケジューラを起動しました（%s秒ごとに確認）",
                     interval)
@@ -18002,6 +17773,21 @@ SCHEDULER_LOCK_FILENAME = "scheduler.lock"
 
 # ロックを取ったファイル(プロセスが終わるまで開いたままにする。閉じるとロックが外れる)
 _scheduler_lock_file = None
+
+def _os_file_lock(lock_file, mode):
+    """開いたファイルの OS のロック(先頭の1バイト。Windows は msvcrt、ほかは fcntl)。取れないときは OSError。
+
+    mode: "try" 待たずに取る / "wait" 取れるまで待つ(Windows は1秒おきに10回まで) / "release" 外す。
+    """
+    if os.name == "nt":
+        import msvcrt
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), {"try": msvcrt.LK_NBLCK, "wait": msvcrt.LK_LOCK,
+                                            "release": msvcrt.LK_UNLCK}[mode], 1)
+    else:
+        import fcntl
+        fcntl.flock(lock_file.fileno(), {"try": fcntl.LOCK_EX | fcntl.LOCK_NB, "wait": fcntl.LOCK_EX,
+                                         "release": fcntl.LOCK_UN}[mode])
 
 def _acquire_scheduler_lock(instance_path):
     """instance/scheduler.lock のロックを取る(待たない)。取れた(既に持っている)なら True。
@@ -18019,13 +17805,7 @@ def _acquire_scheduler_lock(instance_path):
     # 呼び出し元の start_scheduler_once() が受け止める(自動送信だけを止める)
     lock_file = open(os.path.join(instance_path, SCHEDULER_LOCK_FILENAME), "a+b")
     try:
-        if os.name == "nt":
-            import msvcrt
-            lock_file.seek(0)
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _os_file_lock(lock_file, "try")
     except OSError:
         lock_file.close()
         return False
@@ -18098,22 +17878,8 @@ def scheduler_is_stopped(app):
     except OSError:
         return True
     try:
-        if os.name == "nt":
-            import msvcrt
-            probe.seek(0)
-            try:
-                msvcrt.locking(probe.fileno(), msvcrt.LK_NBLCK, 1)
-            except OSError:
-                return False
-            probe.seek(0)
-            msvcrt.locking(probe.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-            try:
-                fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                return False
-            fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+        _os_file_lock(probe, "try")
+        _os_file_lock(probe, "release")
         return True
     except OSError:
         return False
@@ -18127,9 +17893,7 @@ def scheduler_is_stopped(app):
 # ファイルごとのセクションとしてまとめてある(TemplateSections で読む)。
 # テンプレート名・静的ファイルの URL(/static/...)はフォルダに分けていたときと同じ。
 
-TEMPLATES_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "templates.html"
-)
+TEMPLATES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates.html")
 # 区切りの行(「{#=== 名前 ===#}」だけの行)。次の区切りの行の前までが、その名前の中身
 _SECTION_MARKER = re.compile(r"^\{#=== (\S+) ===#\}\r?(?:\n|\Z)", re.MULTILINE)
 # 名前がこれで始まるセクションは静的ファイル(/static/<残りの名前> で配信する)
@@ -18240,7 +18004,7 @@ BLUEPRINTS = (
     routine_bp,
     leaves_bp,
     skills_bp,
-    # マネージャーダッシュボード(AI分析〔9 章〕の画面も同じ Blueprint)
+    # マネージャーダッシュボード(AI分析〔9 章〕の実行・状態の URL も同じ Blueprint)
     manager_bp,
     departments_bp,
     export_bp,
@@ -18260,7 +18024,7 @@ _SECRET_KEY_ATTEMPTS = 3
 def _lock_settings_file(instance_path):
     """instance/settings.lock のロックを取る(ほかのプロセスが持っていれば待つ)。戻り値: 開いたファイル、または None。
 
-    Windows(msvcrt.locking LK_LOCK)は1秒おきに10回まで試し、取れなければ OSError。ほかの OS は取れるまで待つ。
+    Windows は1秒おきに10回まで試し、ほかの OS は取れるまで待つ(12-2 の _os_file_lock)。
     取れない・開けない(権限など)ときは None(ロック無しで続ける。保存の後にファイルの鍵を読み直すので、
     最後はファイルの鍵に合わせる)。
     """
@@ -18269,13 +18033,7 @@ def _lock_settings_file(instance_path):
     except OSError:
         return None
     try:
-        if os.name == "nt":
-            import msvcrt
-            lock_file.seek(0)
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        _os_file_lock(lock_file, "wait")
     except OSError:
         lock_file.close()
         return None
@@ -18286,13 +18044,7 @@ def _unlock_settings_file(lock_file):
     if lock_file is None:
         return
     try:
-        if os.name == "nt":
-            import msvcrt
-            lock_file.seek(0)
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        _os_file_lock(lock_file, "release")
     except OSError:
         pass
     lock_file.close()
@@ -18462,7 +18214,7 @@ class SqliteIntConverter(IntegerConverter):
 # Flask の MAX_FORM_MEMORY_SIZE の既定値(バイト。設定が無いときの案内に使う)
 FORM_MEMORY_DEFAULT = 500_000
 
-# 403・404・405・500 の画面の見出しと案内(英語の既定の画面の代わり。errors/http_error.html)。
+# 400・403・404・405・500 の画面の見出しと案内(英語の既定の画面の代わり。errors/http_error.html)。
 # abort(403, description="見出し\n案内") のように説明を付けたときは、その見出し・案内を表示する
 HTTP_ERROR_PAGES = {
     400: ("送信された内容を受け付けられませんでした",
@@ -18620,7 +18372,7 @@ def check_same_origin():
             args = [(k, v) for k, v in request.args.items(multi=True) if k != GUARDED_GET_TOKEN]
             target = request.script_root + request.path + "?" + urlencode(args + [(GUARDED_GET_TOKEN, token)])
         response = make_response(render_template(
-            "errors/http_error.html", code=200, heading=CROSS_SITE_GET_HEADING, message=CROSS_SITE_GET_MESSAGE,
+            "errors/http_error.html", heading=CROSS_SITE_GET_HEADING, message=CROSS_SITE_GET_MESSAGE,
             confirm_url=target, confirm_label=label, confirm_post=post_confirm))
         response.headers["Cache-Control"] = "no-store"
         return response
@@ -18640,11 +18392,8 @@ def _new_app(env=None, shared_instance=None):
     env はほかの環境(17 章)のキー(メインの環境は None)。ほかの環境のアプリは instance/envs/<キー> を
     instance フォルダにし、基本設定は共通の instance フォルダ(shared_instance)から読む。
     """
-    if env is None:
-        app = Flask(__name__, instance_relative_config=True, static_folder=None, template_folder=None)
-    else:
-        app = Flask(__name__, instance_path=env_instance_path(shared_instance, env), instance_relative_config=True,
-                    static_folder=None, template_folder=None)
+    app = Flask(__name__, instance_path=None if env is None else env_instance_path(shared_instance, env),
+                instance_relative_config=True, static_folder=None, template_folder=None)
     # 運用の記録(設定の変更・自動送信・ほかのプロセスで動いているスケジューラなど。app.logger.info)は、
     # --debug でない通常の起動でも表示する(Flask のロガーは既定で WARNING 以上しか表示しないため)
     if app.logger.getEffectiveLevel() > logging.INFO:
@@ -18698,8 +18447,8 @@ def _new_app(env=None, shared_instance=None):
                 heading, message = custom.split("\n", 1)
             else:
                 message = custom
-        response = make_response(render_template(
-            "errors/http_error.html", code=error.code, heading=heading, message=message), error.code)
+        response = make_response(render_template("errors/http_error.html", heading=heading, message=message),
+                                 error.code)
         if isinstance(error, MethodNotAllowed) and error.valid_methods:
             response.headers["Allow"] = ", ".join(error.valid_methods)  # 既定の画面と同じく受け付ける方法
         return response
@@ -18714,7 +18463,7 @@ def _new_app(env=None, shared_instance=None):
             pass
         heading, message = HTTP_ERROR_PAGES[500]
         try:
-            return render_template("errors/http_error.html", code=500, heading=heading, message=message), 500
+            return render_template("errors/http_error.html", heading=heading, message=message), 500
         except Exception:
             app.logger.exception("500 の画面を作れませんでした")
             return Response(_PLAIN_500, status=500, mimetype="text/html")
@@ -18930,8 +18679,7 @@ def seed_command():
                              leave_type=LEAVE_FULL),
                 LeaveRequest(user_id=user_map["tanaka"].id, leave_date=later, leave_type=LEAVE_AM),
             ]
-            for lv in leaves:
-                db.session.add(lv)
+            db.session.add_all(leaves)
             db.session.commit()
             print(f"サンプル年休を {len(leaves)} 件作成しました。")
 
@@ -19080,19 +18828,17 @@ def _migrate_target_app(path, check_only=False):
     if not path:
         # 通常はアプリ本体(= instance/app.db)を対象にする
         app = current_app._get_current_object()
-        if check_only and "sqlalchemy" not in app.extensions and not os.path.isfile(instance_db_path(app)):
-            raise click.ClickException("DBファイルがありません: {}（--check のため作成していません）".format(
-                instance_db_path(app)))
-        if os.path.isfile(instance_db_path(app)):
-            _check_sqlite_file(instance_db_path(app))
+        db_file = instance_db_path(app)
+        if check_only and "sqlalchemy" not in app.extensions and not os.path.isfile(db_file):
+            raise click.ClickException("DBファイルがありません: {}（--check のため作成していません）".format(db_file))
+        if os.path.isfile(db_file):
+            _check_sqlite_file(db_file)
         prepare_instance(app, create_tables=False)
         return app
 
     _check_sqlite_file(path)
     app = Flask(__name__)
-    app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///{}".format(
-        os.path.abspath(path)
-    )
+    app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///{}".format(os.path.abspath(path))
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
     db.init_app(app)
     return app
@@ -19188,15 +18934,12 @@ def _migrate(app, check_only, db_path=None):
                     skipped.append("{}.{}".format(table, col))
                     continue
                 with db.engine.begin() as conn:
-                    conn.execute(text(
-                        'ALTER TABLE "{}" ADD COLUMN "{}" {}'.format(table, col, ddl_type)
-                    ))
+                    conn.execute(text('ALTER TABLE "{}" ADD COLUMN "{}" {}'.format(table, col, ddl_type)))
                 added += 1
                 print("  追加: {}.{}".format(table, col))
             print("列を {} 件追加しました。".format(added))
             if skipped:
-                print("★手動対応が必要(NOT NULL列のため自動追加不可):",
-                      ", ".join(skipped))
+                print("★手動対応が必要(NOT NULL列のため自動追加不可):", ", ".join(skipped))
 
         extras = unused_columns(insp, include_shared)
         if extras:
@@ -19214,7 +18957,7 @@ def _migrate(app, check_only, db_path=None):
 # 旧版のファイルは読むだけ(一切書き換えない・消さない)で、その値を画面の設定の層(instance/settings.json)に
 # 取り込む(updated_by は「移行」)。アプリは instance/config.py をもう読まないため、取り込むまでその値は使われない。
 # 取り込むのは、FIELDS(11-1)の項目のうち、値があって(空・None・[] でない)初期値(config.py)と違うもの。
-#   - AI_API_URL が空の旧版の設定(社外の既定の接続先に送る形の設定)の AI_API_URL / AI_API_KEY / AI_MODEL は
+#   - AI_API_URL が空の旧版の設定(外部の既定の接続先に送る形の設定)の AI_API_URL / AI_API_KEY / AI_MODEL は
 #     取り込まない(接続先を設定したうえで、画面で設定し直す)
 #   - 旧版の AI_API_URL を取り込み、旧版の AI_API_KEY が空で config.py に AI_API_KEY があるときは、AI_API_KEY の
 #     画面の設定を空にする(config.py のキーを旧版の接続先に送らない。接続先が config.py と同じならそのまま)
@@ -19483,11 +19226,10 @@ def recommend_assignees(levels, start, due, task_id=None, today=None, scale=None
     if not use_skills:
         levels = {}
     period = task_period(start, due, today)
+    dates_reversed = bool(start and due and start > due)
     scale = scale if scale in TASK_SCALE_KEYS else None
     task_h = round(scale_monthly_hours(scale, start, due), 1)   # このタスクの月あたりの目安工数(1人で担当したとき)
-    skills = {}
-    if levels:
-        skills = {s.id: s for s in Skill.query.filter(Skill.id.in_(list(levels))).all()}
+    skills = {s.id: s for s in Skill.query.filter(Skill.id.in_(list(levels))).all()} if levels else {}
     reqs = sorted(((skills[sid], level) for sid, level in levels.items() if sid in skills and skills[sid].is_active),
                   key=lambda pair: task_skill_sort_key(pair[0]))
     ignored = sorted((skills[sid] for sid in levels if sid in skills and not skills[sid].is_active),
@@ -19556,14 +19298,13 @@ def recommend_assignees(levels, start, due, task_id=None, today=None, scale=None
                 elif kind in SHIFT_WORKING_KINDS:
                     workdays += leave_workday_share(leave_on.get(day))
         rest = sorted(rest.items())
-        meets_all = met == len(reqs)
         no_workday = workdays is not None and workdays <= 0
         load_h = workload[user.id]["total_h"] if user.id in workload else 0.0
         after_h = round(load_h + task_h, 1)
         overload = after_h > _LOAD_FULL
         rows.append({
             "user": user, "shift": shift, "detail": detail, "met": met, "short": short, "total": total,
-            "meets_all": meets_all, "leaves": [label for _day, label in rest[:RECOMMEND_LEAVE_SHOWN]],
+            "leaves": [label for _day, label in rest[:RECOMMEND_LEAVE_SHOWN]],
             "more_leaves": max(0, len(rest) - RECOMMEND_LEAVE_SHOWN), "has_leave": bool(rest),
             "hourly_leaves": hourly[:RECOMMEND_LEAVE_SHOWN], "more_hourly": max(0, len(hourly) - RECOMMEND_LEAVE_SHOWN),
             "workdays": _fmt_num(workdays) if workdays is not None else "", "workday_count": workdays or 0,
@@ -19572,17 +19313,16 @@ def recommend_assignees(levels, start, due, task_id=None, today=None, scale=None
             "load_h": _fmt_num(load_h), "load_level": _load_level(load_h),
             "after_h": _fmt_num(after_h), "after_level": _load_level(after_h),
             "spare_h": _fmt_num(round(abs(_LOAD_FULL - after_h), 1)), "overload": overload, "after_value": after_h,
-            "recommended": meets_all and not rest and not no_workday and not overload,
+            "recommended": met == len(reqs) and not rest and not no_workday and not overload,
         })
     rows.sort(key=lambda r: (not r["recommended"], r["has_leave"] or r["no_workday"], -r["met"], r["short"],
                              r["overload"], r["after_value"], r["open_tasks"], -r["workday_count"], -r["total"],
                              r["user"].display_name or ""))
     return {
-        "has_input": (bool(reqs) or period is not None or bool(ignored) or bool(start and due and start > due)
-                      or scale is not None),
+        "has_input": bool(reqs) or period is not None or bool(ignored) or dates_reversed or scale is not None,
         "period": period,
         "period_label": _period_label(period, today) if period is not None else "",
-        "dates_reversed": bool(start and due and start > due),
+        "dates_reversed": dates_reversed,
         "requirements": [{"skill": skill, "need": level} for skill, level in reqs],
         "ignored": ignored,
         "rows": rows[:RECOMMEND_MAX_ROWS],
@@ -19696,7 +19436,6 @@ class MailContent:
     body: str = ""
     attachments: list = dc_field(default_factory=list)
     importance: str = ""   # "high"(重要度: 高)/ "low"(低)/ ""
-    kind: str = ""         # "msg" / "eml"
 
 # ---- 文字コード ----
 _CODEPAGE_CODECS = {
@@ -20171,7 +19910,7 @@ def _read_msg(data):
     cf = _CompoundFile(data)
     root = _MsgProps(cf, 0, 32)
     root.codepage = root.number(0x3FFD) or root.number(0x3FDE)  # PR_MESSAGE_CODEPAGE / PR_INTERNET_CPID
-    mail = MailContent(kind="msg")
+    mail = MailContent()
     mail.subject = root.text(0x0037)  # PR_SUBJECT
     sender_name = root.text(0x0C1A) or root.text(0x0042)  # PR_SENDER_NAME / PR_SENT_REPRESENTING_NAME
     sender_address = next((a for a in (root.text(0x5D01), root.text(0x5D02), root.text(0x0C1F), root.text(0x0065))
@@ -20262,7 +20001,7 @@ def _read_eml(data):
         raise MailReadError(_EML_BROKEN)
     if not any(_eml_header(message, name) for name in ("From", "Subject", "Date", "To", "Message-ID")):
         raise MailReadError(_EML_BROKEN)
-    mail = MailContent(kind="eml")
+    mail = MailContent()
     mail.subject = _eml_header(message, "Subject")
     mail.sender = _eml_header(message, "From")
     mail.to = _eml_header(message, "To")
@@ -20324,8 +20063,6 @@ def read_mail_file(data, filename=""):
     if data[:8] == _CFB_SIGNATURE:
         try:
             return _read_msg(data)
-        except MailReadError:
-            raise
         except (struct.error, IndexError, ValueError, KeyError, UnicodeError, OverflowError, RecursionError,
                 MemoryError):
             raise MailReadError(_MSG_BROKEN)
@@ -20335,8 +20072,6 @@ def read_mail_file(data, filename=""):
         raise MailReadError(_MAIL_NOT_SUPPORTED)
     try:
         return _read_eml(data)
-    except MailReadError:
-        raise
     except (LookupError, ValueError, TypeError, IndexError, KeyError, UnicodeError, RecursionError, MemoryError):
         raise MailReadError(_EML_BROKEN)
 
@@ -20440,19 +20175,25 @@ def _one_line(text, limit=300):
     text = re.sub(r"\s+", " ", clean_text(text or "")).strip()
     return text if len(text) <= limit else text[:limit].rstrip() + "…"
 
+def _mail_header_lines(mail, time_format):
+    """差出人・日時(time_format の形)・宛先・CC の行(値のあるものだけ。【元のメール】と AI に送る文)。"""
+    lines = []
+    if mail.sender:
+        lines.append("差出人: " + _one_line(mail.sender))
+    if mail.sent_at:
+        lines.append("日時: " + mail.sent_at.strftime(time_format))
+    if mail.to:
+        lines.append("宛先: " + _one_line(mail.to))
+    if mail.cc:
+        lines.append("CC: " + _one_line(mail.cc))
+    return lines
+
 def mail_reference_text(mail):
     """内容に入れる【元のメール】(件名・差出人・日時・宛先・CC・添付と本文)。"""
     lines = ["【元のメール】"]
     if mail.subject:
         lines.append("件名: " + _one_line(mail.subject))
-    if mail.sender:
-        lines.append("差出人: " + _one_line(mail.sender))
-    if mail.sent_at:
-        lines.append("日時: " + mail.sent_at.strftime("%Y/%m/%d %H:%M"))
-    if mail.to:
-        lines.append("宛先: " + _one_line(mail.to))
-    if mail.cc:
-        lines.append("CC: " + _one_line(mail.cc))
+    lines += _mail_header_lines(mail, "%Y/%m/%d %H:%M")
     if mail.attachments:
         names = "、".join(_one_line(n, 100) for n in mail.attachments[:10])
         more = len(mail.attachments) - 10
@@ -20496,16 +20237,8 @@ def scale_from_ai(value):
 
 def _mail_ai_input(mail, skills, today):
     """AI に送る文(今日の日付・メール・スキルの一覧)。"""
-    lines = ["今日の日付: " + today.isoformat(), "", "【メール】"]
-    lines.append("件名: " + _one_line(mail.subject))
-    if mail.sender:
-        lines.append("差出人: " + _one_line(mail.sender))
-    if mail.sent_at:
-        lines.append("日時: " + mail.sent_at.strftime("%Y-%m-%d %H:%M"))
-    if mail.to:
-        lines.append("宛先: " + _one_line(mail.to))
-    if mail.cc:
-        lines.append("CC: " + _one_line(mail.cc))
+    lines = ["今日の日付: " + today.isoformat(), "", "【メール】", "件名: " + _one_line(mail.subject)]
+    lines += _mail_header_lines(mail, "%Y-%m-%d %H:%M")
     if mail.attachments:
         lines.append("添付: " + "、".join(_one_line(n, 100) for n in mail.attachments[:20]))
     if mail.importance:
@@ -20613,7 +20346,7 @@ def build_mail_task_draft(mail, use_ai):
             title = result.get("title") or title
             summary = result.get("summary", "")
             start = result.get("start_date")
-            due = result.get("due_date", due if "due_date" not in result else None)
+            due = result.get("due_date", due)
             priority = result.get("priority") or priority
             scale = result.get("scale", "")
             if "skills" in result:
@@ -20637,7 +20370,7 @@ def build_mail_task_draft(mail, use_ai):
 # GET  /tasks/recommend         担当者の推奨の表(HTML の断片を JSON で返す。登録・編集の画面の JavaScript から)
 # GET  /tasks/capacity          規模が期間の出勤日数を超えるかの案内(JSON。登録・編集の画面の JavaScript から)
 # POST /tasks/draft-from-mail   メールのファイルからの下書き(JSON。登録の画面の JavaScript から)
-# どちらもマネージャーだけ(タスクの登録・計画の項目の変更はマネージャーだけのため)。保存はしない。
+# どれもマネージャーだけ(タスクの登録・計画の項目の変更はマネージャーだけのため)。保存はしない。
 
 @tasks_bp.route("/recommend", endpoint="recommend")
 @login_required
@@ -20735,6 +20468,20 @@ def month_key(year, month):
 
 def month_days(year, month):
     return calendar.monthrange(year, month)[1]
+
+def _month_code_list(row, days):
+    """勤務表の月の行(WorkShiftMonth)の日ごとの記号(長さ days。行が無ければすべて記号なし)。"""
+    return (row.code_list() + [""] * days)[:days] if row is not None else [""] * days
+
+def _save_month_codes(row, shift_id, key, codes):
+    """勤務の月(key)の日ごとの記号を codes にする(すべて記号なしなら行を消す。commit は呼び出し側)。"""
+    if not any(codes):
+        if row is not None:
+            db.session.delete(row)
+    elif row is None:
+        db.session.add(WorkShiftMonth(shift_id=shift_id, month=key, codes=json.dumps(codes, ensure_ascii=False)))
+    else:
+        row.codes = json.dumps(codes, ensure_ascii=False)
 
 def shift_day_codes(shift_ids, first, last):
     """勤務ごとの日の記号 {(勤務ID, 日付): 記号}(first〜last の日の勤務表。記号なしの日は入れない)。"""
@@ -20857,7 +20604,7 @@ def parse_shift_codes(raw, days, codes):
     else:
         for mark in SHIFT_SEPARATORS:
             text = text.replace(mark, " ")
-        tokens = [c for c in re.sub(r"\s+", "", text)]
+        tokens = list(re.sub(r"\s+", "", text))
     result, unknown = [], []
     for token in tokens:
         if token in SHIFT_BLANK_MARKS:
@@ -20873,16 +20620,19 @@ def parse_shift_codes(raw, days, codes):
         return None, "記号の一覧に無い記号があります（{}）。".format("、".join(_one_line(u, 10) for u in dict.fromkeys(unknown)))
     return result + [""] * (days - len(result)), None
 
+def _posted_day_codes(form, shift_id, days):
+    """勤務表の修正の画面から送られた勤務の日ごとの選択(day_<勤務>_<日>。空は記号なし)の一覧。送られていなければ None。"""
+    cells = [form.get("day_{}_{}".format(shift_id, number)) for number in range(1, days + 1)]
+    return [(value or "").strip() for value in cells] if any(value is not None for value in cells) else None
+
 def _posted_month_codes(form, shift_id, days):
     """勤務表の修正の画面から送られた勤務の1行(無ければ None)。
 
-    日ごとの選択(day_<勤務>_<日>。空は記号なし)はタブ区切りにして parse_shift_codes で読む。以前の画面の1行の入力
+    日ごとの選択(_posted_day_codes)はタブ区切りにして parse_shift_codes で読む。以前の画面の1行の入力
     (codes_<勤務>。記号を続けて入力する欄)が送られたときはそれを読む。
     """
-    cells = [form.get("day_{}_{}".format(shift_id, number)) for number in range(1, days + 1)]
-    if any(value is not None for value in cells):
-        return "\t".join((value or "").strip() for value in cells)
-    return form.get("codes_{}".format(shift_id))
+    cells = _posted_day_codes(form, shift_id, days)
+    return "\t".join(cells) if cells is not None else form.get("codes_{}".format(shift_id))
 
 def shift_codes_text(codes):
     """日ごとの記号の一覧を、入力欄の文字(空白区切り。記号なしは「-」。最後の記号なしは省く)にする。"""
@@ -20937,13 +20687,12 @@ def build_roster(year, month, dept_id=None, viewer=None):
         cells = []
         for day in days:
             code = day_codes.get((shift.id, day["date"])) if shift is not None else None
-            kind = day_kind(code, codes, day["date"])
             leave = leave_by.get((user.id, day["date"]))
-            cells.append({"date": day["date"], "leave": leave, "kind": kind,
+            cells.append({"date": day["date"], "leave": leave,
                           "mark": ROSTER_LEAVE_MARKS.get(leave.leave_type, "年") if leave is not None else "",
                           "mark_class": (ROSTER_LEAVE_CLASSES.get(leave.leave_type, "roster-leave-half")
                                          if leave is not None else ""),
-                          "off": kind not in SHIFT_WORKING_KINDS})
+                          "off": day_kind(code, codes, day["date"]) not in SHIFT_WORKING_KINDS})
         return {"user": user, "cells": cells, "me": viewer is not None and user.id == viewer.id}
 
     by_shift = {}
@@ -21000,8 +20749,7 @@ def shift_member_counts():
         if not os.path.isfile(path):
             continue
         try:
-            uri = "file:{}?mode=ro".format(urllib.request.pathname2url(os.path.abspath(path)))
-            with closing(sqlite3.connect(uri, uri=True, timeout=2)) as conn:
+            with _open_db_readonly(path) as conn:
                 rows = conn.execute("SELECT us.shift_id, COUNT(*) FROM user_shifts us JOIN users u ON u.id = us.user_id "
                                     "WHERE u.is_active = 1 GROUP BY us.shift_id").fetchall()
         except (sqlite3.Error, OSError):
@@ -21018,12 +20766,14 @@ def _render_shift_settings(code_rows=None):
     if code_rows is None:
         code_rows = saved or [{"code": c, "label": l, "kind": k} for c, l, k in DEFAULT_SHIFT_CODES]
         code_rows = code_rows + [{"code": "", "label": "", "kind": SHIFT_KIND_WORK}] * SHIFT_CODE_ROWS_EXTRA
+    posted_version = request.form.get("codes_version") if request.method == "POST" else None
+    today = date.today()
     return render_template(
         "admin/shifts.html", shifts=shifts, counts=counts, versions={s.id: SHIFT_VERSION.version(s) for s in shifts},
-        code_rows=code_rows, codes_saved=bool(saved), codes_version=request.form.get("codes_version")
-        if request.method == "POST" and request.form.get("codes_version") is not None else _codes_version(saved),
+        code_rows=code_rows, codes_saved=bool(saved),
+        codes_version=posted_version if posted_version is not None else _codes_version(saved),
         kinds=SHIFT_KIND_CHOICES, name_max=SHIFT_NAME_MAX, label_max=SHIFT_CODE_LABEL_MAX,
-        this_month=month_key(date.today().year, date.today().month))
+        this_month=month_key(today.year, today.month))
 
 @admin_bp.route("/shifts", endpoint="shifts")
 def shift_settings():
@@ -21031,7 +20781,7 @@ def shift_settings():
     return _render_shift_settings()
 
 def _shift_form_values(shift=None):
-    """勤務の名前・並び順の入力(名前は SHIFT_NAME_MAX 文字まで。以前の画面から送られた勤務帯〔group_name〕は使わない)。"""
+    """勤務の名前・並び順の入力(名前は SHIFT_NAME_MAX 文字まで)。"""
     return {"name": request.form.get("name", "").strip()[:SHIFT_NAME_MAX],
             "sort_order": form_sort_order(request.form, shift.sort_order if shift is not None else 0)}
 
@@ -21086,10 +20836,9 @@ def save_shift_codes():
         errors.append("記号は{}個までです。".format(SHIFT_CODES_MAX))
     lock_for_write()  # 確かめてから保存するまでの間に、ほかの保存・勤務表の入力が入らないように
     current = list(shift_codes().values())
-    if not errors:
-        if request.form.get("codes_version") != _codes_version(_code_rows(current)):
-            errors.append("画面を開いた後に、ほかの操作で記号が変更されています（保存していません）。"
-                          "画面を開き直して、もう一度変更してください。")
+    if not errors and request.form.get("codes_version") != _codes_version(_code_rows(current)):
+        errors.append("画面を開いた後に、ほかの操作で記号が変更されています（保存していません）。"
+                      "画面を開き直して、もう一度変更してください。")
     if not errors:
         removed = {c.code for c in current} - {r["code"] for r in rows}
         used = set()
@@ -21132,8 +20881,7 @@ def shift_month():
     変えた行だけを保存し、画面を開いた後にほかの操作で変わった行は上書きしない。
     """
     today = date.today()
-    picked = _read_month(request.values.get("month")) or (today.year, today.month)
-    year, month = picked
+    year, month = _read_month(request.values.get("month")) or (today.year, today.month)
     key, days = month_key(year, month), month_days(year, month)
     url = url_for("admin.shift_month", month=key)
     codes = shift_codes()
@@ -21171,7 +20919,7 @@ def shift_month():
             if shift.id not in values:
                 continue
             row = current.get(shift.id)
-            now = (row.code_list() + [""] * days)[:days] if row is not None else [""] * days
+            now = _month_code_list(row, days)
             shown, _error = parse_shift_codes(request.form.get("orig_{}".format(shift.id), ""), days, codes)
             if values[shift.id] == now:
                 continue
@@ -21179,14 +20927,7 @@ def shift_month():
                 # 画面を開いた後にほかの操作で変わった行(開いたときの内容が読めない行も)は、今の内容のまま
                 kept.append(shift.name)
                 continue
-            if not any(values[shift.id]):
-                if row is not None:
-                    db.session.delete(row)
-            elif row is None:
-                db.session.add(WorkShiftMonth(shift_id=shift.id, month=key, codes=json.dumps(values[shift.id],
-                                                                                            ensure_ascii=False)))
-            else:
-                row.codes = json.dumps(values[shift.id], ensure_ascii=False)
+            _save_month_codes(row, shift.id, key, values[shift.id])
             changed.append(shift.name)
         if changed and not commit_or_conflict():
             return redirect(url)
@@ -21210,12 +20951,9 @@ def _render_shift_month(year, month, codes, form=None):
     dates = [date(year, month, number) for number in range(1, days + 1)]
     items = []
     for shift in shifts:
-        saved = (rows[shift.id].code_list() + [""] * days)[:days] if shift.id in rows else [""] * days
-        values = saved
-        if form is not None:
-            posted = [form.get("day_{}_{}".format(shift.id, number)) for number in range(1, days + 1)]
-            if any(value is not None for value in posted):
-                values = [(value or "").strip() for value in posted]
+        saved = _month_code_list(rows.get(shift.id), days)
+        posted = _posted_day_codes(form, shift.id, days) if form is not None else None
+        values = posted if posted is not None else saved
         orig = shift_codes_text(saved)
         items.append({"shift": shift, "orig": form.get("orig_{}".format(shift.id), orig) if form is not None else orig,
                       # off: 休みの日(記号の種類が休日・年休、記号の無い土日・祝日)。rest: 記号が無ければ休みの日
@@ -21245,12 +20983,9 @@ for _rule, _endpoint, _path, _methods in (
 del _rule, _endpoint, _path, _methods
 
 # ---- メンバーの勤務(チーム管理の「メンバーの管理」。5-8) ----
-def shift_choices(current=None):
-    """メンバーの勤務の選択肢(有効な勤務。current が無効にした勤務なら、それも〔「［無効］」付きで〕残す)。"""
-    shifts = _ordered_shifts(active_only=True)
-    if current is not None and not current.is_active:
-        shifts.append(current)
-    return shifts
+def shift_choices():
+    """メンバーの勤務の選択肢(有効な勤務。その人の今の勤務が無効にした勤務なら、画面で「［無効］」付きで足す)。"""
+    return _ordered_shifts(active_only=True)
 
 def read_member_shift(raw, current=None):
     """フォームの勤務(shift_id。空は勤務なし)を読む。戻り値: (WorkShift または None, 誤りの文 または None)。
@@ -21284,13 +21019,10 @@ def set_member_shift(user, shift):
 @manager_required
 def save_member_shift(user_id):
     """メンバーの勤務を保存する(空は勤務なし)。画面を開いたときの勤務(orig)と今の勤務が違えば、上書きしない。"""
-    lock_for_write()
+    user, done = _member_for_change(user_id)
+    if done:
+        return done
     url = url_for("departments.manage")
-    user = db.session.get(User, user_id)
-    if user is None:
-        return flash_redirect("このメンバーは既に削除されています。", "info", url)
-    if not _same_member(user):
-        return redirect(url)
     current = user.work_shift
     shift, error = read_member_shift(request.form.get("shift_id"), current)
     if error:
@@ -21334,8 +21066,6 @@ _SHIFT_FULL_DATE = re.compile(r"^(\d{4})\s*[/\-.年]\s*(\d{1,2})\s*[/\-.月]\s*(
 _SHIFT_MONTH_DAY = re.compile(r"^(\d{1,2})\s*[/月]\s*(\d{1,2})\s*日?(?:\s*[(（][日月火水木金土][)）])?$")
 _SHIFT_DAY = re.compile(r"^(\d{1,2})\s*日?(?:\s*[(（][日月火水木金土][)）])?$")
 SHIFT_IMPORT_EXTENSIONS = (".xlsx", ".xlsm")
-XLSX_MIMETYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-
 class ShiftImportError(Exception):
     """勤務表の Excel を読み取れない(ファイルの形式が違う・壊れている)。文は画面にそのまま出す。"""
 
@@ -21552,20 +21282,14 @@ def save_imported_shifts(months):
         current = {row.shift_id: row for row in WorkShiftMonth.query.filter_by(month=key).all()}
         for shift_id, day_codes in by_shift.items():
             row = current.get(shift_id)
-            now = (row.code_list() + [""] * days)[:days] if row is not None else [""] * days
+            now = _month_code_list(row, days)
             new = list(now)
             for day, code in day_codes.items():
                 new[day - 1] = code
             if new == now:
                 continue
             changed += 1
-            if not any(new):
-                if row is not None:
-                    db.session.delete(row)
-            elif row is None:
-                db.session.add(WorkShiftMonth(shift_id=shift_id, month=key, codes=json.dumps(new, ensure_ascii=False)))
-            else:
-                row.codes = json.dumps(new, ensure_ascii=False)
+            _save_month_codes(row, shift_id, key, new)
     return changed
 
 def _month_range_label(months):
@@ -21642,8 +21366,7 @@ def build_shift_template(year, month, months):
         if y > LEAVE_YEAR_MAX:
             break
         key, days = month_key(y, m), month_days(y, m)
-        saved = {row.shift_id: (row.code_list() + [""] * days)[:days]
-                 for row in WorkShiftMonth.query.filter_by(month=key).all()}
+        saved = {row.shift_id: _month_code_list(row, days) for row in WorkShiftMonth.query.filter_by(month=key).all()}
         sheet = book.create_sheet(title="{}年{}月".format(y, m))
         sheet.cell(row=1, column=1, value="勤務").font = bold
         sheet.cell(row=2, column=1, value="曜日").font = bold
@@ -21702,9 +21425,10 @@ def shift_template():
 #   リンクの基準URL・LDAP・admin のパスワード・SECRET_KEY)と勤務パターン(勤務・勤務表・記号。メインの環境の DB。
 #   3-3)。変えられるのは固定ローカル管理者(admin)だけ(システム管理の画面。18 章)。
 #   メールの宛先(MAIL_TO・MAIL_CC)は環境ごと(各環境のシステム設定の「メールの宛先」タブ。env_mail_settings.json)。
-# 環境の一覧: instance/environments.json。admin がシステム管理の「環境」で追加(名前だけ)・名前の変更・停止/再開を行う。
-#   メンバー(マネージャーを含む)は、admin がその環境を開いてチーム管理で登録する(その後はその環境のマネージャーも
-#   登録できる)。環境は消さない(停止すると開けなくなり、自動送信もしない。DB は残る)。
+# 環境の一覧: instance/environments.json。admin がシステム管理の「環境」で追加(名前と使う機能)・名前の変更・
+#   使う機能の変更・停止/再開・削除を行う(17-5)。メンバー(マネージャーを含む)は、admin がその環境を開いてチーム管理で
+#   登録する(その後はその環境のマネージャーも登録できる)。停止すると開けなくなり、自動送信もしない(DB は残る)。
+#   削除できるのは停止した環境だけ(DB のフォルダは名前を変えて残す)。
 # 使える環境が1つ(メインだけ・ほかはすべて停止)のあいだは、今までと同じ動き(ログイン・URL・クッキー)。
 # 使える環境が2つ以上のとき:
 #   ログイン(/login。メインの環境の画面)で本人を確かめ、印(instance/portal_sessions.json。ログインの記録〔5-1〕と
@@ -21737,8 +21461,6 @@ ENV_ROOT_ENVIRON = "app.env_root"   # environ: 環境の URL の先頭を足す�
 ENV_DISPATCHER_KEY = "env_dispatcher"   # app.extensions(メインの環境): 振り分け
 ENV_MAIN_APP_KEY = "env_main_app"       # app.extensions(ほかの環境): メインの環境のアプリ
 ENV_SCOPED_KEY = "env_scoped"           # app.extensions(ほかの環境): 環境ごとの処理中の印・状態
-ENV_USERNAME_MAX = 64
-ENV_DISPLAY_NAME_MAX = 128
 # 基本設定の項目のうち環境ごとのもの(ほかの環境は、その環境の宛先の設定 ENV_MAIL_SETTINGS〔11-3〕を使う)
 ENV_LOCAL_KEYS = ("MAIL_TO", "MAIL_CC")
 
@@ -21772,6 +21494,11 @@ def env_instance_path(shared, key):
     """環境の instance フォルダ(メインは共通のフォルダそのもの、ほかは instance/envs/<キー>)。"""
     return shared if key == MAIN_ENV_KEY else os.path.join(shared, ENVS_DIRNAME, key)
 
+def _open_db_readonly(path):
+    """環境の DB を読み取り専用で開く(with で閉じる。環境のアプリを作らずに数える。DB を変えない・ファイルを作らない)。"""
+    uri = "file:{}?mode=ro".format(urllib.request.pathname2url(os.path.abspath(path)))
+    return closing(sqlite3.connect(uri, uri=True, timeout=2))
+
 def env_url_prefix(key):
     """環境の URL の先頭(メインは ""、ほかは /env/<キー>)。"""
     return "" if key == MAIN_ENV_KEY else "{}/{}".format(ENV_URL_PREFIX, key)
@@ -21789,8 +21516,9 @@ def _normalize_env_registry(data):
 
     deleted は削除した環境の記録(キー・名前・削除した日時と人・残したフォルダの名前)。そのキーは今後使わない。
     """
+    data = data if isinstance(data, dict) else {}
     envs, seen = [], set()
-    items = data.get("envs") if isinstance(data, dict) else None
+    items = data.get("envs")
     for item in items if isinstance(items, list) else ():
         if not isinstance(item, dict):
             continue
@@ -21809,11 +21537,11 @@ def _normalize_env_registry(data):
         entry["features"] = normalize_env_features(item.get("features"))   # 使う機能(2-8。無ければすべて)
         envs.append(entry)
     main = [e for e in envs if e["key"] == MAIN_ENV_KEY] or [_default_env(MAIN_ENV_KEY)]
-    version = data.get("version") if isinstance(data, dict) else None
+    version = data.get("version")
     if not isinstance(version, int) or isinstance(version, bool) or version < 0:
         version = 0
     deleted, gone = [], set()
-    items = data.get("deleted") if isinstance(data, dict) else None
+    items = data.get("deleted")
     for item in items if isinstance(items, list) else ():
         key = item.get("key") if isinstance(item, dict) else None
         if not isinstance(key, str) or key in gone or key == MAIN_ENV_KEY or not ENV_KEY_PATTERN.fullmatch(key):
@@ -21887,9 +21615,13 @@ def multi_env_enabled(app=None):
         return cached
     return len(active_envs(app)) >= 2
 
+def _find_env(rows, key):
+    """環境の行の一覧(環境の一覧の envs・deleted など)の、キーが key の行(無ければ None)。"""
+    return next((e for e in rows if e["key"] == key), None)
+
 def env_entry(key, app=None):
     """環境の一覧のその環境の行(無ければ None)。"""
-    return next((e for e in env_registry(app)["envs"] if e["key"] == key), None)
+    return _find_env(env_registry(app)["envs"], key)
 
 def env_name(app=None):
     """この環境の名前(画面・メールに出す)。"""
@@ -21980,7 +21712,7 @@ class EnvDispatcher:
         """使える(登録されていて停止していない)環境のアプリ。使えなければ None。"""
         if key == MAIN_ENV_KEY:
             return self.main_app
-        entry = next((e for e in read_env_registry(self.main_app.instance_path)["envs"] if e["key"] == key), None)
+        entry = _find_env(read_env_registry(self.main_app.instance_path)["envs"], key)
         if entry is None or not entry["active"]:
             return None
         return self.build(key)
@@ -22028,7 +21760,6 @@ def install_env_dispatcher(app):
     dispatcher = EnvDispatcher(app, app.wsgi_app)
     app.wsgi_app = dispatcher
     app.extensions[ENV_DISPATCHER_KEY] = dispatcher
-    return dispatcher
 
 def env_dispatcher(app=None):
     """振り分け(メインの環境のアプリに付けたもの)。コマンド(seed など)から作ったアプリでは None。"""
@@ -22041,7 +21772,7 @@ def build_env_app(main_app, key):
     app = _new_app(key, main_app.instance_path)
     app.extensions[ENV_MAIN_APP_KEY] = main_app
     app.config[PORTAL_COOKIE_CONFIG] = main_app.config.get("SESSION_COOKIE_NAME") or "session"
-    # 動作確認(TESTING。判定・相談の応答をその場で作るなど)はメインの環境に合わせる
+    # 動作確認(TESTING。スキルの判定・スキルマップの分析をその場で行うなど)はメインの環境に合わせる
     app.config["TESTING"] = bool(main_app.config.get("TESTING"))
     prepare_instance(app)
     # 再起動が必要な設定(SECRET_KEY)は、メインの環境の実行中の値にそろえる(画面で新しい鍵を作った後・再起動の前に
@@ -22157,12 +21888,15 @@ def start_portal_from_main_login(user):
     local = session.get(LOGIN_SOURCE_KEY) == LOGIN_SOURCE_LOCAL and user.username == ADMIN_USERNAME
     start_portal_session(user.username, "", local, user.role, shown_name=user.display_name, at=at)
 
-def end_main_env_login():
-    """ほかの環境のログアウトのとき: メインの環境のこのブラウザのログインの印を消す(クッキーは共通の入口のログアウトで消す)。"""
-    data = _main_cookie_session()
+def _revoke_cookie_login(data, instance_path):
+    """クッキーのセッション(data)のログインの印を、その環境のログインの記録(instance_path の login_sessions.json)から消す。"""
     user_key, token = data.get("_user_id"), data.get(SESSION_TOKEN_KEY)
     if isinstance(user_key, str) and isinstance(token, str):
-        _revoke_login_sessions(user_key, token, path=os.path.join(shared_instance_path(), LOGIN_SESSIONS_FILENAME))
+        _revoke_login_sessions(user_key, token, path=os.path.join(instance_path, LOGIN_SESSIONS_FILENAME))
+
+def end_main_env_login():
+    """ほかの環境のログアウトのとき: メインの環境のこのブラウザのログインの印を消す(クッキーは共通の入口のログアウトで消す)。"""
+    _revoke_cookie_login(_main_cookie_session(), shared_instance_path())
 
 def end_portal_session():
     """このブラウザの共通のログインの印を消す(メインの環境ではセッションからも消す)。"""
@@ -22240,10 +21974,7 @@ def end_env_logins(response):
         except BadSignature:
             data = None
         if isinstance(data, dict):
-            user_key, token = data.get("_user_id"), data.get(SESSION_TOKEN_KEY)
-            if isinstance(user_key, str) and isinstance(token, str):
-                _revoke_login_sessions(user_key, token, path=os.path.join(
-                    env_instance_path(shared, key), LOGIN_SESSIONS_FILENAME))
+            _revoke_cookie_login(data, env_instance_path(shared, key))
         response.delete_cookie(name, path=current_app.session_interface.get_cookie_path(current_app),
                                domain=current_app.session_interface.get_cookie_domain(current_app))
 
@@ -22265,7 +21996,7 @@ def flash_login_needed(state):
 def _env_refused_page(heading, message, status=403):
     """環境に入れないときの画面(環境の選び直しのボタン付き)。"""
     response = make_response(render_template(
-        "errors/http_error.html", code=status, heading=heading, message=message,
+        "errors/http_error.html", heading=heading, message=message,
         confirm_url=portal_url("/envs"), confirm_label="環境を選び直す"), status)
     response.headers["Cache-Control"] = "no-store"
     return response
@@ -22347,13 +22078,14 @@ def env_nav_context():
     """ナビに出す環境の名前と切り替えの URL(複数の環境のときだけ。テンプレートの env_nav)。"""
     if not has_request_context() or not multi_env_enabled():
         return None
-    return {"name": env_name(), "switch_url": portal_url("/envs"), "is_main": is_main_env()}
+    return {"name": env_name(), "switch_url": portal_url("/envs")}
 
-# ==== 17-5. 環境の追加・名前の変更・使う機能・停止(システム管理の「環境」。固定ローカル管理者 admin だけ。18 章) =========
+# ==== 17-5. 環境の追加・名前の変更・使う機能・停止・削除(システム管理の「環境」。固定ローカル管理者 admin だけ。18 章) =========
 # 追加: 名前と使う機能(2-8。既定はすべて)を決める。キーは e2 から順に(使ったキー・フォルダのあるキーは使わない)。instance/envs/<キー>/ に DB を
 # 作ってから一覧に載せる。メンバー(マネージャーを含む)は、admin がその環境を開いて、チーム管理で登録する。
 # 一覧の変更は、画面を開いたときの一覧の版(hidden の version)と今の版が違えば行わない(ほかの変更と重ならないように)。
 # 停止した環境は、開けず(URL は 404)、環境の選択の画面にも出ず、定期メールも送らない(DB・設定は残る。再開できる)。
+# 削除: 停止した環境だけ。一覧から除いて削除した環境の記録に残し(そのキー・URL は今後使わない)、DB のフォルダは名前を変えて残す。
 
 ENV_ONCE_KIND = "env_create"
 
@@ -22379,8 +22111,7 @@ def _env_db_stats(entry):
     if not os.path.isfile(path):
         return None, None
     try:
-        uri = "file:{}?mode=ro".format(urllib.request.pathname2url(os.path.abspath(path)))
-        with closing(sqlite3.connect(uri, uri=True, timeout=2)) as conn:
+        with _open_db_readonly(path) as conn:
             members = conn.execute("SELECT COUNT(*) FROM users WHERE is_active = 1 AND username != ?",
                                    (ADMIN_USERNAME,)).fetchone()[0]
             columns = {}
@@ -22448,7 +22179,7 @@ def envs_tab_context(inputs=None):
     deleted = [dict(d, url=env_home_url(d["key"])) for d in reversed(registry["deleted"])]   # 新しいものが先
     inputs = inputs or {}
     return {"envs": rows, "deleted": deleted, "version": str(registry["version"]), "error": error,
-            "multi": multi_env_enabled(), "name_max": ENV_NAME_MAX, "inputs": inputs, "idle_days": ENV_IDLE_DAYS,
+            "name_max": ENV_NAME_MAX, "inputs": inputs, "idle_days": ENV_IDLE_DAYS,
             # 追加の欄の使う機能(2-8。既定はすべて。入力の誤りで再表示するときは入力のまま)
             "new_features": env_feature_rows(inputs.get("features") or normalize_env_features(None)),
             "feature_field": ENV_FEATURE_FIELD, "feature_mark": ENV_FEATURE_MARK}
@@ -22474,39 +22205,50 @@ def _next_env_key(registry, shared):
         number += 1
     return "e{}".format(number)
 
-def create_environment(name, created_by, expected_version, features=None):
-    """環境を追加する(DB を作ってから一覧に載せる。メンバーはまだいない)。戻り値: 一覧の行。
+def _change_env_registry(shared, expected_version, change):
+    """環境の一覧を変える(追加・変更・削除)。戻り値は change(今の一覧。read_env_registry の値) の戻り値。
 
-    features は使う機能(2-8。None ならすべて)。
+    同じプロセスのほかの変更(_env_change_lock)・同じフォルダのほかのサーバーの変更(instance/settings.lock)と
+    重ならないようにして一覧を読み、画面を開いた後に変わっていれば(版が expected_version と違えば)SettingsConflictError。
+    """
+    with _env_change_lock:
+        lock_file = _lock_settings_file(shared)
+        try:
+            registry = read_env_registry(shared, strict=True)
+            if registry["version"] != expected_version:
+                raise SettingsConflictError("画面を開いた後に環境の一覧が変わっています。")
+            return change(registry)
+        finally:
+            _unlock_settings_file(lock_file)
+
+def create_environment(name, created_by, expected_version, features=None):
+    """環境を追加する(DB を作ってから一覧に載せる。メンバーはまだいない)。features は使う機能(2-8。None ならすべて)。
+    戻り値: 一覧の行。
 
     一覧が画面を開いた後に変わっていれば SettingsConflictError、名前が重複していれば ValueError、
     一覧が読めなければ SettingsFileError、書けなければ OSError。
     """
     dispatcher = env_dispatcher()
     shared = shared_instance_path()
-    with _env_change_lock:
-        lock_file = _lock_settings_file(shared)  # 同じフォルダのほかのサーバーの変更と重ならないように
+
+    def add(registry):
+        problem = _env_name_error(name, registry)
+        if problem:
+            raise ValueError(problem)
+        key = _next_env_key(registry, shared)
+        app = None
         try:
-            registry = read_env_registry(shared, strict=True)
-            if registry["version"] != expected_version:
-                raise SettingsConflictError("画面を開いた後に環境の一覧が変わっています。")
-            problem = _env_name_error(name, registry)
-            if problem:
-                raise ValueError(problem)
-            key = _next_env_key(registry, shared)
-            app = None
-            try:
-                app = dispatcher.build(key)   # instance/envs/<キー>/app.db とテーブルを作る
-                entry = {"key": key, "name": name, "active": True,
-                         "created_at": datetime.now().strftime("%Y/%m/%d %H:%M"), "created_by": str(created_by)[:64],
-                         "features": normalize_env_features(features)}
-                write_env_registry(shared, registry["envs"] + [entry], created_by, registry["version"])
-            except Exception:
-                _discard_env_build(dispatcher, key, app, shared)
-                raise
-        finally:
-            _unlock_settings_file(lock_file)
-    return entry
+            app = dispatcher.build(key)   # instance/envs/<キー>/app.db とテーブルを作る
+            entry = {"key": key, "name": name, "active": True,
+                     "created_at": datetime.now().strftime("%Y/%m/%d %H:%M"), "created_by": str(created_by)[:64],
+                     "features": normalize_env_features(features)}
+            write_env_registry(shared, registry["envs"] + [entry], created_by, registry["version"])
+        except Exception:
+            _discard_env_build(dispatcher, key, app, shared)
+            raise
+        return entry
+
+    return _change_env_registry(shared, expected_version, add)
 
 def _close_env_app(dispatcher, key, app=None):
     """環境のアプリを忘れ、DB の接続を閉じる(app を指定したときは、振り分けにあるのがそのアプリのときだけ忘れる)。
@@ -22546,28 +22288,24 @@ def _discard_env_build(dispatcher, key, app, shared):
 def change_environment(key, expected_version, username, name=None, active=None, features=None):
     """環境の名前・停止/再開・使う機能(2-8)を変える。戻り値: 変えた後の行。例外は create_environment と同じ(無い環境は KeyError)。"""
     shared = shared_instance_path()
-    with _env_change_lock:
-        lock_file = _lock_settings_file(shared)
-        try:
-            registry = read_env_registry(shared, strict=True)
-            if registry["version"] != expected_version:
-                raise SettingsConflictError("画面を開いた後に環境の一覧が変わっています。")
-            entry = next((e for e in registry["envs"] if e["key"] == key), None)
-            if entry is None:
-                raise KeyError(key)
-            if name is not None:
-                problem = _env_name_error(name, registry, key)
-                if problem:
-                    raise ValueError(problem)
-                entry["name"] = name
-            if active is not None and key != MAIN_ENV_KEY:
-                entry["active"] = bool(active)
-            if features is not None:
-                entry["features"] = normalize_env_features(features)
-            write_env_registry(shared, registry["envs"], username, registry["version"])
-        finally:
-            _unlock_settings_file(lock_file)
-    return entry
+
+    def change(registry):
+        entry = _find_env(registry["envs"], key)
+        if entry is None:
+            raise KeyError(key)
+        if name is not None:
+            problem = _env_name_error(name, registry, key)
+            if problem:
+                raise ValueError(problem)
+            entry["name"] = name
+        if active is not None and key != MAIN_ENV_KEY:
+            entry["active"] = bool(active)
+        if features is not None:
+            entry["features"] = normalize_env_features(features)
+        write_env_registry(shared, registry["envs"], username, registry["version"])
+        return entry
+
+    return _change_env_registry(shared, expected_version, change)
 
 ENV_DELETED_SUFFIX = ".deleted-"   # 削除した環境の DB のフォルダの名前に付ける(「<キー>.deleted-日時」)
 
@@ -22581,44 +22319,40 @@ def delete_environment(key, expected_version, username, confirm_name):
     """
     dispatcher = env_dispatcher()
     shared = shared_instance_path()
-    with _env_change_lock:
-        lock_file = _lock_settings_file(shared)
+
+    def delete(registry):
+        entry = _find_env(registry["envs"], key)
+        if entry is None:
+            raise KeyError(key)
+        if key == MAIN_ENV_KEY:
+            raise ValueError("メインの環境は削除できません。")
+        if entry["active"]:
+            raise ValueError("使用中の環境は削除できません。先に環境の一覧で「停止」してください。")
+        if confirm_name != entry["name"]:
+            raise ValueError("確かめのために入力した名前が、環境の名前（{}）と違います。削除していません。".format(
+                entry["name"]))
+        _close_env_app(dispatcher, key)
+        folder = env_instance_path(shared, key)
+        moved = ""
+        if os.path.isdir(folder):
+            moved = "{}{}{}".format(folder, ENV_DELETED_SUFFIX, datetime.now().strftime("%Y%m%d%H%M%S"))
+            os.rename(folder, moved)
+        record = {"key": key, "name": entry["name"], "deleted_at": datetime.now().strftime("%Y/%m/%d %H:%M"),
+                  "deleted_by": str(username)[:64], "folder": os.path.basename(moved)}
         try:
-            registry = read_env_registry(shared, strict=True)
-            if registry["version"] != expected_version:
-                raise SettingsConflictError("画面を開いた後に環境の一覧が変わっています。")
-            entry = next((e for e in registry["envs"] if e["key"] == key), None)
-            if entry is None:
-                raise KeyError(key)
-            if key == MAIN_ENV_KEY:
-                raise ValueError("メインの環境は削除できません。")
-            if entry["active"]:
-                raise ValueError("使用中の環境は削除できません。先に環境の一覧で「停止」してください。")
-            if confirm_name != entry["name"]:
-                raise ValueError("確かめのために入力した名前が、環境の名前（{}）と違います。削除していません。".format(
-                    entry["name"]))
-            _close_env_app(dispatcher, key)
-            folder = env_instance_path(shared, key)
-            moved = ""
-            if os.path.isdir(folder):
-                moved = "{}{}{}".format(folder, ENV_DELETED_SUFFIX, datetime.now().strftime("%Y%m%d%H%M%S"))
-                os.rename(folder, moved)
-            record = {"key": key, "name": entry["name"], "deleted_at": datetime.now().strftime("%Y/%m/%d %H:%M"),
-                      "deleted_by": str(username)[:64], "folder": os.path.basename(moved)}
-            try:
-                write_env_registry(shared, [e for e in registry["envs"] if e["key"] != key], username,
-                                   registry["version"], deleted=registry["deleted"] + [record])
-            except Exception:
-                if moved:
-                    try:
-                        os.rename(moved, folder)
-                    except OSError:
-                        current_app.logger.exception("削除できなかった環境 %s のフォルダの名前を戻せませんでした（%s）",
-                                                     key, os.path.basename(moved))
-                raise
-        finally:
-            _unlock_settings_file(lock_file)
-    return record
+            write_env_registry(shared, [e for e in registry["envs"] if e["key"] != key], username,
+                               registry["version"], deleted=registry["deleted"] + [record])
+        except Exception:
+            if moved:
+                try:
+                    os.rename(moved, folder)
+                except OSError:
+                    current_app.logger.exception("削除できなかった環境 %s のフォルダの名前を戻せませんでした（%s）",
+                                                 key, os.path.basename(moved))
+            raise
+        return record
+
+    return _change_env_registry(shared, expected_version, delete)
 
 def _form_version(form):
     value = str(form.get("version", ""))
@@ -22630,9 +22364,17 @@ def _envs_tab_url():
 _ENVS_CHANGED = ("画面を開いた後に、ほかの操作（別のタブ）で環境の一覧が変わっていたため、{}"
                  "。今の一覧を確認して、必要ならもう一度操作してください。")
 
+def _deleted_env_redirect(ev, key):
+    """使う機能・削除の画面で、一覧に無い環境: 削除した環境なら「削除しました」と案内して一覧へ戻す(記録にも無ければ 404)。"""
+    done = _find_env(ev["deleted"], key)
+    if done is None:
+        abort(404)
+    return flash_redirect("環境「{}」は削除しました（{}）。".format(done["name"], done["deleted_at"] or "削除済み"),
+                          "info", _envs_tab_url())
+
 @admin_bp.route("/envs", methods=["POST"], endpoint="create_env")
 def create_env():
-    """環境を追加する(名前だけ。admin だけ)。
+    """環境を追加する(名前と使う機能。admin だけ)。
 
     二度押しの2回目は、1回目が終わるまで待ってから「追加済み」と案内する(確認と追加を同じ鍵の中で行う)。
     """
@@ -22671,13 +22413,14 @@ def create_env():
     current_app.logger.info("環境を追加しました: %s %s（%s）", entry["key"], entry["name"], current_user.username)
     # 2つ目の環境で共通のログインが始まる: 追加した人のログインはそのまま続ける(load_user の portal_allows でも作る。
     # 別の人の共通のログインが残っていれば作り直す)
-    portal = portal_state()[0] if multi_env_enabled() else None
-    if multi_env_enabled() and (portal is None or portal["u"] != current_user.username):
-        try:
-            end_portal_session()
-            start_portal_from_main_login(current_user)
-        except OSError:
-            current_app.logger.exception("共通のログインの記録を保存できませんでした")
+    if multi_env_enabled():
+        portal = portal_state()[0]
+        if portal is None or portal["u"] != current_user.username:
+            try:
+                end_portal_session()
+                start_portal_from_main_login(current_user)
+            except OSError:
+                current_app.logger.exception("共通のログインの記録を保存できませんでした")
     return flash_redirect("環境「{}」を追加しました（URL: {}。使う機能: {}）。「開く」からその環境に入り、チーム管理でメンバー"
                           "（マネージャーを含む）を登録してください。".format(entry["name"], env_home_url(entry["key"]),
                                                                     env_features_label(entry["features"])),
@@ -22708,13 +22451,9 @@ def env_features_page(key):
     使わない機能のデータは消さない(使うようにすると元のまま使える)。一覧が画面を開いた後に変わっていれば保存しない。
     """
     ev = envs_tab_context()
-    entry = next((e for e in ev["envs"] if e["key"] == key), None)
+    entry = _find_env(ev["envs"], key)
     if entry is None:
-        done = next((d for d in ev["deleted"] if d["key"] == key), None)
-        if done is None:
-            abort(404)
-        return flash_redirect("環境「{}」は削除しました（{}）。".format(done["name"], done["deleted_at"] or "削除済み"),
-                              "info", _envs_tab_url())
+        return _deleted_env_redirect(ev, key)
     if request.method == "GET":
         return render_template("admin/env_features.html", ev=ev, e=entry, rows=env_feature_rows(entry["features"]))
     features, error = env_features_from_form(request.form)
@@ -22778,13 +22517,9 @@ def delete_env(key):
     if key == MAIN_ENV_KEY:
         abort(400)
     ev = envs_tab_context()
-    entry = next((e for e in ev["envs"] if e["key"] == key), None)
+    entry = _find_env(ev["envs"], key)
     if entry is None:
-        done = next((d for d in ev["deleted"] if d["key"] == key), None)
-        if done is None:
-            abort(404)
-        return flash_redirect("環境「{}」は削除しました（{}）。".format(done["name"], done["deleted_at"] or "削除済み"),
-                              "info", _envs_tab_url())
+        return _deleted_env_redirect(ev, key)
     if request.method == "GET":
         return render_template("admin/env_delete.html", ev=ev, e=entry)
     try:
@@ -22821,7 +22556,8 @@ del _old, _endpoint, _path
 # #### 18. システム管理(固定ローカル管理者 admin だけの画面) #########################################
 # 固定ローカル管理者(admin。ADMIN_USERNAME)は、特定の環境のユーザーではなく、このアプリ全体の管理者。ログインすると、
 # このシステム管理の画面(/admin/。入口で「環境」の画面へ進む)を開く(ログインの前に開こうとした画面があればその画面)。
-#   環境       : すべての環境(グループ)の一覧・開く・追加(名前だけ)・名前の変更・停止/再開・削除(停止した環境。17 章)
+#   環境       : すべての環境(グループ)の一覧・開く・追加(名前と使う機能)・名前の変更・使う機能の変更・停止/再開・
+#                削除(停止した環境。17 章)
 #   基本設定   : すべての環境で共通の設定(AI・メールの送信サーバー・差出人・送信を許可するドメイン・リンク・LDAP・
 #                admin のパスワード・SECRET_KEY。11 章の項目。宛先 MAIL_TO・MAIL_CC は環境ごとのため、ここには出さない)
 #   勤務パターン: 勤務・勤務表の記号・勤務表の入力(すべての環境で共通。16 章)
@@ -22833,15 +22569,15 @@ ADMIN_ONLY_MESSAGE = ("この画面は使えません\n"
                       "システム管理（すべての環境で共通の設定・環境の管理・勤務パターン）は、固定ローカル管理者（admin）だけが"
                       "使えます。必要な場合は admin に依頼してください。")
 
-def is_system_admin(user=None):
+def is_system_admin():
     """固定ローカル管理者(admin)としてログインしているか(このアプリ全体の管理者)。
 
     ログインIDが admin でも、固定ローカルの認証で入ったログインだけ(ADMIN_PASSWORD が空のときに ldap_client.py の
     判定で入った、同じ ID の LDAP のアカウントは、ほかの人と同じ扱い)。複数の環境のときは共通のログインの印
     (portal の l)、1つの環境のときはこのログインの記録(LOGIN_SOURCE_KEY)で確かめる。
     """
-    user = current_user if user is None else user
-    if not (bool(getattr(user, "is_authenticated", False)) and getattr(user, "username", None) == ADMIN_USERNAME):
+    if not (bool(getattr(current_user, "is_authenticated", False))
+            and getattr(current_user, "username", None) == ADMIN_USERNAME):
         return False
     if not has_request_context():
         return False
@@ -22885,7 +22621,7 @@ def _render_admin_envs(status=200, inputs=None):
 
 @admin_bp.route("/envs", endpoint="envs")
 def admin_envs():
-    """環境(グループ)の一覧・追加(名前だけ)・名前の変更・停止/再開。"""
+    """環境(グループ)の一覧と、追加・名前の変更・使う機能・停止/再開・削除の入口。"""
     return _render_admin_envs()
 
 # ---- 基本設定(画面の設定の層 instance/settings.json を編集する。11 章) ----
@@ -22970,7 +22706,7 @@ def admin_test_ai():
     else:
         # 先に伏せ字にしてから短くする(短くした後では、キーの一部が伏せ字にならずに残るため)
         # (表示できない文字は ai_chat で除いてある)
-        reply = mask_secrets(app, " ".join(CONTROL_CHARS.sub("", str(reply)).split()))
+        reply = mask_secrets(app, " ".join(reply.split()))
         if len(reply) > AI_REPLY_MAX:
             reply = reply[:AI_REPLY_MAX] + "…"
         flash("AI接続テスト: OK（応答: {}）".format(reply), "success")
@@ -22996,11 +22732,7 @@ PLAN_STATE_LATE = "late"     # 遅れ(未完了で実行予定日が今日より
 PLAN_STATE_TODAY = "today"   # 今日(実行予定日が今日で未完了)
 PLAN_STATE_OPEN = "open"     # 未完了
 
-def plan_delay_label(days, calendar_days):
-    """計画の遅れの日数の表示(「N営業日」。今日が土日祝で 0営業日のときは暦日の日数も付ける。overdue_days_label と同じ)。"""
-    if days == 0 and calendar_days:
-        return "0営業日（{}日超過・休日）".format(calendar_days)
-    return "{}営業日".format(days)
+plan_delay_label = business_delay_label   # 計画の遅れの日数の表示(2-4。期限超過と同じ)
 
 def plan_progress(steps, today):
     """計画の進み(手順の並び steps〔Task.steps〕と今日 today から。タスクの一覧・個人ダッシュボード・詳細で使う)。
@@ -23035,18 +22767,17 @@ def task_plan_view(task, today):
     rows = []
     for step in task.steps:
         planned = step.planned_date
+        done_label = ""
         if step.done_at is not None:
             state = PLAN_STATE_DONE
+            done_label = "・".join(x for x in (_date_label(step.done_at.date(), today),
+                                               step.done_by.name_label if step.done_by is not None else "") if x)
         elif planned is not None and planned < today:
             state = PLAN_STATE_LATE
         elif planned == today:
             state = PLAN_STATE_TODAY
         else:
             state = PLAN_STATE_OPEN
-        done_label = ""
-        if step.done_at is not None:
-            done_label = "・".join(x for x in (_date_label(step.done_at.date(), today),
-                                               step.done_by.name_label if step.done_by is not None else "") if x)
         rows.append({
             "step": step,
             "state": state,
@@ -23246,11 +22977,10 @@ def _render_plan_form(task, rows, version, status=200, with_current=False):
 @login_required
 def edit_plan(task_id):
     """計画(手順と実行予定日)の編集。1つのフォームで計画全体を保存する。"""
-    if request.method == "POST":
-        lock_for_write()  # 確かめてから保存するまでの間に、ほかの保存・完了の付け外しが入らないように
-    task = get_or_404(Task, task_id)
-    if request.method == "POST" and not row_key_matches(task, request.form.get("row")):
-        return flash_redirect(_STALE_TASK, "warning", url_for("tasks.list_tasks"))
+    # 確かめてから保存するまでの間に、ほかの保存・完了の付け外しが入らないように(POST は書き込みのロックの中で読む)
+    task, stale = _task_for_update(task_id)
+    if stale:
+        return stale
     if not _can_edit(task):
         abort(403, description=_PLAN_FORBIDDEN)
     steps = list(task.steps)
@@ -23284,11 +23014,10 @@ def toggle_plan_step(task_id, step_id):
     手順が見つからない・印が違う(削除された・計画が変わった)ときは 404 にせず、案内して詳細へ戻す。
     既に同じ状態(二度押しの2回目など)なら何もしないで戻す。
     """
-    lock_for_write()  # 同時に押された2回目は、1回目の後の状態で確かめる
-    task = get_or_404(Task, task_id)
+    task, stale = _task_for_update(task_id)   # 同時に押された2回目は、1回目の後の状態で確かめる
+    if stale:
+        return stale
     back = url_for("tasks.detail", task_id=task.id, _anchor="plan")
-    if not row_key_matches(task, request.form.get("row")):
-        return flash_redirect(_STALE_TASK, "warning", url_for("tasks.list_tasks"))
     if not _can_edit(task):
         abort(403, description=_PLAN_FORBIDDEN)
     wanted = request.form.get("done")
