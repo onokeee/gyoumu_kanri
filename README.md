@@ -213,7 +213,7 @@ LDAPとは独立に常に有効な管理者アカウントを1つ用意してい
 | `SECRET_KEY` | セッション暗号化キー。どちらの層にも無ければ起動時に生成して `instance/settings.json` に保存 | 空 |
 | `ADMIN_PASSWORD` | 固定ローカル管理者 `admin` のパスワード。空なら `admin` の確認は `ldap_client.py` に任せる | 空 |
 | `LDAP_API_URL` | LDAP認証APIのURL（本番で使用） | 空 |
-| `AI_API_URL` | ChatGPT互換（OpenAI互換の形式）APIのエンドポイント。既定の接続先は無く、ここで設定した接続先にだけ送る。週報の文章整形・スキルの説明の下書き・AI分析・スキルの自動更新・スキルマップのAI（分析・相談）・メールからのタスクの下書きに使う（AI分析・スキルの自動更新では、メンバーの名前・タスクの内容・進捗の記載をこの接続先に送る） | 空 |
+| `AI_API_URL` | ChatGPT互換（OpenAI互換の形式）APIのエンドポイント（Chat Completions の形式〔`…/v1/chat/completions` など〕と、パスの最後が `/responses` の Responses API の形式のどちらも使えます）。既定の接続先は無く、ここで設定した接続先にだけ送る。週報の文章整形・スキルの説明の下書き・AI分析・スキルの自動更新・スキルマップのAI（分析・相談）・メールからのタスクの下書きに使う（AI分析・スキルの自動更新では、メンバーの名前・タスクの内容・進捗の記載をこの接続先に送る） | 空 |
 | `AI_API_KEY` | APIキー（接続先が求める場合。あるときだけ `Authorization` ヘッダに付ける） | 空 |
 | `AI_MODEL` | 使用するモデル名（接続先で利用できるもの）。`AI_API_URL` と `AI_MODEL` の両方が設定されるまでAIは使わない（週報はルールベースで作成、スキルの説明の「AIで下書き」・スキルの自動更新・スキルマップのAIは使えず、AI分析はアプリの集計とルールの推奨アクションだけ） | 空 |
 | `AI_TIMEOUT` | AIの応答待ちタイムアウト（秒。1以上の整数でなければAIを使わない） | `60` |
@@ -784,7 +784,11 @@ Bさん（2件）
 
 ### ChatGPT-API（AI整形）の設定・移行
 接続情報は基本設定の `AI_API_URL` / `AI_API_KEY` / `AI_MODEL` / `AI_TIMEOUT`（システム管理の「基本設定」〔admin〕。初期値は `config.py`）です。キーは画面の設定（`instance/settings.json`。Git 管理外）に保存し、`config.py` には書かないため、リポジトリに入ることはありません。**既定の接続先・既定のモデル名はコードにありません**（アプリが自分で外部の AI の接続先を選ぶことは無く、設定した接続先にだけ送ります）。接続先がリダイレクトを返したときは、キーを別の接続先へ送らないよう、従わずにエラーにします（`AI_API_URL` には転送されない最終の URL を書きます）。システム管理の「基本設定」で変更すると保存と同時に反映され、「AI接続テスト」で確認できます（`config.py` を直接編集した場合はサーバーの再起動が必要）。AI は週報の文章整形・スキルの説明の下書き（「AIで下書き」）・AI分析・スキルの自動更新・スキルマップの AI（分析・相談）・メールからのタスクの下書き（メールの件名・本文・差出人・宛先・添付のファイル名とスキル項目の一覧・規模の選択肢を送ります）に使います（AI分析・スキルの自動更新では、メンバーの名前・タスクの内容・進捗の記載をこの接続先に送ります）。`AI_API_URL`（http/https の URL）・`AI_MODEL`・`AI_TIMEOUT`（1以上の整数）のどれかが無いあいだは機能は無効になり、どこにも接続せず、週報はルールベースの文章のみ、「AIで下書き」・スキルの自動更新・スキルマップの AI は使えず、AI分析はアプリの集計とルールの推奨アクションだけを表示します（各画面に「AIの接続先（AI_API_URL）とモデル名（AI_MODEL）をシステム管理の「基本設定」（admin）で設定してください」と表示）。
-OpenAI互換の形式のエンドポイントなら `AI_API_URL` をそのURLにするだけで使えます。送る内容は `POST`、ヘッダー `Content-Type: application/json` と `Authorization: Bearer <AI_API_KEY>`（キーが空なら付けません）、本文 `{"model": AI_MODEL, "messages": [{"role": ..., "content": ...}, ...], "temperature": 0.3}` で、応答の `choices[0].message.content` を読みます。接続先が https のときは、**接続先の証明書を確認しません**（Python の requests の `verify=False` と同じです。公的でない認証局・自己署名の証明書を使う接続先でも、証明書を登録せずに URL とキーだけで使えます。証明書を確認すると、Python の知らない発行元の証明書は `[SSL: CERTIFICATE_VERIFY_FAILED] … (_ssl.c:…)` で接続できないためです）。そのため接続先が本物かどうかは確かめないので、信頼できるネットワークの中の接続先に使ってください。安全な再ネゴシエーションに対応していない古いサーバー・中継装置にも接続します（OpenSSL 3 を使う Python の `UNSAFE_LEGACY_RENEGOTIATION_DISABLED` を避けるため）。仕様が異なる場合は、**`app.py` の `_call_chat_api()`（「4-1」）の中身だけ** を書き換えてください（メッセージ列を受け取り、応答の本文を返す関数です。呼び出し側は `ai_chat()` の戻り値 `(本文, エラー)` にしか依存していないため、他のコードは変更不要）。
+OpenAI互換の形式のエンドポイントなら `AI_API_URL` をそのURLにするだけで使えます。送る内容は `POST`、ヘッダー `Content-Type: application/json` と `Authorization: Bearer <AI_API_KEY>`（キーが空なら付けません）で、本文と応答の読み方は `AI_API_URL` の形式によります。
+- **Chat Completions の形式**（`…/v1/chat/completions` など。パスの最後が `/responses` 以外）: 本文 `{"model": AI_MODEL, "messages": [{"role": ..., "content": ...}, ...], "temperature": 0.3}` で、応答の `choices[0].message.content` を読みます。
+- **Responses API の形式**（パスの最後が `/responses`。例: `https://api.example.com/v1/responses`）: 本文 `{"model": AI_MODEL, "input": [{"role": ..., "content": ...}, ...], "store": false}`（`input` は上の `messages` と同じ並び）で、応答の `output` のうち `type` が `message` の項目の `output_text` の `text` をつないで読みます（推論の記録〔`reasoning`〕などのほかの項目は読みません）。`temperature` は送りません（推論のモデルは受け付けず、エラーになるため）。`store: false` で、接続先に応答を保存させません（Chat Completions の既定と同じ）。
+
+接続先が https のときは、**接続先の証明書を確認しません**（Python の requests の `verify=False` と同じです。公的でない認証局・自己署名の証明書を使う接続先でも、証明書を登録せずに URL とキーだけで使えます。証明書を確認すると、Python の知らない発行元の証明書は `[SSL: CERTIFICATE_VERIFY_FAILED] … (_ssl.c:…)` で接続できないためです）。そのため接続先が本物かどうかは確かめないので、信頼できるネットワークの中の接続先に使ってください。安全な再ネゴシエーションに対応していない古いサーバー・中継装置にも接続します（OpenSSL 3 を使う Python の `UNSAFE_LEGACY_RENEGOTIATION_DISABLED` を避けるため）。仕様が異なる場合は、**`app.py` の `_call_chat_api()`（「4-1」）の中身だけ** を書き換えてください（メッセージ列を受け取り、応答の本文を返す関数です。呼び出し側は `ai_chat()` の戻り値 `(本文, エラー)` にしか依存していないため、他のコードは変更不要）。
 
 ### 定期メールの追加
 メール送信は `send_mail()`（「4-2」。テキスト版・HTML版・添付ファイル・宛先の指定に対応）、営業日の判定は `is_business_day()` など（「2-4」）を使います。

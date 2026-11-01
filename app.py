@@ -3583,11 +3583,38 @@ def _ai_tls_context():
     context.options |= getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
     return context
 
+def uses_responses_api(url):
+    """AI_API_URL が Responses API の形式の接続先か(パスの最後が responses。例: https://api.example.com/v1/responses)。"""
+    try:
+        path = urlsplit(str(url or "")).path
+    except ValueError:
+        return False
+    return path.rstrip("/").rsplit("/", 1)[-1].lower() == "responses"
+
+def responses_output_text(data):
+    """Responses API の応答の本文(output のうち type が message の項目の、type が output_text の text をつないだもの)。
+
+    推論の記録(type が reasoning)などのほかの項目は読まない。本文が無ければ空の文字列(ai_chat が「応答が空」にする)。
+    """
+    texts = []
+    for item in data["output"]:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for part in item.get("content") or []:
+            if isinstance(part, dict) and part.get("type") == "output_text":
+                texts.append(part["text"])
+    return "".join(texts)
+
 def _call_chat_api(messages):
-    """チャット補完APIを呼び出して本文テキストを返す。
+    """AI の API を呼び出して応答の本文を返す(AI_API_URL の形式で送る。uses_responses_api)。
 
     送る内容: POST、ヘッダー Content-Type: application/json と Authorization: Bearer <APIキー>(キーが空なら
-    付けない)、本文 {"model": ..., "messages": [...], "temperature": 0.3}。応答の choices[0].message.content を返す。
+    付けない)。本文と応答の読み方は接続先の形式による:
+    - Chat Completions(…/v1/chat/completions など): 本文 {"model": ..., "messages": [...], "temperature": 0.3}。
+      応答の choices[0].message.content を返す。
+    - Responses API(パスの最後が /responses): 本文 {"model": ..., "input": [...], "store": false}(input は messages と
+      同じ role/content の並び)。temperature は送らない(推論のモデルは受け付けず、400 になるため)。store: false で、
+      接続先に応答を保存させない(Chat Completions の既定と同じ)。応答は responses_output_text で読む。
     独自APIに差し替える場合は、この関数だけをそのAPIの仕様に合わせて書き換える。
     (認証ヘッダ・リクエスト形式・レスポンスの取り出し方など)
     例外はそのまま送出し、呼び出し元の ai_chat() で文言に変換する。
@@ -3595,11 +3622,15 @@ def _call_chat_api(messages):
     values = _ai_settings()
     url = values["api_url"]  # 有効な値だけを使う(既定の接続先は無い。未設定なら ai_chat() がここまで来させない)
 
-    payload = {
-        "model": values["model"],
-        "messages": messages,
-        "temperature": 0.3,
-    }
+    responses = uses_responses_api(url)
+    if responses:
+        payload = {"model": values["model"], "input": messages, "store": False}
+    else:
+        payload = {
+            "model": values["model"],
+            "messages": messages,
+            "temperature": 0.3,
+        }
     request_obj = urllib.request.Request(
         url,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -3615,6 +3646,8 @@ def _call_chat_api(messages):
     with opener.open(request_obj, timeout=values["timeout"]) as response:
         data = json.loads(response.read().decode("utf-8"))
 
+    if responses:
+        return responses_output_text(data)
     return data["choices"][0]["message"]["content"]
 
 # ---- 呼び出し側が使うのは、この2つ(依頼の形 chat_messages と送信 ai_chat)と、下の応答の読み取り ----
@@ -16495,7 +16528,7 @@ FIELDS = (
     Field(
         "AI_API_URL", GROUP_AI, "AI APIのエンドポイント",
         "ChatGPT互換（OpenAI互換）のAPI。メンバーの名前・タスクの内容・進捗の記載をこの接続先に送ります。"
-        "例: https://api.example.com/v1/chat/completions",
+        "例: https://api.example.com/v1/chat/completions（…/v1/responses も使えます）",
         type=TYPE_URL, ascii_only=True,
     ),
     Field(
