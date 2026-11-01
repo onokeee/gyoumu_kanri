@@ -2925,7 +2925,7 @@ class Skill(db.Model):
     skill_type = db.Column(
         db.String(16), nullable=False, default=SKILL_TECHNICAL, index=True
     )
-    category = db.Column(db.String(64))  # テクニカル項目のグルーピング(任意)
+    category = db.Column(db.String(64))  # 以前の版のカテゴリ(今は使わない。DB の列はそのまま)
     description = db.Column(db.Text)
     is_active = db.Column(db.Boolean, nullable=False, default=True)
     sort_order = db.Column(db.Integer, nullable=False, default=0)
@@ -2959,6 +2959,11 @@ class Skill(db.Model):
     @property
     def level_labels(self):
         return scale_for(self.skill_type)
+
+    @property
+    def row_key(self):
+        """画面のボタン(削除)でこの項目を指す印(IDの再利用の取り違え防止。make_row_key)。"""
+        return make_row_key(self)
 
     def rating_for(self, user):
         """指定ユーザーの到達度レコードを返す(未評価ならNone)。"""
@@ -6281,8 +6286,8 @@ def cancel_leave(leave_id):
 # メンバーは403)。スキルマップ(マトリクス)、個人スキル、項目定義、到達度の設定を扱う。
 # 到達尺度はすべての区分で共通の Lv0〜3(3-5)。スキルマップの上部には AI の分析コメント・最近の自動更新を出す(8 章)。
 # スキル項目の説明(skills.description)は、到達度の判断の基準(マネージャー・タスクの完了からの自動更新)になる。
-# 項目の追加・編集の画面の「AIで下書き」(POST /skills/items/description-draft)は、スキル名・区分・
-# カテゴリと到達尺度から、見出し(description_outline)で説明の下書きをAIに作らせ、
+# 項目の追加・編集の画面の「AIで下書き」(POST /skills/items/description-draft)は、スキル名・区分と
+# 到達尺度から、見出し(description_outline)で説明の下書きをAIに作らせ、
 # 入力欄に入れるだけ(保存はしない。マネージャーが確認して「更新」「追加」を押したときに保存される)。
 
 skills_bp = managers_blueprint("skills", "/skills")  # マネージャーのみ(2-5)
@@ -6668,6 +6673,18 @@ def edit_member(user_id):
         type_labels=SKILL_TYPE_LABELS,
     )
 
+def skill_usage_counts():
+    """スキル項目ごとの、削除すると一緒に消える記録の数 {スキルID: {"ratings", "operations", "tasks", "changes"}}。"""
+    usage = {}
+    for key, model in (("ratings", SkillRating), ("operations", OperationSkill), ("tasks", TaskSkill),
+                       ("changes", SkillLevelChange)):
+        for skill_id, count in db.session.query(model.skill_id, func.count()).group_by(model.skill_id).all():
+            usage.setdefault(skill_id, {})[key] = count
+    return usage
+
+SKILL_USAGE_LABELS = (("ratings", "メンバーの到達度"), ("operations", "業務の必要レベル"), ("tasks", "タスクの必要スキル"),
+                      ("changes", "到達度の変更の記録"))
+
 @skills_bp.route("/items")
 def items():
     skills = Skill.query.order_by(
@@ -6682,7 +6699,8 @@ def items():
         .group_by(SkillRating.skill_id)
         .all()
     )
-    return render_template("skills/items.html", skills=skills, rated_counts=rated_counts)
+    return render_template("skills/items.html", skills=skills, rated_counts=rated_counts, usage=skill_usage_counts(),
+                           usage_labels=SKILL_USAGE_LABELS)
 
 DESCRIPTION_DRAFT_MAX = 2000
 
@@ -6705,8 +6723,7 @@ def description_outline(skill_type):
     ]
     return outline
 
-SKILL_ITEM_VERSION = VersionFields((("name", "スキル名"), ("category", "カテゴリ"), ("description", "説明"),
-                                    ("sort_order", "並び順")))
+SKILL_ITEM_VERSION = VersionFields((("name", "スキル名"), ("description", "説明"), ("sort_order", "並び順")))
 
 def _render_item_form(skill, form=None, status=200, version=None):
     """スキル項目の追加・編集の画面を表示する(form は再表示する入力)。"""
@@ -6720,7 +6737,7 @@ def _render_item_form(skill, form=None, status=200, version=None):
         **ai_context(),
     ), status
 
-def build_description_messages(name, skill_type, category, current=""):
+def build_description_messages(name, skill_type, current=""):
     """スキルの説明の下書きをAIに作らせるメッセージ(OpenAI形式)。"""
     outline = description_outline(skill_type)
     purpose = ("この説明は、メンバーの到達度（Lv0〜3）を判断するときの基準として使います（マネージャーの判断と、"
@@ -6732,7 +6749,6 @@ def build_description_messages(name, skill_type, category, current=""):
         "■スキル",
         "名称: {}".format(name),
         "区分: {}".format(SKILL_TYPE_LABELS.get(skill_type, skill_type)),
-        "カテゴリ: {}".format(category or "（なし）"),
         "到達尺度（レベルの意味）:",
     ]
     for level, label in _item_scale():
@@ -6758,7 +6774,7 @@ def build_description_messages(name, skill_type, category, current=""):
         "・特定の組織の事情に依存しない、一般的な表現で書く",
     ]
     if skill_type == SKILL_TECHNICAL:
-        lines.append("・スキル名・カテゴリから判断できない道具・ソフトは決めつけず、「（例）」を付けて候補として書く")
+        lines.append("・スキル名から判断できない道具・ソフトは決めつけず、「（例）」を付けて候補として書く")
     lines += [
         "・全体で600文字程度までにまとめる",
         "・{}つの見出しと箇条書きだけを出力する（前置き・まとめの文・コードブロックは付けない）".format(len(outline)),
@@ -6793,14 +6809,14 @@ def clean_description_draft(text, skill_type=None):
         body = body[:DESCRIPTION_DRAFT_MAX].rstrip()
     return body
 
-def draft_skill_description(name, skill_type, category, current=""):
+def draft_skill_description(name, skill_type, current=""):
     """AIでスキルの説明の下書きを作る(保存はしない)。
 
     戻り値: (下書き または None, メッセージ)。メッセージは画面にそのまま表示する。
     """
     if not ai_is_configured():
         return None, "AIが未設定のため、下書きを作成できません。{}。".format(ai_missing_label())
-    text, error = ai_chat(build_description_messages(name, skill_type, category, current))
+    text, error = ai_chat(build_description_messages(name, skill_type, current))
     if error:
         return None, "AIで下書きを作成できませんでした: {}".format(error)
     draft = clean_description_draft(text, skill_type)
@@ -6828,7 +6844,6 @@ def new_item():
         skill = Skill(
             name=name,
             skill_type=stype,
-            category=request.form.get("category", "").strip(),
             description=request.form.get("description", "").strip(),
             sort_order=form_sort_order(request.form),
         )
@@ -6849,8 +6864,7 @@ def edit_item(skill_id):
             flash("スキル名は必須です。", "danger")
             return _render_item_form(skill, request.form)
         # skill_type は到達度との整合のため変更不可(表示のみ)
-        new = {"name": name, "category": request.form.get("category", "").strip(),
-               "description": request.form.get("description", "").strip(),
+        new = {"name": name, "description": request.form.get("description", "").strip(),
                "sort_order": form_sort_order(request.form)}
         current = SKILL_ITEM_VERSION.values(skill)
         changed, conflicts = SKILL_ITEM_VERSION.conflicts(current, new)
@@ -6860,7 +6874,6 @@ def edit_item(skill_id):
                                  form={key: request.form.get(key, "") for key in SKILL_ITEM_VERSION.keys})
             return _render_item_form(skill, form, version=SKILL_ITEM_VERSION.version(current))
         skill.name = new["name"]
-        skill.category = new["category"]
         skill.description = new["description"]
         skill.sort_order = new["sort_order"]
         db.session.commit()
@@ -6873,7 +6886,7 @@ def edit_item(skill_id):
 def description_draft():
     """スキルの説明の下書きをAIで作る(保存はしない)。
 
-    フォームの入力(スキル名・区分・カテゴリ・今の説明)と、編集中なら URL の skill_id から下書きを作る。
+    フォームの入力(スキル名・区分・今の説明)と、編集中なら URL の skill_id から下書きを作る。
     画面の JavaScript からは Accept: application/json で呼び、{ok, draft, message} を受け取って
     説明の欄に入れる。JavaScript が無効なときは、入力を残したまま下書きを入れた画面を表示する。
     どちらも DB には書き込まない。
@@ -6890,19 +6903,18 @@ def description_draft():
     skill_type = choice_or_default(skill.skill_type if skill is not None else request.form.get("skill_type"),
                                    SKILL_TYPE_CHOICES, SKILL_TECHNICAL)
     name = request.form.get("name", "").strip()
-    category = request.form.get("category", "").strip()
     current = request.form.get("description", "")
 
     if not name:
         draft, message = None, "スキル名を入力してから「AIで下書き」を押してください。"
     else:
-        draft, message = draft_skill_description(name, skill_type, category, current)
+        draft, message = draft_skill_description(name, skill_type, current)
     if wants_json:
         return jsonify(ok=draft is not None, draft=draft or "", message=message)
 
     # JavaScript が無効なとき: 入力を残し、説明の欄に下書きを入れて表示する(保存はしない)
     # (追加の画面の1回限りの印 once も引き継ぐ)
-    form = {key: request.form.get(key, "") for key in ("name", "skill_type", "category", "sort_order", "once")}
+    form = {key: request.form.get(key, "") for key in ("name", "skill_type", "sort_order", "once")}
     form["description"] = draft if draft is not None else current
     flash(message, "info" if draft is not None else "danger")
     return _render_item_form(skill, form)
@@ -6910,6 +6922,32 @@ def description_draft():
 @skills_bp.route("/items/<int:skill_id>/toggle", methods=["POST"])
 def toggle_item(skill_id):
     return _toggle_active(get_or_404(Skill, skill_id), "", url_for("skills.items"))
+
+@skills_bp.route("/items/<int:skill_id>/delete", methods=["POST"])
+def delete_item(skill_id):
+    """スキル項目を削除する(マネージャー)。そのスキルのメンバーの到達度・業務の必要レベル・タスクの必要スキル・
+    到達度の変更の記録も一緒に削除する(元に戻せない。残しておきたいときは無効化する)。
+
+    画面の印(row)で、開いたままの古い画面から、削除した項目と同じ ID の新しい別の項目を削除しないようにする。
+    """
+    lock_for_write()
+    back = url_for("skills.items")
+    skill = db.session.get(Skill, skill_id)
+    if skill is None:
+        return flash_redirect("このスキル項目は既に削除されています。", "info", back)
+    if not row_key_matches(skill, request.form.get("row")):
+        return flash_redirect("画面を開いた後に、このスキル項目は削除されています（別の項目は削除していません）。"
+                              "一覧を確かめてください。", "warning", back)
+    name = skill.name
+    counts = skill_usage_counts().get(skill.id, {})
+    TaskSkill.query.filter_by(skill_id=skill.id).delete(synchronize_session=False)
+    SkillLevelChange.query.filter_by(skill_id=skill.id).delete(synchronize_session=False)
+    db.session.delete(skill)   # 到達度(ratings)・業務の必要レベル(operation_reqs)は一緒に消える(cascade)
+    db.session.commit()
+    removed = "・".join("{} {}件".format(label, counts[key]) for key, label in SKILL_USAGE_LABELS if counts.get(key))
+    current_app.logger.info("スキル項目を削除しました: %s（%s）", name, current_user.username)
+    return flash_redirect("スキル項目「{}」を削除しました{}。".format(name, "（{}も削除しました）".format(removed) if removed else ""),
+                          "success", back)
 
 # ---- 業務(Operation)項目の管理(マネージャー)。横軸「業務」ビューの列に使う。 ----
 OPERATION_VERSION = VersionFields((("name", "業務名"), ("description", "説明"), ("sort_order", "並び順")))
@@ -7989,7 +8027,7 @@ def _routine_sheets():
 def _skills_sheets():
     skills = Skill.query.order_by(Skill.skill_type, Skill.sort_order, Skill.name).all()
     s_rows = [[
-        s.id, s.name, s.type_label, s.category, s.description, s.is_active, s.sort_order,
+        s.id, s.name, s.type_label, s.description, s.is_active, s.sort_order,
     ] for s in skills]
 
     ratings = SkillRating.query.order_by(SkillRating.user_id, SkillRating.skill_id).all()
@@ -8019,7 +8057,7 @@ def _skills_sheets():
     ] for c in changes]
 
     return [
-        ("スキル項目", ["ID", "スキル名", "区分", "カテゴリ", "説明", "有効", "並び順"], s_rows),
+        ("スキル項目", ["ID", "スキル名", "区分", "説明", "有効", "並び順"], s_rows),
         ("到達度", ["メンバー", "スキル", "到達度", "メモ", "評価者", "評価日時"], r_rows),
         ("業務", ["ID", "業務名", "説明", "有効", "並び順"], o_rows),
         ("業務別-必要スキル", ["業務", "必要スキル", "必要レベル"], req_rows),
@@ -10113,8 +10151,7 @@ def build_judgment_messages(task, comments, targets, skills, levels):
         desc = _inline(s.description or "")
         if len(desc) > SKILL_DESC_MAX:
             desc = desc[:SKILL_DESC_MAX] + "…"
-        lines.append("S{} [{}{}] {}{}".format(s.id, s.skill_type, "／" + _inline(s.category) if s.category else "",
-                                             _inline(s.name), "：" + desc if desc else ""))
+        lines.append("S{} [{}] {}{}".format(s.id, s.skill_type, _inline(s.name), "：" + desc if desc else ""))
     lines += ["", "【対象者と今の到達度（書いていないスキルは Lv0）】"]
     for uid, t in targets.items():
         held = ["S{} Lv{}".format(s.id, levels[(uid, s.id)]) for s in skills if levels.get((uid, s.id), 0) >= 1]
@@ -10440,8 +10477,8 @@ def skill_map_material():
         desc = _inline(s.description or "")
         if len(desc) > 150:
             desc = desc[:150] + "…"
-        lines.append("S{} [{}{}] {} ／ Lv{}以上 {}名{}{}".format(
-            s.id, s.skill_type, "／" + _inline(s.category) if s.category else "", _inline(s.name),
+        lines.append("S{} [{}] {} ／ Lv{}以上 {}名{}{}".format(
+            s.id, s.skill_type, _inline(s.name),
             SKILL_PROFICIENT_LEVEL, len(holders),
             "（{}）".format("、".join(_inline(u.display_name) for u in holders)) if holders else "",
             " ／ 説明: " + desc if desc else ""))
@@ -11424,7 +11461,6 @@ def _skills_section(members, period, now):
             "skill_type": s.skill_type,
             "type_label": s.type_label,
             "type_color": s.type_color,
-            "category": s.category or "",
             "holders": holders,
             "holder_count": len(holders),
             "thin": bool(members) and len(holders) <= 1,
@@ -18518,14 +18554,14 @@ def seed_command():
         if Skill.query.count() == 0:
             leader = user_map["leader"]
             skills_data = [
-                dict(name="Webアプリ開発", skill_type=SKILL_TECHNICAL, category="開発", sort_order=1),
-                dict(name="システム設計", skill_type=SKILL_TECHNICAL, category="設計", sort_order=2),
-                dict(name="Excelでのデータ集計", skill_type=SKILL_TECHNICAL, category="分析", sort_order=3),
-                dict(name="サーバー・ネットワーク運用", skill_type=SKILL_TECHNICAL, category="運用", sort_order=4),
-                dict(name="Pythonによる業務自動化", skill_type=SKILL_TECHNICAL, category="開発", sort_order=5),
-                dict(name="SQL・データベース操作", skill_type=SKILL_TECHNICAL, category="データ", sort_order=6),
-                dict(name="BIツールでのダッシュボード作成", skill_type=SKILL_TECHNICAL, category="分析", sort_order=7),
-                dict(name="業務システムの操作・設定", skill_type=SKILL_TECHNICAL, category="運用", sort_order=8),
+                dict(name="Webアプリ開発", skill_type=SKILL_TECHNICAL, sort_order=1),
+                dict(name="システム設計", skill_type=SKILL_TECHNICAL, sort_order=2),
+                dict(name="Excelでのデータ集計", skill_type=SKILL_TECHNICAL, sort_order=3),
+                dict(name="サーバー・ネットワーク運用", skill_type=SKILL_TECHNICAL, sort_order=4),
+                dict(name="Pythonによる業務自動化", skill_type=SKILL_TECHNICAL, sort_order=5),
+                dict(name="SQL・データベース操作", skill_type=SKILL_TECHNICAL, sort_order=6),
+                dict(name="BIツールでのダッシュボード作成", skill_type=SKILL_TECHNICAL, sort_order=7),
+                dict(name="業務システムの操作・設定", skill_type=SKILL_TECHNICAL, sort_order=8),
                 dict(name="業務全体の課題抽出", skill_type=SKILL_CONCEPTUAL, sort_order=1),
                 dict(name="施策テーマの立案", skill_type=SKILL_CONCEPTUAL, sort_order=2),
                 dict(name="データに基づく現状分析", skill_type=SKILL_CONCEPTUAL, sort_order=3),

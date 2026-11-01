@@ -19,7 +19,7 @@
     定型業務　　　　　  routine/list.html  routine/detail.html  routine/form.html
                         routine/occurrence.html  routine/reminder_mail.html
     出勤表・年休　　　  leaves/list.html  leaves/calendar.html（出勤表）  leaves/detail.html  leaves/form.html
-    スキル　　　　　　  skills/map.html  skills/member.html  skills/member_edit.html  skills/items.html
+    スキル　　　　　　  skills/map.html  skills/_view_tabs.html  skills/member.html  skills/member_edit.html  skills/items.html
                         skills/item_form.html  skills/coverage.html  skills/operations.html
                         skills/operation_edit.html  skills/_ai_panel.html  skills/history.html
     マネージャー　　　  manager/dashboard.html  manager/_gantt.html  manager/gantt_full.html
@@ -1122,7 +1122,7 @@
               {% for s in items %}
               {% set chosen = selected_skills.get(s.id) %}
               <div class="col d-flex align-items-center gap-2">
-                <label class="small flex-grow-1 mb-0" for="req{{ s.id }}">{{ s.name }}{% if s.category %} <span class="text-muted">({{ s.category }})</span>{% endif %}{% if not s.is_active %} <span class="text-muted">［無効］</span>{% endif %}</label>
+                <label class="small flex-grow-1 mb-0" for="req{{ s.id }}">{{ s.name }}{% if not s.is_active %} <span class="text-muted">［無効］</span>{% endif %}</label>
                 <select name="req_skill_{{ s.id }}" id="req{{ s.id }}" class="form-select form-select-sm task-skill-level" data-skill-name="{{ s.name }}">
                   <option value="">不要</option>
                   {% for level in skill_levels %}
@@ -2274,33 +2274,25 @@
 {# AIのスキル分析・相談・計画・最近の自動更新(app.py の 8 章) #}
 {% include "skills/_ai_panel.html" %}
 
-{# 見方の切り替え(スキル基準 / 業務基準の対応表) #}
-<div class="btn-group btn-group-sm mb-3" role="group">
-  <a href="{{ url_for('skills.list_skills') }}" class="btn btn-outline-primary active">縦=スキル項目</a>
-  <a href="{{ url_for('skills.coverage') }}" class="btn btn-outline-primary">縦=業務（対応可否）</a>
-</div>
-
-{# 横軸に表示する列(ヒト・業務。両方チェックで同時表示) #}
-<form method="get" class="card card-body shadow-sm mb-3 py-2" id="axisForm">
+{# 見方の切り替え(メンバーの到達度・業務に必要なスキル・業務ごとの対応可否。skills/_view_tabs.html) #}
+{% set view = 'person' if show_person else 'operation' %}
+{% include "skills/_view_tabs.html" %}
+{% if view == 'person' %}
+{# メンバーの到達度に、業務に必要なレベルの列も並べる(比べるとき) #}
+<form method="get" class="mb-2" id="axisForm">
   <input type="hidden" name="type" value="{{ skill_type }}">
-  <div class="d-flex align-items-center flex-wrap gap-3">
-    <span class="small text-muted">横軸に表示:</span>
-    <div class="form-check form-check-inline mb-0">
-      <input class="form-check-input" type="checkbox" name="show" value="person" id="showPerson"
-             {% if show_person %}checked{% endif %} onchange="document.getElementById('axisForm').submit()">
-      <label class="form-check-label" for="showPerson"><i class="bi bi-people"></i> ヒト</label>
-    </div>
-    <div class="form-check form-check-inline mb-0">
-      <input class="form-check-input" type="checkbox" name="show" value="operation" id="showOp"
-             {% if show_op %}checked{% endif %} onchange="document.getElementById('axisForm').submit()">
-      <label class="form-check-label" for="showOp"><i class="bi bi-briefcase"></i> 業務</label>
-    </div>
-    <span class="text-muted small">両方チェックで同時表示。業務列＝その業務に必要な到達レベル（ヒトと同じ尺度）。</span>
+  <input type="hidden" name="show" value="person">
+  <div class="form-check form-check-inline small mb-0">
+    <input class="form-check-input" type="checkbox" name="show" value="operation" id="showOp"
+           {% if show_op %}checked{% endif %} onchange="this.form.submit()">
+    <label class="form-check-label" for="showOp">業務に必要なレベルの列も並べる（到達度と比べるとき）</label>
   </div>
 </form>
+{% endif %}
 
-{# 区分タブ(「全スキル」を先頭に。横軸の選択を保持) #}
-<ul class="nav nav-pills mb-3">
+{# 区分(「全スキル」を先頭に。見方の選択を保持) #}
+<ul class="nav nav-pills nav-sm mb-3 align-items-center small">
+  <li class="nav-item text-muted me-2">区分:</li>
   <li class="nav-item">
     <a class="nav-link {% if is_all %}active{% endif %}"
        href="{{ url_for('skills.list_skills', type=all_type, show=show) }}"><i class="bi bi-grid-3x3-gap"></i> 全スキル</a>
@@ -2358,7 +2350,6 @@
         <tr>
           <td class="text-start sticky-col">
             {{ s.name }}
-            {% if s.category %}<br><span class="text-muted small">{{ s.category }}</span>{% endif %}
           </td>
           {# 業務セル: 必要到達レベル(0=不要は空) #}
           {% for o in operations %}
@@ -2423,6 +2414,28 @@
 {% block scripts %}
 <script src="{{ url_for('static', filename='js/skill-ai.js') }}"></script>
 {% endblock %}
+{#=== skills/_view_tabs.html ===#}
+{# スキルマップの見方の切り替え(3つのタブ)と、その見方の説明。変数 view(person / operation / coverage)・
+   skill_type(区分。スキルマップの区分のまま見方を変える。対応可否の画面には無い) #}
+<ul class="nav nav-tabs mb-2">
+  <li class="nav-item">
+    <a class="nav-link {% if view == 'person' %}active{% endif %}" {% if view == 'person' %}aria-current="page"{% endif %}
+       href="{{ url_for('skills.list_skills', type=skill_type, show='person') }}"><i class="bi bi-people"></i> メンバーの到達度</a>
+  </li>
+  <li class="nav-item">
+    <a class="nav-link {% if view == 'operation' %}active{% endif %}" {% if view == 'operation' %}aria-current="page"{% endif %}
+       href="{{ url_for('skills.list_skills', type=skill_type, show='operation') }}"><i class="bi bi-briefcase"></i> 業務に必要なスキル</a>
+  </li>
+  <li class="nav-item">
+    <a class="nav-link {% if view == 'coverage' %}active{% endif %}" {% if view == 'coverage' %}aria-current="page"{% endif %}
+       href="{{ url_for('skills.coverage') }}"><i class="bi bi-check2-square"></i> 業務ごとの対応可否</a>
+  </li>
+</ul>
+<p class="small text-muted mb-2">
+  {% if view == 'person' %}スキル項目ごとに、メンバーの到達度（Lv0〜3）を表示します。
+  {% elif view == 'operation' %}スキル項目ごとに、各業務に必要な到達レベル（メンバーの到達度と同じ尺度）を表示します。
+  {% else %}業務ごとに、各メンバーがその業務に必要なスキルを満たしているか（対応できるか）を表示します。{% endif %}
+</p>
 {#=== skills/member.html ===#}
 {% extends "base.html" %}
 {% from "_macros.html" import fmt_date %}
@@ -2535,7 +2548,6 @@
       <div class="d-flex justify-content-between align-items-center">
         <div>
           <span class="fw-medium">{{ s.name }}</span>
-          {% if s.category %}<span class="text-muted small">({{ s.category }})</span>{% endif %}
         </div>
         <span>
           {% set auto = auto_marks.get(s.id) %}
@@ -2611,9 +2623,7 @@
       {% for s, r in by_type[stype] %}
       <div class="row align-items-center mb-2">
         <div class="col-md-4">
-          <label class="form-label mb-0">{{ s.name }}
-            {% if s.category %}<span class="text-muted small">({{ s.category }})</span>{% endif %}
-          </label>
+          <label class="form-label mb-0">{{ s.name }}</label>
         </div>
         <div class="col-md-5">
           <select name="level_{{ s.id }}" class="form-select form-select-sm">
@@ -2666,14 +2676,13 @@
   <div class="table-responsive">
     <table class="table table-hover align-middle mb-0">
       <thead class="table-light">
-        <tr><th>区分</th><th>スキル名</th><th>カテゴリ</th><th class="text-center">並び順</th><th>状態</th><th title="有効なメンバーのうち、到達度（Lv1以上）が登録されている人数">評価済</th><th></th></tr>
+        <tr><th>区分</th><th>スキル名</th><th class="text-center">並び順</th><th>状態</th><th title="有効なメンバーのうち、到達度（Lv1以上）が登録されている人数">評価済</th><th></th></tr>
       </thead>
       <tbody>
         {% for s in skills %}
         <tr class="{% if not s.is_active %}table-light text-muted{% endif %}">
           <td><span class="badge bg-{{ s.type_color }}">{{ s.type_label }}</span></td>
           <td class="fw-medium">{{ s.name }}</td>
-          <td class="small text-muted">{{ s.category or '―' }}</td>
           <td class="text-center">{{ s.sort_order }}</td>
           <td>
             {% if s.is_active %}<span class="badge bg-success">有効</span>
@@ -2688,10 +2697,17 @@
                 {{ '無効化' if s.is_active else '有効化' }}
               </button>
             </form>
+            {% set u = usage.get(s.id, {}) %}
+            <form method="post" action="{{ url_for('skills.delete_item', skill_id=s.id) }}" class="d-inline"
+                  data-confirm="スキル項目「{{ s.name }}」を削除します。{% if u %}{% for key, label in usage_labels if u.get(key) %}{{ label }} {{ u.get(key) }}件{% if not loop.last %}・{% endif %}{% endfor %}も一緒に削除します。{% endif %}元に戻せません（残しておきたいときは「無効化」してください）。よろしいですか？"
+                  onsubmit="return confirm(this.dataset.confirm);">
+              <input type="hidden" name="row" value="{{ s.row_key }}">
+              <button class="btn btn-sm btn-outline-danger" title="削除"><i class="bi bi-trash"></i> 削除</button>
+            </form>
           </td>
         </tr>
         {% else %}
-        <tr><td colspan="7" class="text-center text-muted py-4">スキル項目がまだありません。</td></tr>
+        <tr><td colspan="6" class="text-center text-muted py-4">スキル項目がまだありません。</td></tr>
         {% endfor %}
       </tbody>
     </table>
@@ -2748,11 +2764,6 @@
       </div>
 
       <div class="row">
-        <div class="col-md-8 mb-3">
-          <label class="form-label" for="item-category">カテゴリ(任意)</label>
-          <input type="text" name="category" id="item-category" class="form-control" value="{{ val('category') }}"
-                 placeholder="例:開発 / 分析 / 運用">
-        </div>
         <div class="col-md-4 mb-3">
           <label class="form-label" for="item-sort">並び順</label>
           <input type="number" name="sort_order" id="item-sort" class="form-control" value="{{ val('sort_order','0') }}">
@@ -2784,7 +2795,7 @@
             <li><strong>■対象外の内容</strong> … このスキルでは評価しない内容（ほかのスキルで扱う内容など）</li>
           </ul>
           <p class="mb-1">
-            「AIで下書き」を押すと、スキル名・区分・カテゴリと到達尺度（今の説明があればそれも参考）から、AIがこの形の下書きを説明の欄に入れます。
+            「AIで下書き」を押すと、スキル名・区分と到達尺度（今の説明があればそれも参考）から、AIがこの形の下書きを説明の欄に入れます。
             <strong>保存はされません</strong>。内容を確認・修正してから「{{ '更新' if editing else '追加' }}」を押してください。
             {% if not ai_enabled %}<span class="text-danger">AIが未設定のため使えません（{{ ai_status }}）。</span>{% endif %}
           </p>
@@ -2818,11 +2829,9 @@
   {% endif %}
 </div>
 
-{# 見方の切り替え #}
-<div class="btn-group btn-group-sm mb-3" role="group">
-  <a href="{{ url_for('skills.list_skills') }}" class="btn btn-outline-primary">縦=スキル項目</a>
-  <a href="{{ url_for('skills.coverage') }}" class="btn btn-outline-primary active">縦=業務（対応可否）</a>
-</div>
+{# 見方の切り替え(skills/_view_tabs.html) #}
+{% set view = 'coverage' %}
+{% include "skills/_view_tabs.html" %}
 
 <p class="text-muted small">
   縦=業務、横=ヒト。各業務に必要なスキル（必要到達レベル）を各メンバーが満たしているかを表します。<br>
@@ -2986,9 +2995,7 @@
       {% for s, r in by_type[stype] %}
       <div class="row align-items-center mb-2">
         <div class="col-md-5">
-          <label class="form-label mb-0">{{ s.name }}
-            {% if s.category %}<span class="text-muted small">({{ s.category }})</span>{% endif %}
-          </label>
+          <label class="form-label mb-0">{{ s.name }}</label>
         </div>
         <div class="col-md-7">
           <select name="level_{{ s.id }}" class="form-select form-select-sm">
@@ -7714,7 +7721,7 @@ a:hover {
 {#=== static/js/skill-item-form.js ===#}
 /* スキル項目の追加・編集の画面(skills/item_form.html)用。
  *
- * ・「AIで下書き」: 入力中のスキル名・区分・カテゴリ・説明をサーバー(/skills/items/description-draft)に
+ * ・「AIで下書き」: 入力中のスキル名・区分・説明をサーバー(/skills/items/description-draft)に
  *   送り、AIの下書きを説明の欄に入れる(保存はしない。保存は「更新」「追加」のボタンで行う)。
  *   説明の欄に入力がある場合は、置き換える前に確認する。
  * ・区分を選び直したときに、テクニカルスキルだけの説明の見出し(使う道具・言語・ソフト。data-technical-only)の
