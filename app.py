@@ -88,7 +88,7 @@ Python のコードはすべてこの app.py にまとめている。ほかの�
       9-6. AI分析: AIの応答の検証
       9-7. AI分析: 実行(バックグラウンド)と保存
       9-8. AI分析: 結果の反映(画面・チームのまとめの材料)
-      9-9. AI分析: 画面
+      9-9. AI分析: 実行と状態(ダッシュボードの「AIで分析」)
       9-10. AI分析: マネージャーダッシュボードのまとめ(エグゼクティブサマリー)
   10. 定型業務のリマインド(メール)
       10-1. リマインド: 予定の作り方(繰り返しのルール・休日の扱い)
@@ -1955,16 +1955,14 @@ FEAT_SKILLS = "skills"
 
 # (キー, 名前, 説明, 前提の機能〔無ければ None〕)。この順に画面に並べる(前提のある機能は、前提の機能の下に字下げする)
 ENV_FEATURES = (
-    (FEAT_TASKS, "タスク管理", "タスクの一覧・登録・進捗の記載・ガントチャート・成果・メールからの下書き・担当者の推奨", None),
-    (FEAT_WEEKLY, "週報", "タスクの週報（Word）を作って、メールで送る", FEAT_TASKS),
-    (FEAT_OVERDUE, "期限超過通知", "期限を過ぎたタスクを、メールで知らせる", FEAT_TASKS),
-    (FEAT_ANALYSIS, "AI分析", "マネージャーダッシュボードのエグゼクティブサマリーと、AI分析の画面", FEAT_TASKS),
-    (FEAT_ROUTINE, "定型・定期業務", "定型・定期業務の一覧・登録（ヒト別の負荷にも入れる）", None),
-    (FEAT_REMINDER, "定型業務リマインド", "実施予定日に担当者へメールで知らせ、完了を入力する（メンバーのメールアドレスの登録も）",
-     FEAT_ROUTINE),
-    (FEAT_LEAVES, "出勤表・年休", "出勤表と年休の登録（タスクの担当者の推奨・規模の案内で、年休・勤務表の休みと出勤日数を見る）",
-     None),
-    (FEAT_SKILLS, "スキル管理", "スキルマップ・スキル項目・業務・タスクの必要スキル・スキルの自動更新", None),
+    (FEAT_TASKS, "タスク管理", "タスクの一覧・進捗・ガントチャート・成果", None),
+    (FEAT_WEEKLY, "週報", "タスクの週報（Word）をメールで送る", FEAT_TASKS),
+    (FEAT_OVERDUE, "期限超過通知", "期限を過ぎたタスクをメールで知らせる", FEAT_TASKS),
+    (FEAT_ANALYSIS, "AI分析", "マネージャーダッシュボードのエグゼクティブサマリー", FEAT_TASKS),
+    (FEAT_ROUTINE, "定型・定期業務", "定型・定期業務の一覧・登録", None),
+    (FEAT_REMINDER, "定型業務リマインド", "実施予定日のメール・完了の入力", FEAT_ROUTINE),
+    (FEAT_LEAVES, "出勤表・年休", "出勤表と年休の登録", None),
+    (FEAT_SKILLS, "スキル管理", "スキルマップ・必要スキル・スキルの自動更新", None),
 )
 ENV_FEATURE_KEYS = tuple(item[0] for item in ENV_FEATURES)
 ENV_FEATURE_LABELS = {item[0]: item[1] for item in ENV_FEATURES}
@@ -7183,7 +7181,7 @@ def toggle_operation(op_id):
 # ==== 5-7. マネージャーダッシュボード =============================================================
 # マネージャーのみアクセス可(各画面に manager_required〔2-5〕)。チーム全体を俯瞰する読み取り専用の
 # 集計ビュー。年休は事由を出さない。
-# 「AI分析（サマリーと推奨アクション）」(/manager/analysis)は 9 章(同じ manager_bp に登録する)。
+# 一番上のエグゼクティブサマリー(AI分析のまとめ)と「AIで分析」の実行は 9 章(同じ manager_bp に登録する)。
 
 manager_bp = Blueprint("manager", __name__, url_prefix="/manager")
 
@@ -10910,8 +10908,8 @@ def skill_ai_panel_context():
     }
 
 # #### 9. AI分析(サマリーと推奨アクション) #########################################################
-# マネージャーダッシュボードの「AI分析（サマリーと推奨アクション）」(/manager/analysis)。ダッシュボードの一番上には、
-# その内容を1つの文章にまとめたエグゼクティブサマリーを表示する(9-10)。
+# マネージャーダッシュボードの一番上の「エグゼクティブサマリー（AI分析）」(9-10)。チームの状況の集計と AI の分析を
+# 1つの文章にまとめて表示する(以前の項目ごとの表の画面〔/manager/analysis〕はなくした)。
 # マネージャーのみ(メンバーは画面・データのどれにもアクセスできない。403)。
 # チームの状況を4つの観点でまとめ、マネージャーが今やることを推奨アクションとして示す:
 #   ① タスクの進捗   進み(期間内の完了・着手)/遅れ(期限超過・期限が近いのに未着手・
@@ -10974,18 +10972,14 @@ AI_ANALYSIS_DEFAULTS = {
 # (キー, 表示名, 最小, 最大, 説明)。画面の入力チェックと読み込み時の検証に使う
 AI_ANALYSIS_FIELDS = (
     ("due_soon_days", "期限が近いとみなす営業日数（N1）", DUE_SOON_DAYS_MIN, DUE_SOON_DAYS_MAX,
-     "「未着手」のタスクで、期限まで残りこの営業日数以内のものを「期限が近いのに未着手」にします（今日が期限なら残り0）。"),
+     "期限まで残りこの日数以内の「未着手」が対象です"),
     ("stale_days", "記載がないとみなす営業日数（N2）", STALE_DAYS_MIN, STALE_DAYS_MAX,
-     "「進行中」のタスクで、担当者の最後の進捗記載（記載が無いとき・進行中にした後に記載が無いときは進行中にした日）から"
-     "この営業日数以上たったものを「進行中なのに記載がない」にします。"
-     "保留がこの営業日数以上続くタスクも、推奨アクション（保留の理由・再開の条件の確認）の候補にします。"),
+     "最後の記載からこの日数以上たった「進行中」が対象です。長い保留にも使います"),
 )
 # AI への送信の設定(画面では「AIへの送信」の欄に表示する。形は AI_ANALYSIS_FIELDS と同じ)
 AI_ANALYSIS_SEND_FIELDS = (
     ("chunk_chars", "1回に送る材料の最大文字数", CHUNK_CHARS_MIN, CHUNK_CHARS_MAX,
-     "1人分の材料（タスクの説明・すべてのコメントなど）がこれより長いときは、タスクのまとまりごとに分けて"
-     "複数回で送ります（省略はしません）。チームのまとめの材料が長いときは、詳細な一覧を先に分けて要約してから送ります。"
-     "接続先のAIが一度に受け取れる量が少ないときは小さくします。"),
+     "長い材料は分けて送ります。接続先のAIが受け取れる量が少ないときは小さくします"),
 )
 _AI_ANALYSIS_ALL_FIELDS = AI_ANALYSIS_FIELDS + AI_ANALYSIS_SEND_FIELDS
 
@@ -13469,7 +13463,7 @@ def _pairs_texts(pairs):
 
 # ==== 9-7. AI分析: 実行(バックグラウンド)と保存 ===================================================
 # 「AIで分析」(POST /manager/analysis/run)で別スレッドの実行を始める(同時に1つだけ)。
-# 画面は実行中の表示(GET /manager/analysis/status を数秒ごとに確認し、終わったら再読み込み)。
+# ダッシュボードは実行中の表示(GET /manager/analysis/status を数秒ごとに確認し、終わったら再読み込み)。
 # 結果は instance/ai_analysis.json に最新の1回分だけを上書きで保存する(DB には保存しない)。
 # AI の呼び出しが1回も成功しなかったときは保存せず(前の結果を残す)、失敗の理由を画面に表示する。
 # 1回の呼び出しが失敗しても残りは続け、読めなかった材料は「未読込」として結果に残す。
@@ -14761,12 +14755,12 @@ def ai_result_matches(stored, period):
     p = stored.get("period") or {}
     return p.get("start") == period["start"].isoformat() and p.get("end") == period["end"].isoformat()
 
-# ==== 9-9. AI分析: 画面 ===========================================================================
-# GET  /manager/analysis          コードの集計(①〜④)とルールによる推奨アクションをすぐに表示する。
-#                                 期間は ?period=7|14|30|90(既定 30)または ?period=range&from=...&to=...
-#                                 保存した AI の結果の期間が同じなら、AI の結果も反映して表示する(9-8)
-# POST /manager/analysis/run      「AIで分析」。別スレッドで実行を始めて画面に戻る(9-7)
+# ==== 9-9. AI分析: 実行と状態(ダッシュボードの「AIで分析」) ===========================================
+# POST /manager/analysis/run      「AIで分析」(エグゼクティブサマリー〔9-10〕のボタン)。別スレッドで実行を始めて
+#                                 マネージャーダッシュボードに戻る(9-7)
 # GET  /manager/analysis/status   実行中の表示用の状態(JSON。APIキー・接続先の URL は含まない)
+# GET  /manager/analysis          以前の「AI分析（サマリーと推奨アクション）」の画面の URL。画面はなくした
+#                                 (エグゼクティブサマリーだけを使う)ため、マネージャーダッシュボードへ移す
 # マネージャーのみ(manager_required〔2-5〕。メンバーは 403、未ログインはログイン画面)。
 
 _ANALYSIS_PERIOD_ARGS = ("period", "from", "to")
@@ -14833,45 +14827,15 @@ def _analysis_ai_view(data, period):
 @manager_bp.route("/analysis", endpoint="analysis")
 @manager_required
 def analysis_dashboard():
-    now = _now()
-    period = analysis_period(request.args, now.date())
-    settings = load_ai_analysis_settings()
-    data = collect_analysis(period, now, settings)
-    ai = _analysis_ai_view(data, period)
-    return render_template(
-        "manager/analysis.html",
-        a=data,
-        ai=ai,
-        ai_run=ai_analysis_status(),
-        period=period,
-        period_choices=ANALYSIS_PERIOD_DAYS,
-        period_range=ANALYSIS_PERIOD_RANGE,
-        settings=settings,
-        sample_note=sample_note,
-        action_max=ACTION_MAX,
-        action_sources=RULE_ACTION_SOURCES,
-        type_choices=SKILL_TYPE_CHOICES,
-        ai_status=ai_status_label(),
-        ai_configured=ai_is_configured(),
-        finding_keys=FINDING_KEYS,
-        skills_ai_keys=SKILLS_AI_KEYS,
-        state_unread=AI_STATE_UNREAD,
-        state_changed=AI_STATE_CHANGED,
-        state_new=AI_STATE_NEW,
-        # 表のコメントの日付(推奨アクションと同じく、分析の基準の日時と違う年は yyyy/mm/dd。1年以上前の
-        # 期限超過・未完了のタスクのコメントを、今年の日付と読まれないように)
-        date_label=lambda d: _analysis_date(d, data),
-    )
+    """以前の AI分析の画面の URL: マネージャーダッシュボード(エグゼクティブサマリー)へ。"""
+    return redirect(url_for("manager.dashboard"))
 
 @manager_bp.route("/analysis/run", methods=["POST"], endpoint="analysis_run")
 @manager_required
 def analysis_run():
-    """「AIで分析」: 画面で選んでいる期間で、別スレッドの実行を始める(back=dashboard ならダッシュボードに戻る)。"""
+    """「AIで分析」: 送られた期間(ダッシュボードは既定の直近N日)で別スレッドの実行を始め、ダッシュボードに戻る。"""
     args = {key: request.form.get(key, "").strip() for key in _ANALYSIS_PERIOD_ARGS}
-    if request.form.get("back") == ANALYSIS_BACK_DASHBOARD:
-        back = url_for("manager.dashboard")   # ダッシュボードのまとめ(9-10)から実行したとき
-    else:
-        back = url_for("manager.analysis", **{k: v for k, v in args.items() if v})
+    back = url_for("manager.dashboard")
     if not ai_is_configured():
         flash("AIが未設定のため、AIで分析できません。{}。".format(ai_missing_label()), "danger")
     elif start_ai_analysis(current_app._get_current_object(), args):
@@ -14887,14 +14851,14 @@ def analysis_status():
     return jsonify(ai_analysis_status())
 
 # ==== 9-10. AI分析: マネージャーダッシュボードのまとめ(エグゼクティブサマリー) =======================
-# マネージャーダッシュボードの一番上に、AI分析(①〜④のまとめ・推奨アクション)を1つの文章にまとめて表示する
-# (画面を切り替えずに見る。表示だけ。項目ごとの表・書き直し案は AI分析の画面〔9-9〕)。
-#   期間 : 保存した AI の結果があればその期間(AI のまとめをそのまま出すため)、無ければ既定の直近30日
-#   文章 : 対象(期間・人数・現時点) → 全体の状況(アプリの集計) → AIのまとめ(AI の結果があるとき)
-#          → いま対応すること(AI の推奨アクション。AI の結果が無ければルールの推奨アクション)
+# マネージャーダッシュボードの一番上に、マネージャーが今対応することを1つの文章にまとめて表示する
+# (表示だけ。AI分析の結果を見るのはここだけ。以前の項目ごとの表の画面はなくした)。
+#   期間 : 保存した AI の結果があればその期間(AI の推奨アクションをそのまま出すため)、無ければ既定の直近30日
+#   文章 : 時点・人数 → 要対応の件数 → いま対応すること(今すぐ対応が要る種類の推奨アクションだけ。AI の結果が
+#          あれば AI が選んだもの、無ければ集計のルールで選んだもの。急がない改善と状況の説明は出さない)
 # 「AIで分析」はダッシュボードからも実行できる(既定の直近30日。終わるとダッシュボードを読み直して表示する)。
 
-ANALYSIS_BACK_DASHBOARD = "dashboard"   # 「AIで分析」のフォームの back(終わった後にダッシュボードに戻る)
+ANALYSIS_BACK_DASHBOARD = "dashboard"   # 「AIで分析」のフォームの back(以前の画面との区別。今はいつもダッシュボードに戻る)
 SUMMARY_REASON_MAX = 200                # 推奨アクションの理由の文字数(まとめの中。長ければ「…」)
 
 def _summary_period(stored, today):
@@ -14906,74 +14870,46 @@ def _summary_period(stored, today):
             return period
     return analysis_period({}, today)
 
-def _summary_amounts(team):
-    """成果(年換算)の合計の文(金額・時間。見込み・実績のどちらも無い種類は書かない)。"""
-    parts = []
-    if team["money_act"] or team["money_est"]:
-        parts.append("金額 実績 ¥{:,.0f}（見込み ¥{:,.0f}）".format(team["money_act"], team["money_est"]))
-    if team["hour_act"] or team["hour_est"]:
-        parts.append("時間 実績 {:,.1f}h（見込み {:,.1f}h）".format(team["hour_act"], team["hour_est"]))
-    return "・".join(parts)
+# エグゼクティブサマリーの「いま対応すること」に出す推奨アクションの種類(今すぐ対応が要るもの)。急がない改善
+# (業務・スキルの偏り・成果や進捗の書き方)は出さない
+URGENT_ACTION_CATEGORIES = ("overdue", "manager_comment", "stale", "due_soon", "hold", "load")
+
+def urgent_actions(data, applied):
+    """「いま対応すること」: AI の推奨アクション(AI の結果を反映したとき)のうち今すぐ対応が要る種類のもの。無ければ、
+    集計のルールの候補のうち今すぐ対応が要る種類のもの(点数の高い順)。どちらも最大 ACTION_MAX 件。
+
+    戻り値: (アクションの一覧, AI が選んだものか)。
+    """
+    if applied:
+        picked = [a for a in data.get("ai_actions") or [] if a.get("category") in URGENT_ACTION_CATEGORIES]
+        if picked:
+            return picked[:ACTION_MAX], True
+    candidates = sorted((a for a in _action_candidates(data) if a["category"] in URGENT_ACTION_CATEGORIES),
+                        key=lambda a: -a["score"])
+    return candidates[:ACTION_MAX], False
 
 def executive_summary_text(data, period_label, applied):
-    """AI分析の結果(collect_analysis の戻り値。applied なら AI の結果を反映済み〔9-8〕)を1つの文章にする。"""
+    """エグゼクティブサマリーの文章: マネージャーが今対応することのまとめ(要対応の件数と、いま対応することの一覧)。
+
+    data は collect_analysis の戻り値(applied なら AI の結果を反映済み〔9-8〕)。
+    """
     progress = data["progress"]["team"]
-    skills = data["skills"]
-    outputs = data["outputs"]["team"]
-    lines = ["対象: {}・メンバー {}名・現時点 {}".format(period_label, len(data["members"]),
-                                                    data["now"].strftime("%Y/%m/%d %H:%M")),
-             "", "【全体の状況】"]
-    lines.append("・タスク: 期間内の完了 {done}件・着手 {started}件。現時点で期限超過 {overdue}件・期限が近いのに未着手 "
-                 "{due_soon}件・進行中なのに記載がない {stale}件・保留 {hold}件。".format(**progress))
-    if progress["mc_total"]:
-        lines.append("・マネージャーのコメント: {mc_total}件のうち、担当者の返信がないもの {mc_no_reply}件。".format(**progress))
-    use_skills = feature_enabled(FEAT_SKILLS)   # スキル管理を使わない環境(2-8)はスキルの行を出さない
-    if use_skills:
-        updates = skills["updates"]["team"]
-        manual = updates["manual_ups"] + updates["manual_downs"]
-        line = "・スキル: 期間内の到達度の更新 {}件（タスクの完了からの自動更新 {}件・マネージャーの変更 {}件）。".format(
-            updates["auto_ups"] + manual, updates["auto_ups"], manual)
-        line += "保有者が1名以下のスキル {}件・対応できる人が1名以下の業務 {}件。".format(
-            len(skills["thin_skills"]), len(skills["single_operations"]))
-        concentration = skills["concentration"]
-        if concentration.get("flag") and concentration.get("top"):
-            line += "単独でできる（Lv{}以上）スキルの {}% を {} さんが持っています（偏り）。".format(
-                skills["proficient"], concentration["top_share"], concentration["top"]["name"])
-        lines.append(line)
-    line = "・成果: 期間内に完了したタスク {}件".format(outputs["completed"])
-    amounts = _summary_amounts(outputs)
-    if amounts:
-        line += "。成果（年換算）: " + amounts
-    if outputs["rewrite"]:
-        line += "。書き直しを勧める成果 {}件".format(outputs["rewrite"])
-    lines.append(line + "。")
     heavy = [r for r in data["abilities"]["rows"] if (r.get("load_h") or 0) >= _LOAD_FULL]
-    if heavy:
-        lines.append("・負荷: フルタイム（{}h/月）以上の人 {}名（{}）。".format(
-            _LOAD_FULL, len(heavy), "、".join("{} {}h/月".format(r["name"], _fmt_num(r["load_h"])) for r in heavy)))
-    else:
-        lines.append("・負荷: フルタイム（{}h/月）以上の人はいません。".format(_LOAD_FULL))
-
-    summary = data.get("ai_summary") if applied else None
-    if summary:
-        lines += ["", "【AIのまとめ】"]
-        for key, label in SUMMARY_KEYS:
-            if key == "skills" and not use_skills:
-                continue
-            items = [str(item).strip() for item in summary.get(key) or [] if str(item).strip()]
-            if items:
-                lines.append(label)
-                lines += ["・" + item for item in items]
-
-    ai_actions = data.get("ai_actions") if applied else None
-    actions = ai_actions or data["actions"]
-    lines += ["", "【いま対応すること（優先度の高い順・{}）】".format(
-        "AIが選んだもの" if ai_actions else "集計のルールで選んだもの")]
+    counts = (("期限超過", progress["overdue"], "件"), ("期限が近いのに未着手", progress["due_soon"], "件"),
+              ("進行中なのに記載がない", progress["stale"], "件"),
+              ("担当者の返信がないマネージャーのコメント", progress["mc_no_reply"], "件"), ("保留", progress["hold"], "件"),
+              ("負荷がフルタイム（{}h/月）以上の人".format(_LOAD_FULL), len(heavy), "名"))
+    shown = ["{} {}{}".format(label, n, unit) for label, n, unit in counts if n]
+    actions, by_ai = urgent_actions(data, applied)
+    lines = ["{} 時点・メンバー {}名（集計の期間: {}）".format(data["now"].strftime("%Y/%m/%d %H:%M"),
+                                                       len(data["members"]), period_label),
+             "要対応: " + ("・".join(shown) if shown else "なし"),
+             "", "【いま対応すること（優先度の高い順・{}）】".format("AIが選んだもの" if by_ai else "集計のルールで選んだもの")]
     if not actions:
         lines.append("いま対応が必要な項目はありません。")
-    for action in actions:
+    for rank, action in enumerate(actions, start=1):
         target = action.get("target") if isinstance(action.get("target"), dict) else {}
-        line = "{}. 〔{}〕{}".format(action.get("rank"), action.get("category_label") or "", action.get("title") or "")
+        line = "{}. 〔{}〕{}".format(rank, action.get("category_label") or "", action.get("title") or "")
         label = str(target.get("label") or "")
         if label or target.get("stale"):
             line += "（{}）".format("・".join(x for x in (label, str(target.get("stale") or "")) if x))
@@ -15017,8 +14953,7 @@ def dashboard_analysis_summary_safe():
         current_app.logger.exception("マネージャーダッシュボードのエグゼクティブサマリーを作れませんでした")
         return {"text": "", "applied": False, "ai": None, "run": None, "ai_configured": ai_is_configured(),
                 "ai_status": ai_status_label(), "default_days": ANALYSIS_DEFAULT_DAYS,
-                "error": "AI分析のまとめを作れませんでした（内容はサーバーのログに記録しました）。"
-                         "項目ごとの表は AI分析の画面で確認できます。"}
+                "error": "AI分析のまとめを作れませんでした（内容はサーバーのログに記録しました）。"}
 
 # #### 10. 定型業務のリマインド(メール) ############################################################
 # 定型・定期業務(3-4・5-4)の実施日に担当者へメールで知らせ、その回の完了の入力があるまで1日2回
@@ -16554,67 +16489,53 @@ FIELDS = (
     ),
     Field(
         "ADMIN_PASSWORD", GROUP_LOGIN, "固定ローカル管理者（admin）のパスワード",
-        "ID「admin」でログインするときのパスワードです。値は表示しません。"
-        "変更する場合だけ、新しいパスワードを2回入力してください（8文字以上）。保存するとすぐに有効になります。"
-        "config.py にも画面の設定にも無い（空の）場合は、admin のログイン可否は ldap_client.py の判定に任されます。",
+        "8文字以上。",
         type=TYPE_SECRET, secret=True, confirm=True, min_length=8,
-        clear_warning="空にすると、admin のログイン可否は ldap_client.py の判定に任されます"
-                      "（ldap_client.py に admin 用の固定パスワードがある場合は、それでログインできるようになります）。",
-        unset_warning="ADMIN_PASSWORD が未設定です（config.py にも画面の設定にも無い・空）。admin のログイン可否は "
-                      "ldap_client.py の判定に任されています（同梱の ldap_client.py では、admin 用の既定の固定パスワードで"
-                      "ログインできます）。新しいパスワードを入力して保存してください。",
+        clear_warning="空にすると、admin のログイン可否は ldap_client.py の判定に任されます。",
+        unset_warning="ADMIN_PASSWORD が未設定です（admin のログイン可否は ldap_client.py の判定に任され、"
+                      "同梱版では既定のパスワードで入れます）。新しいパスワードを保存してください。",
     ),
     # ---- LDAP ----
     Field(
         "LDAP_API_URL", GROUP_LDAP, "LDAP認証APIのURL",
-        "本番でLDAP認証APIに接続する場合のエンドポイントです（例: https://auth.example.com/ldap/auth）。"
-        "この値の使い方は ldap_client.py の実装によります"
-        "（起動時に読み込む実装の場合は、変更後にサーバーの再起動が必要です）。",
+        "例: https://auth.example.com/ldap/auth",
         type=TYPE_URL,
     ),
     # ---- AI ----
     Field(
         "AI_API_URL", GROUP_AI, "AI APIのエンドポイント",
-        "ChatGPT互換（OpenAI互換の形式）APIのエンドポイントです（例: https://api.example.com/v1/chat/completions）。"
-        "既定の接続先は無く、ここで設定した接続先にだけ送ります。"
-        "週報の文章整形・スキルの説明の下書き・AI分析・スキルの自動更新・スキルマップのAI（分析・相談）に使います"
-        "（AI分析・スキルの自動更新では、メンバーの名前・タスクの内容・進捗の記載をこの接続先に送ります）。"
-        "エンドポイントとモデル名の両方が設定されるまで、AIは使いません（週報はルールベースで作成、"
-        "スキルの説明の「AIで下書き」・スキルの自動更新・スキルマップのAIは使えず、"
-        "AI分析はアプリの集計とルールの推奨アクションだけ）。",
+        "ChatGPT互換（OpenAI互換）のAPI。メンバーの名前・タスクの内容・進捗の記載をこの接続先に送ります。"
+        "例: https://api.example.com/v1/chat/completions",
         type=TYPE_URL, ascii_only=True,
     ),
     Field(
         "AI_API_KEY", GROUP_AI, "APIキー",
-        "接続先がキーを求める場合に設定します（Authorization ヘッダに付けます）。キーが不要な接続先なら空のままでかまいません。"
-        "値は表示しません。"
-        "エンドポイントの接続先（ホスト・ポート・http/https）を変えるときは、キーを入力し直すか「空にする」を指定してください。",
+        "接続先がキーを求める場合だけ設定します。",
         type=TYPE_SECRET, secret=True, bound_to=("AI_API_URL",), ascii_only=True,
     ),
     Field(
         "AI_MODEL", GROUP_AI, "モデル名",
-        "使用するモデル名です（接続先で利用できるモデル名。既定のモデル名は無く、空のままではAIを使いません）。",
+        "接続先で使えるモデル名です。空のままではAIを使いません。",
     ),
     Field(
         "AI_TIMEOUT", GROUP_AI, "タイムアウト（秒）",
-        "AIの応答を待つ最大の秒数です（1以上の整数でなければAIを使いません）。",
+        "AIの応答を待つ最大の秒数です。",
         type=TYPE_INT, min=5, max=600,
     ),
     # ---- メール送信 ----
     Field(
         "MAIL_SMTP_SERVER", GROUP_MAIL, "送信サーバー",
-        "ホスト名またはIPアドレスです（例: smtp.example.com）。空ならメールは送信できません。"
-        "送信は暗号化（STARTTLS）・認証（ログイン）なしで行うため、認証なしで送信できるサーバーを指定します。",
+        "例: smtp.example.com。暗号化（STARTTLS）・認証（ログイン）なしで送ります。",
         pattern=_HOST_PATTERN, pattern_help=_HOST_HELP, check=_check_host,
     ),
     Field(
         "MAIL_SMTP_PORT", GROUP_MAIL, "ポート番号",
-        "一般的には 25 です。送信サーバーの指定に合わせます（未設定・1〜65535 の整数でないときは送信しません）。",
+        "通常は 25 です。",
         type=TYPE_INT, min=1, max=65535,
     ),
     Field(
         "MAIL_FROM", GROUP_MAIL, "差出人アドレス",
-        "例: noreply@example.com。テスト送信・メール接続テストは、このアドレス宛てに送ります。",
+        "例: noreply@example.com",
         type=TYPE_ADDRESS,
     ),
     # ---- 宛先 ----
@@ -16630,18 +16551,13 @@ FIELDS = (
     ),
     Field(
         "MAIL_ALLOWED_DOMAINS", GROUP_RECIPIENTS, "送信を許可するドメイン",
-        "メールを送ってよい宛先のドメインです（1行に1件。例: example.com。サブドメイン〔mail.example.com など〕も"
-        "含みます）。設定すると、差出人・宛先（To）・同報（Cc）・メンバーのメールアドレス・定型業務リマインドの"
-        "追加の宛先には、このドメインのアドレスだけを保存でき、ほかのドメインのアドレスには送信しません"
-        "（設定する前に登録したアドレスも送りません）。未設定（空）なら制限しません。",
+        "このドメインのアドレスにだけ送ります。",
         type=TYPE_DOMAINS,
     ),
     # ---- リンク ----
     Field(
         "APP_BASE_URL", GROUP_SERVER, "リンクの基準URL",
-        "メールに載せるタスク・定型業務へのリンクの基準URLです（メンバーのPCからこのアプリを開くときのURL。"
-        "末尾の / は不要。例: http://192.0.2.10:8050）。空ならリンクを付けません（タスク名・業務名だけ）。"
-        "期限超過通知と定型業務リマインドのメールに使います。",
+        "メンバーのPCから開くときのURL（例: http://192.0.2.10:8050。末尾の / は不要）。",
         type=TYPE_URL, no_query=True,
     ),
 )
