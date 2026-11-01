@@ -34,6 +34,7 @@ Python のコードはすべてこの app.py にまとめている。ほかの�
       2-5. 画面の権限の確認(マネージャーだけの画面)
       2-6. 時間のかかる処理の別スレッドでの実行(同時に1つだけ)
       2-7. メール機能(週報・期限超過通知・リマインド)の共通の部品
+      2-8. 環境ごとの使う機能(使わない機能の画面・メニュー・定期メールを止める)
   3. モデル(DBのテーブル)
       3-1. ユーザー
       3-2. タスク
@@ -128,7 +129,7 @@ Python のコードはすべてこの app.py にまとめている。ほかの�
       17-2. 環境ごとのアプリと振り分け(EnvDispatcher)
       17-3. 共通のログイン(instance/portal_sessions.json)
       17-4. 画面(ログインの後の環境の選択・環境に入る)
-      17-5. 環境の追加・名前の変更・停止(システム管理の「環境」。固定ローカル管理者 admin だけ。18 章)
+      17-5. 環境の追加・名前の変更・使う機能・停止(システム管理の「環境」。固定ローカル管理者 admin だけ。18 章)
   18. システム管理(固定ローカル管理者 admin だけの画面)
 """
 import calendar
@@ -1934,6 +1935,123 @@ def mail_footer():
 def _preview_document(html):
     """プレビュー用のHTML(リンクは別タブで開く)。iframe の srcdoc に入れて表示する。"""
     return html.replace("<head>", '<head>\n<base target="_blank">', 1)
+
+# ==== 2-8. 環境ごとの使う機能(使わない機能の画面・メニュー・定期メールを止める) ============================
+# 環境(17 章)ごとに、使う機能を選べる(固定ローカル管理者 admin がシステム管理の「環境」で、環境を追加するときと、
+# 後から選ぶ。環境の一覧〔instance/environments.json〕の各環境の features: {キー: true/false})。
+# 使わない機能は、ナビ・ダッシュボード・システム設定のタブ・Excel の出力に出さず、その画面の URL を開いても使えない
+# (404 で案内する)。定期メール(週報・期限超過通知・定型業務リマインド)も送らない。データは消さない(後から使うように
+# すると元のまま使える)。features の無い環境(以前に追加した環境・メインの環境)と、キーの無い機能は「使う」(今までと
+# 同じ動き)。週報・期限超過通知・AI分析はタスク管理を、定型業務リマインドは定型・定期業務を使うときだけ使える。
+
+FEAT_TASKS = "tasks"
+FEAT_WEEKLY = "weekly"
+FEAT_OVERDUE = "overdue"
+FEAT_ANALYSIS = "analysis"
+FEAT_ROUTINE = "routine"
+FEAT_REMINDER = "reminder"
+FEAT_LEAVES = "leaves"
+FEAT_SKILLS = "skills"
+
+# (キー, 名前, 説明, 前提の機能〔無ければ None〕)。この順に画面に並べる(前提のある機能は、前提の機能の下に字下げする)
+ENV_FEATURES = (
+    (FEAT_TASKS, "タスク管理", "タスクの一覧・登録・進捗の記載・ガントチャート・成果・メールからの下書き・担当者の推奨", None),
+    (FEAT_WEEKLY, "週報", "タスクの週報（Word）を作って、メールで送る", FEAT_TASKS),
+    (FEAT_OVERDUE, "期限超過通知", "期限を過ぎたタスクを、メールで知らせる", FEAT_TASKS),
+    (FEAT_ANALYSIS, "AI分析", "マネージャーダッシュボードのエグゼクティブサマリーと、AI分析の画面", FEAT_TASKS),
+    (FEAT_ROUTINE, "定型・定期業務", "定型・定期業務の一覧・登録（ヒト別の負荷にも入れる）", None),
+    (FEAT_REMINDER, "定型業務リマインド", "実施予定日に担当者へメールで知らせ、完了を入力する（メンバーのメールアドレスの登録も）",
+     FEAT_ROUTINE),
+    (FEAT_LEAVES, "出勤表・年休", "出勤表と年休の登録（タスクの担当者の推奨・規模の案内で、年休・勤務表の休みと出勤日数を見る）",
+     None),
+    (FEAT_SKILLS, "スキル管理", "スキルマップ・スキル項目・業務・タスクの必要スキル・スキルの自動更新", None),
+)
+ENV_FEATURE_KEYS = tuple(item[0] for item in ENV_FEATURES)
+ENV_FEATURE_LABELS = {item[0]: item[1] for item in ENV_FEATURES}
+ENV_FEATURE_PARENTS = {item[0]: item[3] for item in ENV_FEATURES if item[3]}
+ENV_FEATURE_FIELD = "feature"          # 画面のチェックボックスの名前(値は機能のキー。複数)
+ENV_FEATURE_MARK = "features_shown"    # 使う機能の欄のあるフォームの印(印の無い以前の画面からの追加は、すべての機能を使う)
+ENV_FEATURE_NONE = "使う機能を1つ以上選んでください（タスク管理・定型・定期業務・出勤表・年休・スキル管理のどれか）。"
+FEATURE_OFF_MESSAGE = ("この機能は使えません\nこの環境では「{}」を使わない設定です。使うときは、固定ローカル管理者（admin）が"
+                       "システム管理の「環境」で変えられます。")
+
+def normalize_env_features(value):
+    """使う機能を整える: {キー: True/False}(すべての機能のキー)。
+
+    無い・正しくない値は「使う」(false のときだけ使わない)。前提の機能を使わない機能は使わない。
+    """
+    raw = value if isinstance(value, dict) else {}
+    features = {key: raw.get(key) is not False for key in ENV_FEATURE_KEYS}
+    for key, parent in ENV_FEATURE_PARENTS.items():
+        if not features[parent]:
+            features[key] = False
+    return features
+
+def env_features_from_form(form):
+    """画面のフォームの使う機能。戻り値: (使う機能 または None, エラーの文 または None)。
+
+    使う機能の欄の無い以前の画面からの送信(印 ENV_FEATURE_MARK が無い)は (None, None)。前提の機能を選ばなかった
+    機能は使わない。前提の無い機能(タスク管理・定型・定期業務・出勤表・年休・スキル管理)を1つも使わないときはエラー。
+    """
+    if not form.get(ENV_FEATURE_MARK):
+        return None, None
+    chosen = set(form.getlist(ENV_FEATURE_FIELD))
+    features = normalize_env_features({key: key in chosen for key in ENV_FEATURE_KEYS})
+    if not any(features[key] for key in ENV_FEATURE_KEYS if key not in ENV_FEATURE_PARENTS):
+        return features, ENV_FEATURE_NONE
+    return features, None
+
+def env_features(app=None):
+    """この環境で使う機能 {キー: True/False}(環境の一覧のその環境の行。要求の中では1回だけ読む)。"""
+    if app is None and has_request_context():
+        cached = g.get("_env_features")
+        if cached is None:
+            entry = env_entry(env_key())
+            cached = g._env_features = entry["features"] if entry else normalize_env_features(None)
+        return cached
+    entry = env_entry(env_key(app), app)
+    return entry["features"] if entry else normalize_env_features(None)
+
+def feature_enabled(key, app=None):
+    """この環境でその機能(FEAT_*)を使うか(前提の機能を使わないときは使わない)。"""
+    return env_features(app).get(key, True)
+
+def env_features_label(features):
+    """使う機能の表示(すべてなら「すべての機能」、ほかは名前を「、」でつないだもの)。"""
+    names = [ENV_FEATURE_LABELS[key] for key in ENV_FEATURE_KEYS if features.get(key)]
+    return "すべての機能" if len(names) == len(ENV_FEATURE_KEYS) else "、".join(names) or "なし"
+
+def env_feature_rows(features):
+    """使う機能のチェックボックスの並び [{key, label, help, parent, on}]。"""
+    return [{"key": key, "label": label, "help": help_text, "parent": parent, "on": bool(features.get(key))}
+            for key, label, help_text, parent in ENV_FEATURES]
+
+# 機能ごとの画面: Blueprint ごと(Blueprint の名前 → 機能)と、Blueprint の中の一部の画面(エンドポイント → 機能)。
+# システム設定のタブの保存(system.save_<タブ>)は、タブを出すか(system_tab_enabled。11-3)で確かめる
+FEATURE_BLUEPRINTS = {"tasks": FEAT_TASKS, "routine": FEAT_ROUTINE, "leaves": FEAT_LEAVES, "skills": FEAT_SKILLS,
+                      "weekly": FEAT_WEEKLY, "overdue": FEAT_OVERDUE}
+FEATURE_ENDPOINTS = {
+    "manager.gantt_full": FEAT_TASKS,
+    "manager.analysis": FEAT_ANALYSIS, "manager.analysis_run": FEAT_ANALYSIS, "manager.analysis_status": FEAT_ANALYSIS,
+    "routine.occurrence": FEAT_REMINDER, "routine.complete_occurrence": FEAT_REMINDER,
+    "routine.undo_occurrence": FEAT_REMINDER, "system.test_reminder": FEAT_REMINDER,
+    "account.email": FEAT_REMINDER, "departments.save_member_email": FEAT_REMINDER,
+    "export.tasks_xlsx": FEAT_TASKS, "export.routine_xlsx": FEAT_ROUTINE, "export.skills_xlsx": FEAT_SKILLS,
+    "export.leaves_xlsx": FEAT_LEAVES,
+}
+SYSTEM_SAVE_PREFIX = "system.save_"
+
+def check_env_feature():
+    """before_request: この環境で使わない機能の画面は開けない(404 で案内する。何も変えない)。"""
+    endpoint = request.endpoint or ""
+    if endpoint.startswith(SYSTEM_SAVE_PREFIX):
+        tab = endpoint[len(SYSTEM_SAVE_PREFIX):]
+        if tab in TAB_KEYS and not system_tab_enabled(tab):
+            abort(404, description=FEATURE_OFF_MESSAGE.format(system_tab_label(tab)))
+    feature = FEATURE_ENDPOINTS.get(endpoint) or FEATURE_BLUEPRINTS.get(request.blueprint)
+    if feature and not feature_enabled(feature):
+        abort(404, description=FEATURE_OFF_MESSAGE.format(ENV_FEATURE_LABELS[feature]))
+    return None
 
 # #### 3. モデル(DBのテーブル) #####################################################################
 # DBのテーブルは、ここで定義したクラスから作る(足りないテーブルは起動時に create_all で作成。
@@ -4807,6 +4925,11 @@ def main_dashboard():
     if current_user.is_manager:
         # マネージャーのトップはマネージャーダッシュボード(個人ダッシュボードはメンバーの画面)
         return redirect(url_for("manager.dashboard"))
+    me = current_user._get_current_object()
+    routine_panel = dashboard_routine_panel(reminder_today(), me)
+    if not feature_enabled(FEAT_TASKS):
+        # タスク管理を使わない環境(2-8): タスクの欄(数・担当・活動・ガントチャート・成果)は作らない
+        return render_template("main/dashboard.html", routine_panel=routine_panel)
     my_tasks = (
         Task.query.filter(
             Task.assignees.any(User.id == current_user.id),
@@ -4826,7 +4949,6 @@ def main_dashboard():
     }
 
     today = date.today()
-    me = current_user._get_current_object()
     actx = _build_activity(today, [me], include_unassigned=False)
     # 成果の按分(担当者数で割る)を全体と揃えるため、母集団は有効ユーザー全員を渡す
     octx = _build_outcomes(today, get_active_users(), only_user_id=me.id)
@@ -4834,7 +4956,7 @@ def main_dashboard():
 
     return render_template(
         "main/dashboard.html",
-        routine_panel=dashboard_routine_panel(reminder_today(), me),
+        routine_panel=routine_panel,
         my_tasks=my_tasks,
         my_overdue=my_overdue,
         status_counts=status_counts,
@@ -4916,6 +5038,9 @@ def _render_task_form(task, users, form, selected, version=None, skills=None):
         version = TASK_VERSION.shown(form, task)
     if skills is None:
         skills = task_skills_from_form(form) if form is not None else task_skill_levels(task)
+    use_skills = feature_enabled(FEAT_SKILLS)
+    if not use_skills:
+        skills = {}   # スキル管理を使わない環境(2-8): 必要スキルの欄を出さず、推奨にも使わない
     can_plan = current_user.is_manager
     rec = capacity = None
     if can_plan:
@@ -4932,7 +5057,7 @@ def _render_task_form(task, users, form, selected, version=None, skills=None):
         form=form, selected_assignees=selected, version=version,
         can_plan=can_plan,  # 計画系項目(優先度/日付/規模/担当者/必要スキル)を編集できるか
         date_bounds=_task_date_bounds(task),  # 開始日・期限の欄の min/max
-        skill_groups=task_skill_choices(task) if can_plan else [], selected_skills=skills,
+        skill_groups=task_skill_choices(task) if can_plan and use_skills else [], selected_skills=skills,
         skill_levels=TASK_SKILL_LEVELS, skill_scale=SKILL_SCALE, rec=rec, capacity=capacity,
         mail_max_mb=MAIL_DRAFT_MAX_BYTES // 1000000, ai_enabled=ai_is_configured(), ai_status=ai_status_label(),
     )
@@ -5179,6 +5304,15 @@ TASK_COLUMN_KEYS = tuple(c[0] for c in TASK_COLUMNS)
 TASK_COLUMNS_DEFAULT = ("assignees", "priority", "status", "due_date")
 TASK_COLUMNS_PREF = "task_columns"
 
+def task_column_defs():
+    """タスク一覧の「表示する項目」の選択肢(スキル管理を使わない環境〔2-8〕は「必要スキル」を出さない)。"""
+    if feature_enabled(FEAT_SKILLS):
+        return TASK_COLUMNS
+    return tuple(c for c in TASK_COLUMNS if c[0] != "skills")
+
+def task_column_keys():
+    return tuple(c[0] for c in task_column_defs())
+
 def task_columns_for(user):
     """その人がタスク一覧に表示する項目のキー(保存していなければ既定。知らないキーは除く。表の定義順)。"""
     saved = user_pref(user, TASK_COLUMNS_PREF)
@@ -5218,7 +5352,8 @@ def list_tasks():
     # ときも条件ありになる。ほかの画面からの status=完了 などのリンクはそのまま)
     hide_done = request.args.get("hide_done") == "1" if request.args else True
     keyword = search_keyword()
-    columns = task_columns_for(current_user)
+    shown_keys = task_column_keys()
+    columns = [key for key in task_columns_for(current_user) if key in shown_keys]
     # 担当者の選択肢: 有効なユーザーと、選択中の無効化したユーザー(マネージャーには未完了のタスクが残っている
     # 無効化したユーザーも。担当の付け替えのため)。どのユーザーでもない番号は条件に使わない
     users = filter_user_choices(assignee_ids, User.assigned_tasks.any(Task.status != STATUS_DONE)
@@ -5278,7 +5413,7 @@ def list_tasks():
         task_colors=STATUS_COLORS,
         priority_choices=PRIORITY_CHOICES,
         columns=columns,
-        column_defs=TASK_COLUMNS,
+        column_defs=task_column_defs(),
         filters={
             "statuses": statuses, "assignees": assignee_ids, "teams": team_ids, "shifts": shift_ids,
             "scope": scope, "hide_done": hide_done, "q": keyword,
@@ -5294,7 +5429,10 @@ def save_columns():
         value = None
     else:
         chosen = set(request.form.getlist("columns"))
-        value = [key for key in TASK_COLUMN_KEYS if key in chosen]
+        # この環境で出さない項目(2-8。スキル管理を使わないときの「必要スキル」)は、保存してある選択のまま残す
+        hidden = set(TASK_COLUMN_KEYS) - set(task_column_keys())
+        kept = set(task_columns_for(current_user)) & hidden
+        value = [key for key in TASK_COLUMN_KEYS if (key in chosen and key not in hidden) or key in kept]
     try:
         save_user_pref(current_user, TASK_COLUMNS_PREF, value)
     except (OSError, SettingsFileError) as exc:
@@ -5353,7 +5491,9 @@ def new_task():
         if start_date and due_date and start_date > due_date:
             flash(_START_AFTER_DUE, "danger")
             return _render_task_form(None, users, request.form, sel)
-        chosen_skills, err = read_task_skills(request.form, task_skill_choices())
+        # スキル管理を使わない環境(2-8)は必要スキルを付けない
+        chosen_skills, err = (read_task_skills(request.form, task_skill_choices()) if feature_enabled(FEAT_SKILLS)
+                              else ({}, None))
         if err:
             flash(err, "danger")
             return _render_task_form(None, users, request.form, sel)
@@ -5396,9 +5536,9 @@ def task_detail(task_id):
 def _render_task_detail(task, draft=None, status=200):
     """タスクの詳細の画面。draft は進捗状況の記載の入力(記載できなかったときに残す {"body", "status"})。"""
     comment_versions = {c.id: COMMENT_VERSION.version(c) for c in task.comments}
-    # スキルの自動更新の判定(マネージャーだけに表示。8-3)
+    # スキルの自動更新の判定(マネージャーだけに表示。8-3。スキル管理を使わない環境〔2-8〕は出さない)
     judgments = []
-    if current_user.is_manager:
+    if current_user.is_manager and feature_enabled(FEAT_SKILLS):
         judgments = (SkillAutoJudgment.query.filter_by(task_id=task.id)
                      .filter(SkillAutoJudgment.created_at >= task.created_at)
                      .options(selectinload(SkillAutoJudgment.changes))
@@ -5470,9 +5610,9 @@ def edit_task(task_id):
             if start_date and due_date and start_date > due_date:
                 flash(_START_AFTER_DUE, "danger")
                 return _render_task_form(task, users, request.form, sel)
-        # 必要スキル(15-1)もマネージャーだけが変えられる(メンバーは今の値のまま)
+        # 必要スキル(15-1)もマネージャーだけが変えられる(メンバーと、スキル管理を使わない環境〔2-8〕は今の値のまま)
         chosen_skills = task_skill_levels(task)
-        if current_user.is_manager:
+        if current_user.is_manager and feature_enabled(FEAT_SKILLS):
             chosen_skills, err = read_task_skills(request.form, task_skill_choices(task))
             if err:
                 current = _task_values(task)
@@ -5933,7 +6073,7 @@ def new_routine():
         # 「リマインド」の欄(10-4。この欄の無い以前の画面からの登録では作らない)
         today = reminder_today()
         rem_values = None
-        if request.form.get(REMINDER_FORM_MARK):
+        if request.form.get(REMINDER_FORM_MARK) and feature_enabled(FEAT_REMINDER):   # 使わない環境(2-8)は変えない
             rem_values, rem_errors = parse_reminder_form(
                 request.form, reminder_extra_user_choices(None), today,
                 kept_emails=None if current_user.is_manager else "")
@@ -5966,7 +6106,8 @@ def routine_detail(routine_id):
     if not row_key_matches(rw, request.args.get("r")):
         abort(404)
     return render_template("routine/detail.html", routine=rw, can_edit=_can_edit_routine(rw),
-                           reminder=routine_reminder_panel(rw, reminder_today(), current_user))
+                           reminder=routine_reminder_panel(rw, reminder_today(), current_user)
+                           if feature_enabled(FEAT_REMINDER) else None)
 
 @routine_bp.route("/<int:routine_id>/edit", methods=["GET", "POST"])
 @login_required
@@ -5988,7 +6129,7 @@ def edit_routine(routine_id):
         errors = _fill_from_form(rw, request.form, users, is_new=False)
         # 「リマインド」の欄(10-4)。この欄の無い以前の画面からの保存では、リマインドの設定を変えない
         rem_values = None
-        if request.form.get(REMINDER_FORM_MARK):
+        if request.form.get(REMINDER_FORM_MARK) and feature_enabled(FEAT_REMINDER):   # 使わない環境(2-8)は変えない
             rem_values, rem_errors = parse_reminder_form(
                 request.form, rem_choices, today, current_start=rem_current["start_date"],
                 kept_emails=None if current_user.is_manager else rem_current["extra_emails"])
@@ -7075,7 +7216,10 @@ def _build_workload(today, users, exclude_task_id=None):
     # (未割当のタスク・担当者が全員無効化されたタスクは含まない。画面の説明も同じ)
     open_ids, overdue_ids = set(), set()
     # 担当者はまとめて読む(タスクごとに読みに行かない)
-    for t in Task.query.filter(Task.status != STATUS_DONE).options(selectinload(Task.assignees)).all():
+    # タスク管理・定型・定期業務を使わない環境(2-8)は、その分を数えない
+    open_tasks = (Task.query.filter(Task.status != STATUS_DONE).options(selectinload(Task.assignees)).all()
+                  if feature_enabled(FEAT_TASKS) else [])
+    for t in open_tasks:
         if exclude_task_id is not None and t.id == exclude_task_id:
             continue
         assignees = [u for u in t.assignees if u.id in load]
@@ -7100,7 +7244,9 @@ def _build_workload(today, users, exclude_task_id=None):
                 d["overdue"] += 1
             d["task_h"] += share
 
-    for rw in RoutineWork.query.options(selectinload(RoutineWork.assignees), selectinload(RoutineWork.assignee)).all():
+    routines = (RoutineWork.query.options(selectinload(RoutineWork.assignees), selectinload(RoutineWork.assignee)).all()
+                if feature_enabled(FEAT_ROUTINE) else [])
+    for rw in routines:
         share = routine_share_minutes(rw)  # 複数担当は均等割り
         for user in rw.assignee_list:
             d = load.get(user.id)
@@ -7551,28 +7697,35 @@ def manager_dashboard():
     member_ids = {u.id for u in members}
     # 「メンバー」集計の母数は ROLE_MEMBER のみ(マネージャーは除く)
     member_count = len(members)
+    # この環境で使わない機能(2-8)の欄は作らない(タスク・年休・スキル・負荷・AI分析)
+    use_tasks, use_leaves, use_skills = (feature_enabled(FEAT_TASKS), feature_enabled(FEAT_LEAVES),
+                                         feature_enabled(FEAT_SKILLS))
 
-    task_counts = {s: Task.query.filter_by(status=s).count() for s in STATUS_CHOICES}
-    task_open = Task.query.filter(Task.status != STATUS_DONE).count()
-    task_overdue = Task.query.filter(
-        Task.status != STATUS_DONE,
-        Task.due_date.isnot(None),
-        Task.due_date < today,
-    ).count()
-    task_overdue_rate = round(task_overdue / task_open * 100) if task_open else 0
+    task_counts, task_overdue, task_overdue_rate = {}, 0, 0
+    if use_tasks:
+        task_counts = {s: Task.query.filter_by(status=s).count() for s in STATUS_CHOICES}
+        task_open = Task.query.filter(Task.status != STATUS_DONE).count()
+        task_overdue = Task.query.filter(
+            Task.status != STATUS_DONE,
+            Task.due_date.isnot(None),
+            Task.due_date < today,
+        ).count()
+        task_overdue_rate = round(task_overdue / task_open * 100) if task_open else 0
 
-    upcoming_leaves = (
-        LeaveRequest.query.filter(
-            LeaveRequest.leave_date >= today,
-            LeaveRequest.leave_date <= today + timedelta(days=30),
-            # 無効化したメンバーの年休は出さない(本人はログインできず、取消はチーム管理の側で行う)
-            LeaveRequest.user.has(User.is_active.is_(True)),
+    upcoming_leaves = []
+    if use_leaves:
+        upcoming_leaves = (
+            LeaveRequest.query.filter(
+                LeaveRequest.leave_date >= today,
+                LeaveRequest.leave_date <= today + timedelta(days=30),
+                # 無効化したメンバーの年休は出さない(本人はログインできず、取消はチーム管理の側で行う)
+                LeaveRequest.user.has(User.is_active.is_(True)),
+            )
+            .order_by(LeaveRequest.leave_date)
+            .all()
         )
-        .order_by(LeaveRequest.leave_date)
-        .all()
-    )
 
-    tech_skills = _active_skills(SKILL_TECHNICAL)
+    tech_skills = _active_skills(SKILL_TECHNICAL) if use_skills else []
     weak_threshold = max(1, (member_count + 2) // 3)  # 対象の約1/3未満を手薄とみなす
     skill_rows = []
     for s in tech_skills:
@@ -7594,28 +7747,33 @@ def manager_dashboard():
             by_user.setdefault(r.user_id, []).append(r.level)
     n_tech = len(tech_skills)
     member_avg = []
-    for u in members:  # 「メンバー別」なのでメンバーのみを並べる
+    for u in members if use_skills else ():  # 「メンバー別」なのでメンバーのみを並べる
         levels = by_user.get(u.id, [])
         avg = round(sum(levels) / n_tech, 1) if n_tech else 0
         member_avg.append({"user": u, "avg": avg})
 
-    actx = _build_activity(today, users)
-    # 固定ローカル管理者(admin)の行は、記載・業務があるときだけ出す(計算は今までどおり有効なユーザー全員で)
-    actx["activity_rows"] = [r for r in actx["activity_rows"]
-                             if r["user"] is None or is_env_member(r["user"]) or r["tasks"]]
+    actx, octx, gctx = {}, {}, {}
+    if use_tasks:
+        actx = _build_activity(today, users)
+        # 固定ローカル管理者(admin)の行は、記載・業務があるときだけ出す(計算は今までどおり有効なユーザー全員で)
+        actx["activity_rows"] = [r for r in actx["activity_rows"]
+                                 if r["user"] is None or is_env_member(r["user"]) or r["tasks"]]
 
-    workload_rows, workload_totals = _build_workload(today, users)
-    workload_rows = [r for r in workload_rows if is_env_member(r["user"]) or r["task_open"] or r["routine_cnt"]]
+    workload_rows, workload_totals = [], {}
+    if use_tasks or feature_enabled(FEAT_ROUTINE):
+        workload_rows, workload_totals = _build_workload(today, users)
+        workload_rows = [r for r in workload_rows if is_env_member(r["user"]) or r["task_open"] or r["routine_cnt"]]
 
-    octx = _build_outcomes(today, users)
-
-    gctx = _build_gantt(today)
+    if use_tasks:
+        octx = _build_outcomes(today, users)
+        gctx = _build_gantt(today)
 
     return render_template(
         "manager/dashboard.html",
         today=today,
         member_count=member_count,
-        analysis=dashboard_analysis_summary_safe(),   # 一番上のエグゼクティブサマリー(AI分析のまとめ。9-10)
+        # 一番上のエグゼクティブサマリー(AI分析のまとめ。9-10。AI分析を使わない環境〔2-8〕は出さない)
+        analysis=dashboard_analysis_summary_safe() if feature_enabled(FEAT_ANALYSIS) else None,
         workload_rows=workload_rows,
         workload_totals=workload_totals,
         load_full=_LOAD_FULL,
@@ -7628,7 +7786,7 @@ def manager_dashboard():
         member_avg=member_avg,
         proficient=SKILL_PROFICIENT_LEVEL,
         gantt_endpoint="manager.dashboard",
-        gantt_extra=_gantt_extra(actx, octx),
+        gantt_extra=_gantt_extra(actx, octx) if use_tasks else {},
         **actx,  # メンバーの活動状況
         **octx,
         **gctx,
@@ -8158,10 +8316,13 @@ del _name, _sheets
 
 @export_bp.route("/all.xlsx")
 def all_xlsx():
-    sheets = (
-        _tasks_sheets() + _routine_sheets() + _skills_sheets()
-        + _leaves_sheets() + _teams_sheets()
-    )
+    # この環境で使う機能(2-8)のシートだけ(チーム・メンバーはいつも)
+    sheets = []
+    for feature, build in ((FEAT_TASKS, _tasks_sheets), (FEAT_ROUTINE, _routine_sheets),
+                           (FEAT_SKILLS, _skills_sheets), (FEAT_LEAVES, _leaves_sheets)):
+        if feature_enabled(feature):
+            sheets += build()
+    sheets += _teams_sheets()
     return _xlsx_response(sheets, "all_data.xlsx")
 
 # #### 6. 週報(自動作成・メール送信) ###############################################################
@@ -10042,8 +10203,8 @@ def queue_skill_judgment_safely(task_id, triggered_by_id):
 
 def queue_skill_judgment(task_id, triggered_by_id):
     """タスクの完了から自動更新の判定を始める(commit の後に呼ぶ)。オフなら何もしない。戻り値: 判定の記録 または None。"""
-    if not load_skill_ai_settings()["auto_enabled"]:
-        return None
+    if not feature_enabled(FEAT_SKILLS) or not load_skill_ai_settings()["auto_enabled"]:
+        return None   # スキル管理を使わない環境(2-8)・自動更新がオフのときは判定しない
     task = db.session.get(Task, task_id)
     if task is None:
         return None
@@ -11459,13 +11620,17 @@ def _skill_updates_status(members, period):
     return {"changes": views, "rows": rows, "team": team}
 
 def _skills_section(members, period, now):
-    """② スキル状況(スキルの更新は期間内、分布・偏りは現時点)。"""
+    """② スキル状況(スキルの更新は期間内、分布・偏りは現時点)。
+
+    スキル管理を使わない環境(2-8)は、スキル項目・業務が無いときと同じ(空。画面にも出さない)。
+    """
+    use_skills = feature_enabled(FEAT_SKILLS)
     member_ids = [u.id for u in members]
     type_order = {t: i for i, t in enumerate(SKILL_TYPE_CHOICES)}
     skills = sorted(Skill.query.filter_by(is_active=True).all(),
-                    key=lambda s: (type_order.get(s.skill_type, 99), s.sort_order, s.name))
+                    key=lambda s: (type_order.get(s.skill_type, 99), s.sort_order, s.name)) if use_skills else []
     level = {}
-    if member_ids:
+    if member_ids and use_skills:
         for r in SkillRating.query.filter(SkillRating.user_id.in_(member_ids)).all():
             level[(r.user_id, r.skill_id)] = r.level
 
@@ -11497,7 +11662,7 @@ def _skills_section(members, period, now):
         })
 
     operations = (Operation.query.filter_by(is_active=True)
-                  .order_by(Operation.sort_order, Operation.name).all())
+                  .order_by(Operation.sort_order, Operation.name).all()) if use_skills else []
     active_ids = {s.id for s in skills}
     required_by = {}
     for op in operations:
@@ -11563,7 +11728,7 @@ def _skills_section(members, period, now):
     }
 
     return {
-        "updates": _skill_updates_status(members, period),
+        "updates": _skill_updates_status(members if use_skills else [], period),
         "distribution": distribution,
         "skills": skill_rows,
         "thin_skills": thin,
@@ -14762,17 +14927,19 @@ def executive_summary_text(data, period_label, applied):
                  "{due_soon}件・進行中なのに記載がない {stale}件・保留 {hold}件。".format(**progress))
     if progress["mc_total"]:
         lines.append("・マネージャーのコメント: {mc_total}件のうち、担当者の返信がないもの {mc_no_reply}件。".format(**progress))
-    updates = skills["updates"]["team"]
-    manual = updates["manual_ups"] + updates["manual_downs"]
-    line = "・スキル: 期間内の到達度の更新 {}件（タスクの完了からの自動更新 {}件・マネージャーの変更 {}件）。".format(
-        updates["auto_ups"] + manual, updates["auto_ups"], manual)
-    line += "保有者が1名以下のスキル {}件・対応できる人が1名以下の業務 {}件。".format(
-        len(skills["thin_skills"]), len(skills["single_operations"]))
-    concentration = skills["concentration"]
-    if concentration.get("flag") and concentration.get("top"):
-        line += "単独でできる（Lv{}以上）スキルの {}% を {} さんが持っています（偏り）。".format(
-            skills["proficient"], concentration["top_share"], concentration["top"]["name"])
-    lines.append(line)
+    use_skills = feature_enabled(FEAT_SKILLS)   # スキル管理を使わない環境(2-8)はスキルの行を出さない
+    if use_skills:
+        updates = skills["updates"]["team"]
+        manual = updates["manual_ups"] + updates["manual_downs"]
+        line = "・スキル: 期間内の到達度の更新 {}件（タスクの完了からの自動更新 {}件・マネージャーの変更 {}件）。".format(
+            updates["auto_ups"] + manual, updates["auto_ups"], manual)
+        line += "保有者が1名以下のスキル {}件・対応できる人が1名以下の業務 {}件。".format(
+            len(skills["thin_skills"]), len(skills["single_operations"]))
+        concentration = skills["concentration"]
+        if concentration.get("flag") and concentration.get("top"):
+            line += "単独でできる（Lv{}以上）スキルの {}% を {} さんが持っています（偏り）。".format(
+                skills["proficient"], concentration["top_share"], concentration["top"]["name"])
+        lines.append(line)
     line = "・成果: 期間内に完了したタスク {}件".format(outputs["completed"])
     amounts = _summary_amounts(outputs)
     if amounts:
@@ -14791,6 +14958,8 @@ def executive_summary_text(data, period_label, applied):
     if summary:
         lines += ["", "【AIのまとめ】"]
         for key, label in SUMMARY_KEYS:
+            if key == "skills" and not use_skills:
+                continue
             items = [str(item).strip() for item in summary.get(key) or [] if str(item).strip()]
             if items:
                 lines.append(label)
@@ -16050,15 +16219,16 @@ _STALE_OCCURRENCE = ("この定型業務の回は見つかりません（業務�
 OCCURRENCE_BACK_PAGES = ("list", "detail", "dashboard", "occurrence")
 
 def routine_list_panel(today, user):
-    """定型業務の一覧の「未完了の定型業務」(リマインドが有効な業務が無ければ None)。"""
-    if not has_enabled_reminders():
+    """定型業務の一覧の「未完了の定型業務」(リマインドが有効な業務が無い・リマインドを使わない環境〔2-8〕は None)。"""
+    if not feature_enabled(FEAT_REMINDER) or not has_enabled_reminders():
         return None
     refresh_occurrences_for_page(today)
     return {"rows": occurrence_rows(pending_occurrences(today), today, user)}
 
 def dashboard_routine_panel(today, user):
-    """個人ダッシュボードの「今日の定型業務」(自分が担当で、リマインドが有効な業務が無ければ None)。"""
-    if not has_enabled_reminders(assignee_id=user.id):
+    """個人ダッシュボードの「今日の定型業務」(自分が担当で、リマインドが有効な業務が無い・リマインドを使わない環境
+    〔2-8〕は None)。"""
+    if not feature_enabled(FEAT_REMINDER) or not has_enabled_reminders(assignee_id=user.id):
         return None
     refresh_occurrences_for_page(today)
     done_today = (
@@ -17257,10 +17427,34 @@ TABS = (
     (TAB_REMINDER, "定型業務リマインド", "bi-bell"),
 )
 TAB_KEYS = tuple(key for key, _label, _icon in TABS)
+# タブの設定を使う機能(2-8)。メールの宛先は週報・期限超過通知のどちらか、スキル（AI）はスキル管理とタスク管理の両方
+SYSTEM_TAB_FEATURES = {TAB_WEEKLY: FEAT_WEEKLY, TAB_OVERDUE: FEAT_OVERDUE, TAB_ANALYSIS: FEAT_ANALYSIS,
+                       TAB_REMINDER: FEAT_REMINDER}
+
+def system_tab_enabled(tab):
+    """システム設定のそのタブを出すか(タブの設定を使う機能を、この環境で使うか。2-8)。"""
+    if tab == TAB_RECIPIENTS:
+        return feature_enabled(FEAT_WEEKLY) or feature_enabled(FEAT_OVERDUE)
+    if tab == TAB_SKILL_AI:
+        return feature_enabled(FEAT_SKILLS) and feature_enabled(FEAT_TASKS)
+    feature = SYSTEM_TAB_FEATURES.get(tab)
+    return feature is None or feature_enabled(feature)
+
+def system_tab_label(tab):
+    """使わない設定のタブの保存を開いたときの案内に出す機能の名前。"""
+    if tab == TAB_RECIPIENTS:
+        return "週報・期限超過通知"
+    if tab == TAB_SKILL_AI:
+        return ENV_FEATURE_LABELS[FEAT_TASKS if feature_enabled(FEAT_SKILLS) else FEAT_SKILLS]
+    return ENV_FEATURE_LABELS.get(SYSTEM_TAB_FEATURES.get(tab), tab)
 
 def system_tabs():
-    """システム設定のタブ(どの環境も同じ。その環境の機能の設定と宛先)。"""
-    return TABS
+    """システム設定のタブ(その環境の機能の設定と宛先。この環境で使う機能〔2-8〕のタブだけ)。"""
+    return tuple(item for item in TABS if system_tab_enabled(item[0]))
+
+def has_system_settings():
+    """システム設定に出すタブがあるか(ナビの「システム設定」を出すか)。"""
+    return bool(system_tabs())
 
 # ---- この環境のメールの宛先(instance/env_mail_settings.json。ほかの環境は instance/envs/<キー>/) ----
 # 週報・期限超過通知の宛先(To)・同報(Cc)は環境ごと。その環境のマネージャーが「メールの宛先」タブで変える。
@@ -17391,10 +17585,12 @@ def _render_system_settings(tab, status=200, inputs=None, versions=None):
         # 設定ファイルが壊れている(読み込めない)ときは、タブにその旨を出す(表示は既定値。保存はできない)
         contexts[key]["file_error"] = feature.store.load_error()
         contexts[key]["file_error_note"] = feature.file_note
+    tabs = system_tabs()
     return render_template(
         "system/settings.html",
         tab=tab,
-        tabs=system_tabs(),
+        tabs=tabs,
+        shown_tabs=[key for key, _label, _icon in tabs],
         rc=contexts[TAB_RECIPIENTS],
         wk=contexts[TAB_WEEKLY],
         od=contexts[TAB_OVERDUE],
@@ -17406,7 +17602,8 @@ def _render_system_settings(tab, status=200, inputs=None, versions=None):
 
 @system_bp.route("/", endpoint="index")
 def system_index():
-    return redirect(_tab_url(TAB_RECIPIENTS))
+    tabs = system_tabs()
+    return redirect(_tab_url(tabs[0][0]) if tabs else url_for("system.settings"))
 
 @system_bp.route("/settings", endpoint="settings")
 def system_settings():
@@ -17414,7 +17611,8 @@ def system_settings():
     if tab in ADMIN_MOVED_TABS and is_system_admin():
         # 以前の「基本設定」「環境」のタブ: システム管理(18 章)の画面へ
         return redirect(admin_url(ADMIN_MOVED_TABS[tab]))
-    return _render_system_settings(choice_or_default(tab, TAB_KEYS, TAB_RECIPIENTS))
+    keys = [key for key, _label, _icon in system_tabs()]   # この環境で使う機能のタブ(2-8)
+    return _render_system_settings(choice_or_default(tab, keys, keys[0] if keys else None))
 
 # 以前の基本設定の保存・接続テストの URL(POST)。システム管理(18 章)に移した(開いたままの以前の画面から送られた
 # とき用。admin だけが使える。エンドポイントの名前は以前と同じ。環境の追加・変更の URL は 17-5)
@@ -17526,6 +17724,8 @@ CHECK_INTERVAL = 30  # 秒
 #                  記録済み(週報・期限超過通知はその日の印があれば)なら False(app_context の中で呼ぶ。
 #                  JsonSettings.claim_auto_run / claim_auto_slot)
 Job = namedtuple("Job", "name label load_settings due_key run record_failure claim_run")
+# ジョブの機能(2-8。この環境で使わない機能の定期メールは確かめない・送らない)
+JOB_FEATURES = {"weekly": FEAT_WEEKLY, "overdue": FEAT_OVERDUE, "reminder": FEAT_REMINDER}
 
 def _weekly_run(app, settings, now):
     start, end = period_for(now.date(), settings["period_rule"])
@@ -17628,7 +17828,14 @@ def _tick(app, fired, now, start_thread=True):
     1つのジョブの確認で例外が起きても、他のジョブの確認は続ける。
     """
     started = {}
+    try:
+        features = env_features(app)
+    except Exception:
+        app.logger.exception("この環境の使う機能を読めませんでした（定期メールの確認はすべての機能で行います）")
+        features = {}
     for job in JOBS:
+        if not features.get(JOB_FEATURES.get(job.name), True):
+            continue   # この環境で使わない機能(2-8)
         try:
             result = _check_job(app, job, fired.setdefault(job.name, set()), now, start_thread)
         except Exception:
@@ -18343,8 +18550,10 @@ def _new_app(env=None, shared_instance=None):
     def inject_globals():
         # env_nav: 複数の環境(17 章)のときにナビに出す環境の名前・切り替えの URL(1つの環境のあいだは None)
         # admin_url: 固定ローカル管理者(admin)のときのシステム管理の URL(18 章。ほかの人は None)
+        # feature_enabled / has_system_settings: この環境で使う機能(2-8)。ナビ・画面の欄の表示に使う
         return {"app_name": app.config.get("APP_NAME", "業務管理"), "submit_token": submit_token,
-                "env_nav": env_nav_context(), "admin_url": admin_nav_url()}
+                "env_nav": env_nav_context(), "admin_url": admin_nav_url(),
+                "feature_enabled": feature_enabled, "has_system_settings": has_system_settings}
 
     # 送信された入力が大きすぎる(フォームが MAX_FORM_MEMORY_SIZE を超えた)ときは、英語の既定の画面ではなく
     # 上限と対処を日本語で案内する(日本語は URL エンコードで1文字9バイトになるため、1つの欄が約5万字で超える)
@@ -18399,6 +18608,8 @@ def _new_app(env=None, shared_instance=None):
     # 受け付ける。ほかのサイトの画面の中に表示させない
     app.before_request(limit_streamed_body)
     app.before_request(check_same_origin)
+    # この環境で使わない機能(2-8)の画面は開けない(404 で案内する)
+    app.before_request(check_env_feature)
     app.after_request(frame_options)
     app.after_request(no_store_when_logged_in)
     return app
@@ -19149,6 +19360,10 @@ def recommend_assignees(levels, start, due, task_id=None, today=None, scale=None
     task_id は編集中のタスク(担当中のタスクの数・今の負荷に数えない)。戻り値は tasks/_recommend.html の rec。
     """
     today = today or date.today()
+    # スキル管理・出勤表・年休を使わない環境(2-8)は、必要スキル・年休・勤務表の休みと出勤日数を見ない
+    use_skills, use_leaves = feature_enabled(FEAT_SKILLS), feature_enabled(FEAT_LEAVES)
+    if not use_skills:
+        levels = {}
     period = task_period(start, due, today)
     scale = scale if scale in TASK_SCALE_KEYS else None
     task_h = round(scale_monthly_hours(scale, start, due), 1)   # このタスクの月あたりの目安工数(1人で担当したとき)
@@ -19167,7 +19382,7 @@ def recommend_assignees(levels, start, due, task_id=None, today=None, scale=None
                                                SkillRating.skill_id.in_([s.id for s, _level in reqs])):
             have[(rating.user_id, rating.skill_id)] = rating.level
     leaves = {}
-    if period is not None and user_ids:
+    if use_leaves and period is not None and user_ids:
         for leave in (LeaveRequest.query
                       .filter(LeaveRequest.user_id.in_(user_ids), LeaveRequest.leave_date >= period[0],
                               LeaveRequest.leave_date <= period[1])
@@ -19176,7 +19391,7 @@ def recommend_assignees(levels, start, due, task_id=None, today=None, scale=None
     # 勤務表(16 章): 「年休」の種類の記号の日(年休の充当日など)も休み。期間中の出勤日数(半休は 0.5 日)も数える
     shift_by_user = user_shift_map(user_ids)
     period_days = []
-    if period is not None and (period[1] - period[0]).days < SHIFT_DAYS_MAX:
+    if use_leaves and period is not None and (period[1] - period[0]).days < SHIFT_DAYS_MAX:
         period_days = [period[0] + timedelta(days=i) for i in range((period[1] - period[0]).days + 1)]
     codes = shift_codes() if period_days else {}
     day_codes = (shift_day_codes({s.id for s in shift_by_user.values()}, period[0], period[1])
@@ -19257,7 +19472,9 @@ def recommend_assignees(levels, start, due, task_id=None, today=None, scale=None
         "recommended": sum(1 for r in rows if r["recommended"]),
         "members": len(users),
         "counts_workdays": bool(period_days),
-        "long_period": period is not None and not period_days,
+        "long_period": use_leaves and period is not None and not period_days,
+        # この環境で使う機能(2-8)。画面の説明・列を変える
+        "use_skills": use_skills, "use_leaves": use_leaves, "use_routine": feature_enabled(FEAT_ROUTINE),
         # このタスクの規模と、月あたりの目安工数(1人で担当したとき)。フルタイムの基準
         "scale_label": TASK_SCALE_LABELS.get(scale, ""),
         "task_h": _fmt_num(task_h),
@@ -19305,7 +19522,8 @@ def task_capacity_alert(scale, start, due, assignees):
         return None
     chosen = bool(assignees)
     assignees = [u for u in assignees or () if getattr(u, "is_active", True)]
-    if assignees:
+    use_leaves = feature_enabled(FEAT_LEAVES)   # 出勤表・年休を使わない環境(2-8)は営業日で数える
+    if assignees and use_leaves:
         workdays = sum(workdays_by_user(assignees, start, due).values())
         who = ("担当者{}人の出勤日数の合計".format(len(assignees)) if len(assignees) > 1
                else "{}さんの出勤日数".format(assignees[0].display_name))
@@ -19313,7 +19531,9 @@ def task_capacity_alert(scale, start, due, assignees):
     else:
         workdays = sum(1 for i in range((due - start).days + 1) if is_business_day(start + timedelta(days=i)))
         who = "営業日の数"
-        basis = "{}のため営業日・1日{}時間で計算".format("有効な担当者がいない" if chosen else "担当者が未選択", TASK_DAY_HOURS)
+        reason = ("出勤表・年休を使わない環境" if not use_leaves
+                  else "有効な担当者がいない" if chosen else "担当者が未選択")
+        basis = "{}のため営業日・1日{}時間で計算".format(reason, TASK_DAY_HOURS)
     capacity = workdays * TASK_DAY_HOURS
     if hours <= capacity:
         return None
@@ -20245,7 +20465,9 @@ def build_mail_task_draft(mail, use_ai):
     """メール(15-3)から登録の画面に入れる下書きを作る(画面の JavaScript に返す JSON の中身)。"""
     today = date.today()
     base = mail.sent_at.date() if mail.sent_at else today
-    skills = sorted(Skill.query.filter_by(is_active=True).all(), key=task_skill_sort_key)
+    # スキル管理を使わない環境(2-8)は、スキル項目を AI に送らず、必要スキルを入れない
+    skills = (sorted(Skill.query.filter_by(is_active=True).all(), key=task_skill_sort_key)
+              if feature_enabled(FEAT_SKILLS) else [])
     notes = []
     title = mail_task_title(mail.subject)
     due, due_words = mail_due_date([mail.subject, mail.body], base)
@@ -21442,7 +21664,7 @@ def clean_env_name(value):
 
 def _default_env(key):
     return {"key": key, "name": MAIN_ENV_DEFAULT_NAME if key == MAIN_ENV_KEY else key, "active": True,
-            "created_at": "", "created_by": ""}
+            "created_at": "", "created_by": "", "features": normalize_env_features(None)}
 
 def _normalize_env_registry(data):
     """読み込んだ環境の一覧を整える(正しくない行は除く。メインの環境は必ず最初に置き、停止しない)。
@@ -21466,6 +21688,7 @@ def _normalize_env_registry(data):
         for field in ("created_at", "created_by"):
             if isinstance(item.get(field), str):
                 entry[field] = item[field][:64]
+        entry["features"] = normalize_env_features(item.get("features"))   # 使う機能(2-8。無ければすべて)
         envs.append(entry)
     main = [e for e in envs if e["key"] == MAIN_ENV_KEY] or [_default_env(MAIN_ENV_KEY)]
     version = data.get("version") if isinstance(data, dict) else None
@@ -21485,7 +21708,7 @@ def _normalize_env_registry(data):
     return {"envs": main + [e for e in envs if e["key"] != MAIN_ENV_KEY], "deleted": deleted, "version": version}
 
 def read_env_registry(shared, strict=False):
-    """環境の一覧(instance/environments.json)。戻り値: {"envs": [{key, name, active, created_at, created_by}],
+    """環境の一覧(instance/environments.json)。戻り値: {"envs": [{key, name, active, created_at, created_by, features}],
     "deleted": [{key, name, deleted_at, deleted_by, folder}](削除した環境), "version"}。
 
     ファイルが無ければメインの環境だけ。ファイルの版(更新日時と大きさ)が変わったときだけ読み直す。
@@ -21527,6 +21750,7 @@ def write_env_registry(shared, envs, username, expected_version, deleted=None):
         _env_registry_cache.pop(path, None)
     if has_request_context():
         g.pop("_multi_env", None)
+        g.pop("_env_features", None)
     return _normalize_env_registry(data)
 
 def env_registry(app=None):
@@ -22007,8 +22231,8 @@ def env_nav_context():
         return None
     return {"name": env_name(), "switch_url": portal_url("/envs"), "is_main": is_main_env()}
 
-# ==== 17-5. 環境の追加・名前の変更・停止(システム管理の「環境」。固定ローカル管理者 admin だけ。18 章) =========
-# 追加: 名前だけを決める。キーは e2 から順に(使ったキー・フォルダのあるキーは使わない)。instance/envs/<キー>/ に DB を
+# ==== 17-5. 環境の追加・名前の変更・使う機能・停止(システム管理の「環境」。固定ローカル管理者 admin だけ。18 章) =========
+# 追加: 名前と使う機能(2-8。既定はすべて)を決める。キーは e2 から順に(使ったキー・フォルダのあるキーは使わない)。instance/envs/<キー>/ に DB を
 # 作ってから一覧に載せる。メンバー(マネージャーを含む)は、admin がその環境を開いて、チーム管理で登録する。
 # 一覧の変更は、画面を開いたときの一覧の版(hidden の version)と今の版が違えば行わない(ほかの変更と重ならないように)。
 # 停止した環境は、開けず(URL は 404)、環境の選択の画面にも出ず、定期メールも送らない(DB・設定は残る。再開できる)。
@@ -22097,12 +22321,18 @@ def envs_tab_context(inputs=None):
         members, latest = _env_db_stats(entry)
         rows.append(dict(entry, url=env_home_url(entry["key"]), open_url=_env_open_url(entry),
                          members=members, last_updated=latest,
+                         feature_names=[ENV_FEATURE_LABELS[k] for k in ENV_FEATURE_KEYS if entry["features"][k]],
+                         all_features=all(entry["features"].values()),
                          idle_days=(today - latest.date()).days if latest is not None else None,
                          folder="instance/" if entry["key"] == MAIN_ENV_KEY else "instance/{}/{}/".format(
                              ENVS_DIRNAME, entry["key"])))
     deleted = [dict(d, url=env_home_url(d["key"])) for d in reversed(registry["deleted"])]   # 新しいものが先
+    inputs = inputs or {}
     return {"envs": rows, "deleted": deleted, "version": str(registry["version"]), "error": error,
-            "multi": multi_env_enabled(), "name_max": ENV_NAME_MAX, "inputs": inputs or {}, "idle_days": ENV_IDLE_DAYS}
+            "multi": multi_env_enabled(), "name_max": ENV_NAME_MAX, "inputs": inputs, "idle_days": ENV_IDLE_DAYS,
+            # 追加の欄の使う機能(2-8。既定はすべて。入力の誤りで再表示するときは入力のまま)
+            "new_features": env_feature_rows(inputs.get("features") or normalize_env_features(None)),
+            "feature_field": ENV_FEATURE_FIELD, "feature_mark": ENV_FEATURE_MARK}
 
 def _env_name_error(name, registry, key=None):
     """環境の名前の誤り(無ければ None)。key は名前を変える環境(その環境の今の名前とは重複にしない)。"""
@@ -22125,8 +22355,10 @@ def _next_env_key(registry, shared):
         number += 1
     return "e{}".format(number)
 
-def create_environment(name, created_by, expected_version):
+def create_environment(name, created_by, expected_version, features=None):
     """環境を追加する(DB を作ってから一覧に載せる。メンバーはまだいない)。戻り値: 一覧の行。
+
+    features は使う機能(2-8。None ならすべて)。
 
     一覧が画面を開いた後に変わっていれば SettingsConflictError、名前が重複していれば ValueError、
     一覧が読めなければ SettingsFileError、書けなければ OSError。
@@ -22147,7 +22379,8 @@ def create_environment(name, created_by, expected_version):
             try:
                 app = dispatcher.build(key)   # instance/envs/<キー>/app.db とテーブルを作る
                 entry = {"key": key, "name": name, "active": True,
-                         "created_at": datetime.now().strftime("%Y/%m/%d %H:%M"), "created_by": str(created_by)[:64]}
+                         "created_at": datetime.now().strftime("%Y/%m/%d %H:%M"), "created_by": str(created_by)[:64],
+                         "features": normalize_env_features(features)}
                 write_env_registry(shared, registry["envs"] + [entry], created_by, registry["version"])
             except Exception:
                 _discard_env_build(dispatcher, key, app, shared)
@@ -22191,8 +22424,8 @@ def _discard_env_build(dispatcher, key, app, shared):
         except OSError:
             current_app.logger.warning("追加に失敗した環境のフォルダ %s を残しました", folder, exc_info=True)
 
-def change_environment(key, expected_version, username, name=None, active=None):
-    """環境の名前・停止/再開を変える。戻り値: 変えた後の行。例外は create_environment と同じ(無い環境は KeyError)。"""
+def change_environment(key, expected_version, username, name=None, active=None, features=None):
+    """環境の名前・停止/再開・使う機能(2-8)を変える。戻り値: 変えた後の行。例外は create_environment と同じ(無い環境は KeyError)。"""
     shared = shared_instance_path()
     with _env_change_lock:
         lock_file = _lock_settings_file(shared)
@@ -22210,6 +22443,8 @@ def change_environment(key, expected_version, username, name=None, active=None):
                 entry["name"] = name
             if active is not None and key != MAIN_ENV_KEY:
                 entry["active"] = bool(active)
+            if features is not None:
+                entry["features"] = normalize_env_features(features)
             write_env_registry(shared, registry["envs"], username, registry["version"])
         finally:
             _unlock_settings_file(lock_file)
@@ -22285,7 +22520,9 @@ def create_env():
     form = request.form
     raw_name = form.get("name", "")
     name = clean_env_name(raw_name)
-    inputs = {"name": raw_name}
+    # 使う機能(2-8)。欄の無い以前の画面からの追加はすべての機能
+    features, feature_error = env_features_from_form(form)
+    inputs = {"name": raw_name, "features": features}
     with _env_change_lock:
         if already_submitted(ENV_ONCE_KIND) is not None:
             return flash_redirect("この環境は既に追加しました（同じ内容の2回目の送信は行っていません）。", "info",
@@ -22295,11 +22532,13 @@ def create_env():
         except SettingsFileError as exc:
             return flash_redirect("環境を追加できませんでした（環境の一覧のファイルを読み込めないため）: {}".format(exc),
                                   "danger", _envs_tab_url())
-        if problem:
-            flash(problem, "danger")
+        if problem or feature_error:
+            for message in (problem, feature_error):
+                if message:
+                    flash(message, "danger")
             return _render_admin_envs(status=400, inputs=inputs)
         try:
-            entry = create_environment(name, current_user.username, _form_version(form))
+            entry = create_environment(name, current_user.username, _form_version(form), features)
         except SettingsConflictError:
             return flash_redirect(_ENVS_CHANGED.format("追加していません"), "warning", _envs_tab_url())
         except ValueError as exc:
@@ -22320,8 +22559,9 @@ def create_env():
             start_portal_from_main_login(current_user)
         except OSError:
             current_app.logger.exception("共通のログインの記録を保存できませんでした")
-    return flash_redirect("環境「{}」を追加しました（URL: {}）。「開く」からその環境に入り、チーム管理でメンバー"
-                          "（マネージャーを含む）を登録してください。".format(entry["name"], env_home_url(entry["key"])),
+    return flash_redirect("環境「{}」を追加しました（URL: {}。使う機能: {}）。「開く」からその環境に入り、チーム管理でメンバー"
+                          "（マネージャーを含む）を登録してください。".format(entry["name"], env_home_url(entry["key"]),
+                                                                    env_features_label(entry["features"])),
                           "success", _envs_tab_url())
 
 @admin_bp.route("/envs/<key>/rename", methods=["POST"], endpoint="rename_env")
@@ -22341,6 +22581,50 @@ def rename_env(key):
         return flash_redirect("環境の名前を変えられませんでした（{}）。".format(exc.__class__.__name__), "danger",
                               _envs_tab_url())
     return flash_redirect("環境の名前を「{}」にしました。".format(entry["name"]), "success", _envs_tab_url())
+
+@admin_bp.route("/envs/<key>/features", methods=["GET", "POST"], endpoint="env_features")
+def env_features_page(key):
+    """環境の使う機能(2-8)を変える(admin だけ。停止中の環境も変えられる)。GET は選ぶ画面、POST で保存する。
+
+    使わない機能のデータは消さない(使うようにすると元のまま使える)。一覧が画面を開いた後に変わっていれば保存しない。
+    """
+    ev = envs_tab_context()
+    entry = next((e for e in ev["envs"] if e["key"] == key), None)
+    if entry is None:
+        done = next((d for d in ev["deleted"] if d["key"] == key), None)
+        if done is None:
+            abort(404)
+        return flash_redirect("環境「{}」は削除しました（{}）。".format(done["name"], done["deleted_at"] or "削除済み"),
+                              "info", _envs_tab_url())
+    if request.method == "GET":
+        return render_template("admin/env_features.html", ev=ev, e=entry, rows=env_feature_rows(entry["features"]))
+    features, error = env_features_from_form(request.form)
+    if features is None:
+        abort(400)
+    if error:
+        flash(error, "danger")
+        return render_template("admin/env_features.html", ev=ev, e=entry, rows=env_feature_rows(features)), 400
+    if features == entry["features"]:
+        return flash_redirect("環境「{}」の使う機能は変わっていません（{}）。".format(
+            entry["name"], env_features_label(features)), "info", _envs_tab_url())
+    try:
+        changed = change_environment(key, _form_version(request.form), current_user.username, features=features)
+    except SettingsConflictError:
+        return flash_redirect(_ENVS_CHANGED.format("使う機能を変えていません"), "warning", _envs_tab_url())
+    except KeyError:
+        return redirect(url_for("admin.env_features", key=key))   # ほかの操作で削除された(上の案内を出す)
+    except (OSError, SettingsStoreError) as exc:
+        current_app.logger.exception("環境の使う機能を変えられませんでした")
+        return flash_redirect("環境の使う機能を変えられませんでした（{}）。".format(exc.__class__.__name__), "danger",
+                              _envs_tab_url())
+    current_app.logger.info("環境の使う機能を変えました: %s（%s。%s）", key, env_features_label(changed["features"]),
+                            current_user.username)
+    message = "環境「{}」の使う機能を変えました（使う機能: {}）。".format(changed["name"], env_features_label(changed["features"]))
+    off = [ENV_FEATURE_LABELS[k] for k in ENV_FEATURE_KEYS if not changed["features"][k]]
+    if off:
+        message += ("使わない機能（{}）は、この環境のメニュー・画面に出さず、定期メールも送りません。データは消していません"
+                    "（使うようにすると元のまま使えます）。".format("、".join(off)))
+    return flash_redirect(message, "success", _envs_tab_url())
 
 @admin_bp.route("/envs/<key>/toggle", methods=["POST"], endpoint="toggle_env")
 def toggle_env(key):

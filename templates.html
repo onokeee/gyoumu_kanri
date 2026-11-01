@@ -30,13 +30,14 @@
     システム設定　　　  system/settings.html  system/_recipients_tab.html（メールの宛先）  system/_weekly_tab.html
                         system/_overdue_tab.html  system/_skill_ai_tab.html
                         system/_analysis_tab.html  system/_reminder_tab.html
-    システム管理(admin) admin/_layout.html  admin/envs.html  admin/env_delete.html  admin/settings.html
+    システム管理(admin) admin/_layout.html  admin/envs.html  admin/env_delete.html  admin/env_features.html（使う機能）
+                        admin/settings.html
                         system/_config_tab.html（基本設定のフォーム）  admin/shifts.html  admin/shift_month.html
     静的ファイル　　　  static/css/style.css  static/js/sort-table.js  static/js/auto-filter.js
                         static/js/routine-form.js  static/js/task-form.js
                         static/js/skill-item-form.js  static/js/skill-ai.js
                         static/js/weekly-settings.js  static/js/system-settings.js
-                        static/js/shift-month.js  static/js/ai-analysis.js
+                        static/js/shift-month.js  static/js/ai-analysis.js  static/js/env-features.js
 #}
 {#=== base.html ===#}
 <!doctype html>
@@ -78,33 +79,46 @@
                href="{{ url_for('main.dashboard') }}"><i class="bi bi-speedometer2"></i> ダッシュボード</a>
           </li>
           {%- endif %}
+          {#- この環境で使う機能(app.py の 2-8)だけを出す(条件のタグの「-」で前の改行を取り、すべての機能を使う環境の HTML を今までと同じにする) #}
+          {%- if feature_enabled('tasks') %}
           <li class="nav-item">
             <a class="nav-link {% if request.blueprint == 'tasks' %}active{% endif %}"
                href="{{ url_for('tasks.list_tasks') }}"><i class="bi bi-list-task"></i> タスク</a>
           </li>
+          {%- endif %}
+          {%- if feature_enabled('routine') %}
           <li class="nav-item">
             <a class="nav-link {% if request.blueprint == 'routine' %}active{% endif %}"
                href="{{ url_for('routine.list_routines') }}"><i class="bi bi-arrow-repeat"></i> 定型・定期業務</a>
           </li>
-          {% if current_user.is_manager %}
+          {%- endif %}
+          {% if current_user.is_manager and (feature_enabled('weekly') or feature_enabled('overdue') or feature_enabled('reminder')) %}
           {# 定期メール(週報・期限超過通知・定型業務リマインドの設定)はマネージャーのみ #}
           <li class="nav-item dropdown">
             <a class="nav-link dropdown-toggle {% if request.blueprint in ('weekly', 'overdue') %}active{% endif %}"
                href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false"><i class="bi bi-envelope-paper"></i> 定期メール</a>
             <ul class="dropdown-menu">
+              {%- if feature_enabled('weekly') %}
               <li><a class="dropdown-item {% if request.blueprint == 'weekly' %}active{% endif %}"
                      href="{{ url_for('weekly.index') }}"><i class="bi bi-file-earmark-text"></i> 週報</a></li>
+              {%- endif %}
+              {%- if feature_enabled('overdue') %}
               <li><a class="dropdown-item {% if request.blueprint == 'overdue' %}active{% endif %}"
                      href="{{ url_for('overdue.index') }}"><i class="bi bi-alarm"></i> 期限超過通知</a></li>
+              {%- endif %}
               {# 定型業務リマインドは画面を持たず、システム設定のタブ(設定・プレビュー・テスト送信)で扱う #}
+              {%- if feature_enabled('reminder') %}
               <li><a class="dropdown-item" href="{{ url_for('system.settings', tab='reminder') }}"><i class="bi bi-bell"></i> 定型業務リマインド</a></li>
+              {%- endif %}
             </ul>
           </li>
           {% endif %}
+          {%- if feature_enabled('leaves') %}
           <li class="nav-item">
             <a class="nav-link {% if request.blueprint == 'leaves' %}active{% endif %}"
                href="{{ url_for('leaves.calendar_view') }}"><i class="bi bi-calendar-check"></i> 出勤表</a>
           </li>
+          {%- endif %}
           {% if current_user.is_manager %}
           {# マネージャーだけの管理の画面(スキル・チーム管理・システム設定)は「管理」にまとめる
              (項目が多く、一般的な画面の幅で名前が途中で折り返さないように)。マネージャーダッシュボードは一段目の最初の項目 #}
@@ -113,13 +127,17 @@
                href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false"><i class="bi bi-sliders"></i> 管理</a>
             <ul class="dropdown-menu">
               {# スキルはマネージャーのみ。メンバーにはタブを出さない #}
+              {%- if feature_enabled('skills') %}
               <li><a class="dropdown-item {% if request.blueprint == 'skills' %}active{% endif %}"
                      href="{{ url_for('skills.list_skills') }}"><i class="bi bi-mortarboard"></i> スキル</a></li>
+              {%- endif %}
               <li><a class="dropdown-item {% if request.blueprint == 'departments' %}active{% endif %}"
                      href="{{ url_for('departments.manage') }}"><i class="bi bi-diagram-3"></i> チーム管理</a></li>
-              {# システム設定(基本設定・週報・期限超過通知・スキル（AI）などの設定)はマネージャーのみ #}
+              {# システム設定(基本設定・週報・期限超過通知・スキル（AI）などの設定)はマネージャーのみ。出すタブが無い環境は出さない #}
+              {%- if has_system_settings() %}
               <li><a class="dropdown-item {% if request.blueprint == 'system' %}active{% endif %}"
                      href="{{ url_for('system.settings') }}"><i class="bi bi-gear"></i> システム設定</a></li>
+              {%- endif %}
             </ul>
           </li>
           {% endif %}{% if admin_url %}
@@ -137,8 +155,8 @@
               <li><span class="dropdown-item-text small text-muted"><i class="bi bi-diagram-3"></i> {{ current_user.department_names }}</span></li>
               <li><hr class="dropdown-divider"></li>
               {% endif %}
-              {# 自分のメールアドレス(定型業務のリマインドの宛先) #}
-              <li><a class="dropdown-item {% if request.blueprint == 'account' %}active{% endif %}" href="{{ url_for('account.email') }}"><i class="bi bi-envelope"></i> メールアドレス</a></li>{% if admin_url %}
+              {# 自分のメールアドレス(定型業務のリマインドの宛先。リマインドを使う環境だけ) #}
+              {% if feature_enabled('reminder') %}<li><a class="dropdown-item {% if request.blueprint == 'account' %}active{% endif %}" href="{{ url_for('account.email') }}"><i class="bi bi-envelope"></i> メールアドレス</a></li>{% endif %}{% if admin_url %}
               {# 固定ローカル管理者(admin): ほかの環境はシステム管理の一覧から開く #}
               <li><a class="dropdown-item" href="{{ admin_url }}"><i class="bi bi-shield-lock"></i> システム管理</a></li>{% elif env_nav %}
               {# 複数の環境(グループ)のとき: 使う環境の選び直し(環境の選択の画面) #}
@@ -216,6 +234,23 @@
 {% macro ai_analysis_sent_items() -%}
   タスクの名前・説明・コメント（書いた人の氏名・日時を含む）・状態の変更（日時を含む）・成果・メンバーの氏名・スキル（到達度と期間内の変更）
 {%- endmacro %}
+
+{# 環境の使う機能のチェックボックス(システム管理の「環境」の追加・使う機能の変更。app.py の 2-8)。rows は env_feature_rows の値、
+   field・mark はチェックボックスの名前・欄の印(envs_tab_context の feature_field・feature_mark)。前提のある機能は字下げし、
+   前提の機能を外すと選べなくする(static/js/env-features.js。サーバーでも前提の機能を使わない機能は使わない) #}
+{% macro env_feature_checkboxes(rows, prefix, field, mark) %}
+<input type="hidden" name="{{ mark }}" value="1">
+<div class="env-features" data-env-features>
+  {% for f in rows %}
+  <div class="form-check{% if f.parent %} ms-4{% endif %}">
+    <input class="form-check-input" type="checkbox" name="{{ field }}" value="{{ f.key }}" id="{{ prefix }}-{{ f.key }}"
+           {% if f.parent %}data-parent="{{ f.parent }}"{% endif %} {% if f.on %}checked{% endif %}>
+    <label class="form-check-label" for="{{ prefix }}-{{ f.key }}"><span class="fw-medium">{{ f.label }}</span>
+      <span class="small text-muted">（{{ f.help }}）</span></label>
+  </div>
+  {% endfor %}
+</div>
+{% endmacro %}
 {#=== errors/too_large.html ===#}
 {# 送信された入力が大きすぎる(413)ときの画面。limit_bytes は1回の送信の上限(バイト) #}
 {% extends "base.html" %}
@@ -377,6 +412,7 @@
   <a href="{{ url_for('tasks.new_task') }}" class="btn btn-primary"><i class="bi bi-plus-lg"></i> タスク追加</a>
   {% endif %}
 </div>
+{%- if feature_enabled('tasks') %}
 
 {# ステータス別サマリー: 全体数(自分の担当数) #}
 <div class="row g-3 mb-1">
@@ -402,6 +438,7 @@
   期限切れのタスクが <strong>{{ my_overdue|length }}</strong> 件あります。
 </div>
 {% endif %}
+{%- endif %}
 
 {# 今日の定型業務(自分が担当で、リマインドが設定された業務の、実施予定日が今日以前で完了の入力がまだの回。
    完了を入力すると、その回のリマインドは止まる。リマインドが設定された担当の業務が無ければ表示しない) #}
@@ -440,6 +477,7 @@
   </ul>
 </div>
 {% endif %}
+{%- if feature_enabled('tasks') %}
 
 {# 自分の担当タスク #}
 <div class="card shadow-sm">
@@ -656,6 +694,15 @@
   </div>
 </div>
 {% endif %}
+{%- endif %}
+{%- if not feature_enabled('tasks') and not routine_panel %}
+{# タスク管理を使わない環境(app.py の 2-8)で、今日の定型業務も無いとき #}
+<div class="alert alert-light border small">
+  <i class="bi bi-info-circle"></i> ダッシュボードに表示する内容はありません。
+  {%- if feature_enabled('routine') %} <a href="{{ url_for('routine.list_routines', scope='mine') }}">定型・定期業務</a>{% endif %}
+  {%- if feature_enabled('leaves') %} <a href="{{ url_for('leaves.calendar_view') }}">出勤表</a>{% endif %}
+</div>
+{%- endif %}
 {% endblock %}
 {#=== tasks/list.html ===#}
 {% extends "base.html" %}
@@ -927,9 +974,11 @@
 
       <dt class="col-sm-3 text-muted">規模（負荷目安）</dt>
       <dd class="col-sm-9">{% if task.scale_label %}{{ task.scale_label }}（約{{ task.scale_hours }}h）{% else %}―{% endif %}</dd>
+      {%- if feature_enabled('skills') %}
 
       <dt class="col-sm-3 text-muted">必要スキル</dt>
       <dd class="col-sm-9">{% for r in task.sorted_skill_reqs %}<span class="badge bg-light text-dark border me-1">{{ r.label }}</span>{% else %}―{% endfor %}</dd>
+      {%- endif %}
 
       <dt class="col-sm-3 text-muted">内容・詳細</dt>
       <dd class="col-sm-9 pre-wrap">{{ task.description or '―' }}</dd>
@@ -1114,7 +1163,7 @@
       </div>
       {# 下書きは AI で作る(件名・本文などを AI の接続先に送る)。AI が未設定のときは決まった読み取り方で作る(app.py の 15-4) #}
       <div class="small mt-2 mb-0 {{ 'text-muted' if ai_enabled else 'text-warning-emphasis' }}" id="mail-ai-note" data-ai="{{ '1' if ai_enabled else '0' }}">
-        {% if ai_enabled %}<i class="bi bi-stars"></i> AIで下書き（タイトル・内容のまとめ・日付・優先度・規模・必要スキル）を作ります。件名・本文・差出人・宛先・添付のファイル名と、スキル項目の一覧を AI の接続先に送ります（{{ ai_status }}）。
+        {% if ai_enabled %}<i class="bi bi-stars"></i> AIで下書き（タイトル・内容のまとめ・日付・優先度・規模{% if feature_enabled('skills') %}・必要スキル{% endif %}）を作ります。件名・本文・差出人・宛先・添付のファイル名{% if feature_enabled('skills') %}と、スキル項目の一覧{% endif %}を AI の接続先に送ります（{{ ai_status }}）。
         {% else %}<i class="bi bi-exclamation-triangle"></i> AIが未設定のため、メールの内容から決まった読み取り方で下書きを作ります（AI を使うには、固定ローカル管理者 admin がシステム管理の「基本設定」で AI の接続先を設定します）。{% endif %}
       </div>
       <div id="mail-status" class="small mt-2" role="status" aria-live="polite"></div>
@@ -1144,8 +1193,9 @@
         <label class="form-label" for="task-description">内容・詳細</label>
         <textarea name="description" id="task-description" class="form-control" rows="4">{{ val('description') }}</textarea>
       </div>
+      {%- if feature_enabled('skills') %}
 
-      {# 必要スキル(app.py の 15-1)。担当者に必要な到達度の下限。変えられるのはマネージャーだけ #}
+      {# 必要スキル(app.py の 15-1)。担当者に必要な到達度の下限。変えられるのはマネージャーだけ。スキル管理を使う環境だけ #}
       <div class="mb-3">
         <div class="form-label">必要スキル（担当者に必要な到達度。複数可）{% if not can_plan %} <span class="text-muted small">（マネージャーのみ変更可）</span>{% endif %}</div>
         {% if can_plan %}
@@ -1179,9 +1229,10 @@
         <div>{% for r in task.sorted_skill_reqs %}<span class="badge bg-light text-dark border me-1">{{ r.label }}</span>{% else %}<span class="text-muted">なし</span>{% endfor %}</div>
         {% endif %}
       </div>
+      {%- endif %}
 
       {% if not can_plan %}
-      <p class="text-muted small mb-2"><i class="bi bi-info-circle"></i> 優先度・開始日・期限・規模・担当者・必要スキルはマネージャーが設定します。メンバーはステータス・内容・成果を更新できます。</p>
+      <p class="text-muted small mb-2"><i class="bi bi-info-circle"></i> 優先度・開始日・期限・規模・担当者{% if feature_enabled('skills') %}・必要スキル{% endif %}はマネージャーが設定します。メンバーはステータス・内容・成果を更新できます。</p>
       {% endif %}
       <div class="row">
         <div class="col-md-6 mb-3">
@@ -1249,7 +1300,7 @@
       {# 担当者の推奨(app.py の 15-2)。JavaScript が有効なときは、必要スキル・日付を変えるたびに作り直す #}
       <div class="mb-3">
         <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-1">
-          <div class="form-label mb-0"><i class="bi bi-person-check"></i> 推奨の担当者（スキルと出勤表から）</div>
+          <div class="form-label mb-0"><i class="bi bi-person-check"></i> 推奨の担当者（{% if feature_enabled('skills') and feature_enabled('leaves') %}スキルと出勤表から{% elif feature_enabled('skills') %}スキルと負荷から{% elif feature_enabled('leaves') %}出勤表と負荷から{% else %}負荷から{% endif %}）</div>
           <button type="submit" name="recommend" value="1" formnovalidate class="btn btn-sm btn-outline-secondary" id="recommend-button">推奨の担当者を表示</button>
         </div>
         <div id="recommend-panel" class="border rounded p-2">
@@ -1334,7 +1385,7 @@
 {#=== tasks/_recommend.html ===#}
 {# 担当者の推奨(app.py の 15-2)。tasks/form.html と GET /tasks/recommend の応答で使う。変数 rec(recommend_assignees の戻り値) #}
 {% if not rec.has_input %}
-<p class="text-muted small mb-0">必要スキル・開始日・期限・規模を入れると、スキルの到達度・出勤表（年休・勤務表）・負荷から担当者の候補を表示します。</p>
+<p class="text-muted small mb-0">{% if rec.use_skills %}必要スキル・{% endif %}開始日・期限・規模を入れると、{% if rec.use_skills %}スキルの到達度・{% endif %}{% if rec.use_leaves %}出勤表（年休・勤務表）・{% endif %}負荷から担当者の候補を表示します。</p>
 {% elif not rec.members %}
 <p class="text-muted small mb-0">スキル管理の対象のメンバー（有効なメンバー）がいません。</p>
 {% else %}
@@ -1351,7 +1402,7 @@
         <th scope="col"><span class="visually-hidden">推奨</span></th>
         <th scope="col">メンバー</th>
         {% if rec.requirements %}<th scope="col">必要スキル（到達度/必要）</th>{% endif %}
-        <th scope="col">期間中の休み</th>
+        {% if rec.use_leaves %}<th scope="col">期間中の休み</th>{% endif %}
         {% if rec.counts_workdays %}<th scope="col" class="text-end">出勤日数</th>{% endif %}
         <th scope="col" class="text-end text-nowrap">負荷（h/月）</th>
         <th scope="col" class="text-end text-nowrap">{% if rec.scale_label %}担当した後{% else %}余力{% endif %}</th>
@@ -1366,8 +1417,8 @@
         {% if rec.requirements %}
         <td>{% for d in row.detail %}<span class="badge {{ 'text-bg-primary' if d.ok else 'text-bg-danger' }} me-1" title="{{ d.skill.name }}: 到達度 Lv{{ d.have }}（{{ d.have_label }}）／必要 Lv{{ d.need }}">{{ d.skill.name }} {{ d.have }}/{{ d.need }}</span>{% endfor %}</td>
         {% endif %}
-        <td class="small">{% if row.leaves %}{{ row.leaves|join('、') }}{% if row.more_leaves %} ほか{{ row.more_leaves }}日{% endif %}{% elif rec.period %}なし{% else %}―{% endif %}
-          {%- if row.hourly_leaves %}<div class="text-muted">時間休: {{ row.hourly_leaves|join('、') }}{% if row.more_hourly %} ほか{{ row.more_hourly }}日{% endif %}</div>{% endif %}</td>
+        {% if rec.use_leaves %}<td class="small">{% if row.leaves %}{{ row.leaves|join('、') }}{% if row.more_leaves %} ほか{{ row.more_leaves }}日{% endif %}{% elif rec.period %}なし{% else %}―{% endif %}
+          {%- if row.hourly_leaves %}<div class="text-muted">時間休: {{ row.hourly_leaves|join('、') }}{% if row.more_hourly %} ほか{{ row.more_hourly }}日{% endif %}</div>{% endif %}</td>{% endif %}
         {% if rec.counts_workdays %}<td class="text-end text-nowrap">{{ row.workdays }}日</td>{% endif %}
         <td class="text-end text-nowrap">{{ row.load_h }}h <span class="badge text-bg-{{ row.load_level.color }}">{{ row.load_level.label }}</span><div class="small text-muted">担当中 {{ row.open_tasks }}件</div></td>
         <td class="text-end text-nowrap">{% if rec.scale_label %}{{ row.after_h }}h <span class="badge text-bg-{{ row.after_level.color }}">{{ row.after_level.label }}</span>{% endif %}
@@ -1381,8 +1432,8 @@
 {% if rec.more %}<div class="small text-muted">ほか {{ rec.more }} 名（上位 {{ rec.rows|length }} 名を表示）</div>{% endif %}
 {% if rec.ignored %}<div class="small text-muted">無効にしたスキル（{{ rec.ignored|map(attribute='name')|join('、') }}）は比べていません。</div>{% endif %}
 {% if rec.long_period %}<div class="small text-muted">期間が長いため、出勤日数と勤務表の休みの日は数えていません（登録された年休だけ確かめています）。</div>{% endif %}
-<div class="small text-muted">推奨: 期間中に休み（年休・勤務表の年休の日）が無く、出勤日があり、必要スキルの到達度をすべて満たし、このタスクを担当しても月の負荷がフルタイム（{{ rec.load_full }}h）を超えないメンバー（スキル管理の対象のメンバー）。
-負荷は未完了のタスク（規模を期間で月あたりにならしたもの。複数担当は等分）と定型業務の月の工数の合計で、マネージャーダッシュボードの「ヒト別 負荷・案件状況」と同じです（編集中のこのタスクは含めません）。「担当した後」は、このタスクを1人で担当したときの負荷です。担当中は未完了のタスクの数です。</div>
+<div class="small text-muted">推奨: {% if rec.use_leaves %}期間中に休み（年休・勤務表の年休の日）が無く、出勤日があり、{% endif %}{% if rec.use_skills %}必要スキルの到達度をすべて満たし、{% endif %}このタスクを担当しても月の負荷がフルタイム（{{ rec.load_full }}h）を超えないメンバー（{{ 'スキル管理の対象のメンバー' if rec.use_skills else '有効なメンバー' }}）。
+負荷は未完了のタスク（規模を期間で月あたりにならしたもの。複数担当は等分）{% if rec.use_routine %}と定型業務の月の工数{% endif %}の合計で、マネージャーダッシュボードの「ヒト別 負荷・案件状況」と同じです（編集中のこのタスクは含めません）。「担当した後」は、このタスクを1人で担当したときの負荷です。担当中は未完了のタスクの数です。</div>
 {% endif %}
 {#=== routine/list.html ===#}
 {% extends "base.html" %}
@@ -1622,6 +1673,7 @@
   </div>
   {% endif %}
 </div>
+{%- if feature_enabled('reminder') %}
 
 {# リマインド(実施日に担当者へメールで知らせ、完了の入力があるまで1日2回リマインドする。設定は編集画面の「リマインド」。
    アドレスは編集できる人〔担当者・マネージャー〕にだけ表示する。ただし、メンバーが登録したアドレスは、マネージャーと
@@ -1706,6 +1758,7 @@
     {% endif %}
   </div>
 </div>
+{%- endif %}
 {% endblock %}
 {#=== routine/form.html ===#}
 {% extends "base.html" %}
@@ -1752,7 +1805,7 @@
           </div>
           {% endfor %}
         </div>
-        <div class="form-text">複数選ぶと、ヒト別サマリー・負荷の所要時間は人数で均等に分けて計上し、リマインドは担当者全員に送ります。{% if users|rejectattr('is_active')|list %}［無効］は無効化されたメンバーです（担当のまま残します。外す場合はチェックを外してください）。{% endif %}</div>
+        <div class="form-text">複数選ぶと、ヒト別サマリー・負荷の所要時間は人数で均等に分けて計上{{ 'し、リマインドは担当者全員に送ります' if feature_enabled('reminder') else 'します' }}。{% if users|rejectattr('is_active')|list %}［無効］は無効化されたメンバーです（担当のまま残します。外す場合はチェックを外してください）。{% endif %}</div>
         {% else %}
         <div class="form-control-plaintext py-1">{{ routine.assignee_labels if editing else current_user.display_name }}</div>
         <div class="form-text">{{ '担当者はマネージャーが変更します。' if editing else '登録すると自分が担当者になります（担当者の追加・変更はマネージャーが行います）。' }}</div>
@@ -1797,6 +1850,7 @@
         <label class="form-label">業務内容(自由記載)</label>
         <textarea name="content" class="form-control" rows="5">{{ val('content') }}</textarea>
       </div>
+      {%- if feature_enabled('reminder') %}
 
       {# リマインド(実施日に担当者へメールで知らせ、完了の入力があるまで1日2回リマインドする。app.py の 10-4)。
          rem_mark はこの欄のある画面からの送信の印(無い以前の画面からの保存では、リマインドの設定を変えない) #}
@@ -1888,6 +1942,7 @@
         </div>
         <div class="form-text">追加の宛先にも、担当者と同じ内容（この業務の完了の入力がまだの回）を送ります。同じ人に関係する業務が複数あっても、1回の送信で届くメールは1通にまとめます。</div>
       </fieldset>
+      {%- endif %}
 
       <div class="d-flex gap-2">
         <button type="submit" class="btn btn-primary"><i class="bi bi-check-lg"></i> {{ '更新' if editing else '登録' }}</button>
@@ -3290,17 +3345,18 @@
     <ul class="dropdown-menu dropdown-menu-end">
       <li><a class="dropdown-item" href="{{ url_for('export.all_xlsx') }}"><i class="bi bi-download"></i> 全データ（1ファイル）</a></li>
       <li><hr class="dropdown-divider"></li>
-      <li><a class="dropdown-item" href="{{ url_for('export.tasks_xlsx') }}">タスク（履歴含む）</a></li>
-      <li><a class="dropdown-item" href="{{ url_for('export.routine_xlsx') }}">定型・定期業務</a></li>
-      <li><a class="dropdown-item" href="{{ url_for('export.skills_xlsx') }}">スキル・業務</a></li>
-      <li><a class="dropdown-item" href="{{ url_for('export.leaves_xlsx') }}">年休</a></li>
+      {% if feature_enabled('tasks') %}<li><a class="dropdown-item" href="{{ url_for('export.tasks_xlsx') }}">タスク（履歴含む）</a></li>{% endif %}
+      {% if feature_enabled('routine') %}<li><a class="dropdown-item" href="{{ url_for('export.routine_xlsx') }}">定型・定期業務</a></li>{% endif %}
+      {% if feature_enabled('skills') %}<li><a class="dropdown-item" href="{{ url_for('export.skills_xlsx') }}">スキル・業務</a></li>{% endif %}
+      {% if feature_enabled('leaves') %}<li><a class="dropdown-item" href="{{ url_for('export.leaves_xlsx') }}">年休</a></li>{% endif %}
       <li><a class="dropdown-item" href="{{ url_for('export.teams_xlsx') }}">チーム・メンバー</a></li>
     </ul>
   </div>
   </div>
 </div>
+{%- if feature_enabled('analysis') %}
 
-{# ===== エグゼクティブサマリー(AI分析のまとめを1つの文章に。app.py の 9-10。表示だけ) ===== #}
+{# ===== エグゼクティブサマリー(AI分析のまとめを1つの文章に。app.py の 9-10。表示だけ。AI分析を使う環境だけ) ===== #}
 {% set s = analysis %}
 <div class="card shadow-sm mb-3 border-primary" id="ai-panel" data-status-url="{{ url_for('manager.analysis_status') }}"
      data-running="{{ 1 if s.run and s.run.running else 0 }}">
@@ -3348,9 +3404,11 @@
     </div>
   </div>
 </div>
+{%- endif %}
 <p class="text-muted small mb-4">チームの全体俯瞰（対象メンバー {{ member_count }} 名）</p>
 
 <div class="row g-3">
+  {%- if feature_enabled('tasks') %}
   {# タスク進捗 #}
   <div class="col-lg-6">
     <div class="card shadow-sm h-100">
@@ -3374,6 +3432,8 @@
       </div>
     </div>
   </div>
+  {%- endif %}
+  {%- if feature_enabled('leaves') %}
 
   {# 直近1か月の休暇予定 #}
   <div class="col-lg-6">
@@ -3394,6 +3454,8 @@
       </ul>
     </div>
   </div>
+  {%- endif %}
+  {%- if feature_enabled('skills') %}
 
   {# スキル保有状況 #}
   <div class="col-lg-7">
@@ -3435,25 +3497,31 @@
       </ul>
     </div>
   </div>
+  {%- endif %}
 </div>
+{%- if feature_enabled('tasks') or feature_enabled('routine') %}
 
-{# ヒト別 負荷・案件状況(タスク＋定型業務を合算) #}
+{# ヒト別 負荷・案件状況(タスク＋定型業務を合算。この環境で使う機能の列だけ) #}
 <div class="card shadow-sm mt-4">
   <div class="card-header bg-white d-flex justify-content-between align-items-center flex-wrap gap-2">
     <span class="fw-bold"><i class="bi bi-speedometer2"></i> ヒト別 負荷・案件状況</span>
-    <span class="small text-muted">月間の目安工数（タスク＋定型業務を合算）</span>
+    <span class="small text-muted">月間の目安工数{{ '（タスク＋定型業務を合算）' if feature_enabled('tasks') and feature_enabled('routine') else ('（タスク）' if feature_enabled('tasks') else '（定型業務）') }}</span>
   </div>
   <div class="table-responsive">
     <table class="table table-hover align-middle mb-0 text-center sortable">
       <thead class="table-light">
         <tr>
           <th class="text-start">ヒト</th>
+          {%- if feature_enabled('tasks') %}
           <th class="text-nowrap" data-type="num">進行中</th>
           <th class="text-nowrap" data-type="num">未着手</th>
           <th class="text-nowrap" data-type="num">保留</th>
           <th class="text-nowrap" data-type="num">期限<br>超過</th>
           <th class="text-nowrap" data-type="num">タスク<br>(h/月)</th>
+          {%- endif %}
+          {%- if feature_enabled('routine') %}
           <th class="text-nowrap" data-type="num">定型<br>(h/月)</th>
+          {%- endif %}
           <th class="text-nowrap" data-type="num">合計<br>(h/月)</th>
           <th class="text-nowrap" data-type="num">余力<br>(対160h)</th>
           <th class="text-nowrap" data-type="num" style="min-width:130px;">負荷</th>
@@ -3463,12 +3531,16 @@
         {% for r in workload_rows %}
         <tr>
           <td class="text-start text-nowrap fw-medium">{{ r.user.display_name }}</td>
+          {%- if feature_enabled('tasks') %}
           <td data-sort="{{ r.doing }}">{{ r.doing or '―' }}</td>
           <td data-sort="{{ r.todo }}">{{ r.todo or '―' }}</td>
           <td data-sort="{{ r.hold }}">{{ r.hold or '―' }}</td>
           <td class="{% if r.overdue %}text-danger fw-bold{% endif %}" data-sort="{{ r.overdue }}">{{ r.overdue or '―' }}</td>
           <td data-sort="{{ r.task_h }}">{{ r.task_h }}</td>
+          {%- endif %}
+          {%- if feature_enabled('routine') %}
           <td data-sort="{{ r.routine_h }}">{{ r.routine_h }}</td>
+          {%- endif %}
           <td class="fw-bold" data-sort="{{ r.total_h }}">{{ r.total_h }}</td>
           <td class="fw-bold {% if r.spare < 0 %}text-danger{% else %}text-success{% endif %}" data-sort="{{ r.spare }}">
             {{ r.spare }}{% if r.spare < 0 %}<br><span class="small">超過</span>{% endif %}
@@ -3483,17 +3555,21 @@
           </td>
         </tr>
         {% else %}
-        <tr><td colspan="10" class="text-muted py-3">対象者がいません。</td></tr>
+        <tr><td colspan="{{ 4 + (5 if feature_enabled('tasks') else 0) + (1 if feature_enabled('routine') else 0) }}" class="text-muted py-3">対象者がいません。</td></tr>
         {% endfor %}
       </tbody>
       {% if workload_rows %}
       <tfoot class="table-light fw-bold">
         <tr>
           <td class="text-start">合計</td>
+          {%- if feature_enabled('tasks') %}
           <td colspan="3">{{ workload_totals.task_open }} 件</td>
           <td class="{% if workload_totals.overdue %}text-danger{% endif %}">{{ workload_totals.overdue }}</td>
           <td>{{ workload_totals.task_h }}</td>
+          {%- endif %}
+          {%- if feature_enabled('routine') %}
           <td>{{ workload_totals.routine_h }}</td>
+          {%- endif %}
           <td>{{ workload_totals.total_h }}</td>
           <td class="{% if workload_totals.spare < 0 %}text-danger{% else %}text-success{% endif %}">{{ workload_totals.spare }}</td>
           <td></td>
@@ -3503,10 +3579,17 @@
     </table>
   </div>
   <div class="card-footer bg-white small text-muted">
+    {%- if not feature_enabled('tasks') %}
+    <i class="bi bi-info-circle"></i> <strong>フルタイム≒{{ load_full }}h/月を基準</strong>（負荷: 低 &lt;{{ (load_full/2)|int }} ／ 中 &lt;{{ load_full }} ／ 高 ≥{{ load_full }}）。<strong>余力＝{{ load_full }}h/月−合計</strong>（マイナスは超過）。<br>
+    定型・定期業務の月間工数の合計です（複数担当は均等割り）。
+    {%- else %}
     <i class="bi bi-info-circle"></i> <strong>フルタイム≒{{ load_full }}h/月を基準</strong>（負荷: 低 &lt;{{ (load_full/2)|int }} ／ 中 &lt;{{ load_full }} ／ 高 ≥{{ load_full }}）。<strong>余力＝{{ load_full }}h/月−合計</strong>（マイナスは超過）。<br>
     タスクの規模（実働工数の目安）を開始〜期限の期間で月あたりに配分し、定型・定期業務の月間工数と合算。複数担当は均等割り。能力差は「規模の選択（担当者基準）」で織り込み。規模未設定のタスクは工数0で件数のみ計上。合計の行の件数・期限超過は、有効な担当者がいるタスクの数（複数担当のタスクも1件。未割当のタスクと、担当者が全員無効化されたタスクは含みません）。
+    {%- endif %}
   </div>
 </div>
+{%- endif %}
+{%- if feature_enabled('tasks') %}
 
 {# ===== 成果(見込み・実績) ===== #}
 <h2 class="h4 mt-4 mb-1"><i class="bi bi-trophy"></i> 成果（見込み・実績）</h2>
@@ -3830,6 +3913,7 @@
   </div>
   {% endfor %}
 </div>
+{%- endif %}
 {% endblock %}
 {% block scripts %}
 <script src="{{ url_for('static', filename='js/ai-analysis.js') }}"></script>
@@ -4026,7 +4110,7 @@
   <a href="{{ url_for('manager.dashboard') }}" class="btn btn-outline-secondary"><i class="bi bi-arrow-left"></i> マネージャーダッシュボード</a>
 </div>
 <p class="text-muted small mb-3">
-  チームの状況を「① タスクの進捗」「② スキル状況」「③ 成果物の状況」「④ 各人の能力」にまとめ、いま対応することを推奨アクションとして示します。
+  チームの状況を「① タスクの進捗」{% if feature_enabled('skills') %}「② スキル状況」{% endif %}「③ 成果物の状況」「④ 各人の能力」にまとめ、いま対応することを推奨アクションとして示します。
   数値と一覧はアプリが計算しています。④ は指導の参考で、順位・点数は付けません。
 </p>
 
@@ -4523,8 +4607,9 @@
     </div>
   </div>
 </div>
+{%- if feature_enabled('skills') %}
 
-{# ===== ② スキル状況 ===== #}
+{# ===== ② スキル状況(スキル管理を使う環境だけ) ===== #}
 {% set sk = a.skills %}
 {% set up = sk.updates %}
 <h2 class="h4 mt-4 mb-1" id="skills"><i class="bi bi-mortarboard"></i> ② スキル状況</h2>
@@ -4654,6 +4739,7 @@
     </div>
   </div>
 </div>
+{%- endif %}
 
 {# ===== ③ 成果物の状況 ===== #}
 {% set o = a.outputs %}
@@ -4937,7 +5023,7 @@
             <th>ログインID</th>
             <th>役割</th>
             <th>勤務</th>
-            <th>メールアドレス{% if allowed_domains %} <span class="small text-muted fw-normal">（送信を許可するドメイン: {{ allowed_domains|join('、') }}）</span>{% endif %}</th>
+            {% if feature_enabled('reminder') %}<th>メールアドレス{% if allowed_domains %} <span class="small text-muted fw-normal">（送信を許可するドメイン: {{ allowed_domains|join('、') }}）</span>{% endif %}</th>{% endif %}
             <th class="text-end">操作</th>
           </tr>
         </thead>
@@ -4962,6 +5048,7 @@
                 <button class="btn btn-sm btn-outline-primary text-nowrap">保存</button>
               </form>
             </td>
+            {%- if feature_enabled('reminder') %}
             <td>
               {# 定型業務のリマインドの宛先。空にして保存すると削除。開いたときのアドレスの控え(version)と
                  ログインID(画面を開いた後の削除・IDの再利用の確認)を一緒に送る #}
@@ -4975,6 +5062,7 @@
               </form>
               {% if u.id in email_outside %}<div class="small text-danger">送信を許可するドメイン以外のため送信しません</div>{% endif %}
             </td>
+            {%- endif %}
             <td class="text-end">
               {% if u.id == current_user.id %}
               <span class="text-muted small">（自分）</span>
@@ -5028,8 +5116,8 @@
       </div>
     </form>
     <p class="text-muted small mb-0 mt-2"><i class="bi bi-info-circle"></i> 追加したメンバーへのチーム割り当ては、下の「メンバーの紐づけ」で行います。認証は本番LDAPに準拠します。</p>
-    <p class="text-muted small mb-0"><i class="bi bi-calendar-check"></i> 勤務は出勤表の並びと、タスクの担当者の推奨（勤務表の休み・出勤日数）に使います。勤務の追加と勤務表の入力は、すべての環境で共通のため、固定ローカル管理者（admin）がシステム管理の「勤務パターン」で行います。</p>
-    <p class="text-muted small mb-0"><i class="bi bi-envelope"></i> メールアドレスは定型業務のリマインドの宛先です（空にして保存すると削除）。各メンバーもユーザーメニューの「メールアドレス」で自分の分を変更できます。</p>
+    <p class="text-muted small mb-0"><i class="bi bi-calendar-check"></i> 勤務は{% if feature_enabled('leaves') %}出勤表の並びと、タスクの担当者の推奨（勤務表の休み・出勤日数）に使います{% elif feature_enabled('tasks') %}タスク一覧の絞り込み・列（勤務）に使います{% else %}メンバーの情報として残します（出勤表・年休とタスク管理を使わない環境のため、画面では使いません）{% endif %}。勤務の追加と勤務表の入力は、すべての環境で共通のため、固定ローカル管理者（admin）がシステム管理の「勤務パターン」で行います。</p>
+    {% if feature_enabled('reminder') %}<p class="text-muted small mb-0"><i class="bi bi-envelope"></i> メールアドレスは定型業務のリマインドの宛先です（空にして保存すると削除）。各メンバーもユーザーメニューの「メールアドレス」で自分の分を変更できます。</p>{% endif %}
 
     {% if inactive_members %}
     <hr>
@@ -5544,6 +5632,9 @@
   タブごとにフォームが分かれていて、保存ボタンを押したタブの内容だけを保存します（ほかのタブの入力は保存されません）。
   すべての環境で共通の設定（AI・メールの送信サーバーなど）は、固定ローカル管理者（admin）がシステム管理の「基本設定」で変更します。
 </p>
+{%- if not tabs %}
+<div class="alert alert-light border small"><i class="bi bi-info-circle"></i> この環境で使う機能には、ここで変える設定がありません（使う機能は、固定ローカル管理者（admin）がシステム管理の「環境」で変えられます）。</div>
+{%- endif %}
 
 <ul class="nav nav-tabs" id="system-tabs" role="tablist">
   {% for key, label, icon in tabs %}
@@ -5557,24 +5648,36 @@
 </ul>
 
 <div class="tab-content pt-3">
+  {%- if 'recipients' in shown_tabs %}
   <div class="tab-pane fade {% if tab == 'recipients' %}show active{% endif %}" id="pane-recipients" role="tabpanel" aria-labelledby="tab-recipients">
     {{ file_error_alert(rc) }}{% include "system/_recipients_tab.html" %}
   </div>
+  {%- endif %}
+  {%- if 'weekly' in shown_tabs %}
   <div class="tab-pane fade {% if tab == 'weekly' %}show active{% endif %}" id="pane-weekly" role="tabpanel" aria-labelledby="tab-weekly">
     {{ file_error_alert(wk) }}{% include "system/_weekly_tab.html" %}
   </div>
+  {%- endif %}
+  {%- if 'overdue' in shown_tabs %}
   <div class="tab-pane fade {% if tab == 'overdue' %}show active{% endif %}" id="pane-overdue" role="tabpanel" aria-labelledby="tab-overdue">
     {{ file_error_alert(od) }}{% include "system/_overdue_tab.html" %}
   </div>
+  {%- endif %}
+  {%- if 'skill_ai' in shown_tabs %}
   <div class="tab-pane fade {% if tab == 'skill_ai' %}show active{% endif %}" id="pane-skill_ai" role="tabpanel" aria-labelledby="tab-skill_ai">
     {{ file_error_alert(sa) }}{% include "system/_skill_ai_tab.html" %}
   </div>
+  {%- endif %}
+  {%- if 'analysis' in shown_tabs %}
   <div class="tab-pane fade {% if tab == 'analysis' %}show active{% endif %}" id="pane-analysis" role="tabpanel" aria-labelledby="tab-analysis">
     {{ file_error_alert(an) }}{% include "system/_analysis_tab.html" %}
   </div>
+  {%- endif %}
+  {%- if 'reminder' in shown_tabs %}
   <div class="tab-pane fade {% if tab == 'reminder' %}show active{% endif %}" id="pane-reminder" role="tabpanel" aria-labelledby="tab-reminder">
     {{ file_error_alert(rm) }}{% include "system/_reminder_tab.html" %}
   </div>
+  {%- endif %}
 </div>
 {% endblock %}
 
@@ -6148,7 +6251,7 @@
     </button>
     <div class="collapse navbar-collapse" id="navbarAdmin">
       <ul class="navbar-nav me-auto">
-        <li class="nav-item"><a class="nav-link {% if request.endpoint in ('admin.envs', 'admin.create_env', 'admin.delete_env') %}active{% endif %}" href="{{ url_for('admin.envs') }}"><i class="bi bi-collection"></i> 環境</a></li>
+        <li class="nav-item"><a class="nav-link {% if request.endpoint in ('admin.envs', 'admin.create_env', 'admin.delete_env', 'admin.env_features') %}active{% endif %}" href="{{ url_for('admin.envs') }}"><i class="bi bi-collection"></i> 環境</a></li>
         <li class="nav-item"><a class="nav-link {% if request.endpoint in ('admin.settings', 'admin.save_settings') %}active{% endif %}" href="{{ url_for('admin.settings') }}"><i class="bi bi-sliders"></i> 基本設定</a></li>
         <li class="nav-item"><a class="nav-link {% if request.endpoint in ('admin.shifts', 'admin.shift_month', 'admin.new_shift', 'admin.save_shift_codes') %}active{% endif %}" href="{{ url_for('admin.shifts') }}"><i class="bi bi-calendar3"></i> 勤務パターン</a></li>
       </ul>
@@ -6161,8 +6264,10 @@
 </nav>
 {% endblock %}
 {#=== admin/envs.html ===#}
-{# システム管理の「環境」(環境の一覧・開く・追加〔名前だけ〕・名前の変更・停止/再開。admin だけ)。ev は envs_tab_context の値 #}
+{# システム管理の「環境」(環境の一覧・開く・追加〔名前と使う機能〕・名前の変更・使う機能の変更・停止/再開。admin だけ)。
+   ev は envs_tab_context の値 #}
 {% extends "admin/_layout.html" %}
+{% from "_macros.html" import env_feature_checkboxes %}
 {% block title %}環境 &middot; システム管理 &middot; {{ app_name }}{% endblock %}
 
 {% block content %}
@@ -6180,6 +6285,9 @@
   使わなくなった環境は「停止」してから「削除」できます（データのフォルダはバックアップとして残します）。
 </p>
 <p class="small text-muted">
+  「使う機能」は環境ごとに選べます（追加するときと、後から「変更」で）。使わない機能は、その環境のメニュー・画面に出さず、定期メールも送りません（データは消しません）。
+</p>
+<p class="small text-muted">
   「最終更新」は、その環境で業務のデータ（タスク・進捗の記載・定型業務の完了・年休・スキル・チーム・メンバーなど）を最後に更新した日です
   （使われていない環境の棚卸しに使えます。見出しを押すと並び替えられます。{{ ev.idle_days }}日以上更新の無い環境は赤で表示します）。
 </p>
@@ -6194,7 +6302,7 @@
   <div class="card-body">
     <div class="table-responsive">
       <table class="table table-sm align-middle mb-0 sortable">
-        <thead class="table-light"><tr><th>名前</th><th>URL</th><th>状態</th><th class="text-end" data-type="num">メンバー</th><th class="ps-3">最終更新</th><th data-nosort>操作</th></tr></thead>
+        <thead class="table-light"><tr><th>名前</th><th>URL</th><th>状態</th><th data-nosort>使う機能</th><th class="text-end" data-type="num">メンバー</th><th class="ps-3">最終更新</th><th data-nosort>操作</th></tr></thead>
         <tbody>
           {% for e in ev.envs %}
           <tr>
@@ -6208,6 +6316,11 @@
             </td>
             <td class="small text-break"><code>{{ e.url }}</code><div class="text-muted">{{ e.folder }}</div></td>
             <td class="text-nowrap">{% if e.active %}<span class="badge bg-success">使用中</span>{% else %}<span class="badge bg-secondary">停止中</span>{% endif %}</td>
+            <td class="small" style="min-width: 11rem;">
+              {%- if e.all_features %}<span class="badge bg-light text-dark border">すべての機能</span>
+              {%- else %}{% for name in e.feature_names %}<span class="badge bg-light text-dark border me-1">{{ name }}</span>{% endfor %}{% endif %}
+              <div><a href="{{ url_for('admin.env_features', key=e.key) }}" class="small"><i class="bi bi-ui-checks"></i> 変更</a></div>
+            </td>
             <td class="text-end" data-sort="{{ e.members if e.members is not none else '' }}">{% if e.members is none %}―{% else %}{{ e.members }}人{% endif %}</td>
             <td class="small text-nowrap ps-3" data-sort="{{ e.last_updated.strftime('%Y-%m-%d %H:%M') if e.last_updated else '' }}">
               {%- if e.last_updated %}<span class="{{ 'text-danger fw-bold' if e.idle_days >= ev.idle_days else '' }}">{{ e.last_updated.strftime('%Y/%m/%d') }}</span>
@@ -6244,6 +6357,11 @@
         <input type="text" class="form-control form-control-sm" id="env-new-name" name="name" maxlength="{{ ev.name_max }}" required
                value="{{ ev.inputs.name or '' }}" placeholder="例: 〇〇グループ">
       </div>
+      <div class="col-12">
+        <div class="form-label small fw-bold mb-1">使う機能</div>
+        {{ env_feature_checkboxes(ev.new_features, 'env-new', ev.feature_field, ev.feature_mark) }}
+        <div class="form-text">使わない機能は、この環境のメニュー・画面に出さず、定期メールも送りません。後から環境の一覧の「使う機能」の「変更」で変えられます（データは消しません）。</div>
+      </div>
       <div class="col-md-6">
         <button class="btn btn-primary" {% if ev.error %}disabled{% endif %}><i class="bi bi-plus-lg"></i> 環境を追加</button>
       </div>
@@ -6274,6 +6392,9 @@
   </div>
 </div>
 {% endif %}
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/env-features.js') }}"></script>
 {% endblock %}
 {#=== admin/env_delete.html ===#}
 {# システム管理の「環境」の削除の確かめ(admin だけ。停止した環境だけ削除できる)。ev は envs_tab_context の値、e はその環境の行 #}
@@ -6322,6 +6443,43 @@
   </div>
 </form>
 {% endif %}
+{% endblock %}
+{#=== admin/env_features.html ===#}
+{# システム管理の「環境」の使う機能の変更(admin だけ。app.py の 2-8・17-5)。ev は envs_tab_context の値、e はその環境の行、
+   rows は env_feature_rows の値 #}
+{% extends "admin/_layout.html" %}
+{% from "_macros.html" import env_feature_checkboxes %}
+{% block title %}使う機能 &middot; システム管理 &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item">システム管理</li>
+    <li class="breadcrumb-item"><a href="{{ url_for('admin.envs') }}">環境</a></li>
+    <li class="breadcrumb-item active">使う機能</li>
+  </ol>
+</nav>
+<h1 class="h3 mb-1"><i class="bi bi-ui-checks"></i> 使う機能（{{ e.name }}）</h1>
+<p class="small text-muted">
+  この環境で使う機能を選びます。使わない機能は、この環境のメニュー・ダッシュボード・システム設定のタブ・Excel の出力に出さず、その画面も開けません。
+  定期メール（週報・期限超過通知・定型業務リマインド）も送りません。データは消さないため、後から使うようにすると元のまま使えます。
+  週報・期限超過通知・AI分析はタスク管理を、定型業務リマインドは定型・定期業務を使うときだけ選べます。
+</p>
+<form method="post" action="{{ url_for('admin.env_features', key=e.key) }}" class="card card-body shadow-sm mb-3">
+  <input type="hidden" name="version" value="{{ ev.version }}">
+  <dl class="row small mb-2">
+    <dt class="col-sm-2">URL</dt><dd class="col-sm-10"><code>{{ e.url }}</code></dd>
+    <dt class="col-sm-2">状態</dt><dd class="col-sm-10">{% if e.active %}<span class="badge bg-success">使用中</span>{% else %}<span class="badge bg-secondary">停止中</span>{% endif %}</dd>
+  </dl>
+  {{ env_feature_checkboxes(rows, 'env-feature', ev.feature_field, ev.feature_mark) }}
+  <div class="d-flex gap-2 mt-3">
+    <button class="btn btn-primary" {% if ev.error %}disabled{% endif %}><i class="bi bi-check-lg"></i> 保存</button>
+    <a class="btn btn-outline-secondary" href="{{ url_for('admin.envs') }}">やめる</a>
+  </div>
+</form>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/env-features.js') }}"></script>
 {% endblock %}
 {#=== admin/settings.html ===#}
 {# システム管理の「基本設定」(すべての環境で共通の設定。admin だけ)。cfg は app.py の config_form_context の値 #}
@@ -8306,6 +8464,44 @@ a:hover {
     setupCopy();
     setupPolling();
     setupPeriod();
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();
+{#=== static/js/env-features.js ===#}
+/* システム管理の「環境」の使う機能(admin/envs.html の追加・admin/env_features.html)用。
+ *
+ * 前提の機能(タスク管理・定型・定期業務)のチェックを外すと、その機能を前提にする機能(週報・期限超過通知・AI分析・
+ * 定型業務リマインド)のチェックも外して、選べなくする(サーバーでも、前提の機能を使わない機能は使わないとして保存する)。
+ * JavaScript が無効でも保存できる。
+ */
+(function () {
+  "use strict";
+
+  function setup(box) {
+    var inputs = box.querySelectorAll("input[data-parent]");
+
+    function sync() {
+      inputs.forEach(function (input) {
+        var owner = box.querySelector("input[value='" + input.getAttribute("data-parent") + "']");
+        if (!owner) return;
+        input.disabled = !owner.checked;
+        if (!owner.checked) input.checked = false;
+      });
+    }
+
+    box.querySelectorAll("input[type='checkbox']").forEach(function (input) {
+      input.addEventListener("change", sync);
+    });
+    sync();
+  }
+
+  function init() {
+    document.querySelectorAll("[data-env-features]").forEach(setup);
   }
 
   if (document.readyState === "loading") {
