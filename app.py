@@ -2776,6 +2776,23 @@ class WorkShiftCode(db.Model):
     def __repr__(self):
         return f"<WorkShiftCode {self.code} {self.label} {self.kind}>"
 
+class UserNameOverride(db.Model):
+    """admin がシステム管理の「ユーザー」で決めた氏名(ログインIDごと。18 章)。すべての環境で共通(SHARED_BIND)。
+
+    この行があるログインIDは、ログインのときに LDAP の氏名で上書きしない(この氏名にする。5-1)。新しいテーブル
+    (既存のテーブルは変更しない)。「LDAP の氏名に戻す」で行を消す。
+    """
+    __bind_key__ = SHARED_BIND
+    __tablename__ = "user_name_overrides"
+
+    username = db.Column(db.String(64), primary_key=True)
+    display_name = db.Column(db.String(128), nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+    updated_by = db.Column(db.String(64))   # 決めた人のログインID(admin)
+
+    def __repr__(self):
+        return f"<UserNameOverride {self.username}>"
+
 # ==== 3-4. 定型・定期業務 =========================================================================
 
 FREQ_DAY = "日"
@@ -4504,6 +4521,23 @@ def is_local_account(username):
     """
     return username == ADMIN_USERNAME or username in _local_accounts()
 
+def name_override(username):
+    """admin がシステム管理の「ユーザー」で決めた氏名(UserNameOverride。無ければ None)。
+
+    この氏名があれば、ログインのときに LDAP の氏名で上書きしない(18 章)。共通の DB を読めない(以前の版の DB で
+    まだテーブルが無い など)ときも None(ログインを止めない)。読むときに、まだ保存していない変更を書き出さない
+    (no_autoflush。氏名を決める前の新しいユーザーの行を書き出して、氏名が空の誤りにしないように)。
+    """
+    if not username:
+        return None
+    try:
+        with db.session.no_autoflush:
+            row = db.session.get(UserNameOverride, username)
+    except OperationalError:
+        db.session.rollback()
+        return None
+    return row.display_name if row is not None else None
+
 def _login_display_name(info):
     """認証の結果の氏名(display_name)。文字列で空白以外の文字があればその値(前後の空白を除く)、無ければ None。
 
@@ -4523,12 +4557,14 @@ def _ensure_local_user(info):
     info の shown_name は、認証の結果の氏名が無いときに新しい行に付ける氏名(共通のログインの画面に出す氏名。
     1つの環境のときのログインから作った共通のログインで、ほかの環境に初めて入るとき。登録済みの氏名は変えない)。
     """
+    override = name_override(info["username"])   # admin が決めた氏名(18 章)。行を足す前に読む
     for _attempt in range(2):
         user = User.query.filter_by(username=info["username"]).first()
         if user is None:
             user = User(username=info["username"])
             db.session.add(user)
-        user.display_name = (_login_display_name(info) or user.display_name
+        # admin が決めた氏名があればそれ。無ければ認証の結果の氏名
+        user.display_name = (override or _login_display_name(info) or user.display_name
                              or _login_display_name({"display_name": info.get("shown_name")}) or info["username"])
         role = info.get("role")
         user.role = role if role in (ROLE_MANAGER, ROLE_MEMBER) else (user.role or ROLE_MANAGER)
@@ -4544,13 +4580,14 @@ def _match_registered_user(info):
     """LDAP認証済みのIDを『アプリに登録済み・有効』と突き合わせる。
 
     アプリ未登録 or 無効化 なら None(=ログイン不可)。
-    登録済みなら氏名(display_name)は LDAP を正として同期し、
-    役割(role)はアプリの登録(マネージャーがメンバー管理で設定)を正として維持する。
+    登録済みなら氏名(display_name)は LDAP を正として同期し(admin がシステム管理の「ユーザー」で決めた氏名があれば
+    それにして、LDAP の氏名で上書きしない。18 章)、
+    役割(role)はアプリの登録(マネージャーがメンバー管理で設定・admin がシステム管理の「ユーザー」で変更)を正として維持する。
     """
     user = User.query.filter_by(username=info["username"]).first()
     if user is None or not user.is_active:
         return None
-    name = _login_display_name(info)
+    name = name_override(user.username) or _login_display_name(info)
     if name is not None and name != user.display_name:
         # 氏名を返さなかった(None・空)ときは、マネージャーが登録した氏名のまま(空の氏名で上書きしない)
         user.display_name = name
@@ -4784,7 +4821,10 @@ def _portal_login():
             flash(LOGIN_NOT_REGISTERED, "danger")
             return render_template("auth/login.html", username=username)
         try:
-            start_portal_session(info["username"], _login_display_name(info) or "", local, info.get("role"))
+            # 共通のログインの氏名(環境の選択の画面に出し、各環境に入るときにその環境の氏名を合わせる)も、admin が
+            # 決めた氏名があればそれ(18 章)
+            start_portal_session(info["username"], name_override(info["username"]) or _login_display_name(info) or "",
+                                 local, info.get("role"))
         except OSError:
             current_app.logger.exception("共通のログインの記録（instance/%s）を保存できませんでした", PORTAL_SESSIONS_FILENAME)
             flash(LOGIN_RECORD_ERROR, "danger")
@@ -23026,6 +23066,8 @@ del _old, _endpoint, _path
 #   基本設定   : すべての環境で共通の設定(AI・メールの送信サーバー・差出人・送信を許可するドメイン・リンク・LDAP・
 #                admin のパスワード・SECRET_KEY。11 章の項目。宛先 MAIL_TO・MAIL_CC は環境ごとのため、ここには出さない)
 #   勤務パターン: 勤務・勤務表の記号・勤務表の入力(すべての環境で共通。16 章)
+#   ユーザー   : 環境ごとのユーザーの役割(manager / member)の切り替えと、氏名の変更(同じログインIDのすべての環境。
+#                ログインしても LDAP の氏名で上書きしない。下の「ユーザー」)
 # admin は、どの環境にも入って、その環境のマネージャーと同じように編集できる(初めて入るときにその環境のユーザーを
 # 用意する)。各環境のマネージャーは、その環境の中だけを編集する(基本設定・環境・勤務パターンは変えられない)。
 # システム管理の画面はメインの環境のアプリだけにある(ほかの環境の /env/<キー>/admin/… は 404)。
@@ -23176,6 +23218,181 @@ def admin_test_ai():
             reply = reply[:AI_REPLY_MAX] + "…"
         flash("AI接続テスト: OK（応答: {}）".format(reply), "success")
     return redirect(_admin_settings_url())
+
+# ---- ユーザー(環境ごとの役割・すべての環境で共通の氏名) ----
+# GET  /admin/users?env=<キー>            その環境のユーザーの一覧(ログインID・氏名・役割・状態・氏名の決め方)
+# POST /admin/users/<キー>/<ユーザーID>    1人分の保存(氏名・役割・「LDAP の氏名に戻す」)。保存の後は一覧へ戻る
+# 役割は環境ごと(その環境の DB の users.role)。固定ローカル管理者(admin と ldap_client.py の _LOCAL_ACCOUNTS)の役割は
+# ログインのたびに ldap_client.py の値になるため変えない。
+# 氏名は、同じログインIDのすべての環境(停止していないもの)で同じにし、admin が決めた氏名として共通の DB
+# (UserNameOverride)に残す(ログインしても LDAP の氏名で上書きしない。5-1)。「LDAP の氏名に戻す」はその記録を消す
+# (氏名は次のログインから LDAP の氏名。それまでは今の氏名のまま)。氏名を変えずに保存しても記録は作らない。
+# ほかの環境の DB は、その環境のアプリ(17 章)の中で読み書きし、書き込みの前にその DB のロックを取る(_lock_env_db。
+# lock_for_write はログイン中の人〔admin〕をその DB で確かめるため、ほかの環境のアプリの中では使わない)。
+
+USER_NAME_MAX = 128   # 氏名の文字数の上限(users.display_name の大きさ)
+_STALE_USERS = "画面を開いた後にユーザーが変わっています（削除・追加など）。画面を開き直してから操作してください。"
+
+def _lock_env_db():
+    """今のアプリ(環境)の DB の書き込みのロックを取り、読み込んだ値を読み直す(lock_for_write と同じ。人の確かめはしない)。"""
+    db.session.execute(text("UPDATE users SET id = id WHERE 0"))
+    db.session.expire_all()
+
+def _admin_env_app(key):
+    """システム管理の「ユーザー」で扱う環境のアプリ(停止していない環境だけ。無ければ None)。"""
+    if not any(entry["key"] == key for entry in active_envs()):
+        return None
+    dispatcher = env_dispatcher()
+    if dispatcher is None:
+        return current_app._get_current_object() if key == MAIN_ENV_KEY else None
+    return dispatcher.app_for(key)
+
+def _is_fixed_account(username):
+    """役割を変えないアカウント(固定ローカル管理者。ログインのたびに ldap_client.py の役割になる)。"""
+    return is_local_account(username)
+
+def _env_user_rows(app):
+    """環境のユーザーの一覧(有効な人を先に、氏名の順)。override は admin が氏名を決めたか。"""
+    with app.app_context():
+        overrides = {row.username for row in UserNameOverride.query.all()}
+        users = User.query.order_by(User.is_active.desc(), User.display_name, User.id).all()
+        return [{"id": u.id, "username": u.username, "display_name": u.display_name, "role": u.role,
+                 "role_label": u.role_label, "is_active": u.is_active, "fixed": _is_fixed_account(u.username),
+                 "override": u.username in overrides} for u in users]
+
+def users_tab_context(key):
+    """システム管理の「ユーザー」の表示用の値(key の環境が使えなければ env は None)。"""
+    envs = active_envs()
+    entry = next((e for e in envs if e["key"] == key), None)
+    app = _admin_env_app(key) if entry is not None else None
+    rows = _env_user_rows(app) if app is not None else []
+    return {
+        "envs": envs, "env": entry if app is not None else None, "rows": rows, "name_max": USER_NAME_MAX,
+        "roles": [(ROLE_MANAGER, ROLE_LABELS[ROLE_MANAGER]), (ROLE_MEMBER, ROLE_LABELS[ROLE_MEMBER])],
+        "managers": sum(1 for r in rows if r["is_active"] and r["role"] == ROLE_MANAGER and not r["fixed"]),
+        "members": sum(1 for r in rows if r["is_active"] and r["role"] == ROLE_MEMBER and not r["fixed"]),
+    }
+
+@admin_bp.route("/users", endpoint="users")
+def admin_users():
+    """ユーザー(環境を選んで、その環境の人の役割と氏名を変える)。"""
+    context = users_tab_context(request.args.get("env") or MAIN_ENV_KEY)
+    if context["env"] is None:
+        abort(404)
+    return render_template("admin/users.html", us=context)
+
+def _user_name_error(name):
+    """氏名の誤り(無ければ None)。"""
+    if not name:
+        return "氏名を入力してください。"
+    if len(name) > USER_NAME_MAX:
+        return "氏名は{}文字以内で入力してください。".format(USER_NAME_MAX)
+    if _CONFIG_CONTROL.search(name) or CONTROL_CHARS.search(name):
+        return "氏名に改行・制御文字は使えません。"
+    return None
+
+def _save_name_override(username, name, by):
+    """admin が決めた氏名を共通の DB に残す(メインの環境のアプリ〔この要求〕の中で呼ぶ)。"""
+    lock_for_write()
+    row = db.session.get(UserNameOverride, username)
+    if row is None:
+        db.session.add(UserNameOverride(username=username, display_name=name, updated_by=by))
+    else:
+        row.display_name, row.updated_by = name, by
+    db.session.commit()
+
+def _clear_name_override(username):
+    """admin が決めた氏名の記録を消す。戻り値: 消したか(記録が無ければ False)。"""
+    lock_for_write()
+    row = db.session.get(UserNameOverride, username)
+    if row is not None:
+        db.session.delete(row)
+    db.session.commit()
+    return row is not None
+
+def _rename_in_all_envs(username, name):
+    """同じログインIDの人の氏名を、すべての環境(停止していないもの)で name にする。戻り値: 変えた環境の名前の一覧。"""
+    changed = []
+    for entry in active_envs():
+        app = _admin_env_app(entry["key"])
+        if app is None:
+            continue
+        try:
+            with app.app_context():
+                _lock_env_db()
+                user = User.query.filter_by(username=username).first()
+                if user is not None and user.display_name != name:
+                    user.display_name = name
+                    changed.append(entry["name"])
+                db.session.commit()
+        except Exception:
+            current_app.logger.exception("環境 %s の %s の氏名を変えられませんでした", entry["key"], username)
+            flash("環境「{}」の氏名を変えられませんでした（内容はサーバーのログに記録しました）。".format(entry["name"]),
+                  "danger")
+    return changed
+
+@admin_bp.route("/users/<key>/<int:user_id>", methods=["POST"], endpoint="save_user")
+def admin_save_user(key, user_id):
+    """1人分の保存(その環境の役割・すべての環境の氏名・「LDAP の氏名に戻す」)。"""
+    back = url_for("admin.users", env=key)
+    app = _admin_env_app(key)
+    if app is None:
+        abort(404)
+    name = request.form.get("display_name", "").strip()
+    to_ldap = request.form.get("ldap_name") == "1"
+    wanted_role = request.form.get("role")
+    error = None if to_ldap else _user_name_error(name)
+    if error:
+        return flash_redirect(error, "danger", back)
+    by = current_user.username   # ほかの環境のアプリの中では current_user を使わない(別のアプリのログイン)
+    env_name = next(e["name"] for e in active_envs() if e["key"] == key)
+    notes = []
+    with app.app_context():
+        _lock_env_db()
+        user = db.session.get(User, user_id)
+        if user is None:
+            db.session.rollback()
+            return flash_redirect("このユーザーは既に削除されています。", "info", back)
+        if request.form.get("username") != user.username:
+            db.session.rollback()
+            return flash_redirect(_STALE_USERS, "warning", back)
+        username, old_name, old_role = user.username, user.display_name, user.role
+        role_changed = False
+        if wanted_role in (ROLE_MANAGER, ROLE_MEMBER) and wanted_role != old_role:
+            if _is_fixed_account(username):
+                notes.append(("固定のアカウント（{}）の役割は ldap_client.py で決まるため、変えていません。".format(username),
+                              "warning"))
+            else:
+                user.role = wanted_role
+                role_changed = True
+        db.session.commit()
+        managers = sum(1 for u in User.query.filter(User.is_active.is_(True), User.role == ROLE_MANAGER).all()
+                       if not _is_fixed_account(u.username))
+    if role_changed:
+        current_app.logger.info("システム管理: %s の役割を %s から %s にしました(環境 %s。%s)",
+                                username, old_role, wanted_role, key, by)
+        notes.append(("「{}」（{}）の役割を {} にしました（環境「{}」）。".format(old_name, username, ROLE_LABELS[wanted_role],
+                                                                 env_name), "success"))
+        if wanted_role == ROLE_MEMBER and managers == 0:
+            notes.append(("環境「{}」にマネージャーがいなくなりました（admin はこの環境に入れます）。".format(env_name), "warning"))
+    if to_ldap:
+        if _clear_name_override(username):
+            current_app.logger.info("システム管理: %s の氏名を LDAP の氏名に戻しました(%s)", username, by)
+            notes.append(("「{}」（{}）の氏名は、次のログインから LDAP の氏名になります（それまでは今の氏名のままです）。".format(
+                old_name, username), "success"))
+        elif not role_changed:
+            notes.append(("「{}」（{}）の氏名は、もともと LDAP の氏名に合わせています。".format(old_name, username), "info"))
+    elif name != old_name:
+        _save_name_override(username, name, by)
+        changed = _rename_in_all_envs(username, name)
+        current_app.logger.info("システム管理: %s の氏名を変えました(環境 %s。%s)", username, "、".join(changed) or "なし", by)
+        notes.append(("「{}」（{}）の氏名を「{}」にしました（{}。ログインしても LDAP の氏名で上書きしません）。".format(
+            old_name, username, name, "環境「{}」".format("」「".join(changed)) if changed else "すべての環境"), "success"))
+    if not notes:
+        notes.append(("「{}」（{}）は変わっていません。".format(old_name, username), "info"))
+    for message, category in notes:
+        flash(message, category)
+    return redirect(back)
 
 # #### 19. タスクの計画(手順と実行予定日) ###########################################################
 # タスクごとの計画(ゴールまでの手順と実行予定日の並び。TaskStep〔3-2〕・新しいテーブル task_steps)。担当者がまず計画を

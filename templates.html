@@ -33,6 +33,7 @@
     システム管理(admin) admin/_layout.html  admin/envs.html  admin/env_delete.html  admin/env_features.html（使う機能）
                         admin/settings.html
                         system/_config_tab.html（基本設定のフォーム）  admin/shifts.html  admin/shift_month.html
+                        admin/users.html（ユーザー）
     静的ファイル　　　  static/css/style.css  static/js/sort-table.js  static/js/auto-filter.js
                         static/js/routine-form.js  static/js/task-form.js
                         static/js/skill-item-form.js  static/js/skill-ai.js
@@ -5386,6 +5387,7 @@
         <li class="nav-item"><a class="nav-link {% if request.endpoint in ('admin.envs', 'admin.create_env', 'admin.delete_env', 'admin.env_features') %}active{% endif %}" href="{{ url_for('admin.envs') }}"><i class="bi bi-collection"></i> 環境</a></li>
         <li class="nav-item"><a class="nav-link {% if request.endpoint in ('admin.settings', 'admin.save_settings') %}active{% endif %}" href="{{ url_for('admin.settings') }}"><i class="bi bi-sliders"></i> 基本設定</a></li>
         <li class="nav-item"><a class="nav-link {% if request.endpoint in ('admin.shifts', 'admin.shift_month', 'admin.new_shift', 'admin.save_shift_codes') %}active{% endif %}" href="{{ url_for('admin.shifts') }}"><i class="bi bi-calendar3"></i> 勤務パターン</a></li>
+        <li class="nav-item"><a class="nav-link {% if request.endpoint in ('admin.users', 'admin.save_user') %}active{% endif %}" href="{{ url_for('admin.users') }}"><i class="bi bi-people"></i> ユーザー</a></li>
       </ul>
       <ul class="navbar-nav">
         <li class="nav-item"><span class="navbar-text small me-3"><i class="bi bi-person-badge"></i> {{ current_user.display_name }}（admin）</span></li>
@@ -6028,6 +6030,72 @@
 
 {% block scripts %}
 <script src="{{ url_for('static', filename='js/shift-month.js') }}"></script>
+{% endblock %}
+{#=== admin/users.html ===#}
+{# システム管理の「ユーザー」(環境ごとの役割の切り替えと、氏名の変更。admin だけ。app.py の 18 章)。us は users_tab_context の値。
+   1行ごとに別のフォーム(行の欄はフォームの外にあるため form 属性で結ぶ) #}
+{% extends "admin/_layout.html" %}
+{% block title %}ユーザー &middot; システム管理 &middot; {{ app_name }}{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item">システム管理</li>
+    <li class="breadcrumb-item active">ユーザー</li>
+  </ol>
+</nav>
+<h1 class="h3 mb-3"><i class="bi bi-people"></i> ユーザー</h1>
+<ul class="nav nav-pills mb-3 flex-wrap gap-1">
+  {%- for e in us.envs %}
+  <li class="nav-item"><a class="nav-link{{ ' active' if e.key == us.env.key }}"{{ ' aria-current="page"'|safe if e.key == us.env.key }} href="{{ url_for('admin.users', env=e.key) }}">{{ e.name }}</a></li>
+  {%- endfor %}
+</ul>
+<div class="card shadow-sm mb-3">
+  <div class="card-header bg-white fw-bold"><i class="bi bi-person-gear"></i> {{ us.env.name }}のユーザー
+    <span class="small text-muted fw-normal ms-2">manager {{ us.managers }}名・member {{ us.members }}名</span>
+    <i class="bi bi-info-circle text-muted" title="役割はこの環境だけで変わります。氏名を変えると、同じログインIDのすべての環境で同じ氏名になり、ログインしても LDAP の氏名で上書きしません。「LDAP の氏名に戻す」を付けて保存すると、次のログインから LDAP の氏名になります。固定のアカウント（admin など）の役割は ldap_client.py で決まるため変えられません。"></i></div>
+  <div class="card-body">
+    {% if not us.rows %}
+    <p class="text-muted small mb-0">この環境にはユーザーがいません（チーム管理で登録します）。</p>
+    {% else %}
+    <div class="table-responsive">
+      <table class="table table-sm align-middle mb-0">
+        <thead class="table-light"><tr><th>ログインID</th><th>氏名</th><th>役割</th><th>状態</th><th>氏名の決め方</th><th></th></tr></thead>
+        <tbody>
+          {% for u in us.rows %}
+          <tr>
+            <td class="text-nowrap"><code>{{ u.username }}</code></td>
+            <td style="min-width: 14rem;">
+              <input type="text" class="form-control form-control-sm" name="display_name" value="{{ u.display_name }}"
+                     maxlength="{{ us.name_max }}" required form="user-{{ u.id }}" aria-label="氏名（{{ u.username }}）">
+            </td>
+            <td style="min-width: 8rem;">
+              {% if u.fixed %}<span class="badge bg-light text-dark border">{{ u.role_label }}（固定）</span>
+              {% else %}<select class="form-select form-select-sm" name="role" form="user-{{ u.id }}" aria-label="役割（{{ u.username }}）">
+                {% for value, label in us.roles %}<option value="{{ value }}" {% if u.role == value %}selected{% endif %}>{{ label }}</option>{% endfor %}
+              </select>{% endif %}
+            </td>
+            <td class="text-nowrap">{% if u.is_active %}<span class="badge bg-success">有効</span>{% else %}<span class="badge bg-secondary">無効</span>{% endif %}</td>
+            <td class="small text-nowrap">
+              {% if u.override %}<span class="badge bg-warning text-dark">admin が設定</span>
+              <div class="form-check mt-1"><input class="form-check-input" type="checkbox" name="ldap_name" value="1" id="ldap-{{ u.id }}" form="user-{{ u.id }}">
+                <label class="form-check-label" for="ldap-{{ u.id }}">LDAP の氏名に戻す</label></div>
+              {% else %}<span class="text-muted">LDAP の氏名</span>{% endif %}
+            </td>
+            <td class="text-end">
+              <form method="post" action="{{ url_for('admin.save_user', key=us.env.key, user_id=u.id) }}" id="user-{{ u.id }}" class="m-0">
+                <input type="hidden" name="username" value="{{ u.username }}">
+                <button class="btn btn-sm btn-outline-primary text-nowrap">保存</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+  </div>
+</div>
 {% endblock %}
 {#=== static/css/style.css ===#}
 /* 業務管理アプリ 追加スタイル */
