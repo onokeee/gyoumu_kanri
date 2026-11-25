@@ -58,8 +58,10 @@
 </head>
 <body class="bg-light">
   {% block navbar %}{% if current_user.is_authenticated %}
-  {# マネージャーは項目が多いため、横に並べるのは幅 1200px 以上(それより狭い画面はメニューのボタンで開く) #}
-  <nav class="navbar {{ 'navbar-expand-xl' if current_user.is_manager else 'navbar-expand-lg' }} navbar-dark bg-primary">
+  {# マネージャーは項目が多いため、横に並べるのは幅 1200px 以上(それより狭い画面はメニューのボタンで開く)。
+     その幅でも1行に入りきらないときは、下のスクリプトがメニューのボタンにまとめる(data-expand) #}
+  {% set nav_expand = 'navbar-expand-xl' if current_user.is_manager else 'navbar-expand-lg' %}
+  <nav class="navbar {{ nav_expand }} navbar-dark bg-primary" data-expand="{{ nav_expand }}">
     <div class="container-fluid">
       <a class="navbar-brand fw-bold" href="{{ url_for('main.dashboard') }}">
         {{ app_brand(app_name) }}{% if env_nav %} <span class="badge bg-light text-primary align-middle env-badge">{{ env_nav.name }}</span>{% endif %}
@@ -177,6 +179,43 @@
     </div>
   </nav>
   {% endif %}{% endblock %}
+  {# ヘッダーの項目が1行に入りきらないとき(画面の拡大率・使う機能の数・環境の名前の長さで変わる)は、2段にせずに
+     メニューのボタン(≡)にまとめる。ナビの直後で動かし、2段のヘッダーが一瞬も見えないようにする #}
+  <script>
+  (function () {
+    var nav = document.querySelector('nav.navbar[data-expand]');
+    if (!nav) return;
+    var expand = nav.getAttribute('data-expand');
+    var collapse = nav.querySelector('.navbar-collapse');
+    var toggler = nav.querySelector('.navbar-toggler');
+    function wraps() {
+      var items = collapse.querySelectorAll('.navbar-nav > .nav-item');
+      if (!items.length) return false;
+      var first = items[0].getBoundingClientRect();
+      for (var i = 1; i < items.length; i++) {
+        if (items[i].getBoundingClientRect().top >= first.bottom - 2) return true;
+      }
+      return false;
+    }
+    function fit() {
+      nav.classList.add(expand);
+      if (toggler && getComputedStyle(toggler).display !== 'none') return;
+      if (wraps()) nav.classList.remove(expand);
+    }
+    fit();
+    // ヘッダーの幅が変わったとき(画面の幅・拡大率)。ResizeObserver は画面に描く前に呼ばれるため、2段が見えない
+    var lastWidth = nav.clientWidth;
+    function onResize() {
+      if (nav.clientWidth === lastWidth) return;
+      lastWidth = nav.clientWidth;
+      fit();
+    }
+    if (window.ResizeObserver) new ResizeObserver(onResize).observe(nav);
+    window.addEventListener('resize', onResize);
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(fit);
+    window.addEventListener('load', fit);
+  })();
+  </script>
 
   {# 画面の幅いっぱいに使う(広い画面で左右に余白を残さない。幅 992px 以上は左右の余白を少し広く) #}
   <main class="{% block main_class %}container-fluid px-lg-4{% endblock %} py-4">
@@ -5383,7 +5422,7 @@
 {% extends "base.html" %}
 {% from "_macros.html" import app_brand %}
 {% block navbar %}
-<nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+<nav class="navbar navbar-expand-lg navbar-dark bg-dark" data-expand="navbar-expand-lg">
   <div class="container-fluid">
     <a class="navbar-brand fw-bold" href="{{ url_for('admin.envs') }}">
       {{ app_brand(app_name) }} <span class="badge bg-warning text-dark align-middle env-badge">システム管理</span>
@@ -6224,8 +6263,9 @@ a:hover {
 }
 
 /* メニューを横に並べる幅で項目が1行に入りきらないとき(使う機能が多い環境・admin の「システム管理」・画面の拡大率が
-   大きいとき)は、項目を次の行に折り返す(ヘッダーが画面の右へはみ出して、ページ全体が横にスクロールしないように)。
-   次の行に回ったユーザーのメニューは右に寄せる */
+   大きいとき)は、base.html のスクリプトがメニューのボタン(≡)にまとめる。下はスクリプトが動かないときの予備で、項目を
+   次の行に折り返す(ヘッダーが画面の右へはみ出して、ページ全体が横にスクロールしないように)。次の行に回ったユーザーの
+   メニューは右に寄せる */
 @media (min-width: 992px) {
   .navbar-expand-lg .navbar-collapse,
   .navbar-expand-xl .navbar-collapse {
