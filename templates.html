@@ -349,12 +349,13 @@
 {% extends "base.html" %}
 {% from "_macros.html" import app_brand %}
 {% block title %}ログイン &middot; {{ app_name }}{% endblock %}
+{# 画面の高さいっぱいに使い、カードを上下左右の真ん中に置く(style.css の .login-main・.login-wrap) #}
+{% block main_class %}container-fluid px-lg-4 login-main{% endblock %}
 
 {% block content %}
-{# 外枠(カード)は大きく、中のアプリ名・入力欄・ボタンは標準の大きさでカードの真ん中に置く(style.css の .login-wrap) #}
 <div class="login-wrap">
   <div class="card shadow-sm login-card">
-    <div class="card-body p-4">
+    <div class="card-body">
       <div class="login-inner">
         <h1 class="login-brand text-center mb-4">{{ app_brand(app_name) }}</h1>
 
@@ -6174,20 +6175,34 @@ a:hover {
   background-clip: text;
   color: transparent;
 }
-/* ログインの画面(auth/login.html): 外枠(カード)は大きく(倍率 100% で 幅 約585px・高さ 約566px)、中のアプリ名・入力欄・
-   ボタンは標準の大きさ(幅 約348px)のまま、カードの真ん中に置く。狭い画面(576px 未満)は標準のカード */
+/* ログインの画面(auth/login.html): 画面の上下左右の真ん中に、画面の大きさに合わせたカード(幅は最大 約585px)を置く。
+   中のアプリ名・入力欄・ボタンは標準の大きさ(幅 約348px)。カードの上下の余白は画面の高さ・幅に合わせて変わる(最大 約106px) */
+.login-main {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
 .login-wrap {
-  max-width: 36.5rem;
-  margin: 3rem auto 0;
+  flex: 1 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+/* 上に案内(「ログインしてください。」など)があるときも画面の真ん中に見えるように、下にも案内1つ分の空きを作る */
+.login-main:has(> .alert)::after {
+  content: "";
+  flex: 0 0 4.625rem;
 }
 .login-card {
-  min-height: 35.375rem;
+  width: 100%;
+  max-width: 36.5rem;
   border-radius: .625rem;
 }
 .login-card .card-body {
   display: flex;
-  align-items: center;
   justify-content: center;
+  padding: clamp(1.5rem, min(13vh, 18vw), 6.65rem) 1.5rem;
 }
 .login-inner {
   width: 100%;
@@ -6196,11 +6211,6 @@ a:hover {
 .login-brand {
   font-size: 2.5rem;
   line-height: 1.2;
-}
-@media (max-width: 575.98px) {
-  .login-card {
-    min-height: 0;
-  }
 }
 /* 青のナビでも虹の色の順(赤〜紫〜ピンク)にし、地の青に溶けないように水色・青・紫・ピンクは明るい色にする */
 .navbar.bg-primary .app-brand {
