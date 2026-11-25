@@ -732,6 +732,38 @@ Bさん（2件）
 
 ## 以前の版からの更新
 
+### 11/1 の版（fdf4b04）から更新するとき（11/26 の版 29bc380 まで）
+
+会社のサーバーの `app.py` が 11/1 の版（fdf4b04「エグゼクティブサマリーを文章に…」）のときの手順です。この間の変更は、システム管理の「ユーザー」（役割の切り替え・氏名の変更）、アプリ名の WorkPallet、ログインの画面とヘッダーの見た目です。
+
+- **入れ替えるファイル**: `app.py` と `templates.html`（**必ず両方**。`app.py` だけでは画面が開けないことがあります）。`README.md` は任意。`config.py`・`ldap_client.py` はそのままです。
+- **DB**: 起動したときに新しいテーブル `user_name_overrides` を自動で作ります（`migrate` は不要。既存のテーブルは変えません）。
+- **差分を見る**: [GitHub の比較の画面（fdf4b04...29bc380）](https://github.com/onokeee/gyoumu_kanri/compare/fdf4b04...29bc380)
+- **パッチで更新する**: `app.py` だけなら、このリポジトリで `git diff fdf4b04 29bc380 -- app.py > app.patch` を作り、アプリのフォルダで `patch -p1 < app.patch` を実行します（fdf4b04 の `app.py` に当てると 29bc380 の `app.py` と同じになることを確認済み）。3つのファイル（`app.py`・`templates.html`・`README.md`）をまとめて当てるときは、[比較の .diff](https://github.com/onokeee/gyoumu_kanri/compare/fdf4b04...29bc380.diff) を同じく `patch -p1` で当てます。
+
+**`app.py` を手で差し替えるときの一覧**（上から順に。「旧の行」は fdf4b04、「新の行」は 29bc380 の行番号。会社のサーバーの `app.py` が別の版のときは、関数の名前と「〜の後」を目印にします）
+
+| # | 種類 | 場所 | 旧の行 | 新の行 | 内容 |
+|---|---|---|---|---|---|
+| 1 | 差し替え（任意） | ファイルの先頭の説明 | 1 | 1 | 先頭を `"""WorkPallet(業務管理システム。…` に（説明だけ） |
+| 2 | 差し替え | `class FixedConfig` の `APP_NAME` | 254 | 254 | `APP_NAME = "WorkPallet"` に |
+| 3 | 差し替え | `def display_app_name` | 889–898 | 889–898 | 説明と予備の名前を `"WorkPallet"` に（890・895 行目） |
+| 4 | **追加** | [`class UserNameOverride`](https://github.com/onokeee/gyoumu_kanri/blob/29bc380/app.py#L2779-L2795) | 2778 の後 | 2779–2795 | `class WorkShiftCode` の後、`# ==== 3-4. 定型・定期業務` の前 |
+| 5 | **追加** | [`def name_override`](https://github.com/onokeee/gyoumu_kanri/blob/29bc380/app.py#L4524-L4540) | 4506 の後 | 4524–4540 | `def is_local_account` の後、`def _login_display_name` の前 |
+| 6 | 差し替え | [`def _ensure_local_user`](https://github.com/onokeee/gyoumu_kanri/blob/29bc380/app.py#L4552-L4577) | 4518–4541 | 4552–4577 | 関数ごと（admin が決めた氏名を先に使う） |
+| 7 | 差し替え | [`def _match_registered_user`](https://github.com/onokeee/gyoumu_kanri/blob/29bc380/app.py#L4579-L4595) | 4543–4558 | 4579–4595 | 関数ごと（同上） |
+| 8 | 差し替え | [`def _portal_login`](https://github.com/onokeee/gyoumu_kanri/blob/29bc380/app.py#L4787-L4836) | 4750–4796 | 4787–4836 | 関数ごと（中の `start_portal_session(...)` の呼び出しだけ。旧 4787 行 → 新 4824–4827 行） |
+| 9 | 差し替え | `DEFAULT_MAIL_BODY`（週報の既定の本文） | 8494 | 8534 | 最後の行を `※このメールはWorkPalletから送信しています。"""` に |
+| 10 | 差し替え | `def _new_app` の中の `inject_globals` | 18724 | 18764 | `"app_name": app.config.get("APP_NAME") or "WorkPallet",` に（1行） |
+| 11 | 追加（任意） | 18 章の先頭の説明のコメント | 23028 の後 | 23069–23070 | 「ユーザー」の説明の2行（コメントだけ） |
+| 12 | **追加** | [システム管理の「ユーザー」一式](https://github.com/onokeee/gyoumu_kanri/blob/29bc380/app.py#L23222-L23396) | 23179 の後 | 23222–23396 | `def admin_test_ai` の後、`# #### 19. タスクの計画` の前に 175 行 |
+
+12 の中身（新の行）: 説明のコメント 23222–23232、`USER_NAME_MAX`・`_STALE_USERS` 23233–23234、`_lock_env_db` 23236–23239、`_admin_env_app` 23241–23248、`_is_fixed_account` 23250–23252、`_env_user_rows` 23254–23261、`users_tab_context` 23263–23274、`admin_users`（GET /admin/users）23276–23282、`_user_name_error` 23284–23292、`_save_name_override` 23294–23302、`_clear_name_override` 23304–23311、`_rename_in_all_envs` 23313–23332、`admin_save_user`（POST /admin/users/<キー>/<ID>）23334–23395。
+
+`app.py` を変えたコミットは 7395187（システム管理の「ユーザー」。#4〜#8・#11・#12）と 4ed34f2（アプリ名 WorkPallet。#1〜#3・#9・#10）です。ほかのコミット（2ff12bc〜29bc380）は `templates.html` だけの変更です。
+
+### `app/` フォルダに分かれていた版から更新するとき
+
 `app/` フォルダと `serve.py` などのスクリプトに分かれていた版から更新する手順です（ファイルをコピーして配置している場合）。
 
 1. サーバーを止めます（自動起動のタスクがあれば、そのタスクも止めます）。
