@@ -351,28 +351,30 @@
 {% block title %}ログイン &middot; {{ app_name }}{% endblock %}
 
 {% block content %}
-{# 文字の大きさは標準のまま、外枠(カード)を大きくする(倍率 100% で 幅 約585px・高さ 約560px。style.css の .login-wrap) #}
+{# 外枠(カード)は大きく、中のアプリ名・入力欄・ボタンは標準の大きさでカードの真ん中に置く(style.css の .login-wrap) #}
 <div class="login-wrap">
   <div class="card shadow-sm login-card">
-    <div class="card-body">
-      <h1 class="login-brand text-center">{{ app_brand(app_name) }}</h1>
+    <div class="card-body p-4">
+      <div class="login-inner">
+        <h1 class="login-brand text-center mb-4">{{ app_brand(app_name) }}</h1>
 
-      {# ログイン前に開こうとしたページ(next)を送信後も引き継ぐ。login_action は共通の入口の URL
-         (複数の環境のとき、ほかの環境の画面から開いたログインの画面。app.py の 17 章) #}
-      <form method="post" action="{{ login_action or url_for('auth.login', next=request.args.get('next')) }}">
-        <div class="login-field">
-          <label class="form-label">ID</label>
-          <input type="text" name="username" class="form-control" autofocus required
-                 value="{{ username or '' }}" placeholder="ログインID">
-        </div>
-        <div class="login-field">
-          <label class="form-label">パスワード</label>
-          <input type="password" name="password" class="form-control" required placeholder="パスワード">
-        </div>
-        <button type="submit" class="btn btn-primary w-100">
-          <i class="bi bi-box-arrow-in-right"></i> ログイン
-        </button>
-      </form>
+        {# ログイン前に開こうとしたページ(next)を送信後も引き継ぐ。login_action は共通の入口の URL
+           (複数の環境のとき、ほかの環境の画面から開いたログインの画面。app.py の 17 章) #}
+        <form method="post" action="{{ login_action or url_for('auth.login', next=request.args.get('next')) }}">
+          <div class="mb-3">
+            <label class="form-label">ID</label>
+            <input type="text" name="username" class="form-control" autofocus required
+                   value="{{ username or '' }}" placeholder="ログインID">
+          </div>
+          <div class="mb-3">
+            <label class="form-label">パスワード</label>
+            <input type="password" name="password" class="form-control" required placeholder="パスワード">
+          </div>
+          <button type="submit" class="btn btn-primary w-100">
+            <i class="bi bi-box-arrow-in-right"></i> ログイン
+          </button>
+        </form>
+      </div>
     </div>
   </div>
 </div>
@@ -6172,47 +6174,32 @@ a:hover {
   background-clip: text;
   color: transparent;
 }
-/* ログインの画面(auth/login.html): 文字の大きさは標準のまま(アプリ名は 2.5rem)、外枠(カード)を大きくする
-   (倍率 100% で 幅 約585px・高さ 約560px)。そのぶん余白と、入力欄・ボタンの高さを広げる。狭い画面(576px 未満)は標準の余白 */
+/* ログインの画面(auth/login.html): 外枠(カード)は大きく(倍率 100% で 幅 約585px・高さ 約566px)、中のアプリ名・入力欄・
+   ボタンは標準の大きさ(幅 約348px)のまま、カードの真ん中に置く。狭い画面(576px 未満)は標準のカード */
 .login-wrap {
   max-width: 36.5rem;
   margin: 3rem auto 0;
 }
 .login-card {
+  min-height: 35.375rem;
   border-radius: .625rem;
 }
 .login-card .card-body {
-  padding: 3.75rem 2.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.login-inner {
+  width: 100%;
+  max-width: 21.75rem;
 }
 .login-brand {
   font-size: 2.5rem;
   line-height: 1.2;
-  margin-bottom: 4rem;
-}
-.login-field {
-  margin-bottom: 2rem;
-}
-.login-card .form-control,
-.login-card .btn {
-  padding: 1.25rem 1rem;
-  border-radius: .5rem;
-}
-.login-card .btn {
-  margin-top: .5rem;
 }
 @media (max-width: 575.98px) {
-  .login-card .card-body {
-    padding: 1.5rem;
-  }
-  .login-brand {
-    margin-bottom: 1.5rem;
-  }
-  .login-field {
-    margin-bottom: 1rem;
-  }
-  .login-card .form-control,
-  .login-card .btn {
-    padding: .5rem .75rem;
+  .login-card {
+    min-height: 0;
   }
 }
 /* 青のナビでも虹の色の順(赤〜紫〜ピンク)にし、地の青に溶けないように水色・青・紫・ピンクは明るい色にする */
