@@ -351,7 +351,7 @@
 {% block title %}ログイン &middot; {{ app_name }}{% endblock %}
 
 {% block content %}
-{# 倍率 100% でも大きく見えるように、カードの幅・文字・入力欄・ボタンを標準の約 1.7 倍にする(style.css の .login-wrap) #}
+{# 文字の大きさは標準のまま、外枠(カード)を大きくする(倍率 100% で 幅 約585px・高さ 約560px。style.css の .login-wrap) #}
 <div class="login-wrap">
   <div class="card shadow-sm login-card">
     <div class="card-body">
@@ -6172,41 +6172,48 @@ a:hover {
   background-clip: text;
   color: transparent;
 }
-/* ログインの画面(auth/login.html): 倍率 100% でも大きく見えるように、カードの幅・余白・アプリ名・文字・入力欄・ボタンを
-   標準の大きさの --ls 倍(約 1.7 倍)にする。狭い画面(576px 未満)は、はみ出さないように小さめ */
+/* ログインの画面(auth/login.html): 文字の大きさは標準のまま(アプリ名は 2.5rem)、外枠(カード)を大きくする
+   (倍率 100% で 幅 約585px・高さ 約560px)。そのぶん余白と、入力欄・ボタンの高さを広げる。狭い画面(576px 未満)は標準の余白 */
 .login-wrap {
-  --ls: 1.7;
-  max-width: calc(21.5rem * var(--ls));
+  max-width: 36.5rem;
   margin: 3rem auto 0;
 }
-@media (max-width: 575.98px) {
-  .login-wrap {
-    --ls: 1.15;
-  }
-}
 .login-card {
-  border-radius: calc(.375rem * var(--ls));
+  border-radius: .625rem;
 }
 .login-card .card-body {
-  padding: calc(1.5rem * var(--ls));
+  padding: 3.75rem 2.5rem;
 }
 .login-brand {
-  font-size: calc(2.5rem * var(--ls));
+  font-size: 2.5rem;
   line-height: 1.2;
-  margin-bottom: calc(1.5rem * var(--ls));
+  margin-bottom: 4rem;
 }
 .login-field {
-  margin-bottom: calc(1rem * var(--ls));
-}
-.login-card .form-label {
-  font-size: calc(1rem * var(--ls));
-  margin-bottom: calc(.5rem * var(--ls));
+  margin-bottom: 2rem;
 }
 .login-card .form-control,
 .login-card .btn {
-  font-size: calc(1rem * var(--ls));
-  padding: calc(.375rem * var(--ls)) calc(.75rem * var(--ls));
-  border-radius: calc(.375rem * var(--ls));
+  padding: 1.25rem 1rem;
+  border-radius: .5rem;
+}
+.login-card .btn {
+  margin-top: .5rem;
+}
+@media (max-width: 575.98px) {
+  .login-card .card-body {
+    padding: 1.5rem;
+  }
+  .login-brand {
+    margin-bottom: 1.5rem;
+  }
+  .login-field {
+    margin-bottom: 1rem;
+  }
+  .login-card .form-control,
+  .login-card .btn {
+    padding: .5rem .75rem;
+  }
 }
 /* 青のナビでも虹の色の順(赤〜紫〜ピンク)にし、地の青に溶けないように水色・青・紫・ピンクは明るい色にする */
 .navbar.bg-primary .app-brand {
