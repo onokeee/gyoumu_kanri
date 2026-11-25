@@ -6173,9 +6173,9 @@ a:hover {
   background-clip: text;
   color: transparent;
 }
-/* 青のナビでは、青・紫の文字が地に溶けないように、文字のまわりに細い白い縁を付ける */
+/* 青のナビでは、文字が地の青に溶けないように、青・紫を使わないグラデーション(赤みのある色から緑へ)にする */
 .navbar.bg-primary .app-brand {
-  filter: drop-shadow(0 0 1px #fff) drop-shadow(0 0 1px #fff) drop-shadow(0 0 .5px #fff);
+  background-image: linear-gradient(90deg, #ff9aa2 0%, #ffb86b 22%, #ffd43b 45%, #a9e34b 65%, #69db7c 82%, #38d9a9 100%);
 }
 
 /* メニューの名前を途中で折り返さない(「タ/ス/ク」のように1文字ずつ縦に並ばないように) */
