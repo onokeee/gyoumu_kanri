@@ -42,6 +42,7 @@
                         static/js/task-plan.js
 #}
 {#=== base.html ===#}
+{% from "_macros.html" import app_brand -%}
 <!doctype html>
 <html lang="ja">
 <head>
@@ -61,7 +62,7 @@
   <nav class="navbar {{ 'navbar-expand-xl' if current_user.is_manager else 'navbar-expand-lg' }} navbar-dark bg-primary">
     <div class="container-fluid">
       <a class="navbar-brand fw-bold" href="{{ url_for('main.dashboard') }}">
-        <i class="bi bi-clipboard-check"></i> {{ app_name }}{% if env_nav %} <span class="badge bg-light text-primary align-middle env-badge">{{ env_nav.name }}</span>{% endif %}
+        <i class="bi bi-clipboard-check"></i> {{ app_brand(app_name) }}{% if env_nav %} <span class="badge bg-light text-primary align-middle env-badge">{{ env_nav.name }}</span>{% endif %}
       </a>
       <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarMain">
         <span class="navbar-toggler-icon"></span>
@@ -202,6 +203,11 @@
 {#=== _macros.html ===#}
 {# 共通表示マクロ。各テンプレートから {% from '_macros.html' import fmt_date %} で利用する。 #}
 
+{# アプリの名前(ナビ・ログインの画面)。白い角丸の地に、1文字ずつ色を変えた太字(色は style.css の .app-brand-c0〜c6 を順に) #}
+{% macro app_brand(name) -%}
+<span class="app-brand">{% for ch in name %}<span class="app-brand-c{{ loop.index0 % 7 }}">{{ ch }}</span>{% endfor %}</span>
+{%- endmacro %}
+
 {# 日付 YYYY/MM/DD。Noneは ― #}
 {% macro fmt_date(d) -%}
   {%- if d -%}{{ d.strftime('%Y/%m/%d') }}{%- else -%}―{%- endif -%}
@@ -341,6 +347,7 @@
 {% endblock %}
 {#=== auth/login.html ===#}
 {% extends "base.html" %}
+{% from "_macros.html" import app_brand %}
 {% block title %}ログイン &middot; {{ app_name }}{% endblock %}
 
 {% block content %}
@@ -348,7 +355,7 @@
   <div class="col-md-5 col-lg-4">
     <div class="card shadow-sm mt-5">
       <div class="card-body p-4">
-        <h1 class="h4 text-center mb-4"><i class="bi bi-clipboard-check text-primary"></i> {{ app_name }}</h1>
+        <h1 class="h4 text-center mb-4"><i class="bi bi-clipboard-check text-primary"></i> {{ app_brand(app_name) }}</h1>
 
         {# ログイン前に開こうとしたページ(next)を送信後も引き継ぐ。login_action は共通の入口の URL
            (複数の環境のとき、ほかの環境の画面から開いたログインの画面。app.py の 17 章) #}
@@ -5372,11 +5379,12 @@
 {#=== admin/_layout.html ===#}
 {# システム管理の画面(固定ローカル管理者 admin だけ。app.py の 18 章)の共通の枠。ナビはシステム管理の項目だけ #}
 {% extends "base.html" %}
+{% from "_macros.html" import app_brand %}
 {% block navbar %}
 <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
   <div class="container-fluid">
     <a class="navbar-brand fw-bold" href="{{ url_for('admin.envs') }}">
-      <i class="bi bi-shield-lock"></i> {{ app_name }} <span class="badge bg-warning text-dark align-middle env-badge">システム管理</span>
+      <i class="bi bi-shield-lock"></i> {{ app_brand(app_name) }} <span class="badge bg-warning text-dark align-middle env-badge">システム管理</span>
     </a>
     <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarAdmin"
             aria-controls="navbarAdmin" aria-expanded="false" aria-label="メニュー">
@@ -6157,6 +6165,24 @@ a:hover {
 .navbar-brand i {
   vertical-align: -2px;
 }
+
+/* アプリの名前(ナビ・ログインの画面。_macros.html の app_brand): 白い角丸の地に、1文字ずつ色を変えた太字
+   (青・黒のナビでも読めるように地を白にする。色は文字の順に c0〜c6 を繰り返す) */
+.app-brand {
+  display: inline-block;
+  padding: 0 .45rem;
+  border-radius: .5rem;
+  background-color: #fff;
+  font-weight: 800;
+  letter-spacing: .02em;
+}
+.app-brand-c0 { color: #e03131; }
+.app-brand-c1 { color: #e8590c; }
+.app-brand-c2 { color: #2f9e44; }
+.app-brand-c3 { color: #0c8599; }
+.app-brand-c4 { color: #1971c2; }
+.app-brand-c5 { color: #7048e8; }
+.app-brand-c6 { color: #d6336c; }
 
 /* メニューの名前を途中で折り返さない(「タ/ス/ク」のように1文字ずつ縦に並ばないように) */
 .navbar-nav .nav-link,

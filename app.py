@@ -1,4 +1,4 @@
-"""業務管理システム(チームのタスク・定型業務・スキル・年休などを一元管理する Flask アプリ)。
+"""WorkPallet(業務管理システム。チームのタスク・定型業務・スキル・年休などを一元管理する Flask アプリ)。
 
 Python のコードはすべてこの app.py にまとめている。ほかのファイル:
   templates.html   画面テンプレート(Jinja2)・CSS・JavaScript(セクションごとに区切って1ファイル)
@@ -251,7 +251,7 @@ class FixedConfig:
     # SQLAlchemy 設定(DBのパスは prepare_instance() で instance フォルダ基準に設定)
     SQLALCHEMY_TRACK_MODIFICATIONS = False
 
-    APP_NAME = "業務管理システム"
+    APP_NAME = "WorkPallet"   # アプリの名前(画面の上・ブラウザのタブ・メール・Word。画面では1文字ずつ色を変えた太字)
 
     # セッションCookieを他のサイトからのPOST(フォーム送信・fetch など)に付けない。
     # 他サイトのページから勝手に送信・設定変更などをさせないため。
@@ -887,12 +887,12 @@ def get_or_404(model, ident):
     return obj
 
 def display_app_name(app=None):
-    """メール・Word に書くアプリの名前(設定 APP_NAME。空なら「業務管理システム」)。
+    """メール・Word に書くアプリの名前(設定 APP_NAME。空なら「WorkPallet」)。
 
     複数の環境(17 章)のときは、環境の名前を付ける(どのグループのメール・週報かが分かるように)。
     """
     app = app or current_app
-    name = app.config.get("APP_NAME") or "業務管理システム"
+    name = app.config.get("APP_NAME") or "WorkPallet"
     if multi_env_enabled(app):
         return "{}（{}）".format(name, env_name(app))
     return name
@@ -8531,7 +8531,7 @@ DEFAULT_MAIL_BODY = """各位
 {期間} の週報を送付します。
 添付のWordファイルをご確認ください。
 
-※このメールは業務管理システムから送信しています。"""
+※このメールはWorkPalletから送信しています。"""
 
 WEEKLY_DEFAULTS = {
     "enabled": False,
@@ -18761,7 +18761,7 @@ def _new_app(env=None, shared_instance=None):
         # env_nav: 複数の環境(17 章)のときにナビに出す環境の名前・切り替えの URL(1つの環境のあいだは None)
         # admin_url: 固定ローカル管理者(admin)のときのシステム管理の URL(18 章。ほかの人は None)
         # feature_enabled / has_system_settings: この環境で使う機能(2-8)。ナビ・画面の欄の表示に使う
-        return {"app_name": app.config.get("APP_NAME", "業務管理"), "submit_token": submit_token,
+        return {"app_name": app.config.get("APP_NAME") or "WorkPallet", "submit_token": submit_token,
                 "env_nav": env_nav_context(), "admin_url": admin_nav_url(),
                 "feature_enabled": feature_enabled, "has_system_settings": has_system_settings}
 
